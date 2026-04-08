@@ -479,10 +479,19 @@ def create_app(config: dict, store: Store) -> Dash:
         try:
             waveforms = store.get_evoked_waveforms_for_session(session_dir)
         except Exception as e:
+            logger.error("Waveform query error: %s", e, exc_info=True)
             return _empty_fig(f"Error: {e}", 550)
 
         if not waveforms:
             return _empty_fig("No evoked waveforms for this session", 550)
+
+        try:
+            return _build_waveform_figure(waveforms, store, session_dir)
+        except Exception as e:
+            logger.error("Waveform plot error: %s", e, exc_info=True)
+            return _empty_fig(f"Plot error: {e}", 550)
+
+    def _build_waveform_figure(waveforms, store, session_dir):
 
         # Read analysis window from config
         cfg = _load_config()
