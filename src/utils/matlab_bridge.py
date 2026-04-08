@@ -6,6 +6,7 @@ import tempfile
 import os
 import logging
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("qc_monitor.matlab_bridge")
 
@@ -33,24 +34,62 @@ def run_matlab_batch(script: str, timeout: int = 600,
 
 
 def run_pipeline(input_file: str, matlab_exe: str = MATLAB_EXE_DEFAULT,
-                 timeout: int = 600) -> dict:
+                 timeout: int = 600, config: Optional[dict] = None) -> dict:
     """Run the full analysis pipeline on a single .mat file.
 
-    Returns a dict with results from run_pipeline.m, or an error dict.
+    Parameters
+    ----------
+    input_file : str
+        Path to the input .mat file.
+    matlab_exe : str
+        Path to the MATLAB executable.
+    timeout : int
+        Maximum seconds to wait for MATLAB to finish.
+    config : dict, optional
+        Pipeline configuration dict (evoked/criticality/feature settings
+        from config.yaml).  Written to a temp JSON file and passed as the
+        third argument to run_pipeline.m.
+
+    Returns
+    -------
+    dict
+        Parsed pipeline results containing:
+        - features: dict of feature_name -> [epoch values]
+        - criticality: dict with time_points, db_values, db_stds, sigmas
+        - epoch_times: [stimulus times]
+        - channel_names, eeg_channel, stim_channel
+        - evoked_output_path, num_stimuli, num_traces
+        - matlab_stdout, matlab_stderr
+        Or an error dict with exit_status="error" and error_message.
     """
     # Create temp output path for JSON results
     fd, output_json = tempfile.mkstemp(suffix=".json", prefix="qc_pipeline_")
     os.close(fd)
+
+    # Write config to a temp JSON file if provided
+    config_json = None
+    if config is not None:
+        fd_cfg, config_json = tempfile.mkstemp(suffix=".json", prefix="qc_config_")
+        os.close(fd_cfg)
+        with open(config_json, "w") as f:
+            json.dump(config, f)
 
     # Normalize paths for MATLAB (forward slashes)
     input_norm = input_file.replace("\\", "/")
     output_norm = output_json.replace("\\", "/")
     pipeline_dir = PIPELINE_SCRIPT_DIR.replace("\\", "/")
 
-    script = (
-        f"addpath('{pipeline_dir}'); "
-        f"run_pipeline('{input_norm}', '{output_norm}')"
-    )
+    if config_json is not None:
+        config_norm = config_json.replace("\\", "/")
+        script = (
+            f"addpath('{pipeline_dir}'); "
+            f"run_pipeline('{input_norm}', '{output_norm}', '{config_norm}')"
+        )
+    else:
+        script = (
+            f"addpath('{pipeline_dir}'); "
+            f"run_pipeline('{input_norm}', '{output_norm}')"
+        )
 
     try:
         proc = run_matlab_batch(script, timeout=timeout, matlab_exe=matlab_exe)
@@ -79,8 +118,9 @@ def run_pipeline(input_file: str, matlab_exe: str = MATLAB_EXE_DEFAULT,
             "error_message": str(e),
         }
     finally:
-        if os.path.exists(output_json):
-            try:
-                os.unlink(output_json)
-            except OSError:
-                pass
+        for tmp in (output_json, config_json):
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
