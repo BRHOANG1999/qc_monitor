@@ -1,14 +1,17 @@
-function run_pipeline(input_file, output_json)
-% RUN_PIPELINE  Headless analysis pipeline for QC monitor.
+function run_pipeline(input_file, output_json, config_json)
+% RUN_PIPELINE  Full auto-discovering analysis pipeline for QC monitor.
+%
 %   run_pipeline(INPUT_FILE, OUTPUT_JSON)
+%   run_pipeline(INPUT_FILE, OUTPUT_JSON, CONFIG_JSON)
 %
-%   Loads a KMrecorder .mat file, runs evoked extraction + feature extraction
-%   + criticality analysis, and writes results to a JSON file for Python.
+%   1. Loads KMrecorder .mat via load_chunk_data
+%   2. Auto-discovers EEG/stim channels from fnstr
+%   3. Runs batchExtractEvokedResponses with proper channel config
+%   4. Extracts ALL 30 features per epoch
+%   5. Runs criticality analysis on EEG channel
+%   6. Writes comprehensive results to JSON
 %
-%   INPUT_FILE  - path to KMrecorder .mat (sbuf format) or STiM-NET chunk
-%   OUTPUT_JSON - path where results JSON will be written
-%
-%   Called by Python via: matlab -batch "run_pipeline('file.mat','result.json')"
+%   CONFIG_JSON (optional): path to JSON with overrides for evoked/criticality params
 
     t_start = tic;
     result = struct();
@@ -16,129 +19,202 @@ function run_pipeline(input_file, output_json)
     result.exit_status = 'success';
     result.error_message = '';
 
+    % --- Load config overrides if provided ---
+    cfg = struct();
+    if nargin >= 3 && ~isempty(config_json) && exist(config_json, 'file')
+        try
+            cfg = jsondecode(fileread(config_json));
+        catch
+            fprintf('[PIPELINE] Warning: could not parse config JSON\n');
+        end
+    end
+
+    % Default analysis params (overridable via config)
+    pre_ms = get_cfg(cfg, 'pre_stimulus_ms', -100);
+    post_ms = get_cfg(cfg, 'post_stimulus_ms', 500);
+    baseline_on = get_cfg(cfg, 'baseline_correction', true);
+    baseline_win = get_cfg(cfg, 'baseline_window_ms', [-60, -10]);
+    notch60 = get_cfg(cfg, 'notch_60hz', true);
+    notch50 = get_cfg(cfg, 'notch_50hz', false);
+    hp_on = get_cfg(cfg, 'highpass_enabled', false);
+    hp_hz = get_cfg(cfg, 'highpass_cutoff_hz', 1.0);
+    lp_on = get_cfg(cfg, 'lowpass_enabled', false);
+    lp_hz = get_cfg(cfg, 'lowpass_cutoff_hz', 1000.0);
+    stim_thresh_std = get_cfg(cfg, 'stimulus_threshold_std', 3.0);
+    min_stim_dist = get_cfg(cfg, 'min_stimulus_distance_sec', 0.1);
+    crit_ar = get_cfg(cfg, 'ar_order', 5);
+    crit_win = get_cfg(cfg, 'window_sec', 2.0);
+    crit_overlap = get_cfg(cfg, 'overlap_pct', 50);
+
     try
-        % Add STiM-NET paths
-        stimnet_root = 'D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator';
+        % --- Add STiM-NET paths ---
+        stimnet_root = get_cfg(cfg, 'stimnet_root', ...
+            'D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator');
         addpath(genpath(fullfile(stimnet_root, 'src')));
 
-        % --- Step 1: Load data using load_chunk_data (handles both formats) ---
+        % --- Step 1: Load data ---
         fprintf('[PIPELINE] Loading: %s\n', input_file);
         [sbuf, fs, trdata] = load_chunk_data(input_file);
-        fprintf('[PIPELINE] Loaded: %d samples x %d channels @ %d Hz\n', ...
-            size(sbuf, 1), size(sbuf, 2), fs);
+        [n_samples, n_channels] = size(sbuf);
+        fprintf('[PIPELINE] Loaded: %d samples x %d ch @ %d Hz (%.1f sec)\n', ...
+            n_samples, n_channels, fs, n_samples/fs);
 
         result.sampling_rate = fs;
-        result.num_samples = size(sbuf, 1);
-        result.num_channels = size(sbuf, 2);
-        result.duration_sec = size(sbuf, 1) / fs;
+        result.num_samples = n_samples;
+        result.num_channels = n_channels;
+        result.duration_sec = n_samples / fs;
 
-        % --- Step 2: Prepare temp file for batchExtractEvokedResponses ---
-        % batchExtractEvokedResponses expects 'EEG' field + 'fs' field
-        [~, fname, ~] = fileparts(input_file);
-        temp_dir = tempdir;
-        temp_mat = fullfile(temp_dir, [fname '_pipeline_temp.mat']);
+        % --- Step 2: Auto-discover channel roles from fnstr ---
+        raw = load(input_file);
+        eeg_ch = 1;  % 1-indexed, default
+        stim_ch = 2; % 1-indexed, default
 
-        EEG = sbuf;  % [samples x channels] - use column 1 as EEG, column 2 as stim
-        save(temp_mat, 'EEG', 'fs', '-v7');
-        fprintf('[PIPELINE] Temp file: %s\n', temp_mat);
-
-        % --- Step 3: Run evoked extraction ---
-        evoked_output_dir = fullfile(stimnet_root, 'evokedOutput');
-        if ~exist(evoked_output_dir, 'dir')
-            mkdir(evoked_output_dir);
+        if isfield(raw, 'fnstr')
+            fnstr = raw.fnstr;
+            if iscell(fnstr)
+                result.channel_names = fnstr(1:min(n_channels, length(fnstr)));
+                for i = 1:min(n_channels, length(fnstr))
+                    name = fnstr{i};
+                    if startsWith(name, 'BCH') || startsWith(name, 'EEG') || startsWith(name, 'LFP')
+                        eeg_ch = i;
+                    end
+                    if contains(lower(name), 'stim') && stim_ch == 2
+                        stim_ch = i;
+                    end
+                end
+            end
         end
 
-        eeg_channel = 1;
-        stim_channel = min(2, size(sbuf, 2));  % channel 2 if available
+        result.eeg_channel = eeg_ch;
+        result.stim_channel = stim_ch;
+        fprintf('[PIPELINE] Auto-discovered: EEG=Ch%d, Stim=Ch%d\n', eeg_ch, stim_ch);
+
+        % --- Step 3: Save temp file for batchExtractEvokedResponses ---
+        [~, fname, ~] = fileparts(input_file);
+        temp_mat = fullfile(tempdir, [fname '_qc_temp.mat']);
+        EEG = sbuf;
+        save(temp_mat, 'EEG', 'fs', '-v7');
+
+        evoked_output_dir = fullfile(stimnet_root, 'evokedOutput');
+        if ~exist(evoked_output_dir, 'dir'), mkdir(evoked_output_dir); end
+
+        % --- Step 4: Evoked extraction ---
+        result.evoked_success = false;
+        result.num_stimuli = 0;
+        result.num_traces = 0;
+        result.evoked_output_path = '';
 
         try
-            [extract_results, output_files] = batchExtractEvokedResponses({temp_mat}, ...
-                'PreStimulusMS', -100, ...
-                'PostStimulusMS', 500, ...
-                'EEGChannel', eeg_channel, ...
-                'StimulusChannel', stim_channel, ...
-                'BaselineCorrection', true, ...
-                'BaselineWindow', [-60, -10], ...
-                'NotchFilter60Hz', true, ...
+            [er, outfiles] = batchExtractEvokedResponses({temp_mat}, ...
+                'EEGChannel', eeg_ch, ...
+                'StimulusChannel', stim_ch, ...
+                'PreStimulusMS', pre_ms, ...
+                'PostStimulusMS', post_ms, ...
+                'StimulusThreshold', stim_thresh_std, ...
+                'MinStimulusDistance', min_stim_dist, ...
+                'BaselineCorrection', baseline_on, ...
+                'BaselineWindow', baseline_win, ...
+                'NotchFilter60Hz', notch60, ...
+                'NotchFilter50Hz', notch50, ...
+                'HighPassEnabled', hp_on, ...
+                'HighPassCutoff', hp_hz, ...
+                'LowPassEnabled', lp_on, ...
+                'LowPassCutoff', lp_hz, ...
                 'OutputFolder', evoked_output_dir, ...
                 'OutputSuffix', '_evoked');
 
-            if ~isempty(extract_results)
-                result.evoked_success = extract_results(1).success;
-                result.num_stimuli = extract_results(1).numStimuli;
-                result.num_traces = extract_results(1).numTraces;
-                result.evoked_message = extract_results(1).message;
-                if ~isempty(output_files)
-                    result.evoked_output_path = output_files{1};
+            if ~isempty(er) && er(1).success
+                result.evoked_success = true;
+                result.num_stimuli = er(1).numStimuli;
+                result.num_traces = er(1).numTraces;
+                if ~isempty(outfiles)
+                    result.evoked_output_path = outfiles{1};
                 end
+                fprintf('[PIPELINE] Evoked: %d stimuli, %d traces\n', er(1).numStimuli, er(1).numTraces);
             end
-        catch evoked_err
-            result.evoked_success = false;
-            result.evoked_message = evoked_err.message;
-            result.num_stimuli = 0;
-            result.num_traces = 0;
-            fprintf('[PIPELINE] Evoked extraction failed: %s\n', evoked_err.message);
+        catch e
+            result.evoked_message = e.message;
+            fprintf('[PIPELINE] Evoked failed: %s\n', e.message);
         end
 
-        % --- Step 4: Feature extraction (if evoked data exists) ---
+        % --- Step 5: Extract ALL 30 features per epoch ---
+        result.features = struct();
         result.num_features = 0;
-        result.feature_names = {};
-        result.feature_means = [];
+        result.epoch_times = [];
 
-        if isfield(result, 'evoked_output_path') && exist(result.evoked_output_path, 'file')
+        if result.evoked_success && ~isempty(result.evoked_output_path) && exist(result.evoked_output_path, 'file')
             try
-                evoked = load(result.evoked_output_path);
-                if isfield(evoked, 'evokedData') && isfield(evoked.evokedData, 'traces')
-                    traces = evoked.evokedData.traces;
-                    timeAxis = evoked.evokedData.timeAxis;
+                ev = load(result.evoked_output_path);
+                traces = ev.evokedData.traces;   % [samples x epochs]
+                timeAxis = ev.evokedData.timeAxis;
+                stimTimes = ev.evokedData.stimulusTimes;
+                n_epochs = size(traces, 2);
 
-                    fe = FeatureExtractor();
-                    feature_names = {'Line Length', 'Peak Amplitude', 'Trough Amplitude', ...
-                                     'RMS Amplitude', 'Peak Latency', 'Trough Latency'};
-                    feature_means = zeros(1, length(feature_names));
+                result.epoch_times = stimTimes(:)';
 
-                    for fi = 1:length(feature_names)
-                        try
-                            vals = fe.calculateFeatureMetric(feature_names{fi}, traces, timeAxis, fs);
-                            feature_means(fi) = nanmean(vals);
-                        catch
-                            feature_means(fi) = NaN;
-                        end
+                fe = FeatureExtractor();
+                ALL_FEATURES = {'Line Length','Log(AUC)','Peak Amplitude','Trough Amplitude', ...
+                    'Peak-to-Trough','RMS Amplitude','Peak Latency','Trough Latency', ...
+                    'Max Slope','Max Slope Time','Early Area','Late Area','Early/Late Ratio', ...
+                    'Recovery Tau','Recovery Slope','Template Correlation','PCA Recon Error', ...
+                    'Variance','Autocorrelation','AC Width', ...
+                    'Exp Fit A','Sum Power Low','Freq Moment Low','Sum Power High','Freq Moment High'};
+
+                % Sanitize feature names for struct fields
+                for fi = 1:length(ALL_FEATURES)
+                    fname_clean = regexprep(ALL_FEATURES{fi}, '[^a-zA-Z0-9]', '_');
+                    try
+                        vals = fe.calculateFeatureMetric(ALL_FEATURES{fi}, traces, timeAxis, fs);
+                        result.features.(fname_clean) = vals(:)';
+                    catch
+                        result.features.(fname_clean) = NaN(1, n_epochs);
                     end
-
-                    result.num_features = length(feature_names);
-                    result.feature_names = feature_names;
-                    result.feature_means = feature_means;
                 end
-            catch feat_err
-                fprintf('[PIPELINE] Feature extraction failed: %s\n', feat_err.message);
+                result.num_features = length(ALL_FEATURES);
+                fprintf('[PIPELINE] Features: %d metrics x %d epochs\n', length(ALL_FEATURES), n_epochs);
+
+            catch e
+                fprintf('[PIPELINE] Feature extraction failed: %s\n', e.message);
             end
         end
 
-        % --- Step 5: Criticality analysis ---
-        result.criticality_mean = NaN;
-        result.criticality_std = NaN;
+        % --- Step 6: Criticality analysis on EEG channel ---
+        result.criticality = struct();
+        result.criticality.time_points = [];
+        result.criticality.db_values = [];
+        result.criticality.db_stds = [];
+        result.criticality.sigmas = [];
 
         try
-            eeg_signal = sbuf(:, eeg_channel);
+            eeg_signal = sbuf(:, eeg_ch);
             analyzer = CriticalityAnalyzer([]);
-            crit_results = analyzer.analyzeCriticalityFromEEG(eeg_signal, fs, 2.0, 50);
+            crit = analyzer.analyzeCriticalityFromEEG(eeg_signal, fs, crit_win, crit_overlap);
 
-            if isfield(crit_results, 'criticalityDB')
-                valid_db = crit_results.criticalityDB(~isnan(crit_results.criticalityDB));
-                if ~isempty(valid_db)
-                    result.criticality_mean = mean(valid_db);
-                    result.criticality_std = std(valid_db);
+            if isfield(crit, 'criticalityDB')
+                result.criticality.time_points = crit.timePoints(:)';
+                result.criticality.db_values = crit.criticalityDB(:)';
+                if isfield(crit, 'criticalitySD')
+                    result.criticality.db_stds = crit.criticalitySD(:)';
                 end
+                if isfield(crit, 'sigma')
+                    result.criticality.sigmas = crit.sigma(:)';
+                end
+                valid = crit.criticalityDB(~isnan(crit.criticalityDB));
+                result.criticality_mean = mean(valid);
+                result.criticality_std = std(valid);
+                result.criticality_n_valid = length(valid);
+                result.criticality_n_total = length(crit.criticalityDB);
+                fprintf('[PIPELINE] Criticality: %d/%d valid windows, mean=%.3f\n', ...
+                    length(valid), length(crit.criticalityDB), mean(valid));
             end
-        catch crit_err
-            fprintf('[PIPELINE] Criticality failed: %s\n', crit_err.message);
+        catch e
+            fprintf('[PIPELINE] Criticality failed: %s\n', e.message);
+            result.criticality_mean = NaN;
+            result.criticality_std = NaN;
         end
 
-        % Clean up temp file
-        if exist(temp_mat, 'file')
-            delete(temp_mat);
-        end
+        % --- Cleanup ---
+        if exist(temp_mat, 'file'), delete(temp_mat); end
 
     catch main_err
         result.exit_status = 'error';
@@ -149,14 +225,22 @@ function run_pipeline(input_file, output_json)
     result.pipeline_duration_sec = toc(t_start);
     fprintf('[PIPELINE] Done in %.1f sec\n', result.pipeline_duration_sec);
 
-    % --- Write results as JSON ---
+    % --- Write JSON ---
     try
         json_str = jsonencode(result);
         fid = fopen(output_json, 'w');
         fprintf(fid, '%s', json_str);
         fclose(fid);
-        fprintf('[PIPELINE] Results written to: %s\n', output_json);
-    catch json_err
-        fprintf('[PIPELINE] JSON write failed: %s\n', json_err.message);
+    catch e
+        fprintf('[PIPELINE] JSON write failed: %s\n', e.message);
+    end
+end
+
+
+function val = get_cfg(cfg, field, default)
+    if isstruct(cfg) && isfield(cfg, field)
+        val = cfg.(field);
+    else
+        val = default;
     end
 end

@@ -3,64 +3,87 @@ watch:
     - "//100.106.104.22/bhz/database/"
   poll_interval_sec: 30
   min_file_age_sec: 60
-  # Only process .mat files matching KMrecorder naming
-  file_pattern: ".*___\\d{4}_\\d{2}_\\d{2}__\\d{2}_\\d{2}_\\d{2}\\.mat$"
 
-analysis:
-  tier1:
-    enabled: true
-    artifact:
-      method: "fixed"         # "fixed" or "mad"
-      threshold: 500          # fixed power envelope threshold (uV^2)
-      mad_k: 4.0              # multiplier for MAD-based threshold
-      merge_gap_sec: 2.0      # morphological closing gap
-    line_noise_freq: 60       # Hz (US mains)
-    band_definitions:
-      delta: [0.5, 4]
-      theta: [4, 8]
-      alpha: [8, 13]
-      beta: [13, 30]
-      gamma: [30, 100]
-      high_gamma: [100, 200]
-    flatline_std_threshold: 1.0e-6
-    clipping_voltage: 10.0    # DAQ +-10V range
+channel_mapping:
+  auto_discover: true
 
-  tier2:
-    enabled: true
-    idle_trigger_minutes: 10
-    criticality:
-      ar_order: 5
-      b_type: 2
-      fit_method: "YuleWalker"
-      target_sampling_rate: 1000    # downsample before AR fit
-      matlab_exe: "C:/Program Files/MATLAB/R2023a/bin/matlab.exe"
-      criticality_src: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/src/src_criticality"
-    seizure:
-      enabled: true
-      spike_threshold_sd: 4.0      # standard deviations
-      min_spike_width_ms: 0.5
-      max_spike_width_ms: 50.0
-      min_event_duration_sec: 5.0
-      merge_gap_sec: 1.0
-    features:
-      enabled: true
+evoked:
+  pre_stimulus_ms: -100
+  post_stimulus_ms: 500
+  baseline_correction: true
+  baseline_window_ms: [-60, -10]
+  stimulus_threshold_std: 3.0
+  min_stimulus_distance_sec: 0.1
+  notch_60hz: true
+  notch_50hz: false
+  highpass_enabled: false
+  highpass_cutoff_hz: 1.0
+  lowpass_enabled: false
+  lowpass_cutoff_hz: 1000.0
 
-  tier3:
-    enabled: true
-    nightly_hour: 3
-    rhythm:
-      min_period_hours: 4
-      max_period_hours: 72
-    embedding:
-      python_scripts_dir: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/src/python/embedding"
+criticality:
+  ar_order: 5
+  window_sec: 2.0
+  overlap_pct: 50
+  fit_method: "YuleWalker"
+  target_sampling_rate: 1000
+  criticality_type_b: 2
+  calculate_error_bars: false
 
-database:
-  path: "D:/code/qc_monitor/data/monitor.db"
+seizure:
+  spike_threshold_uv: 10
+  spike_min_width: 5
+  spike_max_width: 50
+  min_seizure_duration_sec: 5
+  event_glue_sec: 2
+  min_spikes_per_sec: 2
+  outlier_factor: 3
 
-dashboard:
-  host: "0.0.0.0"
-  port: 8050
-  refresh_interval_sec: 10
+artifact:
+  method: "fixed"
+  fixed_threshold: 500
+  mad_k: 4.0
+  merge_gap_sec: 2.0
+
+qc_thresholds:
+  artifact_pct_warning: 50
+  flatline_std: 1.0e-6
+  clipping_voltage: 10.0
+  line_noise_ratio_warning: 0.2
+
+features:
+  enabled:
+    - "Line Length"
+    - "Log(AUC)"
+    - "Peak Amplitude"
+    - "Trough Amplitude"
+    - "Peak-to-Trough"
+    - "RMS Amplitude"
+    - "Peak Latency"
+    - "Trough Latency"
+    - "Max Slope"
+    - "Max Slope Time"
+    - "Early Area"
+    - "Late Area"
+    - "Early/Late Ratio"
+    - "Recovery Tau"
+    - "Recovery Slope"
+    - "Template Correlation"
+    - "PCA Recon Error"
+    - "Variance"
+    - "Autocorrelation"
+    - "AC Width"
+    - "Rolling Variance"
+    - "Rolling AR(1)"
+    - "Rolling CV"
+    - "Exp Fit A"
+    - "Sum Power Low"
+    - "Freq Moment Low"
+    - "Sum Power High"
+    - "Freq Moment High"
+
+stimnet_root: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator"
+matlab_exe: "matlab"
 
 alerting:
   enabled: true
@@ -75,10 +98,17 @@ alerting:
     network_down_minutes: 5
     no_data_hours: 2
     artifact_pct_warning: 50
-    flatline_warning: true
     seizure_warning: true
     stim_delivery_failure: true
     rate_limit_per_type_minutes: 60
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8050
+  refresh_interval_sec: 10
+
+database:
+  path: "D:/code/qc_monitor/data/monitor.db"
 
 logging:
   level: "INFO"
