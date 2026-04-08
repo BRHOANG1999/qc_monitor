@@ -1557,7 +1557,7 @@ def _waveforms_tab_layout(store: Store):
             ], style={"flex": "1", "minWidth": "300px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
-        dcc.Graph(id="waveform-plot", style={"height": "550px"}),
+        dcc.Graph(id="waveform-plot"),  # height set dynamically by figure layout
     ])
 
 
