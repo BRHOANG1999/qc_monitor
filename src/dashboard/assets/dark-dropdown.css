@@ -1,75 +1,113 @@
-/* Dark theme for Dash dropdowns */
+/* Dark theme for Dash 4.x dropdowns (React-Select v5) */
 
-/* Selected value text */
-.Select-value-label,
-.Select-value {
+/* The main control bar */
+.dash-dropdown .Select-control,
+.dash-dropdown > div > div[class*="control"] {
+    background-color: #1e1e2f !important;
+    border-color: #444 !important;
+    min-height: 36px;
+}
+
+/* Selected single value text — THIS is the key fix */
+.dash-dropdown .Select-value-label,
+.dash-dropdown > div > div[class*="singleValue"],
+.dash-dropdown > div > div > div[class*="singleValue"],
+.dash-dropdown [class*="singleValue"] {
     color: white !important;
 }
 
-/* Placeholder text */
-.Select-placeholder {
+/* Placeholder */
+.dash-dropdown .Select-placeholder,
+.dash-dropdown [class*="placeholder"] {
     color: #888 !important;
 }
 
-/* Input text while typing */
-.Select-input > input {
+/* Input text while typing/searching */
+.dash-dropdown .Select-input > input,
+.dash-dropdown input[role="combobox"],
+.dash-dropdown [class*="input"] input {
     color: white !important;
 }
 
-/* Dropdown menu background */
-.Select-menu-outer {
+/* The dropdown menu container */
+.dash-dropdown .Select-menu-outer,
+.dash-dropdown [class*="menu"] {
     background-color: #1e1e2f !important;
     border: 1px solid #444 !important;
+    z-index: 9999 !important;
 }
 
-/* Individual option in dropdown */
-.VirtualizedSelectOption {
+/* The menu list wrapper */
+.dash-dropdown [class*="menuList"] {
+    background-color: #1e1e2f !important;
+}
+
+/* Individual options */
+.dash-dropdown .Select-option,
+.dash-dropdown [class*="option"] {
     background-color: #1e1e2f !important;
     color: #ddd !important;
 }
 
-/* Hovered option */
-.VirtualizedSelectFocusedOption,
-.VirtualizedSelectOption:hover {
+/* Hovered / focused option */
+.dash-dropdown .Select-option.is-focused,
+.dash-dropdown [class*="option"]:hover,
+.dash-dropdown [class*="option"][class*="focused"],
+.dash-dropdown [class*="option"][class*="Focused"] {
     background-color: #333 !important;
     color: white !important;
 }
 
-/* The select control itself */
-.Select-control {
-    background-color: #1e1e2f !important;
-    border-color: #444 !important;
+/* Selected option in menu */
+.dash-dropdown .Select-option.is-selected,
+.dash-dropdown [class*="option"][class*="selected"],
+.dash-dropdown [class*="option"][class*="Selected"] {
+    background-color: #444 !important;
+    color: white !important;
 }
 
-/* Arrow indicator */
-.Select-arrow {
-    border-color: #888 transparent transparent !important;
+/* Dropdown arrow indicator */
+.dash-dropdown .Select-arrow,
+.dash-dropdown [class*="indicatorContainer"] {
+    color: #888 !important;
+}
+.dash-dropdown [class*="indicatorContainer"]:hover {
+    color: white !important;
 }
 
-/* Clear indicator */
-.Select-clear {
+/* Separator line between value and arrow */
+.dash-dropdown [class*="indicatorSeparator"] {
+    background-color: #444 !important;
+}
+
+/* Clear (X) button */
+.dash-dropdown .Select-clear,
+.dash-dropdown [class*="clearIndicator"] {
     color: #888 !important;
 }
 
 /* Multi-value tags */
-.Select--multi .Select-value {
+.dash-dropdown [class*="multiValue"] {
     background-color: #333 !important;
-    border-color: #555 !important;
+    border: 1px solid #555 !important;
+}
+.dash-dropdown [class*="multiValueLabel"] {
+    color: white !important;
+}
+.dash-dropdown [class*="multiValueRemove"] {
+    color: #888 !important;
+}
+.dash-dropdown [class*="multiValueRemove"]:hover {
+    background-color: #555 !important;
     color: white !important;
 }
 
-/* Non-virtualized dropdown options (newer Dash versions) */
-.dash-dropdown .Select-menu-outer .Select-option {
-    background-color: #1e1e2f !important;
-    color: #ddd !important;
+/* No options message */
+.dash-dropdown [class*="noOptionsMessage"] {
+    color: #888 !important;
 }
 
-.dash-dropdown .Select-menu-outer .Select-option.is-focused {
-    background-color: #333 !important;
-    color: white !important;
-}
-
-.dash-dropdown .Select-menu-outer .Select-option.is-selected {
-    background-color: #444 !important;
-    color: white !important;
+/* Loading message */
+.dash-dropdown [class*="loadingMessage"] {
+    color: #888 !important;
 }
