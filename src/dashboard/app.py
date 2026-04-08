@@ -242,17 +242,48 @@ def create_app(config: dict, store: Store) -> Dash:
         html.Div(id="tab-content", style={"padding": "20px", "backgroundColor": "#111",
                                            "minHeight": "80vh"}),
 
-        dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0),
+        dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
+                     disabled=True),  # auto-refresh OFF by default
+        html.Div([
+            html.Button("Refresh", id="manual-refresh-btn",
+                        style={"backgroundColor": "#333", "color": "white", "border": "1px solid #555",
+                               "borderRadius": "4px", "padding": "4px 12px", "cursor": "pointer",
+                               "marginRight": "8px"}),
+            dcc.Checklist(id="auto-refresh-toggle",
+                          options=[{"label": " Auto-refresh", "value": True}],
+                          value=[], inline=True,
+                          style={"color": "#888", "display": "inline-block", "fontSize": "12px"}),
+        ], style={"position": "fixed", "top": "8px", "right": "20px", "zIndex": "9999",
+                  "display": "flex", "alignItems": "center"}),
+        dcc.Store(id="refresh-trigger", data=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
     ], style={"backgroundColor": "#111", "fontFamily": "Segoe UI, sans-serif", "color": "#ddd"})
+
+    # ------------------------------------------------------------------ #
+    #  Refresh controls
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("refresh", "disabled"),
+        [Input("auto-refresh-toggle", "value")]
+    )
+    def toggle_auto_refresh(val):
+        return not bool(val)
+
+    @app.callback(
+        Output("refresh-trigger", "data"),
+        [Input("manual-refresh-btn", "n_clicks"), Input("refresh", "n_intervals")],
+        [State("refresh-trigger", "data")]
+    )
+    def on_refresh(clicks, intervals, current):
+        return (current or 0) + 1
 
     # ------------------------------------------------------------------ #
     #  Main tab router
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("tab-content", "children"),
-        [Input("tabs", "value"), Input("refresh", "n_intervals")]
+        [Input("tabs", "value"), Input("refresh-trigger", "data")]
     )
     def render_tab(tab, _n):
         try:
@@ -290,100 +321,94 @@ def create_app(config: dict, store: Store) -> Dash:
                             style={"color": "#ff6b6b", "padding": "20px"})
 
     # ------------------------------------------------------------------ #
-    #  Evoked Features callback (renamed from Evoked Response)
+    #  Evoked Features callback — separate row per selected feature
     # ------------------------------------------------------------------ #
     @app.callback(
-        [Output("evoked-scatter", "figure"),
+        [Output("evoked-multi-plots", "children"),
          Output("evoked-stats", "children")],
-        [Input("evoked-feature-dropdown", "value"),
+        [Input("evoked-feature-checklist", "value"),
          Input("evoked-session-dropdown", "value"),
          Input("evoked-hours-dropdown", "value")],
     )
-    def update_evoked(feature_name, session_dir, hours):
-        if not feature_name or not session_dir:
-            return _empty_fig("Select a session and feature"), html.P("No data")
+    def update_evoked_multi(selected_features, session_dir, hours):
+        if not selected_features or not session_dir:
+            return html.P("Select features and a session", style={"color": "#888"}), ""
 
-        try:
-            data = store.get_evoked_feature_timeseries(
-                feature_name=feature_name,
-                session_dir=session_dir,
-                hours=int(hours) if hours else None,
-            )
-        except Exception as e:
-            return _empty_fig(f"Error: {e}"), html.P(f"Error: {e}")
+        plots = []
+        stats_rows = []
+        hrs = int(hours) if hours else 0
 
-        if not data:
-            return _empty_fig("No evoked data for this selection"), html.P("No data available")
-
-        clean_t, clean_v = [], []
-        artifact_t, artifact_v = [], []
-        ictal_t, ictal_v = [], []
-        all_values = []
-
-        for d in data:
-            t = d["chunk_datetime"]
-            v = d["value"]
-            if v is None:
+        for feature_name in selected_features:
+            try:
+                data = store.get_evoked_feature_timeseries(
+                    feature_name=feature_name,
+                    session_dir=session_dir,
+                    hours=hrs,
+                )
+            except Exception as e:
+                plots.append(html.P(f"Error loading {feature_name}: {e}", style={"color": "#ff6b6b"}))
                 continue
-            all_values.append(v)
-            is_art = d.get("is_artifact", 0)
-            is_ict = d.get("is_ictal", 0)
-            if is_art:
-                artifact_t.append(t)
-                artifact_v.append(v)
-            elif is_ict:
-                ictal_t.append(t)
-                ictal_v.append(v)
-            else:
-                clean_t.append(t)
-                clean_v.append(v)
 
-        fig = go.Figure()
-        if clean_t:
-            fig.add_trace(go.Scatter(
-                x=clean_t, y=clean_v, mode="markers", name="Clean",
-                marker=dict(color="#636EFA", size=5, opacity=0.7)))
-        if artifact_t:
-            fig.add_trace(go.Scatter(
-                x=artifact_t, y=artifact_v, mode="markers", name="Artifact",
-                marker=dict(color="#EF553B", size=6, opacity=0.8)))
-        if ictal_t:
-            fig.add_trace(go.Scatter(
-                x=ictal_t, y=ictal_v, mode="markers", name="Ictal",
-                marker=dict(color="#FFA15A", size=6, opacity=0.8)))
+            if not data:
+                plots.append(html.P(f"No data for {feature_name}", style={"color": "#888"}))
+                continue
 
-        label = EVOKED_FEATURE_LABELS.get(feature_name, feature_name)
-        fig.update_layout(
-            template="plotly_dark",
-            title=f"{label} per Epoch Over Time",
-            xaxis_title="Time",
-            yaxis_title=label,
-            height=500,
+            clean_t, clean_v = [], []
+            artifact_t, artifact_v = [], []
+            ictal_t, ictal_v = [], []
+            all_values = []
+
+            for d in data:
+                t = d.get("chunk_datetime")
+                v = d.get("value")
+                if v is None:
+                    continue
+                all_values.append(v)
+                if d.get("is_artifact", 0):
+                    artifact_t.append(t); artifact_v.append(v)
+                elif d.get("is_ictal", 0):
+                    ictal_t.append(t); ictal_v.append(v)
+                else:
+                    clean_t.append(t); clean_v.append(v)
+
+            label = EVOKED_FEATURE_LABELS.get(feature_name, feature_name)
+            fig = go.Figure()
+            if clean_t:
+                fig.add_trace(go.Scatter(x=clean_t, y=clean_v, mode="markers", name="Clean",
+                                         marker=dict(color="#636EFA", size=4, opacity=0.6)))
+            if artifact_t:
+                fig.add_trace(go.Scatter(x=artifact_t, y=artifact_v, mode="markers", name="Artifact",
+                                         marker=dict(color="#EF553B", size=5, opacity=0.7)))
+            if ictal_t:
+                fig.add_trace(go.Scatter(x=ictal_t, y=ictal_v, mode="markers", name="Ictal",
+                                         marker=dict(color="#FFA15A", size=5, opacity=0.7)))
+
+            fig.update_layout(
+                template="plotly_dark",
+                title=label,
+                xaxis_title="Time",
+                yaxis_title=label,
+                height=300,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
+            )
 
-        n_total = len(all_values)
-        n_art = len(artifact_v)
-        n_ict = len(ictal_v)
-        n_clean = len(clean_v)
-        if all_values:
-            mean_val = statistics.mean(all_values)
-            std_val = statistics.stdev(all_values) if len(all_values) > 1 else 0.0
-        else:
-            mean_val, std_val = 0, 0
+            plots.append(dcc.Graph(figure=fig, style={"marginBottom": "8px"}))
 
-        stats = html.Div([
-            html.Div([
-                _status_card("Mean", f"{mean_val:.4g}", "#636EFA"),
-                _status_card("Std", f"{std_val:.4g}", "#AB63FA"),
-                _status_card("N Epochs", str(n_total), "#00CC96"),
-                _status_card("N Artifact", str(n_art), "#EF553B"),
-                _status_card("N Ictal", str(n_ict), "#FFA15A"),
-                _status_card("N Clean", str(n_clean), "#636EFA"),
-            ], style={"display": "flex", "gap": "10px", "flexWrap": "wrap", "marginTop": "10px"}),
-        ])
+            # Per-feature stats
+            n_total = len(all_values)
+            n_art = len(artifact_v)
+            n_clean = len(clean_v)
+            mean_val = statistics.mean(all_values) if all_values else 0
+            std_val = statistics.stdev(all_values) if len(all_values) > 1 else 0
+            stats_rows.append(f"{label}: mean={mean_val:.4g}, std={std_val:.4g}, "
+                              f"N={n_total} (clean={n_clean}, artifact={n_art})")
 
-        return fig, stats
+        summary = html.Div([
+            html.P(s, style={"color": "#aaa", "margin": "2px 0", "fontSize": "12px"})
+            for s in stats_rows
+        ]) if stats_rows else ""
+
+        return html.Div(plots), summary
 
     # ------------------------------------------------------------------ #
     #  Evoked Waveforms callback
@@ -1374,15 +1399,18 @@ def _signal_quality_tab(store: Store):
 # ------------------------------------------------------------------ #
 
 def _evoked_tab_layout(store: Store):
-    """Build the Evoked Features tab layout -- data loaded via callback."""
+    """Build the Evoked Features tab — separate row per selected feature."""
     sessions = store.get_sessions()
     session_options = [{"label": s["session_name"], "value": s["session_dir"]}
                        for s in sessions]
+    plottable = [f for f in EVOKED_FEATURE_COLS
+                 if f not in ("is_artifact", "is_ictal", "epoch_time_sec")]
     feature_options = [{"label": EVOKED_FEATURE_LABELS.get(f, f), "value": f}
-                       for f in EVOKED_FEATURE_COLS
-                       if f not in ("is_artifact", "is_ictal")]
+                       for f in plottable]
 
     default_session = sessions[0]["session_dir"] if sessions else None
+    # Default: show 3 key features
+    default_features = ["peak_amplitude", "line_length", "recovery_tau"]
 
     return html.Div([
         html.H3("Evoked Features", style={"color": "white", "marginBottom": "12px"}),
@@ -1398,28 +1426,35 @@ def _evoked_tab_layout(store: Store):
                 ),
             ], style={"flex": "1", "minWidth": "250px"}),
             html.Div([
-                html.Label("Feature", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="evoked-feature-dropdown",
-                    options=feature_options,
-                    value="peak_amplitude",
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "250px"}),
-            html.Div([
                 html.Label("Time Range", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="evoked-hours-dropdown",
                     options=TIME_RANGE_OPTIONS,
-                    value=48,
+                    value=0,  # all time by default
                     style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
             ], style={"flex": "0 0 180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "12px", "flexWrap": "wrap"}),
 
-        dcc.Graph(id="evoked-scatter", style={"height": "500px"}),
+        html.Div([
+            html.Label("Select features to display (each gets its own plot row):", style=LABEL_STYLE),
+            dcc.Checklist(
+                id="evoked-feature-checklist",
+                options=feature_options,
+                value=default_features,
+                inline=True,
+                style={"color": "#ddd", "fontSize": "12px"},
+                inputStyle={"marginRight": "4px"},
+                labelStyle={"marginRight": "16px", "marginBottom": "4px"},
+            ),
+        ], style={**SECTION_STYLE, "marginBottom": "16px"}),
+
+        # Hidden single-select for backward compat with callback
+        dcc.Dropdown(id="evoked-feature-dropdown", value="peak_amplitude",
+                     style={"display": "none"}),
+
+        html.Div(id="evoked-multi-plots"),
         html.Div(id="evoked-stats"),
     ])
 
