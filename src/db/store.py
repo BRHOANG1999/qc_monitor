@@ -439,7 +439,7 @@ class Store:
                 conditions.append("ef.version_id = ?")
                 params.append(version_id)
 
-            if hours is not None:
+            if hours:
                 cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
                 conditions.append("pf.chunk_datetime > ?")
                 params.append(cutoff)
@@ -605,7 +605,7 @@ class Store:
             if version_id is not None:
                 conditions.append("c.version_id = ?")
                 params.append(version_id)
-            if hours is not None:
+            if hours:
                 cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
                 conditions.append("pf.chunk_datetime > ?")
                 params.append(cutoff)
@@ -833,9 +833,13 @@ class Store:
                           version_id: int | None = None) -> list[dict]:
         conn = self._connect()
         try:
-            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-            conditions = ["pf.chunk_datetime > ?"]
-            params: list = [cutoff]
+            conditions: list[str] = []
+            params: list = []
+
+            if hours:
+                cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                conditions.append("pf.chunk_datetime > ?")
+                params.append(cutoff)
 
             if session_dir:
                 conditions.append("pf.session_dir = ?")
@@ -847,7 +851,7 @@ class Store:
                 conditions.append("cq.version_id = ?")
                 params.append(version_id)
 
-            where = " AND ".join(conditions)
+            where = (" AND ".join(conditions)) if conditions else "1=1"
             rows = conn.execute(
                 f"""SELECT pf.chunk_datetime, cq.*
                     FROM chunk_qc cq JOIN processed_files pf ON cq.file_id = pf.id
@@ -898,5 +902,220 @@ class Store:
                 (cutoff,),
             ).fetchone()
             return row["cnt"] if row else 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  evoked_waveforms
+    # ------------------------------------------------------------------ #
+
+    def insert_evoked_waveform(self, file_id: int, time_axis: list, mean_trace: list,
+                               sem_trace: list, n_epochs: int,
+                               analysis_start_ms: float, analysis_end_ms: float,
+                               version_id: int | None = None):
+        """Insert a mean evoked waveform for a file (JSON-serialised arrays)."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO evoked_waveforms
+                   (file_id, time_axis_ms, mean_trace, sem_trace, n_epochs,
+                    analysis_start_ms, analysis_end_ms, version_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    file_id,
+                    json.dumps(list(time_axis)),
+                    json.dumps(list(mean_trace)),
+                    json.dumps(list(sem_trace)) if sem_trace is not None else None,
+                    n_epochs,
+                    analysis_start_ms,
+                    analysis_end_ms,
+                    version_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_evoked_waveform(self, file_id: int,
+                            version_id: int | None = None) -> dict | None:
+        """Return the mean evoked waveform for a file with parsed JSON arrays."""
+        conn = self._connect()
+        try:
+            if version_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM evoked_waveforms WHERE file_id = ? AND version_id = ?",
+                    (file_id, version_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM evoked_waveforms WHERE file_id = ? ORDER BY id DESC LIMIT 1",
+                    (file_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["time_axis_ms"] = json.loads(d["time_axis_ms"])
+            d["mean_trace"] = json.loads(d["mean_trace"])
+            if d["sem_trace"] is not None:
+                d["sem_trace"] = json.loads(d["sem_trace"])
+            return d
+        finally:
+            conn.close()
+
+    def get_evoked_waveforms_for_session(self, session_dir: str,
+                                         version_id: int | None = None) -> list[dict]:
+        """Return all evoked waveforms for a session, with parsed JSON arrays."""
+        conn = self._connect()
+        try:
+            conditions = ["pf.session_dir = ?"]
+            params: list = [session_dir]
+
+            if version_id is not None:
+                conditions.append("ew.version_id = ?")
+                params.append(version_id)
+
+            where = " AND ".join(conditions)
+            sql = f"""
+                SELECT pf.chunk_datetime, pf.session_dir, ew.*
+                FROM evoked_waveforms ew
+                JOIN processed_files pf ON ew.file_id = pf.id
+                WHERE {where}
+                ORDER BY pf.chunk_datetime
+            """
+            rows = conn.execute(sql, params).fetchall()
+            results = []
+            for row in rows:
+                d = dict(row)
+                d["time_axis_ms"] = json.loads(d["time_axis_ms"])
+                d["mean_trace"] = json.loads(d["mean_trace"])
+                if d["sem_trace"] is not None:
+                    d["sem_trace"] = json.loads(d["sem_trace"])
+                results.append(d)
+            return results
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  processing_log
+    # ------------------------------------------------------------------ #
+
+    def log_activity(self, level: str, action: str, message: str,
+                     file_id: int | None = None, file_path: str | None = None,
+                     duration_sec: float | None = None):
+        """Write an entry to the processing_log table."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO processing_log
+                   (timestamp, level, file_id, file_path, action, message, duration_sec)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now().isoformat(),
+                    level,
+                    file_id,
+                    file_path,
+                    action,
+                    message,
+                    duration_sec,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_activity_log(self, hours: int = 24, level: str | None = None,
+                         limit: int = 500) -> list[dict]:
+        """Return recent processing log entries.
+
+        *hours* controls the lookback window.  If *hours* is 0, no time
+        filter is applied (returns all entries).
+        """
+        conn = self._connect()
+        try:
+            conditions: list[str] = []
+            params: list = []
+
+            if hours:
+                cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                conditions.append("timestamp > ?")
+                params.append(cutoff)
+            if level is not None:
+                conditions.append("level = ?")
+                params.append(level)
+
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT * FROM processing_log {where} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  annotations
+    # ------------------------------------------------------------------ #
+
+    def add_annotation(self, timestamp: str, note: str,
+                       category: str = "observation",
+                       session_dir: str | None = None,
+                       file_id: int | None = None) -> int:
+        """Insert a user annotation / note and return its id."""
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """INSERT INTO annotations
+                   (timestamp, created_at, session_dir, file_id, note, category)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    timestamp,
+                    datetime.now().isoformat(),
+                    session_dir,
+                    file_id,
+                    note,
+                    category,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_annotations(self, session_dir: str | None = None,
+                        hours: int = 0) -> list[dict]:
+        """Return annotations, optionally filtered by session and time window.
+
+        *hours* = 0 (the default) means return all annotations with no
+        time cutoff.
+        """
+        conn = self._connect()
+        try:
+            conditions: list[str] = []
+            params: list = []
+
+            if session_dir is not None:
+                conditions.append("session_dir = ?")
+                params.append(session_dir)
+            if hours:
+                cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+                conditions.append("timestamp > ?")
+                params.append(cutoff)
+
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            rows = conn.execute(
+                f"SELECT * FROM annotations {where} ORDER BY timestamp DESC",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def delete_annotation(self, annotation_id: int):
+        """Delete a single annotation by its id."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            conn.commit()
         finally:
             conn.close()
