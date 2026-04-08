@@ -58,6 +58,8 @@ def run_dashboard(config: dict, store: Store):
         host = config.get("dashboard", {}).get("host", "0.0.0.0")
         port = config.get("dashboard", {}).get("port", 8050)
         logging.getLogger("qc_monitor").info("Dashboard serving at http://%s:%s", host, port)
+        # Suppress Flask/Werkzeug request logging (the POST spam)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
         app.run(host=host, port=port, debug=False, use_reloader=False)
     except ImportError as e:
         logging.getLogger("qc_monitor").warning(

@@ -1389,42 +1389,59 @@ def _overview_tab(store: Store):
         ], style={"fontSize": "13px"}),
     ], style=SECTION_STYLE)
 
-    # Evoked waveform thumbnail for overview
+    # Evoked waveform thumbnail — show latest file, ALL channels
     waveform_thumbnail = html.Div()
     if session_dir:
         try:
             waveforms = store.get_evoked_waveforms_for_session(session_dir)
             if waveforms:
-                wf = waveforms[-1]
-                thumb_fig = go.Figure()
-                time_ms = wf["time_axis_ms"]
-                mean_tr = wf["mean_trace"]
-                sem_tr = wf["sem_trace"]
-                if sem_tr and len(sem_tr) == len(mean_tr):
-                    upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-                    lower = [m - s for m, s in zip(mean_tr, sem_tr)]
-                    thumb_fig.add_trace(go.Scatter(
-                        x=list(time_ms) + list(reversed(time_ms)),
-                        y=upper + list(reversed(lower)),
-                        fill="toself", fillcolor="rgba(99,110,250,0.15)",
-                        line=dict(width=0), showlegend=False, hoverinfo="skip",
-                    ))
-                thumb_fig.add_trace(go.Scatter(
-                    x=time_ms, y=mean_tr, mode="lines",
-                    name="Latest Mean Evoked",
-                    line=dict(color="#636EFA", width=2),
-                ))
-                thumb_fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
-                thumb_fig.update_layout(
-                    template="plotly_dark",
-                    title="Latest Mean Evoked Trace",
-                    height=280, margin=dict(l=40, r=20, t=40, b=30),
-                    xaxis_title="Time (ms)", yaxis_title="Amplitude",
-                    showlegend=False,
-                )
-                waveform_thumbnail = html.Div([
-                    dcc.Graph(figure=thumb_fig, style={"marginTop": "16px"}),
-                ])
+                # Group by channel, take latest per channel
+                latest_by_ch = {}
+                latest_datetime = ""
+                for wf in waveforms:
+                    ch = wf.get("channel", 0)
+                    latest_by_ch[ch] = wf
+                    dt = wf.get("chunk_datetime", "")
+                    if dt > latest_datetime:
+                        latest_datetime = dt
+
+                sorted_chs = sorted(latest_by_ch.keys())
+                n_ch = len(sorted_chs)
+                if n_ch > 0:
+                    colors_list = ["#636EFA", "#00CC96", "#FFA15A", "#EF553B", "#AB63FA"]
+                    thumb_fig = make_subplots(
+                        rows=n_ch, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06,
+                    )
+                    for ri, ch in enumerate(sorted_chs, 1):
+                        wf = latest_by_ch[ch]
+                        ch_name = wf.get("channel_name", f"Ch{ch}")
+                        n_ep = wf.get("n_epochs", 0)
+                        time_ms = wf["time_axis_ms"]
+                        mean_tr = wf["mean_trace"]
+                        color = colors_list[ri % len(colors_list)]
+
+                        thumb_fig.add_trace(go.Scatter(
+                            x=time_ms, y=mean_tr, mode="lines",
+                            name=f"{ch_name} (n={n_ep})",
+                            line=dict(color=color, width=1.5),
+                        ), row=ri, col=1)
+                        thumb_fig.add_vline(x=0, line=dict(color="white", width=0.5, dash="dash"),
+                                            row=ri, col=1)
+                        thumb_fig.update_yaxes(title_text=ch_name, title_font_size=10, row=ri, col=1)
+
+                    thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
+                    thumb_fig.update_layout(
+                        template="plotly_dark",
+                        title=f"Latest Evoked — {latest_datetime[:16]}",
+                        height=180 * n_ch, margin=dict(l=60, r=20, t=40, b=30),
+                        showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="right", x=1, font_size=10),
+                    )
+                    waveform_thumbnail = html.Div([
+                        dcc.Graph(figure=thumb_fig, style={"marginTop": "16px"}),
+                    ])
         except Exception as e:
             logger.debug("Could not load waveform thumbnail: %s", e)
 
