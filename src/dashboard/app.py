@@ -1,10 +1,13 @@
-"""Dash web dashboard for the QC Monitor — v2 with evoked, criticality, settings."""
+"""Dash web dashboard for the QC Monitor — v3 with evoked waveforms, LFP browser,
+electrode health, session compare, activity log, and annotations."""
 
 import json
 import logging
 import os
+import statistics
 from datetime import datetime
 
+import numpy as np
 import yaml
 from dash import Dash, html, dcc, dash_table, callback_context, no_update, ALL
 from dash.dependencies import Input, Output, State
@@ -12,6 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src.db.store import Store
+from src.utils.mat_loader import load_mat
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -52,6 +56,15 @@ ROLE_COLORS = {"eeg": "#636EFA", "stim_copy": "#888888", "reference": "#00CC96"}
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "config.yaml")
 CONFIG_PATH = os.path.normpath(CONFIG_PATH)
 
+# Standard time-range options used across tabs
+TIME_RANGE_OPTIONS = [
+    {"label": "Last 24h", "value": 24},
+    {"label": "Last 48h", "value": 48},
+    {"label": "Last 1 week", "value": 168},
+    {"label": "Last 1 month", "value": 720},
+    {"label": "All time", "value": 0},
+]
+
 # Dark card style
 CARD_STYLE = {
     "backgroundColor": "#1e1e2f",
@@ -74,6 +87,18 @@ DARK_TABLE_STYLE = {
     "style_cell": {"textAlign": "left", "padding": "8px", "fontSize": "13px"},
     "style_filter": {"backgroundColor": "#1a1a2e", "color": "white"},
 }
+
+SECTION_STYLE = {"backgroundColor": "#1e1e2f", "padding": "16px", "borderRadius": "8px",
+                 "border": "1px solid #333", "marginBottom": "16px"}
+LABEL_STYLE = {"color": "#888", "fontSize": "12px", "marginBottom": "2px", "display": "block"}
+INPUT_STYLE = {"backgroundColor": "#111", "color": "white", "border": "1px solid #444",
+               "borderRadius": "4px", "padding": "4px 8px", "width": "100%"}
+FIELD_STYLE = {"flex": "1", "minWidth": "180px"}
+DROPDOWN_STYLE = {"backgroundColor": "#1e1e2f", "color": "white"}
+
+# ====================================================================== #
+#  Helpers
+# ====================================================================== #
 
 
 def _load_config() -> dict:
@@ -129,6 +154,45 @@ def _status_card(title: str, value: str, color: str = "#636EFA"):
     ], style=CARD_STYLE)
 
 
+def _empty_fig(text: str = "No data", height: int = 400) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        annotations=[dict(text=text, showarrow=False, font=dict(size=16, color="#888"))],
+    )
+    return fig
+
+
+def _session_dropdown_options(store: Store) -> list[dict]:
+    sessions = store.get_sessions()
+    return [{"label": s["session_name"], "value": s["session_dir"]} for s in sessions]
+
+
+def _default_session(store: Store) -> str | None:
+    sessions = store.get_sessions()
+    return sessions[0]["session_dir"] if sessions else None
+
+
+def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dict]:
+    """Return processed file rows for a session, ordered by chunk_datetime."""
+    conn = store._connect()
+    try:
+        rows = conn.execute(
+            """SELECT id, file_path, chunk_datetime, session_name
+               FROM processed_files
+               WHERE session_dir = ? AND status = 'done'
+               ORDER BY chunk_datetime""",
+            (session_dir,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ====================================================================== #
+#  App factory
+# ====================================================================== #
+
 def create_app(config: dict, store: Store) -> Dash:
     refresh_sec = config.get("dashboard", {}).get("refresh_interval_sec", 10)
 
@@ -141,19 +205,31 @@ def create_app(config: dict, store: Store) -> Dash:
         ], style={"padding": "12px 24px", "backgroundColor": "#0d0d1a", "color": "white",
                   "borderBottom": "1px solid #333"}),
 
-        # Tabs
+        # Tabs — ordered as specified
         dcc.Tabs(id="tabs", value="overview", children=[
             dcc.Tab(label="Overview", value="overview",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Evoked Waveforms", value="waveforms",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Evoked Features", value="evoked",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Signal Quality", value="signal",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Evoked Response", value="evoked",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Criticality", value="criticality",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="LFP Browser", value="lfp",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Electrode Health", value="electrode_health",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Session Compare", value="session_compare",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Stim QC", value="stim",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Settings", value="settings",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Activity Log", value="activity_log",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Annotations", value="annotations",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Alerts", value="alerts",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
@@ -165,7 +241,7 @@ def create_app(config: dict, store: Store) -> Dash:
                                            "minHeight": "80vh"}),
 
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0),
-        # Hidden stores for inter-callback data
+        # Hidden stores
         dcc.Store(id="selected-session-dir"),
     ], style={"backgroundColor": "#111", "fontFamily": "Segoe UI, sans-serif", "color": "#ddd"})
 
@@ -180,16 +256,28 @@ def create_app(config: dict, store: Store) -> Dash:
         try:
             if tab == "overview":
                 return _overview_tab(store)
+            elif tab == "waveforms":
+                return _waveforms_tab_layout(store)
             elif tab == "signal":
                 return _signal_quality_tab(store)
             elif tab == "evoked":
                 return _evoked_tab_layout(store)
             elif tab == "criticality":
                 return _criticality_tab_layout(store)
+            elif tab == "lfp":
+                return _lfp_browser_tab_layout(store)
+            elif tab == "electrode_health":
+                return _electrode_health_tab_layout(store)
+            elif tab == "session_compare":
+                return _session_compare_tab_layout(store)
             elif tab == "stim":
                 return _stim_tab(store)
             elif tab == "settings":
                 return _settings_tab_layout(store)
+            elif tab == "activity_log":
+                return _activity_log_tab_layout(store)
+            elif tab == "annotations":
+                return _annotations_tab_layout(store)
             elif tab == "alerts":
                 return _alerts_tab(store)
             elif tab == "sessions":
@@ -200,7 +288,7 @@ def create_app(config: dict, store: Store) -> Dash:
                             style={"color": "#ff6b6b", "padding": "20px"})
 
     # ------------------------------------------------------------------ #
-    #  Evoked Response callback
+    #  Evoked Features callback (renamed from Evoked Response)
     # ------------------------------------------------------------------ #
     @app.callback(
         [Output("evoked-scatter", "figure"),
@@ -211,11 +299,7 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def update_evoked(feature_name, session_dir, hours):
         if not feature_name or not session_dir:
-            empty = go.Figure()
-            empty.update_layout(template="plotly_dark",
-                                annotations=[dict(text="Select a session and feature",
-                                                  showarrow=False, font=dict(size=16))])
-            return empty, html.P("No data")
+            return _empty_fig("Select a session and feature"), html.P("No data")
 
         try:
             data = store.get_evoked_feature_timeseries(
@@ -224,20 +308,11 @@ def create_app(config: dict, store: Store) -> Dash:
                 hours=int(hours) if hours else None,
             )
         except Exception as e:
-            empty = go.Figure()
-            empty.update_layout(template="plotly_dark",
-                                annotations=[dict(text=f"Error: {e}",
-                                                  showarrow=False, font=dict(size=14, color="red"))])
-            return empty, html.P(f"Error: {e}")
+            return _empty_fig(f"Error: {e}"), html.P(f"Error: {e}")
 
         if not data:
-            empty = go.Figure()
-            empty.update_layout(template="plotly_dark",
-                                annotations=[dict(text="No evoked data for this selection",
-                                                  showarrow=False, font=dict(size=16))])
-            return empty, html.P("No data available")
+            return _empty_fig("No evoked data for this selection"), html.P("No data available")
 
-        # Separate by type
         clean_t, clean_v = [], []
         artifact_t, artifact_v = [], []
         ictal_t, ictal_v = [], []
@@ -285,13 +360,11 @@ def create_app(config: dict, store: Store) -> Dash:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
 
-        # Summary stats
         n_total = len(all_values)
         n_art = len(artifact_v)
         n_ict = len(ictal_v)
         n_clean = len(clean_v)
         if all_values:
-            import statistics
             mean_val = statistics.mean(all_values)
             std_val = statistics.stdev(all_values) if len(all_values) > 1 else 0.0
         else:
@@ -311,6 +384,88 @@ def create_app(config: dict, store: Store) -> Dash:
         return fig, stats
 
     # ------------------------------------------------------------------ #
+    #  Evoked Waveforms callback
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("waveform-plot", "figure"),
+        [Input("waveform-session-dropdown", "value")],
+    )
+    def update_waveform_plot(session_dir):
+        if not session_dir:
+            return _empty_fig("Select a session", 550)
+
+        try:
+            waveforms = store.get_evoked_waveforms_for_session(session_dir)
+        except Exception as e:
+            return _empty_fig(f"Error: {e}", 550)
+
+        if not waveforms:
+            return _empty_fig("No evoked waveforms for this session", 550)
+
+        fig = go.Figure()
+        n_wf = len(waveforms)
+
+        for idx, wf in enumerate(waveforms):
+            time_ms = wf["time_axis_ms"]
+            mean_tr = wf["mean_trace"]
+            sem_tr = wf["sem_trace"]
+            file_label = wf.get("chunk_datetime", f"File {idx}")[:16]
+
+            # Color gradient: oldest=light, newest=dark
+            frac = idx / max(n_wf - 1, 1)
+            r = int(100 + 155 * (1 - frac))
+            g = int(110 + 145 * (1 - frac))
+            b = int(250)
+            line_color = f"rgb({r},{g},{b})"
+            fill_color = f"rgba({r},{g},{b},0.12)"
+
+            # SEM band
+            if sem_tr is not None and len(sem_tr) == len(mean_tr):
+                upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+                lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+                fig.add_trace(go.Scatter(
+                    x=list(time_ms) + list(reversed(time_ms)),
+                    y=upper + list(reversed(lower)),
+                    fill="toself", fillcolor=fill_color,
+                    line=dict(width=0), showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+            fig.add_trace(go.Scatter(
+                x=time_ms, y=mean_tr, mode="lines",
+                name=file_label,
+                line=dict(color=line_color, width=1.5 if idx == n_wf - 1 else 0.8),
+            ))
+
+        # Vertical line at t=0 (stimulus)
+        fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"),
+                      annotation_text="Stim", annotation_position="top right",
+                      annotation_font_color="white")
+
+        # Shaded analysis window
+        if waveforms:
+            last_wf = waveforms[-1]
+            a_start = last_wf.get("analysis_start_ms")
+            a_end = last_wf.get("analysis_end_ms")
+            if a_start is not None and a_end is not None:
+                fig.add_vrect(x0=a_start, x1=a_end,
+                              fillcolor="rgba(99,110,250,0.08)",
+                              line_width=0,
+                              annotation_text="Analysis Window",
+                              annotation_position="top left",
+                              annotation_font_color="#888")
+
+        fig.update_layout(
+            template="plotly_dark",
+            title="Mean Evoked Waveforms (all files in session)",
+            xaxis_title="Time (ms)",
+            yaxis_title="Amplitude",
+            height=550,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        return fig
+
+    # ------------------------------------------------------------------ #
     #  Criticality callback
     # ------------------------------------------------------------------ #
     @app.callback(
@@ -320,11 +475,7 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def update_criticality(session_dir, hours):
         if not session_dir:
-            fig = go.Figure()
-            fig.update_layout(template="plotly_dark",
-                              annotations=[dict(text="Select a session",
-                                                showarrow=False, font=dict(size=16))])
-            return fig
+            return _empty_fig("Select a session", 550)
 
         ch_map = _get_channel_map(store, session_dir)
 
@@ -334,23 +485,13 @@ def create_app(config: dict, store: Store) -> Dash:
                 hours=int(hours) if hours else None,
             )
         except Exception as e:
-            fig = go.Figure()
-            fig.update_layout(template="plotly_dark",
-                              annotations=[dict(text=f"Error: {e}",
-                                                showarrow=False, font=dict(size=14, color="red"))])
-            return fig
+            return _empty_fig(f"Error: {e}", 550)
 
         if not data:
-            fig = go.Figure()
-            fig.update_layout(template="plotly_dark",
-                              annotations=[dict(text="No criticality data",
-                                                showarrow=False, font=dict(size=16))])
-            return fig
+            return _empty_fig("No criticality data", 550)
 
-        # Group by channel
         channels = sorted(set(d["channel"] for d in data))
 
-        # Only plot EEG channels if we have a channel map
         fig = go.Figure()
         for ch in channels:
             ch_data = [d for d in data if d["channel"] == ch]
@@ -358,7 +499,6 @@ def create_app(config: dict, store: Store) -> Dash:
             vals = [d["db_value"] for d in ch_data]
 
             info = ch_map.get(ch, {"name": f"Ch{ch}", "role": "eeg"})
-            # Only plot EEG channels
             if ch_map and info["role"] != "eeg":
                 continue
 
@@ -371,13 +511,331 @@ def create_app(config: dict, store: Store) -> Dash:
 
         fig.update_layout(
             template="plotly_dark",
-            title="Criticality (dB) Over Time — EEG Channels",
+            title="Criticality (dB) Over Time -- EEG Channels",
             xaxis_title="Time",
             yaxis_title="dB Value",
             height=550,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         return fig
+
+    # ------------------------------------------------------------------ #
+    #  LFP Browser callback
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("lfp-plot", "figure"),
+        [Input("lfp-load-btn", "n_clicks")],
+        [State("lfp-session-dropdown", "value"),
+         State("lfp-file-dropdown", "value")],
+        prevent_initial_call=True,
+    )
+    def load_lfp(n_clicks, session_dir, file_path):
+        if not n_clicks or not file_path:
+            return _empty_fig("Select a file and click Load", 600)
+
+        try:
+            chunk = load_mat(file_path)
+        except Exception as e:
+            return _empty_fig(f"Error loading file: {e}", 600)
+
+        fs = chunk.fs
+        n_samples = int(5 * fs)
+        signal = chunk.signal[:n_samples, :]
+        n_ch = signal.shape[1]
+        time_sec = np.arange(signal.shape[0]) / fs
+
+        ch_map = _get_channel_map(store, session_dir) if session_dir else {}
+
+        fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.005)
+
+        for ch_idx in range(n_ch):
+            info = ch_map.get(ch_idx, {"name": f"Ch{ch_idx}", "role": "eeg"})
+            color = _color_for_role(info["role"])
+            fig.add_trace(go.Scatter(
+                x=time_sec, y=signal[:, ch_idx],
+                mode="lines", name=info["name"],
+                line=dict(color=color, width=0.8),
+            ), row=ch_idx + 1, col=1)
+            fig.update_yaxes(title_text=info["name"], row=ch_idx + 1, col=1,
+                             title_font=dict(size=9, color="#aaa"),
+                             tickfont=dict(size=8))
+
+        fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
+        fig.update_layout(
+            template="plotly_dark",
+            title=f"Raw LFP (first 5 sec) -- {n_ch} channels @ {fs:.0f} Hz",
+            height=max(600, n_ch * 80),
+            showlegend=False,
+        )
+        return fig
+
+    @app.callback(
+        Output("lfp-file-dropdown", "options"),
+        Input("lfp-session-dropdown", "value"),
+    )
+    def update_lfp_file_options(session_dir):
+        if not session_dir:
+            return []
+        files = _get_processed_files_for_session(store, session_dir)
+        return [{"label": f"{f['chunk_datetime'][:16]} - {os.path.basename(f['file_path'])}",
+                 "value": f["file_path"]} for f in files]
+
+    # ------------------------------------------------------------------ #
+    #  Electrode Health callback
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("electrode-health-plot", "figure"),
+        [Input("electrode-health-session-dropdown", "value"),
+         Input("electrode-health-hours-dropdown", "value")],
+    )
+    def update_electrode_health(session_dir, hours):
+        if not session_dir:
+            return _empty_fig("Select a session", 700)
+
+        hours_val = int(hours) if hours else 0
+        try:
+            data = store.get_qc_timeseries(session_dir=session_dir, hours=hours_val)
+        except Exception as e:
+            return _empty_fig(f"Error: {e}", 700)
+
+        if not data:
+            return _empty_fig("No QC data available", 700)
+
+        # Separate by channel_role
+        stim_copy_data = [d for d in data if d.get("channel_role") == "stim_copy"]
+        reference_data = [d for d in data if d.get("channel_role") == "reference"]
+
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                            subplot_titles=["Stim Copy RMS", "Reference RMS",
+                                            "Line Noise Ratio (60 Hz indicator)"],
+                            vertical_spacing=0.08)
+
+        # Stim copy RMS
+        stim_channels = sorted(set(d["channel"] for d in stim_copy_data))
+        for ch in stim_channels:
+            ch_data = [d for d in stim_copy_data if d["channel"] == ch]
+            ch_name = ch_data[0].get("channel_name") or f"Ch{ch}"
+            fig.add_trace(go.Scatter(
+                x=[d["chunk_datetime"] for d in ch_data],
+                y=[d["rms_amplitude"] for d in ch_data],
+                mode="lines+markers", name=f"{ch_name} (stim_copy)",
+                line=dict(color="#888888"), marker=dict(size=3),
+            ), row=1, col=1)
+
+        # Reference RMS
+        ref_channels = sorted(set(d["channel"] for d in reference_data))
+        for ch in ref_channels:
+            ch_data = [d for d in reference_data if d["channel"] == ch]
+            ch_name = ch_data[0].get("channel_name") or f"Ch{ch}"
+            fig.add_trace(go.Scatter(
+                x=[d["chunk_datetime"] for d in ch_data],
+                y=[d["rms_amplitude"] for d in ch_data],
+                mode="lines+markers", name=f"{ch_name} (reference)",
+                line=dict(color="#00CC96"), marker=dict(size=3),
+            ), row=2, col=1)
+
+        # Line noise ratio for ALL channels (aggregate trend)
+        all_channels = sorted(set(d["channel"] for d in data))
+        ch_map = _get_channel_map(store, session_dir)
+        for ch in all_channels:
+            ch_data = [d for d in data if d["channel"] == ch]
+            info = ch_map.get(ch, {"name": f"Ch{ch}", "role": "eeg"})
+            fig.add_trace(go.Scatter(
+                x=[d["chunk_datetime"] for d in ch_data],
+                y=[d["line_noise_ratio"] for d in ch_data],
+                mode="lines", name=info["name"],
+                line=dict(color=_color_for_role(info["role"]), width=1),
+                showlegend=False,
+            ), row=3, col=1)
+
+        fig.update_layout(
+            height=700, template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig.update_annotations(font=dict(color="white"))
+        return fig
+
+    # ------------------------------------------------------------------ #
+    #  Session Compare callback
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        [Output("session-compare-waveform-plot", "figure"),
+         Output("session-compare-features-plot", "figure")],
+        [Input("compare-session-a-dropdown", "value"),
+         Input("compare-session-b-dropdown", "value")],
+    )
+    def update_session_compare(session_a, session_b):
+        if not session_a or not session_b:
+            return (_empty_fig("Select two sessions", 450),
+                    _empty_fig("Select two sessions", 450))
+
+        # --- Waveform overlay ---
+        wf_fig = go.Figure()
+        for sess_dir, color, label in [(session_a, "#636EFA", "Session A"),
+                                       (session_b, "#EF553B", "Session B")]:
+            try:
+                waveforms = store.get_evoked_waveforms_for_session(sess_dir)
+            except Exception:
+                waveforms = []
+
+            if waveforms:
+                # Use the latest waveform
+                wf = waveforms[-1]
+                time_ms = wf["time_axis_ms"]
+                mean_tr = wf["mean_trace"]
+                sem_tr = wf["sem_trace"]
+
+                sessions = store.get_sessions()
+                sname = sess_dir
+                for s in sessions:
+                    if s["session_dir"] == sess_dir:
+                        sname = s["session_name"]
+                        break
+
+                if sem_tr and len(sem_tr) == len(mean_tr):
+                    upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+                    lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+                    fill_color = color.replace(")", ",0.15)").replace("rgb", "rgba") if color.startswith("rgb") else color
+                    if color == "#636EFA":
+                        fill_color = "rgba(99,110,250,0.15)"
+                    else:
+                        fill_color = "rgba(239,85,59,0.15)"
+                    fig_band_x = list(time_ms) + list(reversed(time_ms))
+                    fig_band_y = upper + list(reversed(lower))
+                    wf_fig.add_trace(go.Scatter(
+                        x=fig_band_x, y=fig_band_y,
+                        fill="toself", fillcolor=fill_color,
+                        line=dict(width=0), showlegend=False, hoverinfo="skip",
+                    ))
+
+                wf_fig.add_trace(go.Scatter(
+                    x=time_ms, y=mean_tr, mode="lines",
+                    name=f"{label}: {sname}",
+                    line=dict(color=color, width=2),
+                ))
+
+        wf_fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
+        wf_fig.update_layout(
+            template="plotly_dark",
+            title="Mean Evoked Waveform Overlay",
+            xaxis_title="Time (ms)", yaxis_title="Amplitude",
+            height=450,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        # --- Feature distribution comparison (top 5 features) ---
+        top_features = ["peak_amplitude", "trough_amplitude", "rms_amplitude",
+                        "line_length", "peak_to_trough"]
+        feat_fig = go.Figure()
+
+        for sess_dir, color, label in [(session_a, "#636EFA", "Session A"),
+                                       (session_b, "#EF553B", "Session B")]:
+            means = []
+            stds = []
+            f_names = []
+            for feat in top_features:
+                try:
+                    fdata = store.get_evoked_feature_timeseries(
+                        feature_name=feat, session_dir=sess_dir)
+                    vals = [d["value"] for d in fdata if d["value"] is not None
+                            and not d.get("is_artifact", 0)]
+                except Exception:
+                    vals = []
+
+                f_names.append(EVOKED_FEATURE_LABELS.get(feat, feat))
+                if vals:
+                    means.append(statistics.mean(vals))
+                    stds.append(statistics.stdev(vals) if len(vals) > 1 else 0)
+                else:
+                    means.append(0)
+                    stds.append(0)
+
+            sessions = store.get_sessions()
+            sname = sess_dir
+            for s in sessions:
+                if s["session_dir"] == sess_dir:
+                    sname = s["session_name"]
+                    break
+
+            feat_fig.add_trace(go.Bar(
+                x=f_names, y=means,
+                name=f"{label}: {sname}",
+                marker_color=color,
+                error_y=dict(type="data", array=stds, visible=True),
+            ))
+
+        feat_fig.update_layout(
+            template="plotly_dark",
+            title="Feature Distribution Comparison (top 5)",
+            xaxis_title="Feature", yaxis_title="Value",
+            barmode="group", height=450,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        return wf_fig, feat_fig
+
+    # ------------------------------------------------------------------ #
+    #  Activity Log callback
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("activity-log-table", "data"),
+        [Input("activity-log-hours-dropdown", "value"),
+         Input("activity-log-level-dropdown", "value")],
+    )
+    def update_activity_log(hours, level):
+        hours_val = int(hours) if hours else 24
+        level_val = level if level and level != "ALL" else None
+        try:
+            logs = store.get_activity_log(hours=hours_val, level=level_val, limit=500)
+        except Exception:
+            logs = []
+        return [
+            {
+                "timestamp": entry.get("timestamp", "")[:19],
+                "level": entry.get("level", ""),
+                "action": entry.get("action", ""),
+                "message": (entry.get("message") or "")[:200],
+                "file_path": os.path.basename(entry.get("file_path") or ""),
+                "duration": f"{entry['duration_sec']:.2f}" if entry.get("duration_sec") else "",
+            }
+            for entry in logs
+        ]
+
+    # ------------------------------------------------------------------ #
+    #  Annotations callbacks
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        [Output("annotation-status", "children"),
+         Output("annotation-table", "data")],
+        Input("annotation-submit-btn", "n_clicks"),
+        [State("annotation-timestamp", "value"),
+         State("annotation-note", "value"),
+         State("annotation-category", "value"),
+         State("annotation-session-dropdown", "value")],
+        prevent_initial_call=True,
+    )
+    def submit_annotation(n_clicks, timestamp_val, note, category, session_dir):
+        if not n_clicks:
+            return no_update, no_update
+        if not note or not note.strip():
+            return html.Div("Note cannot be empty", style={"color": "#EF553B"}), no_update
+        ts = timestamp_val or datetime.now().isoformat()
+        try:
+            ann_id = store.add_annotation(
+                timestamp=ts,
+                note=note.strip(),
+                category=category or "observation",
+                session_dir=session_dir or None,
+            )
+            all_ann = store.get_annotations()
+            table_data = _annotations_table_data(all_ann)
+            return (
+                html.Div(f"Annotation #{ann_id} saved", style={"color": "#00CC96"}),
+                table_data,
+            )
+        except Exception as e:
+            return html.Div(f"Error: {e}", style={"color": "#EF553B"}), no_update
 
     # ------------------------------------------------------------------ #
     #  Settings callbacks
@@ -641,7 +1099,6 @@ def _overview_tab(store: Store):
     active_session = sessions[0] if sessions else {}
     session_dir = active_session.get("session_dir", "")
 
-    # Channel map for active session
     ch_map = _get_channel_map(store, session_dir) if session_dir else {}
 
     recent_alerts = store.get_recent_alerts(hours=24)
@@ -663,6 +1120,45 @@ def _overview_tab(store: Store):
                      "#00CC96" if disk > 50 else "#EF553B"),
         _status_card("Files/Hour", str(fph), "#636EFA"),
     ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"})
+
+    # Evoked waveform thumbnail for overview
+    waveform_thumbnail = html.Div()
+    if session_dir:
+        try:
+            waveforms = store.get_evoked_waveforms_for_session(session_dir)
+            if waveforms:
+                wf = waveforms[-1]
+                thumb_fig = go.Figure()
+                time_ms = wf["time_axis_ms"]
+                mean_tr = wf["mean_trace"]
+                sem_tr = wf["sem_trace"]
+                if sem_tr and len(sem_tr) == len(mean_tr):
+                    upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+                    lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+                    thumb_fig.add_trace(go.Scatter(
+                        x=list(time_ms) + list(reversed(time_ms)),
+                        y=upper + list(reversed(lower)),
+                        fill="toself", fillcolor="rgba(99,110,250,0.15)",
+                        line=dict(width=0), showlegend=False, hoverinfo="skip",
+                    ))
+                thumb_fig.add_trace(go.Scatter(
+                    x=time_ms, y=mean_tr, mode="lines",
+                    name="Latest Mean Evoked",
+                    line=dict(color="#636EFA", width=2),
+                ))
+                thumb_fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
+                thumb_fig.update_layout(
+                    template="plotly_dark",
+                    title="Latest Mean Evoked Trace",
+                    height=280, margin=dict(l=40, r=20, t=40, b=30),
+                    xaxis_title="Time (ms)", yaxis_title="Amplitude",
+                    showlegend=False,
+                )
+                waveform_thumbnail = html.Div([
+                    dcc.Graph(figure=thumb_fig, style={"marginTop": "16px"}),
+                ])
+        except Exception as e:
+            logger.debug("Could not load waveform thumbnail: %s", e)
 
     # Active session info
     if active_session:
@@ -688,7 +1184,6 @@ def _overview_tab(store: Store):
                       "borderRadius": "8px", "border": "1px solid #333", "marginTop": "8px"}),
         ])
 
-        # Channel map display
         if ch_map:
             ch_rows = []
             for idx in sorted(ch_map.keys()):
@@ -751,8 +1246,39 @@ def _overview_tab(store: Store):
             html.P("No alerts in the last 24 hours", style={"color": "#888"}),
         ])
 
-    return html.Div([cards, session_info, channel_table, alerts_section])
+    return html.Div([cards, waveform_thumbnail, session_info, channel_table, alerts_section])
 
+
+# ------------------------------------------------------------------ #
+#  Evoked Waveforms tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _waveforms_tab_layout(store: Store):
+    session_options = _session_dropdown_options(store)
+    default = _default_session(store)
+
+    return html.Div([
+        html.H3("Evoked Waveforms", style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.Div([
+                html.Label("Session", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="waveform-session-dropdown",
+                    options=session_options,
+                    value=default,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "300px"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+
+        dcc.Graph(id="waveform-plot", style={"height": "550px"}),
+    ])
+
+
+# ------------------------------------------------------------------ #
+#  Signal Quality tab (existing)
+# ------------------------------------------------------------------ #
 
 def _signal_quality_tab(store: Store):
     sessions = store.get_sessions()
@@ -807,8 +1333,12 @@ def _signal_quality_tab(store: Store):
     return html.Div([dcc.Graph(figure=fig)])
 
 
+# ------------------------------------------------------------------ #
+#  Evoked Features tab (renamed from Evoked Response)
+# ------------------------------------------------------------------ #
+
 def _evoked_tab_layout(store: Store):
-    """Build the Evoked Response tab layout — data loaded via callback."""
+    """Build the Evoked Features tab layout -- data loaded via callback."""
     sessions = store.get_sessions()
     session_options = [{"label": s["session_name"], "value": s["session_dir"]}
                        for s in sessions]
@@ -819,43 +1349,38 @@ def _evoked_tab_layout(store: Store):
     default_session = sessions[0]["session_dir"] if sessions else None
 
     return html.Div([
+        html.H3("Evoked Features", style={"color": "white", "marginBottom": "12px"}),
         html.Div([
             html.Div([
-                html.Label("Session", style={"color": "#888", "fontSize": "12px"}),
+                html.Label("Session", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="evoked-session-dropdown",
                     options=session_options,
                     value=default_session,
-                    style={"backgroundColor": "#1e1e2f", "color": "white"},
+                    style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "250px"}),
             html.Div([
-                html.Label("Feature", style={"color": "#888", "fontSize": "12px"}),
+                html.Label("Feature", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="evoked-feature-dropdown",
                     options=feature_options,
                     value="peak_amplitude",
-                    style={"backgroundColor": "#1e1e2f", "color": "white"},
+                    style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "250px"}),
             html.Div([
-                html.Label("Hours", style={"color": "#888", "fontSize": "12px"}),
+                html.Label("Time Range", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="evoked-hours-dropdown",
-                    options=[
-                        {"label": "Last 6h", "value": 6},
-                        {"label": "Last 24h", "value": 24},
-                        {"label": "Last 48h", "value": 48},
-                        {"label": "Last 7d", "value": 168},
-                        {"label": "All", "value": ""},
-                    ],
+                    options=TIME_RANGE_OPTIONS,
                     value=48,
-                    style={"backgroundColor": "#1e1e2f", "color": "white"},
+                    style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
-            ], style={"flex": "0 0 150px"}),
+            ], style={"flex": "0 0 180px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
         dcc.Graph(id="evoked-scatter", style={"height": "500px"}),
@@ -863,8 +1388,12 @@ def _evoked_tab_layout(store: Store):
     ])
 
 
+# ------------------------------------------------------------------ #
+#  Criticality tab (existing)
+# ------------------------------------------------------------------ #
+
 def _criticality_tab_layout(store: Store):
-    """Build the Criticality tab layout — data loaded via callback."""
+    """Build the Criticality tab layout -- data loaded via callback."""
     sessions = store.get_sessions()
     session_options = [{"label": s["session_name"], "value": s["session_dir"]}
                        for s in sessions]
@@ -873,36 +1402,154 @@ def _criticality_tab_layout(store: Store):
     return html.Div([
         html.Div([
             html.Div([
-                html.Label("Session", style={"color": "#888", "fontSize": "12px"}),
+                html.Label("Session", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="criticality-session-dropdown",
                     options=session_options,
                     value=default_session,
-                    style={"backgroundColor": "#1e1e2f", "color": "white"},
+                    style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "250px"}),
             html.Div([
-                html.Label("Hours", style={"color": "#888", "fontSize": "12px"}),
+                html.Label("Time Range", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="criticality-hours-dropdown",
-                    options=[
-                        {"label": "Last 6h", "value": 6},
-                        {"label": "Last 24h", "value": 24},
-                        {"label": "Last 48h", "value": 48},
-                        {"label": "Last 7d", "value": 168},
-                        {"label": "All", "value": ""},
-                    ],
+                    options=TIME_RANGE_OPTIONS,
                     value=48,
-                    style={"backgroundColor": "#1e1e2f", "color": "white"},
+                    style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
-            ], style={"flex": "0 0 150px"}),
+            ], style={"flex": "0 0 180px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
         dcc.Graph(id="criticality-plot", style={"height": "550px"}),
     ])
 
+
+# ------------------------------------------------------------------ #
+#  LFP Browser tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _lfp_browser_tab_layout(store: Store):
+    session_options = _session_dropdown_options(store)
+    default = _default_session(store)
+
+    return html.Div([
+        html.H3("LFP Browser", style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.Div([
+                html.Label("Session", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="lfp-session-dropdown",
+                    options=session_options,
+                    value=default,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "250px"}),
+            html.Div([
+                html.Label("File", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="lfp-file-dropdown",
+                    options=[],
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "2", "minWidth": "350px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
+                html.Button("Load LFP", id="lfp-load-btn", n_clicks=0,
+                            style={"backgroundColor": "#636EFA", "color": "white",
+                                   "border": "none", "padding": "8px 20px",
+                                   "borderRadius": "6px", "cursor": "pointer",
+                                   "fontSize": "14px", "fontWeight": "bold"}),
+            ], style={"flex": "0 0 120px", "display": "flex", "alignItems": "flex-end"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+
+        html.P("Loads the first 5 seconds of raw LFP from the selected .mat file.",
+               style={"color": "#888", "fontSize": "12px", "marginBottom": "8px"}),
+
+        dcc.Graph(id="lfp-plot", figure=_empty_fig("Select a session and file, then click Load", 600)),
+    ])
+
+
+# ------------------------------------------------------------------ #
+#  Electrode Health tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _electrode_health_tab_layout(store: Store):
+    session_options = _session_dropdown_options(store)
+    default = _default_session(store)
+
+    return html.Div([
+        html.H3("Electrode Health", style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.Div([
+                html.Label("Session", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="electrode-health-session-dropdown",
+                    options=session_options,
+                    value=default,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "250px"}),
+            html.Div([
+                html.Label("Time Range", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="electrode-health-hours-dropdown",
+                    options=TIME_RANGE_OPTIONS,
+                    value=48,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "0 0 180px"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+
+        dcc.Graph(id="electrode-health-plot", figure=_empty_fig("Select a session", 700)),
+    ])
+
+
+# ------------------------------------------------------------------ #
+#  Session Compare tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _session_compare_tab_layout(store: Store):
+    session_options = _session_dropdown_options(store)
+
+    return html.Div([
+        html.H3("Session Compare", style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.Div([
+                html.Label("Session A", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="compare-session-a-dropdown",
+                    options=session_options,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "300px"}),
+            html.Div([
+                html.Label("Session B", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="compare-session-b-dropdown",
+                    options=session_options,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "300px"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+
+        dcc.Graph(id="session-compare-waveform-plot", style={"height": "450px"}),
+        dcc.Graph(id="session-compare-features-plot", style={"height": "450px",
+                                                              "marginTop": "16px"}),
+    ])
+
+
+# ------------------------------------------------------------------ #
+#  Stim QC tab (existing)
+# ------------------------------------------------------------------ #
 
 def _stim_tab(store: Store):
     conn = store._connect()
@@ -947,6 +1594,10 @@ def _stim_tab(store: Store):
     ])
 
 
+# ------------------------------------------------------------------ #
+#  Settings tab (existing)
+# ------------------------------------------------------------------ #
+
 def _settings_tab_layout(store: Store):
     """Build the Settings tab with all subsections."""
     try:
@@ -973,20 +1624,11 @@ def _settings_tab_layout(store: Store):
         "Sum Power High", "Freq Moment High",
     ]
 
-    # Version history
     versions = store.get_all_settings_versions()
     version_data = _version_table_data(versions)
 
-    section_style = {"backgroundColor": "#1e1e2f", "padding": "16px", "borderRadius": "8px",
-                     "border": "1px solid #333", "marginBottom": "16px"}
-    label_style = {"color": "#888", "fontSize": "12px", "marginBottom": "2px",
-                   "display": "block"}
-    input_style = {"backgroundColor": "#111", "color": "white", "border": "1px solid #444",
-                   "borderRadius": "4px", "padding": "4px 8px", "width": "100%"}
-    field_style = {"flex": "1", "minWidth": "180px"}
-
     def _input(id_, val, type_="number", **kw):
-        return dcc.Input(id=id_, value=val, type=type_, style=input_style, **kw)
+        return dcc.Input(id=id_, value=val, type=type_, style=INPUT_STYLE, **kw)
 
     def _check(id_, val):
         return dcc.Checklist(
@@ -1000,160 +1642,160 @@ def _settings_tab_layout(store: Store):
         html.Div([
             html.H4("Evoked Analysis", style={"color": "white", "marginTop": "0"}),
             html.Div([
-                html.Div([html.Label("Pre-stimulus (ms)", style=label_style),
+                html.Div([html.Label("Pre-stimulus (ms)", style=LABEL_STYLE),
                           _input("evoked-pre-stim", ev.get("pre_stimulus_ms", -100))],
-                         style=field_style),
-                html.Div([html.Label("Post-stimulus (ms)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Post-stimulus (ms)", style=LABEL_STYLE),
                           _input("evoked-post-stim", ev.get("post_stimulus_ms", 500))],
-                         style=field_style),
-                html.Div([html.Label("Stimulus threshold (std)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Stimulus threshold (std)", style=LABEL_STYLE),
                           _input("evoked-stim-thresh", ev.get("stimulus_threshold_std", 3.0), step=0.1)],
-                         style=field_style),
-                html.Div([html.Label("Min stim distance (sec)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Min stim distance (sec)", style=LABEL_STYLE),
                           _input("evoked-min-stim-dist", ev.get("min_stimulus_distance_sec", 0.1), step=0.01)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
-                html.Div([html.Label("Baseline correction", style=label_style),
+                html.Div([html.Label("Baseline correction", style=LABEL_STYLE),
                           _check("evoked-baseline-correction", ev.get("baseline_correction", True))],
-                         style=field_style),
-                html.Div([html.Label("Baseline start (ms)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Baseline start (ms)", style=LABEL_STYLE),
                           _input("evoked-baseline-start", bl_window[0] if len(bl_window) > 0 else -60)],
-                         style=field_style),
-                html.Div([html.Label("Baseline end (ms)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Baseline end (ms)", style=LABEL_STYLE),
                           _input("evoked-baseline-end", bl_window[1] if len(bl_window) > 1 else -10)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
-                html.Div([html.Label("Notch 60 Hz", style=label_style),
+                html.Div([html.Label("Notch 60 Hz", style=LABEL_STYLE),
                           _check("evoked-notch60", ev.get("notch_60hz", True))],
-                         style=field_style),
-                html.Div([html.Label("Notch 50 Hz", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Notch 50 Hz", style=LABEL_STYLE),
                           _check("evoked-notch50", ev.get("notch_50hz", False))],
-                         style=field_style),
-                html.Div([html.Label("Highpass enabled", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Highpass enabled", style=LABEL_STYLE),
                           _check("evoked-hp-enabled", ev.get("highpass_enabled", False))],
-                         style=field_style),
-                html.Div([html.Label("Highpass cutoff (Hz)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Highpass cutoff (Hz)", style=LABEL_STYLE),
                           _input("evoked-hp-cutoff", ev.get("highpass_cutoff_hz", 1.0), step=0.1)],
-                         style=field_style),
-                html.Div([html.Label("Lowpass enabled", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Lowpass enabled", style=LABEL_STYLE),
                           _check("evoked-lp-enabled", ev.get("lowpass_enabled", False))],
-                         style=field_style),
-                html.Div([html.Label("Lowpass cutoff (Hz)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Lowpass cutoff (Hz)", style=LABEL_STYLE),
                           _input("evoked-lp-cutoff", ev.get("lowpass_cutoff_hz", 1000.0))],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- Criticality ---
         html.Div([
             html.H4("Criticality", style={"color": "white", "marginTop": "0"}),
             html.Div([
-                html.Div([html.Label("AR order", style=label_style),
+                html.Div([html.Label("AR order", style=LABEL_STYLE),
                           _input("crit-ar-order", cr.get("ar_order", 5), step=1)],
-                         style=field_style),
-                html.Div([html.Label("Window (sec)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Window (sec)", style=LABEL_STYLE),
                           _input("crit-window-sec", cr.get("window_sec", 2.0), step=0.1)],
-                         style=field_style),
-                html.Div([html.Label("Overlap %", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Overlap %", style=LABEL_STYLE),
                           dcc.Slider(id="crit-overlap", min=0, max=90, step=10,
                                      value=cr.get("overlap_pct", 50),
                                      marks={i: str(i) for i in range(0, 91, 10)},
                                      tooltip={"placement": "bottom"})],
-                         style={**field_style, "minWidth": "300px"}),
+                         style={**FIELD_STYLE, "minWidth": "300px"}),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
-                html.Div([html.Label("Fit method", style=label_style),
+                html.Div([html.Label("Fit method", style=LABEL_STYLE),
                           dcc.Dropdown(id="crit-fit-method",
                                        options=[{"label": m, "value": m}
                                                 for m in ["YuleWalker", "Burg", "Covariance"]],
                                        value=cr.get("fit_method", "YuleWalker"),
                                        style={"backgroundColor": "#111", "color": "white"})],
-                         style=field_style),
-                html.Div([html.Label("Target SR", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Target SR", style=LABEL_STYLE),
                           _input("crit-target-sr", cr.get("target_sampling_rate", 1000))],
-                         style=field_style),
-                html.Div([html.Label("Type B", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Type B", style=LABEL_STYLE),
                           _input("crit-type-b", cr.get("criticality_type_b", 2), step=1)],
-                         style=field_style),
-                html.Div([html.Label("Error bars", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Error bars", style=LABEL_STYLE),
                           _check("crit-error-bars", cr.get("calculate_error_bars", False))],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- Seizure ---
         html.Div([
             html.H4("Seizure Detection", style={"color": "white", "marginTop": "0"}),
             html.Div([
-                html.Div([html.Label("Spike threshold (uV)", style=label_style),
+                html.Div([html.Label("Spike threshold (uV)", style=LABEL_STYLE),
                           _input("seiz-spike-thresh", sz.get("spike_threshold_uv", 10))],
-                         style=field_style),
-                html.Div([html.Label("Spike min width", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Spike min width", style=LABEL_STYLE),
                           _input("seiz-spike-min-w", sz.get("spike_min_width", 5), step=1)],
-                         style=field_style),
-                html.Div([html.Label("Spike max width", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Spike max width", style=LABEL_STYLE),
                           _input("seiz-spike-max-w", sz.get("spike_max_width", 50), step=1)],
-                         style=field_style),
-                html.Div([html.Label("Min seizure dur (sec)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Min seizure dur (sec)", style=LABEL_STYLE),
                           _input("seiz-min-dur", sz.get("min_seizure_duration_sec", 5), step=0.5)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
-                html.Div([html.Label("Event glue (sec)", style=label_style),
+                html.Div([html.Label("Event glue (sec)", style=LABEL_STYLE),
                           _input("seiz-glue-sec", sz.get("event_glue_sec", 2), step=0.5)],
-                         style=field_style),
-                html.Div([html.Label("Min spikes/sec", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Min spikes/sec", style=LABEL_STYLE),
                           _input("seiz-min-spikes", sz.get("min_spikes_per_sec", 2), step=0.5)],
-                         style=field_style),
-                html.Div([html.Label("Outlier factor", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Outlier factor", style=LABEL_STYLE),
                           _input("seiz-outlier", sz.get("outlier_factor", 3), step=0.5)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- Artifact ---
         html.Div([
             html.H4("Artifact Rejection", style={"color": "white", "marginTop": "0"}),
             html.Div([
-                html.Div([html.Label("Method", style=label_style),
+                html.Div([html.Label("Method", style=LABEL_STYLE),
                           dcc.Dropdown(id="art-method",
                                        options=[{"label": m, "value": m}
                                                 for m in ["fixed", "mad"]],
                                        value=ar.get("method", "fixed"),
                                        style={"backgroundColor": "#111", "color": "white"})],
-                         style=field_style),
-                html.Div([html.Label("Fixed threshold", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Fixed threshold", style=LABEL_STYLE),
                           _input("art-fixed-thresh", ar.get("fixed_threshold", 500))],
-                         style=field_style),
-                html.Div([html.Label("MAD k", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("MAD k", style=LABEL_STYLE),
                           _input("art-mad-k", ar.get("mad_k", 4.0), step=0.1)],
-                         style=field_style),
-                html.Div([html.Label("Merge gap (sec)", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Merge gap (sec)", style=LABEL_STYLE),
                           _input("art-merge-gap", ar.get("merge_gap_sec", 2.0), step=0.1)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- QC Thresholds ---
         html.Div([
             html.H4("QC Thresholds", style={"color": "white", "marginTop": "0"}),
             html.Div([
-                html.Div([html.Label("Artifact % warning", style=label_style),
+                html.Div([html.Label("Artifact % warning", style=LABEL_STYLE),
                           _input("qc-artifact-warn", qc.get("artifact_pct_warning", 50))],
-                         style=field_style),
-                html.Div([html.Label("Flatline std", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Flatline std", style=LABEL_STYLE),
                           _input("qc-flatline-std", qc.get("flatline_std", 1e-6), step=1e-7)],
-                         style=field_style),
-                html.Div([html.Label("Clipping voltage", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Clipping voltage", style=LABEL_STYLE),
                           _input("qc-clipping-v", qc.get("clipping_voltage", 10.0))],
-                         style=field_style),
-                html.Div([html.Label("Line noise ratio warning", style=label_style),
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Line noise ratio warning", style=LABEL_STYLE),
                           _input("qc-linenoise-warn", qc.get("line_noise_ratio_warning", 0.2), step=0.01)],
-                         style=field_style),
+                         style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- Features ---
         html.Div([
@@ -1165,7 +1807,7 @@ def _settings_tab_layout(store: Store):
                 style={"color": "#ddd", "columns": "3", "columnGap": "20px"},
                 inputStyle={"marginRight": "6px"},
             ),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
 
         # --- Buttons ---
         html.Div([
@@ -1175,7 +1817,7 @@ def _settings_tab_layout(store: Store):
                                 "fontSize": "14px", "fontWeight": "bold"}),
             html.Div(style={"flex": "0 0 20px"}),
             dcc.Input(id="version-label-input", placeholder="Version label (optional)",
-                      style={**input_style, "width": "250px"}),
+                      style={**INPUT_STYLE, "width": "250px"}),
             html.Button("Save as New Version", id="btn-save-version", n_clicks=0,
                          style={"backgroundColor": "#00CC96", "color": "white", "border": "none",
                                 "padding": "10px 24px", "borderRadius": "6px", "cursor": "pointer",
@@ -1213,22 +1855,211 @@ def _settings_tab_layout(store: Store):
                 page_size=10,
                 sort_action="native",
             ),
-        ], style=section_style),
+        ], style=SECTION_STYLE),
     ])
 
 
-def _version_table_data(versions: list[dict]) -> list[dict]:
-    return [
+# ------------------------------------------------------------------ #
+#  Activity Log tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _activity_log_tab_layout(store: Store):
+    # Pre-load initial data
+    try:
+        initial_logs = store.get_activity_log(hours=24, limit=500)
+    except Exception:
+        initial_logs = []
+
+    initial_data = [
         {
-            "id": v["id"],
-            "label": v.get("label", ""),
-            "created_at": v["created_at"][:19],
-            "is_active": "Yes" if v.get("is_active") else "No",
-            "hash_short": v.get("version_hash", "")[:12],
+            "timestamp": entry.get("timestamp", "")[:19],
+            "level": entry.get("level", ""),
+            "action": entry.get("action", ""),
+            "message": (entry.get("message") or "")[:200],
+            "file_path": os.path.basename(entry.get("file_path") or ""),
+            "duration": f"{entry['duration_sec']:.2f}" if entry.get("duration_sec") else "",
         }
-        for v in versions
+        for entry in initial_logs
     ]
 
+    return html.Div([
+        html.H3("Activity Log", style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.Div([
+                html.Label("Time Range", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="activity-log-hours-dropdown",
+                    options=TIME_RANGE_OPTIONS,
+                    value=24,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "0 0 180px"}),
+            html.Div([
+                html.Label("Level", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="activity-log-level-dropdown",
+                    options=[
+                        {"label": "ALL", "value": "ALL"},
+                        {"label": "INFO", "value": "INFO"},
+                        {"label": "WARNING", "value": "WARNING"},
+                        {"label": "ERROR", "value": "ERROR"},
+                    ],
+                    value="ALL",
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "0 0 150px"}),
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
+
+        dash_table.DataTable(
+            id="activity-log-table",
+            data=initial_data,
+            columns=[
+                {"name": "Timestamp", "id": "timestamp"},
+                {"name": "Level", "id": "level"},
+                {"name": "Action", "id": "action"},
+                {"name": "Message", "id": "message"},
+                {"name": "File", "id": "file_path"},
+                {"name": "Duration (s)", "id": "duration"},
+            ],
+            **DARK_TABLE_STYLE,
+            style_data_conditional=[
+                {"if": {"filter_query": "{level} = ERROR"},
+                 "backgroundColor": "#3d1111", "color": "#ff6b6b"},
+                {"if": {"filter_query": "{level} = WARNING"},
+                 "backgroundColor": "#3d3011", "color": "#ffd93d"},
+                {"if": {"filter_query": "{level} = INFO"},
+                 "color": "#6bb5ff"},
+            ],
+            page_size=30,
+            filter_action="native",
+            sort_action="native",
+        ),
+    ])
+
+
+# ------------------------------------------------------------------ #
+#  Annotations tab (NEW)
+# ------------------------------------------------------------------ #
+
+def _annotations_tab_layout(store: Store):
+    session_options = _session_dropdown_options(store)
+
+    try:
+        all_annotations = store.get_annotations()
+    except Exception:
+        all_annotations = []
+
+    table_data = _annotations_table_data(all_annotations)
+
+    return html.Div([
+        html.H3("Annotations", style={"color": "white", "marginBottom": "12px"}),
+
+        # Existing annotations table
+        dash_table.DataTable(
+            id="annotation-table",
+            data=table_data,
+            columns=[
+                {"name": "ID", "id": "id"},
+                {"name": "Timestamp", "id": "timestamp"},
+                {"name": "Category", "id": "category"},
+                {"name": "Note", "id": "note"},
+                {"name": "Session", "id": "session_dir"},
+                {"name": "Created At", "id": "created_at"},
+            ],
+            **DARK_TABLE_STYLE,
+            style_data_conditional=[
+                {"if": {"filter_query": "{category} = electrode"},
+                 "color": "#FFA15A"},
+                {"if": {"filter_query": "{category} = injection"},
+                 "color": "#AB63FA"},
+                {"if": {"filter_query": "{category} = experiment"},
+                 "color": "#636EFA"},
+                {"if": {"filter_query": "{category} = observation"},
+                 "color": "#00CC96"},
+            ],
+            page_size=20,
+            filter_action="native",
+            sort_action="native",
+        ),
+
+        # Add Note form
+        html.Div([
+            html.H4("Add Note", style={"color": "white", "marginTop": "24px", "marginBottom": "12px"}),
+            html.Div([
+                html.Div([
+                    html.Label("Timestamp", style=LABEL_STYLE),
+                    dcc.Input(
+                        id="annotation-timestamp",
+                        value=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                        type="text",
+                        style=INPUT_STYLE,
+                        placeholder="YYYY-MM-DDTHH:MM:SS",
+                    ),
+                ], style={"flex": "1", "minWidth": "220px"}),
+                html.Div([
+                    html.Label("Category", style=LABEL_STYLE),
+                    dcc.Dropdown(
+                        id="annotation-category",
+                        options=[
+                            {"label": "Electrode", "value": "electrode"},
+                            {"label": "Injection", "value": "injection"},
+                            {"label": "Experiment", "value": "experiment"},
+                            {"label": "Observation", "value": "observation"},
+                        ],
+                        value="observation",
+                        style=DROPDOWN_STYLE,
+                        className="dark-dropdown",
+                    ),
+                ], style={"flex": "0 0 180px"}),
+                html.Div([
+                    html.Label("Session (optional)", style=LABEL_STYLE),
+                    dcc.Dropdown(
+                        id="annotation-session-dropdown",
+                        options=session_options,
+                        style=DROPDOWN_STYLE,
+                        className="dark-dropdown",
+                    ),
+                ], style={"flex": "1", "minWidth": "250px"}),
+            ], style={"display": "flex", "gap": "16px", "marginBottom": "12px", "flexWrap": "wrap"}),
+
+            html.Div([
+                html.Label("Note", style=LABEL_STYLE),
+                dcc.Textarea(
+                    id="annotation-note",
+                    style={**INPUT_STYLE, "height": "80px", "resize": "vertical"},
+                    placeholder="Enter your annotation...",
+                ),
+            ], style={"marginBottom": "12px"}),
+
+            html.Button("Submit Annotation", id="annotation-submit-btn", n_clicks=0,
+                        style={"backgroundColor": "#00CC96", "color": "white",
+                               "border": "none", "padding": "10px 24px",
+                               "borderRadius": "6px", "cursor": "pointer",
+                               "fontSize": "14px", "fontWeight": "bold"}),
+            html.Div(id="annotation-status", style={"marginTop": "8px"}),
+        ], style=SECTION_STYLE),
+    ])
+
+
+def _annotations_table_data(annotations: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": a.get("id", ""),
+            "timestamp": (a.get("timestamp") or "")[:19],
+            "category": a.get("category", ""),
+            "note": a.get("note", ""),
+            "session_dir": os.path.basename(a.get("session_dir") or ""),
+            "created_at": (a.get("created_at") or "")[:19],
+        }
+        for a in annotations
+    ]
+
+
+# ------------------------------------------------------------------ #
+#  Alerts tab (existing)
+# ------------------------------------------------------------------ #
 
 def _alerts_tab(store: Store):
     alerts = store.get_recent_alerts(hours=168)  # 7 days
@@ -1257,6 +2088,10 @@ def _alerts_tab(store: Store):
         ) if alerts else html.P("No alerts in the last 7 days", style={"color": "#888"}),
     ])
 
+
+# ------------------------------------------------------------------ #
+#  Sessions tab (existing)
+# ------------------------------------------------------------------ #
 
 def _sessions_tab(store: Store):
     sessions = store.get_sessions()
@@ -1314,3 +2149,20 @@ def _sessions_tab(store: Store):
             filter_action="native",
         ),
     ])
+
+
+# ------------------------------------------------------------------ #
+#  Version table helper
+# ------------------------------------------------------------------ #
+
+def _version_table_data(versions: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": v["id"],
+            "label": v.get("label", ""),
+            "created_at": v["created_at"][:19],
+            "is_active": "Yes" if v.get("is_active") else "No",
+            "hash_short": v.get("version_hash", "")[:12],
+        }
+        for v in versions
+    ]
