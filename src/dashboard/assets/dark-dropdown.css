@@ -1,0 +1,75 @@
+/* Dark theme for Dash dropdowns */
+
+/* Selected value text */
+.Select-value-label,
+.Select-value {
+    color: white !important;
+}
+
+/* Placeholder text */
+.Select-placeholder {
+    color: #888 !important;
+}
+
+/* Input text while typing */
+.Select-input > input {
+    color: white !important;
+}
+
+/* Dropdown menu background */
+.Select-menu-outer {
+    background-color: #1e1e2f !important;
+    border: 1px solid #444 !important;
+}
+
+/* Individual option in dropdown */
+.VirtualizedSelectOption {
+    background-color: #1e1e2f !important;
+    color: #ddd !important;
+}
+
+/* Hovered option */
+.VirtualizedSelectFocusedOption,
+.VirtualizedSelectOption:hover {
+    background-color: #333 !important;
+    color: white !important;
+}
+
+/* The select control itself */
+.Select-control {
+    background-color: #1e1e2f !important;
+    border-color: #444 !important;
+}
+
+/* Arrow indicator */
+.Select-arrow {
+    border-color: #888 transparent transparent !important;
+}
+
+/* Clear indicator */
+.Select-clear {
+    color: #888 !important;
+}
+
+/* Multi-value tags */
+.Select--multi .Select-value {
+    background-color: #333 !important;
+    border-color: #555 !important;
+    color: white !important;
+}
+
+/* Non-virtualized dropdown options (newer Dash versions) */
+.dash-dropdown .Select-menu-outer .Select-option {
+    background-color: #1e1e2f !important;
+    color: #ddd !important;
+}
+
+.dash-dropdown .Select-menu-outer .Select-option.is-focused {
+    background-color: #333 !important;
+    color: white !important;
+}
+
+.dash-dropdown .Select-menu-outer .Select-option.is-selected {
+    background-color: #444 !important;
+    color: white !important;
+}

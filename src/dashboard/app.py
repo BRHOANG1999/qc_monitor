@@ -196,7 +196,9 @@ def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dic
 def create_app(config: dict, store: Store) -> Dash:
     refresh_sec = config.get("dashboard", {}).get("refresh_interval_sec", 10)
 
-    app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True)
+    assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+    app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
+               assets_folder=assets_dir)
 
     app.layout = html.Div([
         # Header
