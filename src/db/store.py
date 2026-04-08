@@ -969,6 +969,35 @@ class Store:
         finally:
             conn.close()
 
+    def get_evoked_waveform_by_file(self, file_id: int,
+                                      version_id: int | None = None) -> list[dict]:
+        """Return ALL channel waveforms for a single file."""
+        conn = self._connect()
+        try:
+            if version_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM evoked_waveforms WHERE file_id = ? AND version_id = ? ORDER BY channel",
+                    (file_id, version_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM evoked_waveforms WHERE file_id = ? ORDER BY channel",
+                    (file_id,),
+                ).fetchall()
+            results = []
+            for row in rows:
+                d = dict(row)
+                d["time_axis_ms"] = json.loads(d["time_axis_ms"])
+                d["mean_trace"] = json.loads(d["mean_trace"])
+                if d.get("sem_trace") is not None:
+                    d["sem_trace"] = json.loads(d["sem_trace"])
+                if d.get("stim_mean_trace") is not None:
+                    d["stim_mean_trace"] = json.loads(d["stim_mean_trace"])
+                results.append(d)
+            return results
+        finally:
+            conn.close()
+
     def get_evoked_waveforms_for_session(self, session_dir: str,
                                          version_id: int | None = None) -> list[dict]:
         """Return all evoked waveforms for a session, with parsed JSON arrays."""

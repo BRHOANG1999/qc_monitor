@@ -471,30 +471,44 @@ def create_app(config: dict, store: Store) -> Dash:
         return html.Div(plots), summary
 
     # ------------------------------------------------------------------ #
-    #  Evoked Waveforms callback
+    #  Evoked Waveforms callbacks
     # ------------------------------------------------------------------ #
     @app.callback(
-        Output("waveform-plot", "figure"),
+        [Output("waveform-file-dropdown", "options"),
+         Output("waveform-file-dropdown", "value")],
         [Input("waveform-session-dropdown", "value")],
     )
-    def update_waveform_plot(session_dir):
+    def update_waveform_file_list(session_dir):
         if not session_dir:
-            return _empty_fig("Select a session", 550)
+            return [], None
+        files = _get_processed_files_for_session(store, session_dir)
+        options = [{"label": f["chunk_datetime"], "value": f["id"]} for f in files]
+        latest = options[-1]["value"] if options else None
+        return options, latest
+
+    @app.callback(
+        Output("waveform-plot", "figure"),
+        [Input("waveform-file-dropdown", "value")],
+        [State("waveform-session-dropdown", "value")],
+    )
+    def update_waveform_plot(file_id, session_dir):
+        if not file_id:
+            return _empty_fig("Select a file", 400)
 
         try:
-            waveforms = store.get_evoked_waveforms_for_session(session_dir)
+            waveforms = store.get_evoked_waveform_by_file(file_id)
         except Exception as e:
             logger.error("Waveform query error: %s", e, exc_info=True)
-            return _empty_fig(f"Error: {e}", 550)
+            return _empty_fig(f"Error: {e}", 400)
 
         if not waveforms:
-            return _empty_fig("No evoked waveforms for this session", 550)
+            return _empty_fig("No evoked waveforms for this file", 400)
 
         try:
             return _build_waveform_figure(waveforms, store, session_dir)
         except Exception as e:
             logger.error("Waveform plot error: %s", e, exc_info=True)
-            return _empty_fig(f"Plot error: {e}", 550)
+            return _empty_fig(f"Plot error: {e}", 400)
 
     def _build_waveform_figure(waveforms, store, session_dir):
 
@@ -1509,6 +1523,15 @@ def _waveforms_tab_layout(store: Store):
     session_options = _session_dropdown_options(store)
     default = _default_session(store)
 
+    # Build file options for the default session
+    file_options = []
+    default_file = None
+    if default:
+        files = _get_processed_files_for_session(store, default)
+        file_options = [{"label": f["chunk_datetime"], "value": f["id"]} for f in files]
+        if file_options:
+            default_file = file_options[-1]["value"]  # latest file
+
     return html.Div([
         html.H3("Evoked Waveforms", style={"color": "white", "marginBottom": "12px"}),
         html.Div([
@@ -1522,9 +1545,19 @@ def _waveforms_tab_layout(store: Store):
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "300px"}),
+            html.Div([
+                html.Label("File", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="waveform-file-dropdown",
+                    options=file_options,
+                    value=default_file,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1", "minWidth": "300px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
-        dcc.Graph(id="waveform-plot"),  # height set dynamically by figure layout
+        dcc.Graph(id="waveform-plot"),
     ])
 
 
