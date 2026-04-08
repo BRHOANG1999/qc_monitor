@@ -182,8 +182,13 @@ def _session_dropdown_options(store: Store) -> list[dict]:
 
 
 def _default_session(store: Store) -> str | None:
+    """Return the session with the most processed files (not just the newest)."""
     sessions = store.get_sessions()
-    return sessions[0]["session_dir"] if sessions else None
+    if not sessions:
+        return None
+    # Pick session with most processed files
+    best = max(sessions, key=lambda s: s.get("processed", 0))
+    return best["session_dir"] if best.get("processed", 0) > 0 else sessions[0]["session_dir"]
 
 
 def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dict]:
@@ -321,13 +326,13 @@ def create_app(config: dict, store: Store) -> Dash:
         return f"Last refresh {elapsed // 60}m {elapsed % 60}s ago"
 
     # ------------------------------------------------------------------ #
-    #  Main tab router
+    #  Main tab router — only re-render on TAB CHANGE, not on refresh
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("tab-content", "children"),
-        [Input("tabs", "value"), Input("refresh-trigger", "data")]
+        [Input("tabs", "value")]
     )
-    def render_tab(tab, _n):
+    def render_tab(tab):
         try:
             if tab == "overview":
                 return _overview_tab(store)
