@@ -51,8 +51,8 @@ feature_analysis:
   early_area_end_ms: 50.0
   late_area_start_ms: 50.0
   late_area_end_ms: 200.0
-  analysis_start_ms: 5.0
-  analysis_end_ms: 50.0
+  analysis_start_ms: 2.0
+  analysis_end_ms: 200.0
 criticality:
   ar_order: 5
   window_sec: 2.0

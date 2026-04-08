@@ -112,14 +112,18 @@ function run_pipeline(input_file, output_json, config_json)
         evoked_output_dir = fullfile(stimnet_root, 'evokedOutput');
         if ~exist(evoked_output_dir, 'dir'), mkdir(evoked_output_dir); end
 
-        % --- Step 4: Evoked extraction for EACH LFP channel ---
+        % --- Step 4: Evoked extraction for ALL channels ---
+        % LFP channels get full evoked extraction via batchExtractEvokedResponses
+        % StimCopy channels get epoch-sliced mean waveform (same windows)
         result.per_channel = struct();
         result.num_stimuli = 0;
         result.num_traces = 0;
         result.evoked_success = false;
 
-        for li = 1:length(lfp_channels)
-            lfp_ch = lfp_channels(li);
+        % Process ALL channels (LFP + stimCopy)
+        all_channels = [lfp_channels, stim_channels];
+        for li = 1:length(all_channels)
+            lfp_ch = all_channels(li);
             ch_name = channel_names{lfp_ch};
             ch_key = sprintf('ch%d', lfp_ch);
 

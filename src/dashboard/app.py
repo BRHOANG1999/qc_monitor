@@ -359,10 +359,23 @@ def create_app(config: dict, store: Store) -> Dash:
             all_values = []
 
             for d in data:
-                t = d.get("chunk_datetime")
+                # Use epoch_time_sec for continuous x-axis (seconds within file)
+                # Add to chunk_datetime for absolute timestamp
+                epoch_sec = d.get("epoch_time_sec")
+                chunk_dt = d.get("chunk_datetime", "")
                 v = d.get("value")
                 if v is None:
                     continue
+                # Build absolute epoch time: chunk start + epoch offset
+                if epoch_sec is not None and chunk_dt:
+                    try:
+                        from datetime import datetime as _dt, timedelta as _td
+                        base = _dt.fromisoformat(chunk_dt.replace("_", "-").replace("--", " ").replace("__", "T"))
+                        t = (base + _td(seconds=float(epoch_sec))).isoformat()
+                    except Exception:
+                        t = chunk_dt  # fallback to file-level timestamp
+                else:
+                    t = chunk_dt
                 all_values.append(v)
                 if d.get("is_artifact", 0):
                     artifact_t.append(t); artifact_v.append(v)
@@ -432,95 +445,94 @@ def create_app(config: dict, store: Store) -> Dash:
         # Read analysis window from config
         cfg = _load_config()
         fa = cfg.get("feature_analysis", {})
-        win_start = fa.get("window_start_ms", fa.get("analysis_start_ms", -100))
-        win_end = fa.get("window_end_ms", fa.get("analysis_end_ms", 500))
+        win_start = fa.get("window_start_ms", -100)
+        win_end = fa.get("window_end_ms", 500)
 
-        # Show latest file prominently, plus faded older traces (max 10)
-        latest = waveforms[-1]
-        has_stim = latest.get("stim_mean_trace") is not None
+        # Group waveforms by channel — latest file per channel
+        latest_per_channel = {}
+        for wf in waveforms:
+            ch = wf.get("channel", 0)
+            ch_name = wf.get("channel_name", f"Ch{ch}")
+            latest_per_channel[(ch, ch_name)] = wf  # keeps overwriting → last = latest
+
+        # Also get channel map for role info
+        ch_map = _get_channel_map(store, session_dir)
+
+        # One subplot row per channel (all 4: stimCopy, BCH040SR, stimCopy, saline)
+        n_rows = len(latest_per_channel)
+        if n_rows == 0:
+            return _empty_fig("No channel data", 550)
+
+        sorted_channels = sorted(latest_per_channel.keys(), key=lambda x: x[0])
+        titles = []
+        for ch_idx, ch_name in sorted_channels:
+            role = ch_map.get(ch_idx, {}).get("role", "")
+            role_label = f" ({role})" if role else ""
+            titles.append(f"Ch{ch_idx}: {ch_name}{role_label}")
 
         fig = make_subplots(
-            rows=2 if has_stim else 1, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.7, 0.3] if has_stim else [1.0],
-            subplot_titles=["LFP Evoked Response", "Stimulus Copy"] if has_stim else ["LFP Evoked Response"],
-            vertical_spacing=0.08,
+            rows=n_rows, cols=1, shared_xaxes=True,
+            subplot_titles=titles,
+            vertical_spacing=0.05,
         )
 
-        # Older traces (faded, max 10 evenly sampled)
-        n_wf = len(waveforms)
-        if n_wf > 1:
-            step = max(1, (n_wf - 1) // 10)
-            older = waveforms[:-1:step]
-            for wf in older:
-                time_ms = wf["time_axis_ms"]
-                mean_tr = wf["mean_trace"]
+        colors = {"eeg": "#636EFA", "stim_copy": "#FFA15A", "lfp": "#636EFA"}
+
+        for row_idx, (ch_key) in enumerate(sorted_channels, 1):
+            ch_idx, ch_name = ch_key
+            wf = latest_per_channel[ch_key]
+            time_ms = wf["time_axis_ms"]
+            mean_tr = wf["mean_trace"]
+            sem_tr = wf.get("sem_trace")
+            stim_tr = wf.get("stim_mean_trace")
+            n_ep = wf.get("n_epochs", 0)
+            role = ch_map.get(ch_idx, {}).get("role", "eeg")
+            color = colors.get(role, "#636EFA")
+            file_label = wf.get("chunk_datetime", "")[:16]
+
+            # SEM band
+            if sem_tr and len(sem_tr) == len(mean_tr):
+                upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+                lower = [m - s for m, s in zip(mean_tr, sem_tr)]
                 fig.add_trace(go.Scatter(
-                    x=time_ms, y=mean_tr, mode="lines",
-                    line=dict(color="rgba(150,150,200,0.2)", width=0.5),
-                    showlegend=False, hoverinfo="skip",
-                ), row=1, col=1)
+                    x=list(time_ms) + list(reversed(time_ms)),
+                    y=upper + list(reversed(lower)),
+                    fill="toself", fillcolor=color.replace(")", ",0.15)").replace("rgb", "rgba") if "rgb" in color else f"rgba(99,110,250,0.15)",
+                    line=dict(width=0), showlegend=False, hoverinfo="skip",
+                ), row=row_idx, col=1)
 
-        # Latest trace — bold with SEM
-        time_ms = latest["time_axis_ms"]
-        mean_tr = latest["mean_trace"]
-        sem_tr = latest.get("sem_trace")
-        n_epochs = latest.get("n_epochs", 0)
-        ch_name = latest.get("channel_name", "LFP")
-
-        if sem_tr and len(sem_tr) == len(mean_tr):
-            upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-            lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+            # Mean trace
             fig.add_trace(go.Scatter(
-                x=list(time_ms) + list(reversed(time_ms)),
-                y=upper + list(reversed(lower)),
-                fill="toself", fillcolor="rgba(99,110,250,0.2)",
-                line=dict(width=0), showlegend=False, hoverinfo="skip",
-            ), row=1, col=1)
+                x=time_ms, y=mean_tr, mode="lines",
+                name=f"{ch_name} (n={n_ep})",
+                line=dict(color=color, width=2),
+            ), row=row_idx, col=1)
 
-        file_label = latest.get("chunk_datetime", "Latest")[:16]
-        fig.add_trace(go.Scatter(
-            x=time_ms, y=mean_tr, mode="lines",
-            name=f"{ch_name} — {file_label} (n={n_epochs})",
-            line=dict(color="#636EFA", width=2),
-        ), row=1, col=1)
+            # If this is an LFP channel and has stim trace, show it faded
+            if stim_tr and role != "stim_copy":
+                stim_time = time_ms[:len(stim_tr)]
+                fig.add_trace(go.Scatter(
+                    x=stim_time, y=stim_tr, mode="lines",
+                    name="Stim artifact", showlegend=(row_idx == 1),
+                    line=dict(color="#FFA15A", width=1, dash="dot"),
+                ), row=row_idx, col=1)
 
-        # Stim copy trace (bottom subplot)
-        if has_stim:
-            stim_tr = latest["stim_mean_trace"]
-            # stim trace may have different length if extraction used different params
-            stim_time = time_ms[:len(stim_tr)] if len(stim_tr) <= len(time_ms) else list(range(len(stim_tr)))
-            fig.add_trace(go.Scatter(
-                x=stim_time, y=stim_tr, mode="lines",
-                name="Stim Artifact",
-                line=dict(color="#FFA15A", width=1.5),
-            ), row=2, col=1)
+            # Stimulus marker
+            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"),
+                          row=row_idx, col=1)
 
-        # Stimulus marker
-        fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row="all", col=1)
-
-        # Analysis window shading
-        fig.add_vrect(x0=win_start, x1=win_end,
-                      fillcolor="rgba(0,204,150,0.1)", line_width=0,
-                      annotation_text=f"Analysis [{win_start}, {win_end}] ms",
-                      annotation_position="top left",
-                      annotation_font_color="#00CC96",
-                      row=1, col=1)
+        # Analysis window shading on all rows
+        for row_idx in range(1, n_rows + 1):
+            fig.add_vrect(x0=win_start, x1=win_end,
+                          fillcolor="rgba(0,204,150,0.06)", line_width=0,
+                          row=row_idx, col=1)
 
         fig.update_layout(
             template="plotly_dark",
-            height=550 if has_stim else 400,
-            xaxis_title="Time (ms)" if not has_stim else None,
+            height=250 * n_rows,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        if has_stim:
-            fig.update_xaxes(title_text="Time (ms)", row=2, col=1)
-
-        # Zoom x-axis to analysis window with some padding
-        pad = (win_end - win_start) * 0.3
-        fig.update_xaxes(range=[win_start - pad, win_end + pad], row=1, col=1)
-        if has_stim:
-            fig.update_xaxes(range=[win_start - pad, win_end + pad], row=2, col=1)
+        fig.update_xaxes(title_text="Time (ms)", row=n_rows, col=1)
 
         return fig
 
