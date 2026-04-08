@@ -90,12 +90,12 @@ DARK_TABLE_STYLE = {
                      "border": "1px solid #333", "fontSize": "12px"},
     "style_data": {"backgroundColor": "#0f0f1a", "color": "#ccc", "border": "1px solid #222",
                    "fontSize": "12px"},
-    "style_data_conditional": [
-        {"if": {"row_index": "odd"}, "backgroundColor": "#141425"},
-    ],
     "style_cell": {"textAlign": "left", "padding": "8px 12px", "fontSize": "12px"},
     "style_filter": {"backgroundColor": "#16162a", "color": "white"},
 }
+
+# Zebra stripe base — merge with table-specific conditional styles
+ZEBRA_STRIPE = {"if": {"row_index": "odd"}, "backgroundColor": "#141425"}
 
 SECTION_STYLE = {"background": "linear-gradient(180deg, #1e1e2f 0%, #181828 100%)",
                  "padding": "16px 20px", "borderRadius": "10px",
@@ -1469,7 +1469,7 @@ def _overview_tab(store: Store):
                              {"name": "Name", "id": "name"},
                              {"name": "Role", "id": "role"}],
                     **DARK_TABLE_STYLE,
-                    style_data_conditional=[
+                    style_data_conditional=[ZEBRA_STRIPE,
                         {"if": {"filter_query": "{role} = eeg"},
                          "color": ROLE_COLORS["eeg"]},
                         {"if": {"filter_query": "{role} = stim_copy"},
@@ -1497,7 +1497,7 @@ def _overview_tab(store: Store):
                       for a in recent_alerts[:15]],
                 columns=[{"name": c, "id": c} for c in ["time", "severity", "type", "message"]],
                 **DARK_TABLE_STYLE,
-                style_data_conditional=[
+                style_data_conditional=[ZEBRA_STRIPE,
                     {"if": {"filter_query": "{severity} = critical"},
                      "backgroundColor": "#3d1111", "color": "#ff6b6b"},
                     {"if": {"filter_query": "{severity} = warning"},
@@ -1861,7 +1861,7 @@ def _stim_tab(store: Store):
                      ["time", "session", "channel", "charge_nC", "freq_Hz",
                       "pulses", "expected", "delivery_%"]],
             **DARK_TABLE_STYLE,
-            style_data_conditional=[
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{delivery_%} contains '0.0'"},
                  "backgroundColor": "#3d1111", "color": "#ff6b6b"},
             ],
@@ -2264,7 +2264,7 @@ def _settings_tab_layout(store: Store):
                     {"name": "Hash (short)", "id": "hash_short"},
                 ],
                 **DARK_TABLE_STYLE,
-                style_data_conditional=[
+                style_data_conditional=[ZEBRA_STRIPE,
                     {"if": {"filter_query": "{is_active} = Yes"},
                      "backgroundColor": "#112211", "color": "#00CC96"},
                 ],
@@ -2340,7 +2340,7 @@ def _activity_log_tab_layout(store: Store):
                 {"name": "Duration (s)", "id": "duration"},
             ],
             **DARK_TABLE_STYLE,
-            style_data_conditional=[
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{level} = ERROR"},
                  "backgroundColor": "#3d1111", "color": "#ff6b6b"},
                 {"if": {"filter_query": "{level} = WARNING"},
@@ -2385,7 +2385,7 @@ def _annotations_tab_layout(store: Store):
                 {"name": "Created At", "id": "created_at"},
             ],
             **DARK_TABLE_STYLE,
-            style_data_conditional=[
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{category} = electrode"},
                  "color": "#FFA15A"},
                 {"if": {"filter_query": "{category} = injection"},
@@ -2490,7 +2490,7 @@ def _alerts_tab(store: Store):
             columns=[{"name": c, "id": c}
                      for c in ["time", "severity", "type", "message", "session"]],
             **DARK_TABLE_STYLE,
-            style_data_conditional=[
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{severity} = critical"},
                  "backgroundColor": "#3d1111", "color": "#ff6b6b"},
                 {"if": {"filter_query": "{severity} = warning"},
@@ -2556,7 +2556,7 @@ def _sessions_tab(store: Store):
                 {"name": "Stim Charge (nC)", "id": "stim_charge"},
             ],
             **DARK_TABLE_STYLE,
-            style_data_conditional=[
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{errors} > 0"},
                  "backgroundColor": "#3d1111", "color": "#ff6b6b"},
             ],
