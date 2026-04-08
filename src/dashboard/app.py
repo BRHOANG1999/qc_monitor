@@ -557,7 +557,17 @@ def create_app(config: dict, store: Store) -> Dash:
             stim_tr = wf.get("stim_mean_trace")
             n_ep = wf.get("n_epochs", 0)
 
+            # Helper: compute y-range from data within x-range
+            def _yrange(times, values, x0, x1):
+                vals = [v for tv, v in zip(times, values) if x0 <= tv <= x1]
+                if not vals:
+                    return None
+                mn, mx = min(vals), max(vals)
+                pad = (mx - mn) * 0.1 if mx > mn else 0.001
+                return [mn - pad, mx + pad]
+
             # Row A: Artifact comparison — stim copy (orange) vs LFP (blue), zoomed -1 to 1ms
+            art_yvals = []
             if stim_tr and len(stim_tr) > 0:
                 stim_t = t[:len(stim_tr)] if len(stim_tr) <= len(t) else t
                 fig.add_trace(go.Scatter(
@@ -565,13 +575,19 @@ def create_app(config: dict, store: Store) -> Dash:
                     name="StimCopy", line=dict(color="#FFA15A", width=2),
                     showlegend=(row == 1),
                 ), row=row, col=1)
+                art_yvals += [v for tv, v in zip(stim_t, stim_tr) if -1 <= tv <= 1]
             fig.add_trace(go.Scatter(
                 x=t, y=m, mode="lines",
                 name=name, line=dict(color="#636EFA", width=2),
                 showlegend=(row == 1),
             ), row=row, col=1)
+            art_yvals += [v for tv, v in zip(t, m) if -1 <= tv <= 1]
             fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
             fig.update_xaxes(range=[-1, 1], title_text="ms", row=row, col=1)
+            if art_yvals:
+                mn, mx = min(art_yvals), max(art_yvals)
+                pad = (mx - mn) * 0.1 if mx > mn else 0.001
+                fig.update_yaxes(range=[mn - pad, mx + pad], row=row, col=1)
             row += 1
 
             # Row B: LFP evoked response zoomed to analysis window
@@ -590,8 +606,18 @@ def create_app(config: dict, store: Store) -> Dash:
                 showlegend=False,
             ), row=row, col=1)
             fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
-            # Zoom to analysis window only
             fig.update_xaxes(range=[ana_start, ana_end], title_text="ms", row=row, col=1)
+            yr = _yrange(t, m, ana_start, ana_end)
+            if yr:
+                # Include SEM bounds if available
+                if s and len(s) == len(m):
+                    sem_vals = [mv + sv for tv, mv, sv in zip(t, m, s) if ana_start <= tv <= ana_end]
+                    sem_vals += [mv - sv for tv, mv, sv in zip(t, m, s) if ana_start <= tv <= ana_end]
+                    if sem_vals:
+                        yr = [min(yr[0], min(sem_vals)), max(yr[1], max(sem_vals))]
+                        pad = (yr[1] - yr[0]) * 0.1
+                        yr = [yr[0] - pad, yr[1] + pad]
+                fig.update_yaxes(range=yr, row=row, col=1)
             row += 1
 
         fig.update_layout(
