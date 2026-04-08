@@ -259,7 +259,7 @@ def create_app(config: dict, store: Store) -> Dash:
                   "display": "flex", "alignItems": "center"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
-        dcc.Interval(id="elapsed-ticker", interval=1000, n_intervals=0),
+        dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
     ], style={"backgroundColor": "#111", "fontFamily": "Segoe UI, sans-serif", "color": "#ddd"})
