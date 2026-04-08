@@ -52,8 +52,10 @@ function run_pipeline(input_file, output_json, config_json)
         stimnet_root = get_cfg(cfg, 'stimnet_root', ...
             'D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator');
         addpath(genpath(fullfile(stimnet_root, 'src')));
-        % Our local matlab/ dir is already on path (added by run_pipeline call)
-        % and takes priority — uses our fixed batchEvokedWorkerFcn that skips trdata
+        % Re-add our local dir to FRONT of path so our fixed
+        % batchEvokedWorkerFcn takes priority over src/utils/ original
+        localDir = fileparts(mfilename('fullpath'));
+        addpath(localDir);
 
         % --- Step 1: Load & auto-discover channels ---
         fprintf('[PIPELINE] Loading: %s\n', input_file);

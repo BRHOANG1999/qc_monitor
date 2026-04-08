@@ -176,13 +176,20 @@ def main():
 
             if new_files:
                 new_files.sort(key=lambda f: f.chunk_datetime)
-                logger.info("Found %d new files — queuing all for processing", len(new_files))
+                logger.info("Found %d new files — registering all in DB", len(new_files))
 
-                # Add all to known set immediately (so next scan doesn't re-find them)
+                # Register ALL files in DB upfront so dashboard shows full queue
                 for nf in new_files:
                     known_paths.add(nf.path)
+                    store.register_file(
+                        file_path=nf.path, file_size=nf.size, file_mtime=nf.mtime,
+                        session_dir=nf.session_dir, session_name=nf.session_name,
+                        chunk_datetime=nf.chunk_datetime,
+                    )
 
-                # Process entire queue without re-scanning between files
+                logger.info("Queued %d files — starting processing", len(new_files))
+
+                # Process entire queue
                 for i, nf in enumerate(new_files, 1):
                     logger.info("[%d/%d] Processing: %s",
                                 i, len(new_files), os.path.basename(nf.path))
