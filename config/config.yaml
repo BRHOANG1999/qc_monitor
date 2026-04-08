@@ -25,16 +25,49 @@ epoch_extraction:
   notch_50hz: false
   notch_60hz: true
 
-## Step 2: Feature Analysis
-## Defines the sub-window WITHIN each extracted epoch where scalar features
-## (Line Length, Peak Amplitude, Early/Late Area, etc.) are computed.
+## Step 2: Feature Analysis (Configure & Analyze)
+## Mirrors the Chronic Evoked Features dialog from the STiM-NET pipeline.
 feature_analysis:
-  analysis_start_ms: 5        # start of evoked response analysis window
-  analysis_end_ms: 50         # end of evoked response analysis window
+  # Evoked response window (sub-window for feature computation)
+  window_start_ms: -100
+  window_end_ms: 500
+  # Stimulus artifact masking
+  stim_artifact_start_ms: -5
+  stim_artifact_end_ms: 15
+  # Filtering (applied to traces before features)
+  bandpass_enabled: false
+  bandpass_highpass_hz: 1.0
+  bandpass_lowpass_hz: 100.0
+  notch_enabled: false
+  notch_frequency_hz: 60
+  # Smoothing
+  smoothing_enabled: false
+  smoothing_window_ms: 5
+  # Baseline correction
+  baseline_correction: true
+  # Artifact exclusion
+  artifact_exclusion_enabled: false
+  artifact_method: "fixed"
+  artifact_threshold: 500.0
+  artifact_merge_gap_sec: 2.0
+  template_source: "early50ms"
+  template_upper_r: 0.7
+  template_lower_r: 0.3
+  rawamp_multiplier: 4.0
+  noise_neg_threshold: 0
+  noise_pos_threshold: 0
+  noise_glue_window_sec: 1.0
+  # Ictal spike rescue
+  ictal_rescue_enabled: false
+  ictal_rescue_window_ms: 500
+  # Feature sub-windows
   early_area_start_ms: 0
   early_area_end_ms: 50
   late_area_start_ms: 50
   late_area_end_ms: 200
+  # Analysis sub-window (for scalar features)
+  analysis_start_ms: 5
+  analysis_end_ms: 50
 criticality:
   ar_order: 5
   window_sec: 2.0

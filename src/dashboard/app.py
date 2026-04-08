@@ -1727,12 +1727,117 @@ def _settings_tab_layout(store: Store):
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
         ], style={**SECTION_STYLE, "borderLeft": "3px solid #636EFA"}),
 
-        # --- Step 2: Feature Analysis ---
+        # --- Step 2: Feature Analysis (Configure & Analyze) ---
         html.Div([
-            html.H4("Step 2: Feature Analysis", style={"color": "#00CC96", "marginTop": "0"}),
-            html.P("Defines the sub-window WITHIN each extracted epoch where scalar features "
-                   "(Line Length, Peak Amplitude, etc.) are computed.",
+            html.H4("Step 2: Feature Analysis (Configure & Analyze)",
+                     style={"color": "#00CC96", "marginTop": "0"}),
+            html.P("Mirrors the Chronic Evoked Features dialog. Configures filtering, "
+                   "artifact exclusion, and feature windows applied to extracted epochs.",
                    style={"color": "#888", "fontSize": "12px", "marginBottom": "12px"}),
+
+            # Row 1: Evoked response window + stimulus artifact window
+            html.H5("Windows", style={"color": "#aaa", "marginBottom": "4px"}),
+            html.Div([
+                html.Div([html.Label("Window start (ms)", style=LABEL_STYLE),
+                          _input("feat-win-start", fa.get("window_start_ms", -100))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Window end (ms)", style=LABEL_STYLE),
+                          _input("feat-win-end", fa.get("window_end_ms", 500))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Stim artifact start (ms)", style=LABEL_STYLE),
+                          _input("feat-stim-art-start", fa.get("stim_artifact_start_ms", -5))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Stim artifact end (ms)", style=LABEL_STYLE),
+                          _input("feat-stim-art-end", fa.get("stim_artifact_end_ms", 15))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
+
+            # Row 2: Filtering
+            html.H5("Filtering", style={"color": "#aaa", "marginBottom": "4px"}),
+            html.Div([
+                html.Div([html.Label("Bandpass filter", style=LABEL_STYLE),
+                          _check("feat-bp-enabled", fa.get("bandpass_enabled", False))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Highpass (Hz)", style=LABEL_STYLE),
+                          _input("feat-bp-hp", fa.get("bandpass_highpass_hz", 1.0), step=0.5)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Lowpass (Hz)", style=LABEL_STYLE),
+                          _input("feat-bp-lp", fa.get("bandpass_lowpass_hz", 100.0), step=10)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Notch filter", style=LABEL_STYLE),
+                          _check("feat-notch-enabled", fa.get("notch_enabled", False))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Notch freq (Hz)", style=LABEL_STYLE),
+                          _input("feat-notch-freq", fa.get("notch_frequency_hz", 60))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
+
+            # Row 3: Smoothing + Baseline
+            html.Div([
+                html.Div([html.Label("Moving average smoothing", style=LABEL_STYLE),
+                          _check("feat-smooth-enabled", fa.get("smoothing_enabled", False))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Smoothing window (ms)", style=LABEL_STYLE),
+                          _input("feat-smooth-win", fa.get("smoothing_window_ms", 5), step=1)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Baseline correction", style=LABEL_STYLE),
+                          _check("feat-baseline", fa.get("baseline_correction", True))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "16px"}),
+
+            # Row 4: Artifact Exclusion
+            html.H5("Artifact Exclusion", style={"color": "#aaa", "marginBottom": "4px"}),
+            html.Div([
+                html.Div([html.Label("Enable artifact exclusion", style=LABEL_STYLE),
+                          _check("feat-art-enabled", fa.get("artifact_exclusion_enabled", False))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Method", style=LABEL_STYLE),
+                          dcc.Dropdown(id="feat-art-method",
+                                       options=[{"label": m, "value": m} for m in
+                                                ["fixed", "mad", "template", "rawamp", "noise"]],
+                                       value=fa.get("artifact_method", "fixed"),
+                                       style=DROPDOWN_STYLE)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Threshold / k-value", style=LABEL_STYLE),
+                          _input("feat-art-thresh", fa.get("artifact_threshold", 500.0))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Merge gap (sec)", style=LABEL_STYLE),
+                          _input("feat-art-merge", fa.get("artifact_merge_gap_sec", 2.0), step=0.5)],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
+
+            # Row 5: Template-specific params
+            html.Div([
+                html.Div([html.Label("Template source", style=LABEL_STYLE),
+                          dcc.Dropdown(id="feat-tmpl-source",
+                                       options=[{"label": "Early 50ms", "value": "early50ms"},
+                                                {"label": "Grand Mean", "value": "grandMean"}],
+                                       value=fa.get("template_source", "early50ms"),
+                                       style=DROPDOWN_STYLE)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Upper band (r)", style=LABEL_STYLE),
+                          _input("feat-tmpl-upper", fa.get("template_upper_r", 0.7), step=0.05)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Lower band (r)", style=LABEL_STYLE),
+                          _input("feat-tmpl-lower", fa.get("template_lower_r", 0.3), step=0.05)],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Raw amp multiplier (k)", style=LABEL_STYLE),
+                          _input("feat-rawamp-k", fa.get("rawamp_multiplier", 4.0), step=0.5)],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
+
+            # Row 6: Ictal rescue
+            html.Div([
+                html.Div([html.Label("Ictal spike rescue", style=LABEL_STYLE),
+                          _check("feat-ictal-rescue", fa.get("ictal_rescue_enabled", False))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Rescue window (ms)", style=LABEL_STYLE),
+                          _input("feat-ictal-win", fa.get("ictal_rescue_window_ms", 500))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "16px"}),
+
+            # Row 7: Feature sub-windows
+            html.H5("Feature Sub-Windows", style={"color": "#aaa", "marginBottom": "4px"}),
             html.Div([
                 html.Div([html.Label("Analysis start (ms)", style=LABEL_STYLE),
                           _input("feat-analysis-start", fa.get("analysis_start_ms", 5))],
