@@ -487,95 +487,137 @@ def create_app(config: dict, store: Store) -> Dash:
         # Read analysis window from config
         cfg = _load_config()
         fa = cfg.get("feature_analysis", {})
-        win_start = fa.get("window_start_ms", -100)
-        win_end = fa.get("window_end_ms", 500)
+        ana_start = fa.get("analysis_start_ms", fa.get("window_start_ms", 2))
+        ana_end = fa.get("analysis_end_ms", fa.get("window_end_ms", 50))
 
-        # Group waveforms by channel — latest file per channel
-        latest_per_channel = {}
+        # Group latest waveform per channel
+        latest_per_ch = {}
         for wf in waveforms:
             ch = wf.get("channel", 0)
-            ch_name = wf.get("channel_name", f"Ch{ch}")
-            latest_per_channel[(ch, ch_name)] = wf  # keeps overwriting → last = latest
+            latest_per_ch[ch] = wf
 
-        # Also get channel map for role info
         ch_map = _get_channel_map(store, session_dir)
 
-        # One subplot row per channel (all 4: stimCopy, BCH040SR, stimCopy, saline)
-        n_rows = len(latest_per_channel)
-        if n_rows == 0:
-            return _empty_fig("No channel data", 550)
+        # Build StimCopy→LFP pairs based on channel order
+        # e.g., Ch0(stimCopy)→Ch1(LFP), Ch2(stimCopy)→Ch3(LFP)
+        stim_chs = sorted([c for c in latest_per_ch if ch_map.get(c, {}).get("role") == "stim_copy"])
+        lfp_chs = sorted([c for c in latest_per_ch if ch_map.get(c, {}).get("role") != "stim_copy"])
 
-        sorted_channels = sorted(latest_per_channel.keys(), key=lambda x: x[0])
+        pairs = []
+        used_lfp = set()
+        for sc in stim_chs:
+            # Find the next LFP channel after this stimCopy
+            partner = None
+            for lc in lfp_chs:
+                if lc > sc and lc not in used_lfp:
+                    partner = lc
+                    used_lfp.add(lc)
+                    break
+            if partner is not None:
+                pairs.append((sc, partner))
+
+        # Any unpaired LFP channels get their own row
+        unpaired_lfp = [lc for lc in lfp_chs if lc not in used_lfp]
+
+        # Layout: 2 rows per pair (artifact comparison + analysis window) + 1 per unpaired
+        n_rows = len(pairs) * 2 + len(unpaired_lfp)
+        if n_rows == 0:
+            return _empty_fig("No channel pairs found", 400)
+
         titles = []
-        for ch_idx, ch_name in sorted_channels:
-            role = ch_map.get(ch_idx, {}).get("role", "")
-            role_label = f" ({role})" if role else ""
-            titles.append(f"Ch{ch_idx}: {ch_name}{role_label}")
+        for sc, lc in pairs:
+            sc_name = ch_map.get(sc, {}).get("name", f"Ch{sc}")
+            lc_name = ch_map.get(lc, {}).get("name", f"Ch{lc}")
+            titles.append(f"Artifact: {sc_name} vs {lc_name} (-1 to 1 ms)")
+            titles.append(f"Evoked: {lc_name} ({ana_start}-{ana_end} ms)")
+        for lc in unpaired_lfp:
+            lc_name = ch_map.get(lc, {}).get("name", f"Ch{lc}")
+            titles.append(f"Evoked: {lc_name} ({ana_start}-{ana_end} ms)")
 
         fig = make_subplots(
-            rows=n_rows, cols=1, shared_xaxes=True,
+            rows=n_rows, cols=1, shared_xaxes=False,
             subplot_titles=titles,
-            vertical_spacing=0.05,
+            vertical_spacing=0.04,
         )
 
-        colors = {"eeg": "#636EFA", "stim_copy": "#FFA15A", "lfp": "#636EFA"}
+        row = 1
+        for sc, lc in pairs:
+            sc_wf = latest_per_ch[sc]
+            lc_wf = latest_per_ch[lc]
+            sc_name = ch_map.get(sc, {}).get("name", f"Ch{sc}")
+            lc_name = ch_map.get(lc, {}).get("name", f"Ch{lc}")
 
-        for row_idx, (ch_key) in enumerate(sorted_channels, 1):
-            ch_idx, ch_name = ch_key
-            wf = latest_per_channel[ch_key]
-            time_ms = wf["time_axis_ms"]
-            mean_tr = wf["mean_trace"]
-            sem_tr = wf.get("sem_trace")
-            stim_tr = wf.get("stim_mean_trace")
-            n_ep = wf.get("n_epochs", 0)
-            role = ch_map.get(ch_idx, {}).get("role", "eeg")
-            color = colors.get(role, "#636EFA")
-            file_label = wf.get("chunk_datetime", "")[:16]
-
-            # SEM band
-            if sem_tr and len(sem_tr) == len(mean_tr):
-                upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-                lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+            # Row A: Artifact comparison — both channels superimposed, -1 to 1 ms
+            for wf, name, color in [(sc_wf, sc_name, "#FFA15A"), (lc_wf, lc_name, "#636EFA")]:
                 fig.add_trace(go.Scatter(
-                    x=list(time_ms) + list(reversed(time_ms)),
-                    y=upper + list(reversed(lower)),
-                    fill="toself", fillcolor=color.replace(")", ",0.15)").replace("rgb", "rgba") if "rgb" in color else f"rgba(99,110,250,0.15)",
+                    x=wf["time_axis_ms"], y=wf["mean_trace"], mode="lines",
+                    name=name, line=dict(color=color, width=2),
+                    legendgroup=f"pair{sc}", showlegend=(row == 1),
+                ), row=row, col=1)
+            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
+            fig.update_xaxes(range=[-1, 1], title_text="ms", row=row, col=1)
+            row += 1
+
+            # Row B: LFP evoked response in analysis window
+            t = lc_wf["time_axis_ms"]
+            m = lc_wf["mean_trace"]
+            s = lc_wf.get("sem_trace")
+            n_ep = lc_wf.get("n_epochs", 0)
+            if s and len(s) == len(m):
+                upper = [mv + sv for mv, sv in zip(m, s)]
+                lower = [mv - sv for mv, sv in zip(m, s)]
+                fig.add_trace(go.Scatter(
+                    x=list(t) + list(reversed(t)), y=upper + list(reversed(lower)),
+                    fill="toself", fillcolor="rgba(99,110,250,0.15)",
                     line=dict(width=0), showlegend=False, hoverinfo="skip",
-                ), row=row_idx, col=1)
-
-            # Mean trace
+                ), row=row, col=1)
             fig.add_trace(go.Scatter(
-                x=time_ms, y=mean_tr, mode="lines",
-                name=f"{ch_name} (n={n_ep})",
-                line=dict(color=color, width=2),
-            ), row=row_idx, col=1)
+                x=t, y=m, mode="lines",
+                name=f"{lc_name} (n={n_ep})",
+                line=dict(color="#636EFA", width=2),
+                showlegend=False,
+            ), row=row, col=1)
+            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
+            fig.add_vrect(x0=ana_start, x1=ana_end,
+                          fillcolor="rgba(0,204,150,0.08)", line_width=0, row=row, col=1)
+            pad = (ana_end - ana_start) * 0.2
+            fig.update_xaxes(range=[ana_start - pad, ana_end + pad],
+                             title_text="ms", row=row, col=1)
+            row += 1
 
-            # If this is an LFP channel and has stim trace, show it faded
-            if stim_tr and role != "stim_copy":
-                stim_time = time_ms[:len(stim_tr)]
+        # Unpaired LFP channels
+        for lc in unpaired_lfp:
+            lc_wf = latest_per_ch[lc]
+            lc_name = ch_map.get(lc, {}).get("name", f"Ch{lc}")
+            t = lc_wf["time_axis_ms"]
+            m = lc_wf["mean_trace"]
+            s = lc_wf.get("sem_trace")
+            n_ep = lc_wf.get("n_epochs", 0)
+            if s and len(s) == len(m):
+                upper = [mv + sv for mv, sv in zip(m, s)]
+                lower = [mv - sv for mv, sv in zip(m, s)]
                 fig.add_trace(go.Scatter(
-                    x=stim_time, y=stim_tr, mode="lines",
-                    name="Stim artifact", showlegend=(row_idx == 1),
-                    line=dict(color="#FFA15A", width=1, dash="dot"),
-                ), row=row_idx, col=1)
-
-            # Stimulus marker
-            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"),
-                          row=row_idx, col=1)
-
-        # Analysis window shading on all rows
-        for row_idx in range(1, n_rows + 1):
-            fig.add_vrect(x0=win_start, x1=win_end,
-                          fillcolor="rgba(0,204,150,0.06)", line_width=0,
-                          row=row_idx, col=1)
+                    x=list(t) + list(reversed(t)), y=upper + list(reversed(lower)),
+                    fill="toself", fillcolor="rgba(99,110,250,0.15)",
+                    line=dict(width=0), showlegend=False, hoverinfo="skip",
+                ), row=row, col=1)
+            fig.add_trace(go.Scatter(
+                x=t, y=m, mode="lines", name=f"{lc_name} (n={n_ep})",
+                line=dict(color="#636EFA", width=2), showlegend=False,
+            ), row=row, col=1)
+            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
+            fig.add_vrect(x0=ana_start, x1=ana_end,
+                          fillcolor="rgba(0,204,150,0.08)", line_width=0, row=row, col=1)
+            pad = (ana_end - ana_start) * 0.2
+            fig.update_xaxes(range=[ana_start - pad, ana_end + pad],
+                             title_text="ms", row=row, col=1)
+            row += 1
 
         fig.update_layout(
             template="plotly_dark",
-            height=250 * n_rows,
+            height=220 * n_rows,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        fig.update_xaxes(title_text="Time (ms)", row=n_rows, col=1)
-
         return fig
 
     # ------------------------------------------------------------------ #
