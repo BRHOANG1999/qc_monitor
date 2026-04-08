@@ -1,11 +1,13 @@
 """Dispatch queue: manages processing of new files through analysis tiers."""
 
+import json
 import logging
+import os
 import time
-from datetime import datetime
 
 from src.db.store import Store
 from src.utils.mat_loader import load_mat
+from src.utils.session_config import SessionConfig, discover_from_session_dir
 from src.analyzers.qc_basic import analyze_basic_qc
 from src.analyzers.spectral import analyze_spectral
 from src.analyzers.artifact import analyze_artifact
@@ -20,14 +22,20 @@ class Dispatcher:
     def __init__(self, store: Store, config: dict):
         self.store = store
         self.config = config
-        self.tier1_cfg = config.get("analysis", {}).get("tier1", {})
-        self.tier2_cfg = config.get("analysis", {}).get("tier2", {})
+        self._session_configs: dict[str, SessionConfig] = {}
 
-    def process_file(self, new_file: NewFile) -> bool:
-        """Process a single file through Tier 1 (Python QC) + Tier 2 (MATLAB pipeline).
+    def get_session_config(self, session_dir: str) -> SessionConfig:
+        """Get or auto-discover session config for a session directory."""
+        if session_dir not in self._session_configs:
+            cfg = discover_from_session_dir(session_dir)
+            self._session_configs[session_dir] = cfg
+            # Persist to DB
+            from dataclasses import asdict
+            self.store.upsert_session_config(session_dir, asdict(cfg))
+        return self._session_configs[session_dir]
 
-        Returns True if processing succeeded.
-        """
+    def process_file(self, new_file: NewFile, version_id: int = None) -> bool:
+        """Process a single file through Tier 1 (Python QC) + Tier 2 (MATLAB pipeline)."""
         file_id = self.store.register_file(
             file_path=new_file.path,
             file_size=new_file.size,
@@ -39,8 +47,11 @@ class Dispatcher:
 
         self.store.update_file_status(file_id, "processing")
 
+        # Auto-discover session config
+        sess_cfg = self.get_session_config(new_file.session_dir)
+
         try:
-            # --- Tier 1: Python QC ---
+            # --- Tier 1: Python QC (channel-aware) ---
             t1_start = time.time()
             chunk = load_mat(new_file.path)
             self.store.update_file_status(file_id, "processing",
@@ -49,31 +60,26 @@ class Dispatcher:
                                           sampling_rate=chunk.fs,
                                           duration_sec=chunk.duration_sec)
 
-            # Basic QC
+            qc_cfg = self.config.get("qc_thresholds", {})
+            art_cfg = self.config.get("artifact", {})
+
             basic_results = analyze_basic_qc(
                 chunk,
-                clipping_voltage=self.tier1_cfg.get("clipping_voltage", 10.0),
-                flatline_std_threshold=self.tier1_cfg.get("flatline_std_threshold", 1e-6),
+                clipping_voltage=qc_cfg.get("clipping_voltage", 10.0),
+                flatline_std_threshold=qc_cfg.get("flatline_std", 1e-6),
             )
 
-            # Spectral
-            bands = self.tier1_cfg.get("band_definitions", None)
-            spectral_results = analyze_spectral(
-                chunk, bands=bands,
-                line_noise_freq=self.tier1_cfg.get("line_noise_freq", 60.0),
-            )
+            spectral_results = analyze_spectral(chunk, line_noise_freq=60.0)
 
-            # Artifact
-            artifact_cfg = self.tier1_cfg.get("artifact", {})
             artifact_results = analyze_artifact(
                 chunk,
-                method=artifact_cfg.get("method", "fixed"),
-                threshold=artifact_cfg.get("threshold", 500.0),
-                mad_k=artifact_cfg.get("mad_k", 4.0),
-                merge_gap_sec=artifact_cfg.get("merge_gap_sec", 2.0),
+                method=art_cfg.get("method", "fixed"),
+                threshold=art_cfg.get("fixed_threshold", 500.0),
+                mad_k=art_cfg.get("mad_k", 4.0),
+                merge_gap_sec=art_cfg.get("merge_gap_sec", 2.0),
             )
 
-            # Merge and store per-channel
+            # Store per-channel with names and roles
             for ch in range(chunk.num_channels):
                 metrics = {}
                 if ch < len(basic_results):
@@ -82,10 +88,26 @@ class Dispatcher:
                     metrics.update(spectral_results[ch])
                 if ch < len(artifact_results):
                     metrics.update(artifact_results[ch])
-                self.store.insert_chunk_qc(file_id, ch, metrics)
+
+                # Channel name and role from auto-discovery
+                ch_name = sess_cfg.channel_names[ch] if ch < len(sess_cfg.channel_names) else f"Ch{ch}"
+                ch_role = "unknown"
+                if ch in sess_cfg.eeg_channels:
+                    ch_role = "eeg"
+                elif ch in sess_cfg.stim_copy_channels:
+                    ch_role = "stim_copy"
+                elif ch in sess_cfg.reference_channels:
+                    ch_role = "reference"
+
+                self.store.insert_chunk_qc(file_id, ch, metrics,
+                                           channel_name=ch_name,
+                                           channel_role=ch_role,
+                                           version_id=version_id)
 
             t1_elapsed = time.time() - t1_start
-            logger.info("Tier 1 done for %s (%.1fs, %d ch)", new_file.path, t1_elapsed, chunk.num_channels)
+            logger.info("Tier 1: %s (%.1fs, %d ch: %s)",
+                        os.path.basename(new_file.path), t1_elapsed,
+                        chunk.num_channels, sess_cfg.channel_names[:chunk.num_channels])
 
             # Stim QC
             stim_results = analyze_stim_report(new_file.path)
@@ -94,22 +116,91 @@ class Dispatcher:
                 for sr in stim_results:
                     self.store.insert_stim_qc(file_id, sr["stim_channel"], sr)
 
-            # Check for video
+            # Video check
             video_path = new_file.path.rsplit(".", 1)[0] + "_v1.mp4"
-            if _file_exists(video_path):
+            if os.path.isfile(video_path):
                 self.store.update_file_status(file_id, "processing", has_video=1)
 
-            # --- Tier 2: MATLAB Pipeline ---
-            if self.tier2_cfg.get("enabled", True):
+            # --- Tier 2: MATLAB Pipeline (channel-aware, configurable) ---
+            matlab_enabled = self.config.get("matlab_exe", None) is not None
+            if matlab_enabled:
                 t2_start = time.time()
-                matlab_exe = self.tier2_cfg.get("criticality", {}).get(
-                    "matlab_exe", "matlab"
+
+                # Build config for MATLAB from current settings
+                matlab_config = {
+                    "stimnet_root": self.config.get("stimnet_root", ""),
+                    **self.config.get("evoked", {}),
+                    **self.config.get("criticality", {}),
+                }
+
+                matlab_exe = self.config.get("matlab_exe", "matlab")
+                result = matlab_run_pipeline(
+                    new_file.path, matlab_exe=matlab_exe,
+                    timeout=600, config=matlab_config
                 )
-                result = matlab_run_pipeline(new_file.path, matlab_exe=matlab_exe, timeout=600)
                 t2_elapsed = time.time() - t2_start
-                logger.info("Tier 2 done for %s (%.1fs): %s",
-                            new_file.path, t2_elapsed, result.get("exit_status", "unknown"))
-                self.store.insert_matlab_result(file_id, result)
+
+                exit_status = result.get("exit_status", "unknown")
+                logger.info("Tier 2: %s (%.1fs): %s, %d stimuli, %d traces",
+                            os.path.basename(new_file.path), t2_elapsed, exit_status,
+                            result.get("num_stimuli", 0), result.get("num_traces", 0))
+
+                # Store MATLAB results
+                self.store.insert_matlab_result(file_id, result, version_id=version_id)
+
+                # Store per-epoch evoked features
+                features = result.get("features", {})
+                epoch_times = result.get("epoch_times", [])
+                if features and epoch_times:
+                    n_epochs = len(epoch_times)
+                    epochs = []
+                    for ei in range(n_epochs):
+                        epoch = {
+                            "epoch_index": ei,
+                            "epoch_time_sec": epoch_times[ei] if ei < len(epoch_times) else 0,
+                        }
+                        for fname, vals in features.items():
+                            # Normalize feature name to DB column
+                            col = _feature_to_column(fname)
+                            if col and ei < len(vals):
+                                epoch[col] = vals[ei]
+                        epochs.append(epoch)
+                    self.store.bulk_insert_evoked_features(file_id, epochs, version_id)
+
+                    # Evoked summary
+                    summary = {
+                        "evoked_output_path": result.get("evoked_output_path", ""),
+                        "num_stimuli_detected": result.get("num_stimuli", 0),
+                        "num_traces_extracted": result.get("num_traces", 0),
+                    }
+                    pa = features.get("Peak_Amplitude", [])
+                    if pa:
+                        import numpy as np
+                        arr = np.array([x for x in pa if x is not None and x == x])
+                        if len(arr) > 0:
+                            summary["mean_peak_amplitude"] = float(np.mean(arr))
+                            summary["std_peak_amplitude"] = float(np.std(arr))
+                    self.store.insert_evoked_summary(file_id, summary, version_id)
+
+                # Store criticality windows
+                crit = result.get("criticality", {})
+                tp = crit.get("time_points", [])
+                db = crit.get("db_values", [])
+                if tp and db:
+                    windows = []
+                    stds = crit.get("db_stds", [])
+                    sigs = crit.get("sigmas", [])
+                    for wi in range(len(tp)):
+                        windows.append({
+                            "channel": result.get("eeg_channel", 1) - 1,  # 0-indexed
+                            "window_index": wi,
+                            "time_sec": tp[wi],
+                            "db_value": db[wi] if db[wi] == db[wi] else None,  # NaN check
+                            "db_std": stds[wi] if wi < len(stds) and stds[wi] == stds[wi] else None,
+                            "sigma": sigs[wi] if wi < len(sigs) else None,
+                            "ar_order": self.config.get("criticality", {}).get("ar_order", 5),
+                        })
+                    self.store.bulk_insert_criticality(file_id, windows, version_id)
 
             self.store.update_file_status(file_id, "done")
             return True
@@ -120,11 +211,35 @@ class Dispatcher:
             return False
 
 
-def _file_exists(path: str) -> bool:
-    try:
-        return os.path.isfile(path)
-    except OSError:
-        return False
+# Map MATLAB feature struct field names to DB column names
+_FEATURE_MAP = {
+    "Line_Length": "line_length",
+    "Log_AUC_": "log_auc",
+    "Peak_Amplitude": "peak_amplitude",
+    "Trough_Amplitude": "trough_amplitude",
+    "Peak_to_Trough": "peak_to_trough",
+    "RMS_Amplitude": "rms_amplitude",
+    "Peak_Latency": "peak_latency_ms",
+    "Trough_Latency": "trough_latency_ms",
+    "Max_Slope": "max_slope",
+    "Max_Slope_Time": "max_slope_time_ms",
+    "Early_Area": "early_area",
+    "Late_Area": "late_area",
+    "Early_Late_Ratio": "early_late_ratio",
+    "Recovery_Tau": "recovery_tau",
+    "Recovery_Slope": "recovery_slope",
+    "Template_Correlation": "template_correlation",
+    "PCA_Recon_Error": "pca_recon_error",
+    "Variance": "variance",
+    "Autocorrelation": "autocorrelation",
+    "AC_Width": "ac_width",
+    "Exp_Fit_A": "exp_fit_a",
+    "Sum_Power_Low": "sum_power_low",
+    "Freq_Moment_Low": "freq_moment_low",
+    "Sum_Power_High": "sum_power_high",
+    "Freq_Moment_High": "freq_moment_high",
+}
 
 
-import os
+def _feature_to_column(matlab_field: str) -> str | None:
+    return _FEATURE_MAP.get(matlab_field)

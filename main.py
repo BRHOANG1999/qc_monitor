@@ -79,7 +79,7 @@ def main():
     config = load_config(config_path)
 
     if args.no_matlab:
-        config.setdefault("analysis", {}).setdefault("tier2", {})["enabled"] = False
+        config.pop("matlab_exe", None)
 
     # Setup logging
     log_cfg = config.get("logging", {})
@@ -106,6 +106,10 @@ def main():
     )
 
     dispatcher = Dispatcher(store, config)
+
+    # Create initial settings version
+    version_id = store.create_settings_version(config, label="initial")
+    logger.info("Settings version: %d", version_id)
 
     emailer = EmailAlerter(config)
     alert_engine = AlertRuleEngine(store, emailer, config)
@@ -177,7 +181,7 @@ def main():
                 known_paths.add(nf.path)
                 logger.info("Processing: %s", os.path.basename(nf.path))
 
-                success = dispatcher.process_file(nf)
+                success = dispatcher.process_file(nf, version_id=version_id)
 
                 if success:
                     # Check alerts on the QC results
