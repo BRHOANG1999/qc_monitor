@@ -326,13 +326,13 @@ def create_app(config: dict, store: Store) -> Dash:
         return f"Last refresh {elapsed // 60}m {elapsed % 60}s ago"
 
     # ------------------------------------------------------------------ #
-    #  Main tab router — only re-render on TAB CHANGE, not on refresh
+    #  Main tab router — re-renders on tab change AND manual refresh
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("tab-content", "children"),
-        [Input("tabs", "value")]
+        [Input("tabs", "value"), Input("refresh-trigger", "data")]
     )
-    def render_tab(tab):
+    def render_tab(tab, _refresh):
         try:
             if tab == "overview":
                 return _overview_tab(store)
