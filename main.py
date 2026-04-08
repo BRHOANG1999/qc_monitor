@@ -20,6 +20,9 @@ import threading
 import psutil
 import shutil
 
+# Ensure project root is on sys.path for thread imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import yaml
 
 from src.db.store import Store
@@ -54,12 +57,13 @@ def run_dashboard(config: dict, store: Store):
         app = create_app(config, store)
         host = config.get("dashboard", {}).get("host", "0.0.0.0")
         port = config.get("dashboard", {}).get("port", 8050)
+        logging.getLogger("qc_monitor").info("Dashboard serving at http://%s:%s", host, port)
         app.run(host=host, port=port, debug=False, use_reloader=False)
-    except ImportError:
+    except ImportError as e:
         logging.getLogger("qc_monitor").warning(
-            "Dash not installed. Run: pip install dash plotly. Dashboard disabled.")
+            "Dash not installed (%s). Run: pip install dash plotly", e)
     except Exception as e:
-        logging.getLogger("qc_monitor").error("Dashboard failed: %s", e)
+        logging.getLogger("qc_monitor").error("Dashboard failed: %s", e, exc_info=True)
 
 
 def main():
