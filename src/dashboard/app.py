@@ -67,32 +67,45 @@ TIME_RANGE_OPTIONS = [
 
 # Dark card style
 CARD_STYLE = {
-    "backgroundColor": "#1e1e2f",
-    "borderRadius": "8px",
+    "borderRadius": "10px",
     "padding": "15px 20px",
     "minWidth": "130px",
     "textAlign": "center",
-    "border": "1px solid #333",
+    "border": "1px solid rgba(255,255,255,0.06)",
+    "background": "linear-gradient(180deg, #1e1e2f 0%, #181828 100%)",
+    "boxShadow": "0 2px 8px rgba(0,0,0,0.3)",
+    "transition": "transform 0.15s, box-shadow 0.15s",
 }
 
-TAB_STYLE = {"backgroundColor": "#0d0d1a", "color": "#aaa", "padding": "10px 20px",
-             "border": "1px solid #333", "borderBottom": "none"}
+TAB_STYLE = {"backgroundColor": "#0d0d1a", "color": "#777", "padding": "10px 20px",
+             "border": "1px solid #222", "borderBottom": "none",
+             "borderRadius": "6px 6px 0 0", "fontSize": "13px"}
 TAB_SELECTED_STYLE = {"backgroundColor": "#1a1a2e", "color": "white", "padding": "10px 20px",
-                      "border": "1px solid #555", "borderBottom": "none", "fontWeight": "bold"}
+                      "border": "1px solid #444", "borderBottom": "2px solid #636EFA",
+                      "borderRadius": "6px 6px 0 0", "fontWeight": "bold", "fontSize": "13px",
+                      "boxShadow": "0 2px 8px rgba(99,110,250,0.15)"}
 
 DARK_TABLE_STYLE = {
-    "style_header": {"backgroundColor": "#1a1a2e", "color": "white", "fontWeight": "bold",
-                     "border": "1px solid #444"},
-    "style_data": {"backgroundColor": "#111", "color": "#ddd", "border": "1px solid #333"},
-    "style_cell": {"textAlign": "left", "padding": "8px", "fontSize": "13px"},
-    "style_filter": {"backgroundColor": "#1a1a2e", "color": "white"},
+    "style_header": {"backgroundColor": "#16162a", "color": "white", "fontWeight": "bold",
+                     "border": "1px solid #333", "fontSize": "12px"},
+    "style_data": {"backgroundColor": "#0f0f1a", "color": "#ccc", "border": "1px solid #222",
+                   "fontSize": "12px"},
+    "style_data_conditional": [
+        {"if": {"row_index": "odd"}, "backgroundColor": "#141425"},
+    ],
+    "style_cell": {"textAlign": "left", "padding": "8px 12px", "fontSize": "12px"},
+    "style_filter": {"backgroundColor": "#16162a", "color": "white"},
 }
 
-SECTION_STYLE = {"backgroundColor": "#1e1e2f", "padding": "16px", "borderRadius": "8px",
-                 "border": "1px solid #333", "marginBottom": "16px"}
-LABEL_STYLE = {"color": "#888", "fontSize": "12px", "marginBottom": "2px", "display": "block"}
-INPUT_STYLE = {"backgroundColor": "#111", "color": "white", "border": "1px solid #444",
-               "borderRadius": "4px", "padding": "4px 8px", "width": "100%"}
+SECTION_STYLE = {"background": "linear-gradient(180deg, #1e1e2f 0%, #181828 100%)",
+                 "padding": "16px 20px", "borderRadius": "10px",
+                 "border": "1px solid #2a2a3e", "marginBottom": "16px",
+                 "boxShadow": "0 1px 6px rgba(0,0,0,0.3)"}
+LABEL_STYLE = {"color": "#888", "fontSize": "11px", "marginBottom": "3px", "display": "block",
+               "letterSpacing": "0.3px"}
+INPUT_STYLE = {"backgroundColor": "#0f0f1a", "color": "white", "border": "1px solid #333",
+               "borderRadius": "6px", "padding": "6px 10px", "width": "100%",
+               "transition": "border-color 0.2s, box-shadow 0.2s"}
 FIELD_STYLE = {"flex": "1", "minWidth": "180px"}
 DROPDOWN_STYLE = {"backgroundColor": "#1e1e2f", "color": "white"}
 
@@ -203,9 +216,14 @@ def create_app(config: dict, store: Store) -> Dash:
     app.layout = html.Div([
         # Header
         html.Div([
-            html.H1("QC Monitor", style={"margin": "0", "fontSize": "20px"}),
-        ], style={"padding": "12px 24px", "backgroundColor": "#0d0d1a", "color": "white",
-                  "borderBottom": "1px solid #333"}),
+            html.H1("QC Monitor", style={"margin": "0", "fontSize": "18px", "fontWeight": "600",
+                                          "letterSpacing": "1px"}),
+        ], id="app-header",
+           style={"padding": "10px 24px",
+                  "background": "linear-gradient(135deg, #0d0d2b 0%, #1a1035 50%, #0d1a2e 100%)",
+                  "color": "white",
+                  "borderBottom": "1px solid rgba(99,110,250,0.3)",
+                  "boxShadow": "0 2px 12px rgba(0,0,0,0.5)"}),
 
         # Tabs — ordered as specified
         dcc.Tabs(id="tabs", value="overview", children=[
@@ -239,7 +257,7 @@ def create_app(config: dict, store: Store) -> Dash:
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
         ], style={"borderBottom": "none"}),
 
-        html.Div(id="tab-content", style={"padding": "20px", "backgroundColor": "#111",
+        html.Div(id="tab-content", style={"padding": "24px", "backgroundColor": "#0f0f1a",
                                            "minHeight": "80vh"}),
 
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
@@ -255,14 +273,19 @@ def create_app(config: dict, store: Store) -> Dash:
                           options=[{"label": " Auto-refresh", "value": True}],
                           value=[], inline=True,
                           style={"color": "#888", "display": "inline-block", "fontSize": "12px"}),
-        ], style={"position": "fixed", "top": "8px", "right": "20px", "zIndex": "9999",
-                  "display": "flex", "alignItems": "center"}),
+        ], id="refresh-bar",
+           style={"position": "fixed", "top": "6px", "right": "20px", "zIndex": "9999",
+                  "display": "flex", "alignItems": "center",
+                  "background": "rgba(15,15,26,0.85)", "backdropFilter": "blur(8px)",
+                  "padding": "4px 12px", "borderRadius": "8px",
+                  "border": "1px solid rgba(255,255,255,0.06)"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
-    ], style={"backgroundColor": "#111", "fontFamily": "Segoe UI, sans-serif", "color": "#ddd"})
+    ], style={"backgroundColor": "#0f0f1a", "fontFamily": "'Segoe UI', -apple-system, sans-serif",
+              "color": "#ddd", "minHeight": "100vh"})
 
     # ------------------------------------------------------------------ #
     #  Refresh controls
@@ -1300,18 +1323,27 @@ def _overview_tab(store: Store):
     pct_done = (100 * total_done / total_files) if total_files > 0 else 0
 
     queue_section = html.Div([
-        html.H4("Processing Queue", style={"color": "#aaa", "marginTop": "16px", "marginBottom": "8px"}),
+        html.H4("Processing Queue", style={"color": "#aaa", "marginTop": "16px", "marginBottom": "8px",
+                                            "fontSize": "14px", "letterSpacing": "0.5px"}),
         html.Div([
-            html.Div(style={
-                "width": f"{pct_done:.1f}%", "backgroundColor": "#00CC96",
-                "height": "24px", "borderRadius": "4px", "transition": "width 0.5s",
-            }),
-        ], style={"backgroundColor": "#333", "borderRadius": "4px", "overflow": "hidden", "marginBottom": "8px"}),
+            html.Div(
+                f"{pct_done:.0f}%" if pct_done > 5 else "",
+                style={
+                    "width": f"{max(pct_done, 1):.1f}%",
+                    "background": "linear-gradient(90deg, #00CC96 0%, #00AA80 100%)",
+                    "height": "28px", "borderRadius": "6px",
+                    "transition": "width 0.8s cubic-bezier(0.4, 0, 0.2, 1)",
+                    "display": "flex", "alignItems": "center", "justifyContent": "center",
+                    "fontSize": "11px", "fontWeight": "bold", "color": "white",
+                    "textShadow": "0 1px 2px rgba(0,0,0,0.5)",
+                }),
+        ], style={"backgroundColor": "#1a1a2e", "borderRadius": "6px", "overflow": "hidden",
+                  "marginBottom": "8px", "boxShadow": "inset 0 1px 4px rgba(0,0,0,0.4)"}),
         html.Div([
             html.Span(f"{total_done} done", style={"color": "#00CC96", "marginRight": "16px"}),
             html.Span(f"{total_pending} queued", style={"color": "#FFA15A", "marginRight": "16px"}),
             html.Span(f"{total_errors} errors", style={"color": "#EF553B", "marginRight": "16px"}),
-            html.Span(f"{total_files} total detected", style={"color": "#888"}),
+            html.Span(f"{total_files} total detected", style={"color": "#666"}),
         ], style={"fontSize": "13px"}),
     ], style=SECTION_STYLE)
 
