@@ -249,6 +249,8 @@ def create_app(config: dict, store: Store) -> Dash:
                         style={"backgroundColor": "#333", "color": "white", "border": "1px solid #555",
                                "borderRadius": "4px", "padding": "4px 12px", "cursor": "pointer",
                                "marginRight": "8px"}),
+            html.Span(id="last-refresh-label",
+                      style={"color": "#555", "fontSize": "11px", "marginRight": "10px"}),
             dcc.Checklist(id="auto-refresh-toggle",
                           options=[{"label": " Auto-refresh", "value": True}],
                           value=[], inline=True,
@@ -256,6 +258,8 @@ def create_app(config: dict, store: Store) -> Dash:
         ], style={"position": "fixed", "top": "8px", "right": "20px", "zIndex": "9999",
                   "display": "flex", "alignItems": "center"}),
         dcc.Store(id="refresh-trigger", data=0),
+        dcc.Store(id="last-refresh-ts", data=None),
+        dcc.Interval(id="elapsed-ticker", interval=1000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
     ], style={"backgroundColor": "#111", "fontFamily": "Segoe UI, sans-serif", "color": "#ddd"})
@@ -271,12 +275,27 @@ def create_app(config: dict, store: Store) -> Dash:
         return not bool(val)
 
     @app.callback(
-        Output("refresh-trigger", "data"),
+        [Output("refresh-trigger", "data"), Output("last-refresh-ts", "data")],
         [Input("manual-refresh-btn", "n_clicks"), Input("refresh", "n_intervals")],
         [State("refresh-trigger", "data")]
     )
     def on_refresh(clicks, intervals, current):
-        return (current or 0) + 1
+        import time as _time
+        return (current or 0) + 1, _time.time()
+
+    @app.callback(
+        Output("last-refresh-label", "children"),
+        [Input("elapsed-ticker", "n_intervals")],
+        [State("last-refresh-ts", "data")],
+    )
+    def update_elapsed(_, ts):
+        if ts is None:
+            return ""
+        import time as _time
+        elapsed = int(_time.time() - ts)
+        if elapsed < 60:
+            return f"Last refresh {elapsed}s ago"
+        return f"Last refresh {elapsed // 60}m {elapsed % 60}s ago"
 
     # ------------------------------------------------------------------ #
     #  Main tab router
