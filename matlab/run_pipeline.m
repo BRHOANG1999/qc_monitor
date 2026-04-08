@@ -32,6 +32,8 @@ function run_pipeline(input_file, output_json, config_json)
     % Default analysis params (overridable via config)
     pre_ms = get_cfg(cfg, 'pre_stimulus_ms', -100);
     post_ms = get_cfg(cfg, 'post_stimulus_ms', 500);
+    analysis_start_ms = get_cfg(cfg, 'analysis_start_ms', 5);
+    analysis_end_ms = get_cfg(cfg, 'analysis_end_ms', 50);
     baseline_on = get_cfg(cfg, 'baseline_correction', true);
     baseline_win = get_cfg(cfg, 'baseline_window_ms', [-60, -10]);
     notch60 = get_cfg(cfg, 'notch_60hz', true);
@@ -152,6 +154,23 @@ function run_pipeline(input_file, output_json, config_json)
 
                 result.epoch_times = stimTimes(:)';
 
+                % --- Sub-slice to analysis window for feature computation ---
+                % Extraction window is the full epoch (-100 to +500ms)
+                % Analysis window is the evoked response portion (e.g., 5 to 50ms)
+                aw_mask = timeAxis >= analysis_start_ms & timeAxis <= analysis_end_ms;
+                if sum(aw_mask) > 10
+                    analysis_traces = traces(aw_mask, :);
+                    analysis_time = timeAxis(aw_mask);
+                else
+                    % Fallback to full window if analysis window too small
+                    analysis_traces = traces;
+                    analysis_time = timeAxis;
+                end
+                result.analysis_window_ms = [analysis_start_ms, analysis_end_ms];
+                result.analysis_n_samples = size(analysis_traces, 1);
+                fprintf('[PIPELINE] Analysis window: [%d, %d] ms (%d samples)\n', ...
+                    analysis_start_ms, analysis_end_ms, size(analysis_traces, 1));
+
                 fe = FeatureExtractor();
                 ALL_FEATURES = {'Line Length','Log(AUC)','Peak Amplitude','Trough Amplitude', ...
                     'Peak-to-Trough','RMS Amplitude','Peak Latency','Trough Latency', ...
@@ -160,11 +179,11 @@ function run_pipeline(input_file, output_json, config_json)
                     'Variance','Autocorrelation','AC Width', ...
                     'Exp Fit A','Sum Power Low','Freq Moment Low','Sum Power High','Freq Moment High'};
 
-                % Sanitize feature names for struct fields
+                % Features computed on analysis window (not full extraction window)
                 for fi = 1:length(ALL_FEATURES)
                     fname_clean = regexprep(ALL_FEATURES{fi}, '[^a-zA-Z0-9]', '_');
                     try
-                        vals = fe.calculateFeatureMetric(ALL_FEATURES{fi}, traces, timeAxis, fs);
+                        vals = fe.calculateFeatureMetric(ALL_FEATURES{fi}, analysis_traces, analysis_time, fs);
                         result.features.(fname_clean) = vals(:)';
                     catch
                         result.features.(fname_clean) = NaN(1, n_epochs);
@@ -172,6 +191,12 @@ function run_pipeline(input_file, output_json, config_json)
                 end
                 result.num_features = length(ALL_FEATURES);
                 fprintf('[PIPELINE] Features: %d metrics x %d epochs\n', length(ALL_FEATURES), n_epochs);
+
+                % --- Mean evoked waveform (for dashboard plotting) ---
+                result.mean_trace = mean(traces, 2, 'omitnan')';  % [1 x samples]
+                result.sem_trace = (std(traces, 0, 2, 'omitnan') / sqrt(n_epochs))';
+                result.time_axis_ms = timeAxis(:)';  % ms relative to stimulus
+                result.n_trace_samples = length(timeAxis);
 
             catch e
                 fprintf('[PIPELINE] Feature extraction failed: %s\n', e.message);
@@ -211,6 +236,41 @@ function run_pipeline(input_file, output_json, config_json)
             fprintf('[PIPELINE] Criticality failed: %s\n', e.message);
             result.criticality_mean = NaN;
             result.criticality_std = NaN;
+        end
+
+        % --- Step 7: LFP summary (PSD, stim artifact, per-channel stats) ---
+        try
+            eeg_signal = sbuf(:, eeg_ch);
+
+            % PSD via Welch (subsample to ~500 points for JSON)
+            nfft = min(2*fs, length(eeg_signal));
+            [pxx, f] = pwelch(eeg_signal, hamming(nfft), [], [], fs);
+            step = max(1, floor(length(f) / 500));
+            result.lfp_psd_freqs = f(1:step:end)';
+            result.lfp_psd_power = pxx(1:step:end)';
+
+            % Stim artifact amplitude on stim copy channel
+            if stim_ch <= n_channels
+                stim_sig = sbuf(:, stim_ch);
+                result.stim_artifact_rms = rms(stim_sig);
+                result.stim_artifact_peak = max(abs(stim_sig));
+            end
+
+            % Per-channel LFP stats
+            result.lfp_stats = struct();
+            for ci = 1:n_channels
+                ch_sig = sbuf(:, ci);
+                ch_name = sprintf('ch%d', ci);
+                result.lfp_stats.(ch_name).rms = rms(ch_sig);
+                result.lfp_stats.(ch_name).mean = mean(ch_sig);
+                result.lfp_stats.(ch_name).std_val = std(ch_sig);
+                result.lfp_stats.(ch_name).peak = max(ch_sig);
+                result.lfp_stats.(ch_name).trough = min(ch_sig);
+                result.lfp_stats.(ch_name).p2p = max(ch_sig) - min(ch_sig);
+            end
+            fprintf('[PIPELINE] LFP stats: %d channels\n', n_channels);
+        catch e
+            fprintf('[PIPELINE] LFP summary failed: %s\n', e.message);
         end
 
         % --- Cleanup ---

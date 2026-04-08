@@ -51,6 +51,10 @@ class Dispatcher:
         sess_cfg = self.get_session_config(new_file.session_dir)
 
         try:
+            self.store.log_activity("INFO", "PROCESSING_START",
+                                    f"Starting: {os.path.basename(new_file.path)}",
+                                    file_id=file_id, file_path=new_file.path)
+
             # --- Tier 1: Python QC (channel-aware) ---
             t1_start = time.time()
             chunk = load_mat(new_file.path)
@@ -182,6 +186,23 @@ class Dispatcher:
                             summary["std_peak_amplitude"] = float(np.std(arr))
                     self.store.insert_evoked_summary(file_id, summary, version_id)
 
+                # Store mean evoked waveform
+                mean_trace = result.get("mean_trace", [])
+                time_axis = result.get("time_axis_ms", [])
+                sem_trace = result.get("sem_trace", [])
+                if mean_trace and time_axis:
+                    evoked_cfg = self.config.get("evoked", {})
+                    self.store.insert_evoked_waveform(
+                        file_id,
+                        time_axis=time_axis,
+                        mean_trace=mean_trace,
+                        sem_trace=sem_trace,
+                        n_epochs=result.get("num_traces", 0),
+                        analysis_start_ms=evoked_cfg.get("analysis_start_ms", 5.0),
+                        analysis_end_ms=evoked_cfg.get("analysis_end_ms", 50.0),
+                        version_id=version_id,
+                    )
+
                 # Store criticality windows
                 crit = result.get("criticality", {})
                 tp = crit.get("time_points", [])
@@ -202,12 +223,20 @@ class Dispatcher:
                         })
                     self.store.bulk_insert_criticality(file_id, windows, version_id)
 
+            total_elapsed = time.time() - t1_start
             self.store.update_file_status(file_id, "done")
+            self.store.log_activity("INFO", "PROCESSING_DONE",
+                                    f"Done: {os.path.basename(new_file.path)}",
+                                    file_id=file_id, file_path=new_file.path,
+                                    duration_sec=total_elapsed)
             return True
 
         except Exception as e:
             logger.error("Processing failed for %s: %s", new_file.path, e, exc_info=True)
             self.store.update_file_status(file_id, "error")
+            self.store.log_activity("ERROR", "PROCESSING_FAILED",
+                                    f"Failed: {os.path.basename(new_file.path)}: {e}",
+                                    file_id=file_id, file_path=new_file.path)
             return False
 
 

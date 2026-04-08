@@ -1,99 +1,94 @@
 watch:
   paths:
-    - "//100.106.104.22/bhz/database/"
+  - //100.106.104.22/bhz/database/
   poll_interval_sec: 30
   min_file_age_sec: 60
-
 channel_mapping:
   auto_discover: true
-
 evoked:
-  pre_stimulus_ms: -100
-  post_stimulus_ms: 500
+  pre_stimulus_ms: -100.0
+  post_stimulus_ms: 500.0
   baseline_correction: true
-  baseline_window_ms: [-60, -10]
+  baseline_window_ms:
+  - -60.0
+  - -10.0
   stimulus_threshold_std: 3.0
   min_stimulus_distance_sec: 0.1
-  notch_60hz: true
+  notch_60hz: false
   notch_50hz: false
   highpass_enabled: false
   highpass_cutoff_hz: 1.0
   lowpass_enabled: false
   lowpass_cutoff_hz: 1000.0
-
+  analysis_start_ms: 5.0
+  analysis_end_ms: 50.0
 criticality:
   ar_order: 5
   window_sec: 2.0
   overlap_pct: 50
-  fit_method: "YuleWalker"
+  fit_method: YuleWalker
   target_sampling_rate: 1000
   criticality_type_b: 2
   calculate_error_bars: false
-
 seizure:
-  spike_threshold_uv: 10
+  spike_threshold_uv: 10.0
   spike_min_width: 5
   spike_max_width: 50
-  min_seizure_duration_sec: 5
-  event_glue_sec: 2
-  min_spikes_per_sec: 2
-  outlier_factor: 3
-
+  min_seizure_duration_sec: 5.0
+  event_glue_sec: 2.0
+  min_spikes_per_sec: 2.0
+  outlier_factor: 3.0
 artifact:
-  method: "fixed"
-  fixed_threshold: 500
+  method: fixed
+  fixed_threshold: 500.0
   mad_k: 4.0
   merge_gap_sec: 2.0
-
 qc_thresholds:
-  artifact_pct_warning: 50
-  flatline_std: 1.0e-6
+  artifact_pct_warning: 50.0
+  flatline_std: 1.0e-06
   clipping_voltage: 10.0
   line_noise_ratio_warning: 0.2
-
 features:
   enabled:
-    - "Line Length"
-    - "Log(AUC)"
-    - "Peak Amplitude"
-    - "Trough Amplitude"
-    - "Peak-to-Trough"
-    - "RMS Amplitude"
-    - "Peak Latency"
-    - "Trough Latency"
-    - "Max Slope"
-    - "Max Slope Time"
-    - "Early Area"
-    - "Late Area"
-    - "Early/Late Ratio"
-    - "Recovery Tau"
-    - "Recovery Slope"
-    - "Template Correlation"
-    - "PCA Recon Error"
-    - "Variance"
-    - "Autocorrelation"
-    - "AC Width"
-    - "Rolling Variance"
-    - "Rolling AR(1)"
-    - "Rolling CV"
-    - "Exp Fit A"
-    - "Sum Power Low"
-    - "Freq Moment Low"
-    - "Sum Power High"
-    - "Freq Moment High"
-
-stimnet_root: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator"
-matlab_exe: "matlab"
-
+  - Line Length
+  - Log(AUC)
+  - Peak Amplitude
+  - Trough Amplitude
+  - Peak-to-Trough
+  - RMS Amplitude
+  - Peak Latency
+  - Trough Latency
+  - Max Slope
+  - Max Slope Time
+  - Early Area
+  - Late Area
+  - Early/Late Ratio
+  - Recovery Tau
+  - Recovery Slope
+  - Template Correlation
+  - PCA Recon Error
+  - Variance
+  - Autocorrelation
+  - AC Width
+  - Rolling Variance
+  - Rolling AR(1)
+  - Rolling CV
+  - Exp Fit A
+  - Sum Power Low
+  - Freq Moment Low
+  - Sum Power High
+  - Freq Moment High
+stimnet_root: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator
+matlab_exe: matlab
 alerting:
   enabled: true
   smtp:
-    server: "smtp.gmail.com"
+    server: smtp.gmail.com
     port: 587
-    from_email: "underflowbot@gmail.com"
-    password_env_var: "QC_MONITOR_EMAIL_PASSWORD"
+    from_email: underflowbot@gmail.com
+    password_env_var: QC_MONITOR_EMAIL_PASSWORD
     recipients:
-      - "hoang392@umn.edu"
+    - hoang392@umn.edu
   rules:
     network_down_minutes: 5
     no_data_hours: 2
@@ -101,17 +96,14 @@ alerting:
     seizure_warning: true
     stim_delivery_failure: true
     rate_limit_per_type_minutes: 60
-
 dashboard:
-  host: "0.0.0.0"
+  host: 0.0.0.0
   port: 8050
   refresh_interval_sec: 10
-
 database:
-  path: "D:/code/qc_monitor/data/monitor.db"
-
+  path: D:/code/qc_monitor/data/monitor.db
 logging:
-  level: "INFO"
-  dir: "D:/code/qc_monitor/logs"
+  level: INFO
+  dir: D:/code/qc_monitor/logs
   max_file_size_mb: 10
   max_files: 5

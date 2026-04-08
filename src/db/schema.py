@@ -229,6 +229,47 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
 
+-- Mean evoked waveforms per file (for plotting)
+CREATE TABLE IF NOT EXISTS evoked_waveforms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    time_axis_ms TEXT NOT NULL,
+    mean_trace TEXT NOT NULL,
+    sem_trace TEXT,
+    n_epochs INTEGER,
+    analysis_start_ms REAL,
+    analysis_end_ms REAL,
+    version_id INTEGER REFERENCES settings_versions(id),
+    UNIQUE(file_id, version_id)
+);
+
+-- Processing activity log
+CREATE TABLE IF NOT EXISTS processing_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    level TEXT NOT NULL,
+    file_id INTEGER,
+    file_path TEXT,
+    action TEXT NOT NULL,
+    message TEXT,
+    duration_sec REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proclog_ts ON processing_log(timestamp);
+
+-- User annotations / notes
+CREATE TABLE IF NOT EXISTS annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    session_dir TEXT,
+    file_id INTEGER,
+    note TEXT NOT NULL,
+    category TEXT DEFAULT 'observation'
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_ts ON annotations(timestamp);
+
 -- System health snapshots
 CREATE TABLE IF NOT EXISTS system_health (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
