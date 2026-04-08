@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+logs/
+config/email_config.yaml
+.env

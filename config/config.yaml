@@ -1,0 +1,87 @@
+watch:
+  paths:
+    - "//100.106.104.22/bhz/database/"
+  poll_interval_sec: 30
+  min_file_age_sec: 60
+  # Only process .mat files matching KMrecorder naming
+  file_pattern: ".*___\\d{4}_\\d{2}_\\d{2}__\\d{2}_\\d{2}_\\d{2}\\.mat$"
+
+analysis:
+  tier1:
+    enabled: true
+    artifact:
+      method: "fixed"         # "fixed" or "mad"
+      threshold: 500          # fixed power envelope threshold (uV^2)
+      mad_k: 4.0              # multiplier for MAD-based threshold
+      merge_gap_sec: 2.0      # morphological closing gap
+    line_noise_freq: 60       # Hz (US mains)
+    band_definitions:
+      delta: [0.5, 4]
+      theta: [4, 8]
+      alpha: [8, 13]
+      beta: [13, 30]
+      gamma: [30, 100]
+      high_gamma: [100, 200]
+    flatline_std_threshold: 1.0e-6
+    clipping_voltage: 10.0    # DAQ +-10V range
+
+  tier2:
+    enabled: true
+    idle_trigger_minutes: 10
+    criticality:
+      ar_order: 5
+      b_type: 2
+      fit_method: "YuleWalker"
+      target_sampling_rate: 1000    # downsample before AR fit
+      matlab_exe: "C:/Program Files/MATLAB/R2023a/bin/matlab.exe"
+      criticality_src: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/src/src_criticality"
+    seizure:
+      enabled: true
+      spike_threshold_sd: 4.0      # standard deviations
+      min_spike_width_ms: 0.5
+      max_spike_width_ms: 50.0
+      min_event_duration_sec: 5.0
+      merge_gap_sec: 1.0
+    features:
+      enabled: true
+
+  tier3:
+    enabled: true
+    nightly_hour: 3
+    rhythm:
+      min_period_hours: 4
+      max_period_hours: 72
+    embedding:
+      python_scripts_dir: "D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/src/python/embedding"
+
+database:
+  path: "D:/code/qc_monitor/data/monitor.db"
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8050
+  refresh_interval_sec: 10
+
+alerting:
+  enabled: true
+  smtp:
+    server: "smtp.gmail.com"
+    port: 587
+    from_email: "underflowbot@gmail.com"
+    password_env_var: "QC_MONITOR_EMAIL_PASSWORD"
+    recipients:
+      - "hoang392@umn.edu"
+  rules:
+    network_down_minutes: 5
+    no_data_hours: 2
+    artifact_pct_warning: 50
+    flatline_warning: true
+    seizure_warning: true
+    stim_delivery_failure: true
+    rate_limit_per_type_minutes: 60
+
+logging:
+  level: "INFO"
+  dir: "D:/code/qc_monitor/logs"
+  max_file_size_mb: 10
+  max_files: 5
