@@ -171,26 +171,26 @@ def main():
                     time.sleep(backoff)
                     continue
 
-            # Scan for new files
+            # Scan for new files (full recursive scan of all watch paths)
             new_files = watcher.scan(known_paths)
 
             if new_files:
-                logger.info("Found %d new files", len(new_files))
-                # Sort by datetime (oldest first)
                 new_files.sort(key=lambda f: f.chunk_datetime)
+                logger.info("Found %d new files — queuing all for processing", len(new_files))
 
-            for nf in new_files:
-                known_paths.add(nf.path)
-                logger.info("Processing: %s", os.path.basename(nf.path))
+                # Add all to known set immediately (so next scan doesn't re-find them)
+                for nf in new_files:
+                    known_paths.add(nf.path)
 
-                success = dispatcher.process_file(nf, version_id=version_id)
+                # Process entire queue without re-scanning between files
+                for i, nf in enumerate(new_files, 1):
+                    logger.info("[%d/%d] Processing: %s",
+                                i, len(new_files), os.path.basename(nf.path))
+                    dispatcher.process_file(nf, version_id=version_id)
 
-                if success:
-                    # Check alerts on the QC results
-                    # (alert checking happens inside dispatcher for per-chunk metrics)
-                    pass
+                logger.info("Queue complete: %d files processed", len(new_files))
 
-            # Sleep until next poll
+            # Sleep until next poll (only scans again after queue is drained)
             elapsed = time.time() - loop_start
             sleep_time = max(1, poll_interval - elapsed)
             time.sleep(sleep_time)
