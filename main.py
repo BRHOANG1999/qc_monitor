@@ -1,6 +1,6 @@
 """QC Monitor — 24/7 offline analysis daemon for KMrecorder data.
 
-Watches \\100.106.104.22\bhz\database\ for new .mat files, runs Tier 1 Python QC
+Watches \\\\100.106.104.22\\bhz\\database\\ for new .mat files, runs Tier 1 Python QC
 and Tier 2 MATLAB analysis pipeline, stores results in SQLite, and (optionally)
 serves a Dash dashboard + sends email alerts.
 
