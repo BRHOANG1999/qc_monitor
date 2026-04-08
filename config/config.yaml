@@ -5,17 +5,14 @@ watch:
   min_file_age_sec: 60
 channel_mapping:
   auto_discover: true
-## Step 1: Epoch Extraction
-## Cuts a window around each detected stimulus to produce *_evoked.mat files.
-## These are the intermediary files the user can also analyze manually.
 epoch_extraction:
-  pre_stimulus_ms: -100       # negative = before stimulus
-  post_stimulus_ms: 500       # positive = after stimulus
+  pre_stimulus_ms: -100.0
+  post_stimulus_ms: 500.0
   stimulus_threshold_std: 3.0
   min_stimulus_distance_sec: 0.1
   baseline_correction: true
-  baseline_start_ms: -60
-  baseline_end_ms: -10
+  baseline_start_ms: -60.0
+  baseline_end_ms: -10.0
   highpass_enabled: false
   highpass_cutoff_hz: 1.0
   highpass_order: 4
@@ -24,48 +21,36 @@ epoch_extraction:
   lowpass_order: 4
   notch_50hz: false
   notch_60hz: true
-
-## Step 2: Feature Analysis (Configure & Analyze)
-## Mirrors the Chronic Evoked Features dialog from the STiM-NET pipeline.
 feature_analysis:
-  # Evoked response window (sub-window for feature computation)
   window_start_ms: -100
   window_end_ms: 500
-  # Stimulus artifact masking
   stim_artifact_start_ms: -5
   stim_artifact_end_ms: 15
-  # Filtering (applied to traces before features)
   bandpass_enabled: false
   bandpass_highpass_hz: 1.0
   bandpass_lowpass_hz: 100.0
   notch_enabled: false
   notch_frequency_hz: 60
-  # Smoothing
   smoothing_enabled: false
   smoothing_window_ms: 5
-  # Baseline correction
   baseline_correction: true
-  # Artifact exclusion
   artifact_exclusion_enabled: false
-  artifact_method: "fixed"
+  artifact_method: fixed
   artifact_threshold: 500.0
   artifact_merge_gap_sec: 2.0
-  template_source: "early50ms"
+  template_source: early50ms
   template_upper_r: 0.7
   template_lower_r: 0.3
   rawamp_multiplier: 4.0
   noise_neg_threshold: 0
   noise_pos_threshold: 0
   noise_glue_window_sec: 1.0
-  # Ictal spike rescue
   ictal_rescue_enabled: false
   ictal_rescue_window_ms: 500
-  # Feature sub-windows
   early_area_start_ms: 0
   early_area_end_ms: 50
   late_area_start_ms: 50
   late_area_end_ms: 200
-  # Analysis sub-window (for scalar features)
   analysis_start_ms: 5
   analysis_end_ms: 50
 criticality:

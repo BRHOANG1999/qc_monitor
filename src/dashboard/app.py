@@ -905,7 +905,37 @@ def create_app(config: dict, store: Store) -> Dash:
          State("qc-flatline-std", "value"),
          State("qc-clipping-v", "value"),
          State("qc-linenoise-warn", "value"),
-         State("features-checklist", "value")],
+         State("features-checklist", "value"),
+         # Step 2: Feature Analysis states
+         State("feat-win-start", "value"),
+         State("feat-win-end", "value"),
+         State("feat-stim-art-start", "value"),
+         State("feat-stim-art-end", "value"),
+         State("feat-bp-enabled", "value"),
+         State("feat-bp-hp", "value"),
+         State("feat-bp-lp", "value"),
+         State("feat-notch-enabled", "value"),
+         State("feat-notch-freq", "value"),
+         State("feat-smooth-enabled", "value"),
+         State("feat-smooth-win", "value"),
+         State("feat-baseline", "value"),
+         State("feat-art-enabled", "value"),
+         State("feat-art-method", "value"),
+         State("feat-art-thresh", "value"),
+         State("feat-art-merge", "value"),
+         State("feat-tmpl-source", "value"),
+         State("feat-tmpl-upper", "value"),
+         State("feat-tmpl-lower", "value"),
+         State("feat-rawamp-k", "value"),
+         State("feat-ictal-rescue", "value"),
+         State("feat-ictal-win", "value"),
+         State("feat-analysis-start", "value"),
+         State("feat-analysis-end", "value"),
+         State("feat-early-start", "value"),
+         State("feat-early-end", "value"),
+         State("feat-late-start", "value"),
+         State("feat-late-end", "value"),
+         ],
         prevent_initial_call=True,
     )
     def save_settings(n_clicks, *values):
@@ -920,7 +950,17 @@ def create_app(config: dict, store: Store) -> Dash:
              sp_thresh, sp_min_w, sp_max_w, min_dur, glue_sec, min_spikes, outlier,
              art_method, art_fixed, art_mad, art_merge,
              qc_art_warn, qc_flat, qc_clip, qc_ln,
-             features_enabled) = values
+             features_enabled,
+             # Step 2 values
+             f_win_start, f_win_end, f_stim_start, f_stim_end,
+             f_bp_en, f_bp_hp, f_bp_lp, f_notch_en, f_notch_freq,
+             f_smooth_en, f_smooth_win, f_baseline,
+             f_art_en, f_art_method, f_art_thresh, f_art_merge,
+             f_tmpl_src, f_tmpl_upper, f_tmpl_lower, f_rawamp_k,
+             f_ictal_en, f_ictal_win,
+             f_analysis_start, f_analysis_end,
+             f_early_start, f_early_end, f_late_start, f_late_end,
+             ) = values
 
             # Step 1: Epoch Extraction
             ee = cfg.setdefault("epoch_extraction", {})
@@ -937,8 +977,38 @@ def create_app(config: dict, store: Store) -> Dash:
             if hp_cut is not None: ee["highpass_cutoff_hz"] = float(hp_cut)
             ee["lowpass_enabled"] = bool(lp_en)
             if lp_cut is not None: ee["lowpass_cutoff_hz"] = float(lp_cut)
-            # Remove old "evoked" key if it exists
             cfg.pop("evoked", None)
+
+            # Step 2: Feature Analysis
+            fa = cfg.setdefault("feature_analysis", {})
+            if f_win_start is not None: fa["window_start_ms"] = float(f_win_start)
+            if f_win_end is not None: fa["window_end_ms"] = float(f_win_end)
+            if f_stim_start is not None: fa["stim_artifact_start_ms"] = float(f_stim_start)
+            if f_stim_end is not None: fa["stim_artifact_end_ms"] = float(f_stim_end)
+            fa["bandpass_enabled"] = bool(f_bp_en)
+            if f_bp_hp is not None: fa["bandpass_highpass_hz"] = float(f_bp_hp)
+            if f_bp_lp is not None: fa["bandpass_lowpass_hz"] = float(f_bp_lp)
+            fa["notch_enabled"] = bool(f_notch_en)
+            if f_notch_freq is not None: fa["notch_frequency_hz"] = float(f_notch_freq)
+            fa["smoothing_enabled"] = bool(f_smooth_en)
+            if f_smooth_win is not None: fa["smoothing_window_ms"] = float(f_smooth_win)
+            fa["baseline_correction"] = bool(f_baseline)
+            fa["artifact_exclusion_enabled"] = bool(f_art_en)
+            if f_art_method: fa["artifact_method"] = f_art_method
+            if f_art_thresh is not None: fa["artifact_threshold"] = float(f_art_thresh)
+            if f_art_merge is not None: fa["artifact_merge_gap_sec"] = float(f_art_merge)
+            if f_tmpl_src: fa["template_source"] = f_tmpl_src
+            if f_tmpl_upper is not None: fa["template_upper_r"] = float(f_tmpl_upper)
+            if f_tmpl_lower is not None: fa["template_lower_r"] = float(f_tmpl_lower)
+            if f_rawamp_k is not None: fa["rawamp_multiplier"] = float(f_rawamp_k)
+            fa["ictal_rescue_enabled"] = bool(f_ictal_en)
+            if f_ictal_win is not None: fa["ictal_rescue_window_ms"] = float(f_ictal_win)
+            if f_analysis_start is not None: fa["analysis_start_ms"] = float(f_analysis_start)
+            if f_analysis_end is not None: fa["analysis_end_ms"] = float(f_analysis_end)
+            if f_early_start is not None: fa["early_area_start_ms"] = float(f_early_start)
+            if f_early_end is not None: fa["early_area_end_ms"] = float(f_early_end)
+            if f_late_start is not None: fa["late_area_start_ms"] = float(f_late_start)
+            if f_late_end is not None: fa["late_area_end_ms"] = float(f_late_end)
 
             cfg["criticality"]["ar_order"] = int(ar_order) if ar_order is not None else cfg["criticality"]["ar_order"]
             cfg["criticality"]["window_sec"] = float(win_sec) if win_sec is not None else cfg["criticality"]["window_sec"]
@@ -1716,7 +1786,7 @@ def _settings_tab_layout(store: Store):
                    "These intermediary files can also be analyzed manually.",
                    style={"color": "#888", "fontSize": "12px", "marginBottom": "12px"}),
             html.Div([
-                html.Div([html.Label("Pre-stimulus (ms)", style=LABEL_STYLE),
+                html.Div([html.Label("Pre-stimulus (ms, negative = before)", style=LABEL_STYLE),
                           _input("evoked-pre-stim", ee.get("pre_stimulus_ms", -100))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Post-stimulus (ms)", style=LABEL_STYLE),
