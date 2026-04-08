@@ -91,17 +91,14 @@ def discover_session_config(mat_path: str) -> SessionConfig:
         config.channel_names = config.channel_names[:config.num_channels]
 
     # --- Auto-detect channel roles from names ---
+    # Rule: stimCopy channels are stimulus artifact recordings.
+    # ALL other channels are LFP (including saline, BCH*, generic names).
     for i, name in enumerate(config.channel_names):
         name_lower = name.lower().strip()
         if "stim" in name_lower:
             config.stim_copy_channels.append(i)
-        elif name.startswith("BCH") or name.startswith("EEG") or name.startswith("LFP"):
-            config.eeg_channels.append(i)
-        elif "saline" in name_lower or "ref" in name_lower or "gnd" in name_lower:
-            config.reference_channels.append(i)
-        elif name.startswith("Ch ") or name.startswith("Ch_"):
-            # Generic unnamed channel — treat as EEG by default
-            config.eeg_channels.append(i)
+        else:
+            config.eeg_channels.append(i)  # all non-stim = LFP
 
     # --- Sampling rate ---
     if "fs" in data:

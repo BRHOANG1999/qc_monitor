@@ -186,22 +186,28 @@ class Dispatcher:
                             summary["std_peak_amplitude"] = float(np.std(arr))
                     self.store.insert_evoked_summary(file_id, summary, version_id)
 
-                # Store mean evoked waveform
-                mean_trace = result.get("mean_trace", [])
-                time_axis = result.get("time_axis_ms", [])
-                sem_trace = result.get("sem_trace", [])
-                if mean_trace and time_axis:
-                    evoked_cfg = self.config.get("evoked", {})
-                    self.store.insert_evoked_waveform(
-                        file_id,
-                        time_axis=time_axis,
-                        mean_trace=mean_trace,
-                        sem_trace=sem_trace,
-                        n_epochs=result.get("num_traces", 0),
-                        analysis_start_ms=evoked_cfg.get("analysis_start_ms", 5.0),
-                        analysis_end_ms=evoked_cfg.get("analysis_end_ms", 50.0),
-                        version_id=version_id,
-                    )
+                # Store per-channel evoked waveforms (LFP + stim trace)
+                per_channel = result.get("per_channel", {})
+                evoked_cfg = self.config.get("evoked", {})
+                for ch_key, ch_data in per_channel.items():
+                    if not isinstance(ch_data, dict):
+                        continue
+                    mean_trace = ch_data.get("mean_trace", [])
+                    time_axis = ch_data.get("time_axis_ms", [])
+                    if mean_trace and time_axis:
+                        self.store.insert_evoked_waveform(
+                            file_id,
+                            channel=ch_data.get("channel", 0) - 1,  # 0-indexed
+                            channel_name=ch_data.get("channel_name", ch_key),
+                            time_axis=time_axis,
+                            mean_trace=mean_trace,
+                            sem_trace=ch_data.get("sem_trace", []),
+                            stim_mean_trace=ch_data.get("stim_mean_trace", []),
+                            n_epochs=ch_data.get("num_traces", 0),
+                            analysis_start_ms=evoked_cfg.get("analysis_start_ms", 5.0),
+                            analysis_end_ms=evoked_cfg.get("analysis_end_ms", 50.0),
+                            version_id=version_id,
+                        )
 
                 # Store criticality windows
                 crit = result.get("criticality", {})
@@ -213,7 +219,7 @@ class Dispatcher:
                     sigs = crit.get("sigmas", [])
                     for wi in range(len(tp)):
                         windows.append({
-                            "channel": result.get("eeg_channel", 1) - 1,  # 0-indexed
+                            "channel": result.get("criticality_channel", result.get("lfp_channels", [1])[0]) - 1,
                             "window_index": wi,
                             "time_sec": tp[wi],
                             "db_value": db[wi] if db[wi] == db[wi] else None,  # NaN check

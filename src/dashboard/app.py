@@ -1123,6 +1123,29 @@ def _overview_tab(store: Store):
         _status_card("Files/Hour", str(fph), "#636EFA"),
     ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"})
 
+    # File queue progress across all sessions
+    total_files = sum(s.get("num_files", 0) for s in sessions)
+    total_done = sum(s.get("processed", 0) for s in sessions)
+    total_errors = sum(s.get("errors", 0) for s in sessions)
+    total_pending = total_files - total_done - total_errors
+    pct_done = (100 * total_done / total_files) if total_files > 0 else 0
+
+    queue_section = html.Div([
+        html.H4("Processing Queue", style={"color": "#aaa", "marginTop": "16px", "marginBottom": "8px"}),
+        html.Div([
+            html.Div(style={
+                "width": f"{pct_done:.1f}%", "backgroundColor": "#00CC96",
+                "height": "24px", "borderRadius": "4px", "transition": "width 0.5s",
+            }),
+        ], style={"backgroundColor": "#333", "borderRadius": "4px", "overflow": "hidden", "marginBottom": "8px"}),
+        html.Div([
+            html.Span(f"{total_done} done", style={"color": "#00CC96", "marginRight": "16px"}),
+            html.Span(f"{total_pending} queued", style={"color": "#FFA15A", "marginRight": "16px"}),
+            html.Span(f"{total_errors} errors", style={"color": "#EF553B", "marginRight": "16px"}),
+            html.Span(f"{total_files} total detected", style={"color": "#888"}),
+        ], style={"fontSize": "13px"}),
+    ], style=SECTION_STYLE)
+
     # Evoked waveform thumbnail for overview
     waveform_thumbnail = html.Div()
     if session_dir:
@@ -1248,7 +1271,7 @@ def _overview_tab(store: Store):
             html.P("No alerts in the last 24 hours", style={"color": "#888"}),
         ])
 
-    return html.Div([cards, waveform_thumbnail, session_info, channel_table, alerts_section])
+    return html.Div([cards, queue_section, waveform_thumbnail, session_info, channel_table, alerts_section])
 
 
 # ------------------------------------------------------------------ #

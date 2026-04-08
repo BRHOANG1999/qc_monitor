@@ -910,22 +910,27 @@ class Store:
     # ------------------------------------------------------------------ #
 
     def insert_evoked_waveform(self, file_id: int, time_axis: list, mean_trace: list,
-                               sem_trace: list, n_epochs: int,
-                               analysis_start_ms: float, analysis_end_ms: float,
+                               sem_trace: list = None, stim_mean_trace: list = None,
+                               n_epochs: int = 0, channel: int = 0,
+                               channel_name: str = "",
+                               analysis_start_ms: float = 5.0,
+                               analysis_end_ms: float = 50.0,
                                version_id: int | None = None):
-        """Insert a mean evoked waveform for a file (JSON-serialised arrays)."""
+        """Insert a mean evoked waveform for a file+channel (JSON-serialised arrays)."""
         conn = self._connect()
         try:
             conn.execute(
                 """INSERT OR REPLACE INTO evoked_waveforms
-                   (file_id, time_axis_ms, mean_trace, sem_trace, n_epochs,
+                   (file_id, channel, channel_name, time_axis_ms, mean_trace,
+                    sem_trace, stim_mean_trace, n_epochs,
                     analysis_start_ms, analysis_end_ms, version_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    file_id,
+                    file_id, channel, channel_name,
                     json.dumps(list(time_axis)),
                     json.dumps(list(mean_trace)),
-                    json.dumps(list(sem_trace)) if sem_trace is not None else None,
+                    json.dumps(list(sem_trace)) if sem_trace else None,
+                    json.dumps(list(stim_mean_trace)) if stim_mean_trace else None,
                     n_epochs,
                     analysis_start_ms,
                     analysis_end_ms,
@@ -956,8 +961,10 @@ class Store:
             d = dict(row)
             d["time_axis_ms"] = json.loads(d["time_axis_ms"])
             d["mean_trace"] = json.loads(d["mean_trace"])
-            if d["sem_trace"] is not None:
+            if d.get("sem_trace") is not None:
                 d["sem_trace"] = json.loads(d["sem_trace"])
+            if d.get("stim_mean_trace") is not None:
+                d["stim_mean_trace"] = json.loads(d["stim_mean_trace"])
             return d
         finally:
             conn.close()
@@ -988,8 +995,10 @@ class Store:
                 d = dict(row)
                 d["time_axis_ms"] = json.loads(d["time_axis_ms"])
                 d["mean_trace"] = json.loads(d["mean_trace"])
-                if d["sem_trace"] is not None:
+                if d.get("sem_trace") is not None:
                     d["sem_trace"] = json.loads(d["sem_trace"])
+                if d.get("stim_mean_trace") is not None:
+                    d["stim_mean_trace"] = json.loads(d["stim_mean_trace"])
                 results.append(d)
             return results
         finally:

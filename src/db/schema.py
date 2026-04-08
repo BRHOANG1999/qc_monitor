@@ -229,18 +229,21 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
 
--- Mean evoked waveforms per file (for plotting)
+-- Mean evoked waveforms per file per channel (for plotting)
 CREATE TABLE IF NOT EXISTS evoked_waveforms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    channel INTEGER NOT NULL,
+    channel_name TEXT,
     time_axis_ms TEXT NOT NULL,
     mean_trace TEXT NOT NULL,
     sem_trace TEXT,
+    stim_mean_trace TEXT,
     n_epochs INTEGER,
     analysis_start_ms REAL,
     analysis_end_ms REAL,
     version_id INTEGER REFERENCES settings_versions(id),
-    UNIQUE(file_id, version_id)
+    UNIQUE(file_id, channel, version_id)
 );
 
 -- Processing activity log

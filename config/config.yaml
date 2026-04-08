@@ -6,22 +6,38 @@ watch:
 channel_mapping:
   auto_discover: true
 evoked:
-  pre_stimulus_ms: -100.0
-  post_stimulus_ms: 500.0
-  baseline_correction: true
-  baseline_window_ms:
-  - -60.0
-  - -10.0
+  # Extraction window (epochs cut around each stimulus)
+  pre_stimulus_ms: 100
+  post_stimulus_ms: 500
+
+  # Stimulus detection
   stimulus_threshold_std: 3.0
   min_stimulus_distance_sec: 0.1
-  notch_60hz: false
-  notch_50hz: false
+
+  # Baseline correction
+  baseline_correction: true
+  baseline_start_ms: -60
+  baseline_end_ms: -10
+
+  # Filters
   highpass_enabled: false
   highpass_cutoff_hz: 1.0
+  highpass_order: 4
   lowpass_enabled: false
   lowpass_cutoff_hz: 1000.0
-  analysis_start_ms: 5.0
-  analysis_end_ms: 50.0
+  lowpass_order: 4
+  notch_50hz: false
+  notch_60hz: true
+
+  # Feature sub-windows (within extracted epoch)
+  early_area_start_ms: 0
+  early_area_end_ms: 50
+  late_area_start_ms: 50
+  late_area_end_ms: 200
+
+  # Analysis window (sub-window for scalar features like Line Length)
+  analysis_start_ms: 5
+  analysis_end_ms: 50
 criticality:
   ar_order: 5
   window_sec: 2.0
