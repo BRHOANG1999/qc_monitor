@@ -29,20 +29,25 @@ function run_pipeline(input_file, output_json, config_json)
         end
     end
 
-    % Default analysis params (overridable via config)
-    pre_ms = get_cfg(cfg, 'pre_stimulus_ms', -100);
+    % --- Step 1 params: Epoch Extraction ---
+    pre_ms = get_cfg(cfg, 'pre_stimulus_ms', -100);   % negative = before stimulus
     post_ms = get_cfg(cfg, 'post_stimulus_ms', 500);
-    analysis_start_ms = get_cfg(cfg, 'analysis_start_ms', 5);
-    analysis_end_ms = get_cfg(cfg, 'analysis_end_ms', 50);
+    stim_thresh_std = get_cfg(cfg, 'stimulus_threshold_std', 3.0);
+    min_stim_dist = get_cfg(cfg, 'min_stimulus_distance_sec', 0.1);
     baseline_on = get_cfg(cfg, 'baseline_correction', true);
-    baseline_win = get_cfg(cfg, 'baseline_window_ms', [-60, -10]);
+    baseline_start = get_cfg(cfg, 'baseline_start_ms', -60);
+    baseline_end = get_cfg(cfg, 'baseline_end_ms', -10);
+    baseline_win = [baseline_start, baseline_end];
     notch60 = get_cfg(cfg, 'notch_60hz', true);
     notch50 = get_cfg(cfg, 'notch_50hz', false);
     hp_on = get_cfg(cfg, 'highpass_enabled', false);
     hp_hz = get_cfg(cfg, 'highpass_cutoff_hz', 1.0);
     lp_on = get_cfg(cfg, 'lowpass_enabled', false);
     lp_hz = get_cfg(cfg, 'lowpass_cutoff_hz', 1000.0);
-    stim_thresh_std = get_cfg(cfg, 'stimulus_threshold_std', 3.0);
+
+    % --- Step 2 params: Feature Analysis (sub-window within epoch) ---
+    analysis_start_ms = get_cfg(cfg, 'analysis_start_ms', 5);
+    analysis_end_ms = get_cfg(cfg, 'analysis_end_ms', 50);
     min_stim_dist = get_cfg(cfg, 'min_stimulus_distance_sec', 0.1);
     crit_ar = get_cfg(cfg, 'ar_order', 5);
     crit_win = get_cfg(cfg, 'window_sec', 2.0);
@@ -127,7 +132,7 @@ function run_pipeline(input_file, output_json, config_json)
                 [er, outfiles] = batchExtractEvokedResponses({temp_mat}, ...
                     'EEGChannel', lfp_ch, ...
                     'StimulusChannel', stim_ch, ...
-                    'PreStimulusMS', pre_ms, ...
+                    'PreStimulusMS', abs(pre_ms), ...  % batchExtract expects positive, negates internally
                     'PostStimulusMS', post_ms, ...
                     'StimulusThreshold', stim_thresh_std, ...
                     'MinStimulusDistance', min_stim_dist, ...

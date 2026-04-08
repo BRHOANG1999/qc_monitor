@@ -897,18 +897,23 @@ def create_app(config: dict, store: Store) -> Dash:
              qc_art_warn, qc_flat, qc_clip, qc_ln,
              features_enabled) = values
 
-            cfg["evoked"]["pre_stimulus_ms"] = float(pre_stim) if pre_stim is not None else cfg["evoked"]["pre_stimulus_ms"]
-            cfg["evoked"]["post_stimulus_ms"] = float(post_stim) if post_stim is not None else cfg["evoked"]["post_stimulus_ms"]
-            cfg["evoked"]["baseline_correction"] = bool(baseline_corr)
-            cfg["evoked"]["baseline_window_ms"] = [float(bl_start or -60), float(bl_end or -10)]
-            cfg["evoked"]["stimulus_threshold_std"] = float(stim_thresh) if stim_thresh is not None else cfg["evoked"]["stimulus_threshold_std"]
-            cfg["evoked"]["min_stimulus_distance_sec"] = float(min_stim_dist) if min_stim_dist is not None else cfg["evoked"]["min_stimulus_distance_sec"]
-            cfg["evoked"]["notch_60hz"] = bool(notch60)
-            cfg["evoked"]["notch_50hz"] = bool(notch50)
-            cfg["evoked"]["highpass_enabled"] = bool(hp_en)
-            cfg["evoked"]["highpass_cutoff_hz"] = float(hp_cut) if hp_cut is not None else cfg["evoked"]["highpass_cutoff_hz"]
-            cfg["evoked"]["lowpass_enabled"] = bool(lp_en)
-            cfg["evoked"]["lowpass_cutoff_hz"] = float(lp_cut) if lp_cut is not None else cfg["evoked"]["lowpass_cutoff_hz"]
+            # Step 1: Epoch Extraction
+            ee = cfg.setdefault("epoch_extraction", {})
+            if pre_stim is not None: ee["pre_stimulus_ms"] = float(pre_stim)
+            if post_stim is not None: ee["post_stimulus_ms"] = float(post_stim)
+            ee["baseline_correction"] = bool(baseline_corr)
+            ee["baseline_start_ms"] = float(bl_start or -60)
+            ee["baseline_end_ms"] = float(bl_end or -10)
+            if stim_thresh is not None: ee["stimulus_threshold_std"] = float(stim_thresh)
+            if min_stim_dist is not None: ee["min_stimulus_distance_sec"] = float(min_stim_dist)
+            ee["notch_60hz"] = bool(notch60)
+            ee["notch_50hz"] = bool(notch50)
+            ee["highpass_enabled"] = bool(hp_en)
+            if hp_cut is not None: ee["highpass_cutoff_hz"] = float(hp_cut)
+            ee["lowpass_enabled"] = bool(lp_en)
+            if lp_cut is not None: ee["lowpass_cutoff_hz"] = float(lp_cut)
+            # Remove old "evoked" key if it exists
+            cfg.pop("evoked", None)
 
             cfg["criticality"]["ar_order"] = int(ar_order) if ar_order is not None else cfg["criticality"]["ar_order"]
             cfg["criticality"]["window_sec"] = float(win_sec) if win_sec is not None else cfg["criticality"]["window_sec"]
@@ -1003,11 +1008,12 @@ def create_app(config: dict, store: Store) -> Dash:
              features_enabled) = values
 
             config_dict = {
-                "evoked": {
+                "epoch_extraction": {
                     "pre_stimulus_ms": float(pre_stim or -100),
                     "post_stimulus_ms": float(post_stim or 500),
                     "baseline_correction": bool(baseline_corr),
-                    "baseline_window_ms": [float(bl_start or -60), float(bl_end or -10)],
+                    "baseline_start_ms": float(bl_start or -60),
+                    "baseline_end_ms": float(bl_end or -10),
                     "stimulus_threshold_std": float(stim_thresh or 3.0),
                     "min_stimulus_distance_sec": float(min_stim_dist or 0.1),
                     "notch_60hz": bool(notch60),
@@ -1016,6 +1022,11 @@ def create_app(config: dict, store: Store) -> Dash:
                     "highpass_cutoff_hz": float(hp_cut or 1.0),
                     "lowpass_enabled": bool(lp_en),
                     "lowpass_cutoff_hz": float(lp_cut or 1000.0),
+                },
+                "feature_analysis": {
+                    "analysis_start_ms": 5, "analysis_end_ms": 50,
+                    "early_area_start_ms": 0, "early_area_end_ms": 50,
+                    "late_area_start_ms": 50, "late_area_end_ms": 200,
                 },
                 "criticality": {
                     "ar_order": int(ar_order or 5),
@@ -1630,13 +1641,13 @@ def _settings_tab_layout(store: Store):
     except Exception:
         cfg = {}
 
-    ev = cfg.get("evoked", {})
+    ee = cfg.get("epoch_extraction", {})   # Step 1: extraction window
+    fa = cfg.get("feature_analysis", {})   # Step 2: analysis sub-window
     cr = cfg.get("criticality", {})
     sz = cfg.get("seizure", {})
     ar = cfg.get("artifact", {})
     qc = cfg.get("qc_thresholds", {})
     ft = cfg.get("features", {})
-    bl_window = ev.get("baseline_window_ms", [-60, -10])
 
     all_features = [
         "Line Length", "Log(AUC)", "Peak Amplitude", "Trough Amplitude",
@@ -1663,55 +1674,88 @@ def _settings_tab_layout(store: Store):
         )
 
     return html.Div([
-        # --- Evoked ---
+        # --- Step 1: Epoch Extraction ---
         html.Div([
-            html.H4("Evoked Analysis", style={"color": "white", "marginTop": "0"}),
+            html.H4("Step 1: Epoch Extraction", style={"color": "#636EFA", "marginTop": "0"}),
+            html.P("Cuts a window around each detected stimulus to produce evoked.mat files. "
+                   "These intermediary files can also be analyzed manually.",
+                   style={"color": "#888", "fontSize": "12px", "marginBottom": "12px"}),
             html.Div([
                 html.Div([html.Label("Pre-stimulus (ms)", style=LABEL_STYLE),
-                          _input("evoked-pre-stim", ev.get("pre_stimulus_ms", -100))],
+                          _input("evoked-pre-stim", ee.get("pre_stimulus_ms", -100))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Post-stimulus (ms)", style=LABEL_STYLE),
-                          _input("evoked-post-stim", ev.get("post_stimulus_ms", 500))],
+                          _input("evoked-post-stim", ee.get("post_stimulus_ms", 500))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Stimulus threshold (std)", style=LABEL_STYLE),
-                          _input("evoked-stim-thresh", ev.get("stimulus_threshold_std", 3.0), step=0.1)],
+                          _input("evoked-stim-thresh", ee.get("stimulus_threshold_std", 3.0), step=0.1)],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Min stim distance (sec)", style=LABEL_STYLE),
-                          _input("evoked-min-stim-dist", ev.get("min_stimulus_distance_sec", 0.1), step=0.01)],
+                          _input("evoked-min-stim-dist", ee.get("min_stimulus_distance_sec", 0.1), step=0.01)],
                          style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
                 html.Div([html.Label("Baseline correction", style=LABEL_STYLE),
-                          _check("evoked-baseline-correction", ev.get("baseline_correction", True))],
+                          _check("evoked-baseline-correction", ee.get("baseline_correction", True))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Baseline start (ms)", style=LABEL_STYLE),
-                          _input("evoked-baseline-start", bl_window[0] if len(bl_window) > 0 else -60)],
+                          _input("evoked-baseline-start", ee.get("baseline_start_ms", -60))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Baseline end (ms)", style=LABEL_STYLE),
-                          _input("evoked-baseline-end", bl_window[1] if len(bl_window) > 1 else -10)],
+                          _input("evoked-baseline-end", ee.get("baseline_end_ms", -10))],
                          style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
             html.Div([
                 html.Div([html.Label("Notch 60 Hz", style=LABEL_STYLE),
-                          _check("evoked-notch60", ev.get("notch_60hz", True))],
+                          _check("evoked-notch60", ee.get("notch_60hz", True))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Notch 50 Hz", style=LABEL_STYLE),
-                          _check("evoked-notch50", ev.get("notch_50hz", False))],
+                          _check("evoked-notch50", ee.get("notch_50hz", False))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Highpass enabled", style=LABEL_STYLE),
-                          _check("evoked-hp-enabled", ev.get("highpass_enabled", False))],
+                          _check("evoked-hp-enabled", ee.get("highpass_enabled", False))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Highpass cutoff (Hz)", style=LABEL_STYLE),
-                          _input("evoked-hp-cutoff", ev.get("highpass_cutoff_hz", 1.0), step=0.1)],
+                          _input("evoked-hp-cutoff", ee.get("highpass_cutoff_hz", 1.0), step=0.1)],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Lowpass enabled", style=LABEL_STYLE),
-                          _check("evoked-lp-enabled", ev.get("lowpass_enabled", False))],
+                          _check("evoked-lp-enabled", ee.get("lowpass_enabled", False))],
                          style=FIELD_STYLE),
                 html.Div([html.Label("Lowpass cutoff (Hz)", style=LABEL_STYLE),
-                          _input("evoked-lp-cutoff", ev.get("lowpass_cutoff_hz", 1000.0))],
+                          _input("evoked-lp-cutoff", ee.get("lowpass_cutoff_hz", 1000.0))],
                          style=FIELD_STYLE),
             ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
-        ], style=SECTION_STYLE),
+        ], style={**SECTION_STYLE, "borderLeft": "3px solid #636EFA"}),
+
+        # --- Step 2: Feature Analysis ---
+        html.Div([
+            html.H4("Step 2: Feature Analysis", style={"color": "#00CC96", "marginTop": "0"}),
+            html.P("Defines the sub-window WITHIN each extracted epoch where scalar features "
+                   "(Line Length, Peak Amplitude, etc.) are computed.",
+                   style={"color": "#888", "fontSize": "12px", "marginBottom": "12px"}),
+            html.Div([
+                html.Div([html.Label("Analysis start (ms)", style=LABEL_STYLE),
+                          _input("feat-analysis-start", fa.get("analysis_start_ms", 5))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Analysis end (ms)", style=LABEL_STYLE),
+                          _input("feat-analysis-end", fa.get("analysis_end_ms", 50))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Early area start (ms)", style=LABEL_STYLE),
+                          _input("feat-early-start", fa.get("early_area_start_ms", 0))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Early area end (ms)", style=LABEL_STYLE),
+                          _input("feat-early-end", fa.get("early_area_end_ms", 50))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap", "marginBottom": "12px"}),
+            html.Div([
+                html.Div([html.Label("Late area start (ms)", style=LABEL_STYLE),
+                          _input("feat-late-start", fa.get("late_area_start_ms", 50))],
+                         style=FIELD_STYLE),
+                html.Div([html.Label("Late area end (ms)", style=LABEL_STYLE),
+                          _input("feat-late-end", fa.get("late_area_end_ms", 200))],
+                         style=FIELD_STYLE),
+            ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"}),
+        ], style={**SECTION_STYLE, "borderLeft": "3px solid #00CC96"}),
 
         # --- Criticality ---
         html.Div([

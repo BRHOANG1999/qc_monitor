@@ -130,10 +130,11 @@ class Dispatcher:
             if matlab_enabled:
                 t2_start = time.time()
 
-                # Build config for MATLAB from current settings
+                # Build flat config for MATLAB from both extraction + analysis sections
                 matlab_config = {
                     "stimnet_root": self.config.get("stimnet_root", ""),
-                    **self.config.get("evoked", {}),
+                    **self.config.get("epoch_extraction", {}),
+                    **self.config.get("feature_analysis", {}),
                     **self.config.get("criticality", {}),
                 }
 
@@ -188,7 +189,7 @@ class Dispatcher:
 
                 # Store per-channel evoked waveforms (LFP + stim trace)
                 per_channel = result.get("per_channel", {})
-                evoked_cfg = self.config.get("evoked", {})
+                evoked_cfg = self.config.get("feature_analysis", {})
                 for ch_key, ch_data in per_channel.items():
                     if not isinstance(ch_data, dict):
                         continue
