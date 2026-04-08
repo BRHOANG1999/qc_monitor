@@ -171,14 +171,32 @@ def main():
                     time.sleep(backoff)
                     continue
 
-            # Scan for new files (full recursive scan of all watch paths)
+            # First: process any pending files already in the DB (from previous runs)
+            pending = store.get_pending_files(limit=9999)
+            if pending:
+                logger.info("Resuming %d pending files from DB", len(pending))
+                for i, pf in enumerate(pending, 1):
+                    logger.info("[%d/%d] Processing pending: %s",
+                                i, len(pending), os.path.basename(pf["file_path"]))
+                    # Create a NewFile-like object from the DB row
+                    from src.watcher import NewFile
+                    nf = NewFile(
+                        path=pf["file_path"], size=pf.get("file_size", 0),
+                        mtime=pf.get("file_mtime", 0),
+                        session_dir=pf.get("session_dir", ""),
+                        session_name=pf.get("session_name", ""),
+                        chunk_datetime=pf.get("chunk_datetime", ""),
+                    )
+                    dispatcher.process_file(nf, version_id=version_id)
+                logger.info("Pending queue complete: %d files", len(pending))
+
+            # Then: scan for NEW files not yet in the DB
             new_files = watcher.scan(known_paths)
 
             if new_files:
                 new_files.sort(key=lambda f: f.chunk_datetime)
                 logger.info("Found %d new files — registering all in DB", len(new_files))
 
-                # Register ALL files in DB upfront so dashboard shows full queue
                 for nf in new_files:
                     known_paths.add(nf.path)
                     store.register_file(
@@ -189,7 +207,6 @@ def main():
 
                 logger.info("Queued %d files — starting processing", len(new_files))
 
-                # Process entire queue
                 for i, nf in enumerate(new_files, 1):
                     logger.info("[%d/%d] Processing: %s",
                                 i, len(new_files), os.path.basename(nf.path))
