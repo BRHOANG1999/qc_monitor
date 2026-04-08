@@ -22,17 +22,17 @@ epoch_extraction:
   notch_50hz: false
   notch_60hz: true
 feature_analysis:
-  window_start_ms: -100
-  window_end_ms: 500
-  stim_artifact_start_ms: -5
-  stim_artifact_end_ms: 15
+  window_start_ms: 1.0
+  window_end_ms: 200.0
+  stim_artifact_start_ms: -5.0
+  stim_artifact_end_ms: 15.0
   bandpass_enabled: false
   bandpass_highpass_hz: 1.0
   bandpass_lowpass_hz: 100.0
-  notch_enabled: false
-  notch_frequency_hz: 60
-  smoothing_enabled: false
-  smoothing_window_ms: 5
+  notch_enabled: true
+  notch_frequency_hz: 60.0
+  smoothing_enabled: true
+  smoothing_window_ms: 2.0
   baseline_correction: true
   artifact_exclusion_enabled: false
   artifact_method: fixed
@@ -46,13 +46,13 @@ feature_analysis:
   noise_pos_threshold: 0
   noise_glue_window_sec: 1.0
   ictal_rescue_enabled: false
-  ictal_rescue_window_ms: 500
-  early_area_start_ms: 0
-  early_area_end_ms: 50
-  late_area_start_ms: 50
-  late_area_end_ms: 200
-  analysis_start_ms: 5
-  analysis_end_ms: 50
+  ictal_rescue_window_ms: 500.0
+  early_area_start_ms: 0.0
+  early_area_end_ms: 50.0
+  late_area_start_ms: 50.0
+  late_area_end_ms: 200.0
+  analysis_start_ms: 5.0
+  analysis_end_ms: 50.0
 criticality:
   ar_order: 5
   window_sec: 2.0

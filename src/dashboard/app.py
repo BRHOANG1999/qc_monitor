@@ -429,67 +429,99 @@ def create_app(config: dict, store: Store) -> Dash:
         if not waveforms:
             return _empty_fig("No evoked waveforms for this session", 550)
 
-        fig = go.Figure()
+        # Read analysis window from config
+        cfg = _load_config()
+        fa = cfg.get("feature_analysis", {})
+        win_start = fa.get("window_start_ms", fa.get("analysis_start_ms", -100))
+        win_end = fa.get("window_end_ms", fa.get("analysis_end_ms", 500))
+
+        # Show latest file prominently, plus faded older traces (max 10)
+        latest = waveforms[-1]
+        has_stim = latest.get("stim_mean_trace") is not None
+
+        fig = make_subplots(
+            rows=2 if has_stim else 1, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.7, 0.3] if has_stim else [1.0],
+            subplot_titles=["LFP Evoked Response", "Stimulus Copy"] if has_stim else ["LFP Evoked Response"],
+            vertical_spacing=0.08,
+        )
+
+        # Older traces (faded, max 10 evenly sampled)
         n_wf = len(waveforms)
-
-        for idx, wf in enumerate(waveforms):
-            time_ms = wf["time_axis_ms"]
-            mean_tr = wf["mean_trace"]
-            sem_tr = wf["sem_trace"]
-            file_label = wf.get("chunk_datetime", f"File {idx}")[:16]
-
-            # Color gradient: oldest=light, newest=dark
-            frac = idx / max(n_wf - 1, 1)
-            r = int(100 + 155 * (1 - frac))
-            g = int(110 + 145 * (1 - frac))
-            b = int(250)
-            line_color = f"rgb({r},{g},{b})"
-            fill_color = f"rgba({r},{g},{b},0.12)"
-
-            # SEM band
-            if sem_tr is not None and len(sem_tr) == len(mean_tr):
-                upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-                lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+        if n_wf > 1:
+            step = max(1, (n_wf - 1) // 10)
+            older = waveforms[:-1:step]
+            for wf in older:
+                time_ms = wf["time_axis_ms"]
+                mean_tr = wf["mean_trace"]
                 fig.add_trace(go.Scatter(
-                    x=list(time_ms) + list(reversed(time_ms)),
-                    y=upper + list(reversed(lower)),
-                    fill="toself", fillcolor=fill_color,
-                    line=dict(width=0), showlegend=False,
-                    hoverinfo="skip",
-                ))
+                    x=time_ms, y=mean_tr, mode="lines",
+                    line=dict(color="rgba(150,150,200,0.2)", width=0.5),
+                    showlegend=False, hoverinfo="skip",
+                ), row=1, col=1)
 
+        # Latest trace — bold with SEM
+        time_ms = latest["time_axis_ms"]
+        mean_tr = latest["mean_trace"]
+        sem_tr = latest.get("sem_trace")
+        n_epochs = latest.get("n_epochs", 0)
+        ch_name = latest.get("channel_name", "LFP")
+
+        if sem_tr and len(sem_tr) == len(mean_tr):
+            upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+            lower = [m - s for m, s in zip(mean_tr, sem_tr)]
             fig.add_trace(go.Scatter(
-                x=time_ms, y=mean_tr, mode="lines",
-                name=file_label,
-                line=dict(color=line_color, width=1.5 if idx == n_wf - 1 else 0.8),
-            ))
+                x=list(time_ms) + list(reversed(time_ms)),
+                y=upper + list(reversed(lower)),
+                fill="toself", fillcolor="rgba(99,110,250,0.2)",
+                line=dict(width=0), showlegend=False, hoverinfo="skip",
+            ), row=1, col=1)
 
-        # Vertical line at t=0 (stimulus)
-        fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"),
-                      annotation_text="Stim", annotation_position="top right",
-                      annotation_font_color="white")
+        file_label = latest.get("chunk_datetime", "Latest")[:16]
+        fig.add_trace(go.Scatter(
+            x=time_ms, y=mean_tr, mode="lines",
+            name=f"{ch_name} — {file_label} (n={n_epochs})",
+            line=dict(color="#636EFA", width=2),
+        ), row=1, col=1)
 
-        # Shaded analysis window
-        if waveforms:
-            last_wf = waveforms[-1]
-            a_start = last_wf.get("analysis_start_ms")
-            a_end = last_wf.get("analysis_end_ms")
-            if a_start is not None and a_end is not None:
-                fig.add_vrect(x0=a_start, x1=a_end,
-                              fillcolor="rgba(99,110,250,0.08)",
-                              line_width=0,
-                              annotation_text="Analysis Window",
-                              annotation_position="top left",
-                              annotation_font_color="#888")
+        # Stim copy trace (bottom subplot)
+        if has_stim:
+            stim_tr = latest["stim_mean_trace"]
+            # stim trace may have different length if extraction used different params
+            stim_time = time_ms[:len(stim_tr)] if len(stim_tr) <= len(time_ms) else list(range(len(stim_tr)))
+            fig.add_trace(go.Scatter(
+                x=stim_time, y=stim_tr, mode="lines",
+                name="Stim Artifact",
+                line=dict(color="#FFA15A", width=1.5),
+            ), row=2, col=1)
+
+        # Stimulus marker
+        fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row="all", col=1)
+
+        # Analysis window shading
+        fig.add_vrect(x0=win_start, x1=win_end,
+                      fillcolor="rgba(0,204,150,0.1)", line_width=0,
+                      annotation_text=f"Analysis [{win_start}, {win_end}] ms",
+                      annotation_position="top left",
+                      annotation_font_color="#00CC96",
+                      row=1, col=1)
 
         fig.update_layout(
             template="plotly_dark",
-            title="Mean Evoked Waveforms (all files in session)",
-            xaxis_title="Time (ms)",
-            yaxis_title="Amplitude",
-            height=550,
+            height=550 if has_stim else 400,
+            xaxis_title="Time (ms)" if not has_stim else None,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
+        if has_stim:
+            fig.update_xaxes(title_text="Time (ms)", row=2, col=1)
+
+        # Zoom x-axis to analysis window with some padding
+        pad = (win_end - win_start) * 0.3
+        fig.update_xaxes(range=[win_start - pad, win_end + pad], row=1, col=1)
+        if has_stim:
+            fig.update_xaxes(range=[win_start - pad, win_end + pad], row=2, col=1)
+
         return fig
 
     # ------------------------------------------------------------------ #
