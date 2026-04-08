@@ -1,113 +1,118 @@
-/* Dark theme for Dash 4.x dropdowns (React-Select v5) */
+/* Dark theme for Dash 4.x custom dropdown component */
+/* Classes: dash-dropdown, dash-dropdown-trigger, dash-dropdown-value,
+   dash-dropdown-placeholder, dash-dropdown-content, dash-dropdown-options,
+   dash-dropdown-option, dash-dropdown-search, dash-dropdown-clear,
+   dash-dropdown-actions, dash-dropdown-value-item, etc. */
 
-/* The main control bar */
-.dash-dropdown .Select-control,
-.dash-dropdown > div > div[class*="control"] {
+/* Main wrapper */
+.dash-dropdown {
     background-color: #1e1e2f !important;
-    border-color: #444 !important;
-    min-height: 36px;
-}
-
-/* Selected single value text — THIS is the key fix */
-.dash-dropdown .Select-value-label,
-.dash-dropdown > div > div[class*="singleValue"],
-.dash-dropdown > div > div > div[class*="singleValue"],
-.dash-dropdown [class*="singleValue"] {
     color: white !important;
 }
 
-/* Placeholder */
-.dash-dropdown .Select-placeholder,
-.dash-dropdown [class*="placeholder"] {
+/* The trigger button (shows selected value) */
+.dash-dropdown-trigger {
+    background-color: #1e1e2f !important;
+    border: 1px solid #444 !important;
+    color: white !important;
+}
+
+/* Selected value text */
+.dash-dropdown-value,
+.dash-dropdown-value-item {
+    color: white !important;
+}
+
+/* Placeholder text */
+.dash-dropdown-placeholder {
     color: #888 !important;
 }
 
-/* Input text while typing/searching */
-.dash-dropdown .Select-input > input,
-.dash-dropdown input[role="combobox"],
-.dash-dropdown [class*="input"] input {
-    color: white !important;
-}
-
-/* The dropdown menu container */
-.dash-dropdown .Select-menu-outer,
-.dash-dropdown [class*="menu"] {
+/* The dropdown popup content */
+.dash-dropdown-content {
     background-color: #1e1e2f !important;
     border: 1px solid #444 !important;
     z-index: 9999 !important;
 }
 
-/* The menu list wrapper */
-.dash-dropdown [class*="menuList"] {
+/* Options container */
+.dash-dropdown-options {
     background-color: #1e1e2f !important;
 }
 
-/* Individual options */
-.dash-dropdown .Select-option,
-.dash-dropdown [class*="option"] {
+/* Individual option */
+.dash-dropdown-option {
     background-color: #1e1e2f !important;
     color: #ddd !important;
 }
 
-/* Hovered / focused option */
-.dash-dropdown .Select-option.is-focused,
-.dash-dropdown [class*="option"]:hover,
-.dash-dropdown [class*="option"][class*="focused"],
-.dash-dropdown [class*="option"][class*="Focused"] {
+/* Hovered option */
+.dash-dropdown-option:hover,
+.dash-dropdown-option[data-focused="true"],
+.dash-dropdown-option[aria-selected="true"] {
     background-color: #333 !important;
     color: white !important;
 }
 
-/* Selected option in menu */
-.dash-dropdown .Select-option.is-selected,
-.dash-dropdown [class*="option"][class*="selected"],
-.dash-dropdown [class*="option"][class*="Selected"] {
+/* Active/selected option in list */
+.dash-dropdown-option[data-selected="true"] {
     background-color: #444 !important;
     color: white !important;
 }
 
-/* Dropdown arrow indicator */
-.dash-dropdown .Select-arrow,
-.dash-dropdown [class*="indicatorContainer"] {
+/* Search input */
+.dash-dropdown-search,
+.dash-dropdown-search input {
+    background-color: #1e1e2f !important;
+    color: white !important;
+    border-color: #444 !important;
+}
+
+.dash-dropdown-search-container {
+    background-color: #1e1e2f !important;
+}
+
+.dash-dropdown-search-icon {
     color: #888 !important;
 }
-.dash-dropdown [class*="indicatorContainer"]:hover {
+
+/* Clear button */
+.dash-dropdown-clear {
+    color: #888 !important;
+}
+.dash-dropdown-clear:hover {
     color: white !important;
 }
 
-/* Separator line between value and arrow */
-.dash-dropdown [class*="indicatorSeparator"] {
-    background-color: #444 !important;
-}
-
-/* Clear (X) button */
-.dash-dropdown .Select-clear,
-.dash-dropdown [class*="clearIndicator"] {
+/* Action buttons / icons area */
+.dash-dropdown-actions {
     color: #888 !important;
 }
 
-/* Multi-value tags */
-.dash-dropdown [class*="multiValue"] {
+.dash-dropdown-trigger-icon {
+    color: #888 !important;
+}
+
+/* Grid container for multi-value */
+.dash-dropdown-grid-container {
+    background-color: #1e1e2f !important;
+}
+
+/* Value count badge (multi) */
+.dash-dropdown-value-count {
     background-color: #333 !important;
-    border: 1px solid #555 !important;
-}
-.dash-dropdown [class*="multiValueLabel"] {
-    color: white !important;
-}
-.dash-dropdown [class*="multiValueRemove"] {
-    color: #888 !important;
-}
-.dash-dropdown [class*="multiValueRemove"]:hover {
-    background-color: #555 !important;
     color: white !important;
 }
 
-/* No options message */
-.dash-dropdown [class*="noOptionsMessage"] {
-    color: #888 !important;
+/* Wrapper */
+.dash-dropdown-wrapper {
+    background-color: #1e1e2f !important;
 }
 
-/* Loading message */
-.dash-dropdown [class*="loadingMessage"] {
+/* Action button */
+.dash-dropdown-action-button {
     color: #888 !important;
+}
+.dash-dropdown-action-button:hover {
+    color: white !important;
 }
