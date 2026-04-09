@@ -171,32 +171,10 @@ def main():
                     time.sleep(backoff)
                     continue
 
-            # First: process any pending files already in the DB (from previous runs)
-            pending = store.get_pending_files(limit=9999)
-            if pending:
-                logger.info("Resuming %d pending files from DB", len(pending))
-                for i, pf in enumerate(pending, 1):
-                    logger.info("[%d/%d] Processing pending: %s",
-                                i, len(pending), os.path.basename(pf["file_path"]))
-                    # Create a NewFile-like object from the DB row
-                    from src.watcher import NewFile
-                    nf = NewFile(
-                        path=pf["file_path"], size=pf.get("file_size", 0),
-                        mtime=pf.get("file_mtime", 0),
-                        session_dir=pf.get("session_dir", ""),
-                        session_name=pf.get("session_name", ""),
-                        chunk_datetime=pf.get("chunk_datetime", ""),
-                    )
-                    dispatcher.process_file(nf, version_id=version_id)
-                logger.info("Pending queue complete: %d files", len(pending))
-
-            # Then: scan for NEW files not yet in the DB
+            # Scan for new files and register them in DB
             new_files = watcher.scan(known_paths)
-
             if new_files:
                 new_files.sort(key=lambda f: f.chunk_datetime)
-                logger.info("Found %d new files — registering all in DB", len(new_files))
-
                 for nf in new_files:
                     known_paths.add(nf.path)
                     store.register_file(
@@ -204,20 +182,28 @@ def main():
                         session_dir=nf.session_dir, session_name=nf.session_name,
                         chunk_datetime=nf.chunk_datetime,
                     )
+                logger.info("Registered %d new files", len(new_files))
 
-                logger.info("Queued %d files — starting processing", len(new_files))
-
-                for i, nf in enumerate(new_files, 1):
-                    logger.info("[%d/%d] Processing: %s",
-                                i, len(new_files), os.path.basename(nf.path))
-                    dispatcher.process_file(nf, version_id=version_id)
-
-                logger.info("Queue complete: %d files processed", len(new_files))
-
-            # Sleep until next poll (only scans again after queue is drained)
-            elapsed = time.time() - loop_start
-            sleep_time = max(1, poll_interval - elapsed)
-            time.sleep(sleep_time)
+            # Process ONE pending file per loop iteration
+            # This way the watcher rescans between files and picks up new arrivals
+            pending = store.get_pending_files(limit=1)
+            if pending:
+                pf = pending[0]
+                total_pending = len(store.get_pending_files(limit=99999))
+                logger.info("[%d queued] Processing: %s",
+                            total_pending, os.path.basename(pf["file_path"]))
+                from src.watcher import NewFile
+                nf = NewFile(
+                    path=pf["file_path"], size=pf.get("file_size", 0),
+                    mtime=pf.get("file_mtime", 0),
+                    session_dir=pf.get("session_dir", ""),
+                    session_name=pf.get("session_name", ""),
+                    chunk_datetime=pf.get("chunk_datetime", ""),
+                )
+                dispatcher.process_file(nf, version_id=version_id)
+            else:
+                # Nothing to process — sleep until next poll
+                time.sleep(poll_interval)
 
         except KeyboardInterrupt:
             logger.info("Shutting down (Ctrl+C)")
