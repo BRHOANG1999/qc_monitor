@@ -1,5 +1,6 @@
 """Dispatch queue: manages processing of new files through analysis tiers."""
 
+import gc
 import json
 import logging
 import os
@@ -112,6 +113,10 @@ class Dispatcher:
             logger.info("Tier 1: %s (%.1fs, %d ch: %s)",
                         os.path.basename(new_file.path), t1_elapsed,
                         chunk.num_channels, sess_cfg.channel_names[:chunk.num_channels])
+
+            # Free the large signal array before MATLAB runs
+            del chunk
+            gc.collect()
 
             # Stim QC
             stim_results = analyze_stim_report(new_file.path)

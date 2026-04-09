@@ -226,6 +226,14 @@ def main():
             logger.error("Main loop error: %s", e, exc_info=True)
             time.sleep(poll_interval)
 
+    # Cleanup: kill any orphaned MATLAB subprocesses
+    logger.info("Cleaning up MATLAB subprocesses...")
+    try:
+        import subprocess
+        subprocess.run(["taskkill", "/F", "/IM", "MATLAB.exe"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
     logger.info("QC Monitor stopped")
 
 
