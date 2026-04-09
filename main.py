@@ -142,6 +142,7 @@ def main():
     # Main loop
     last_health_time = 0
     consecutive_network_failures = 0
+    files_since_scan = 10  # force initial scan
 
     logger.info("Entering main watch loop (poll every %ds)...", poll_interval)
 
@@ -171,21 +172,22 @@ def main():
                     time.sleep(backoff)
                     continue
 
-            # Scan for new files and register them in DB
-            new_files = watcher.scan(known_paths)
-            if new_files:
-                new_files.sort(key=lambda f: f.chunk_datetime)
-                for nf in new_files:
-                    known_paths.add(nf.path)
-                    store.register_file(
-                        file_path=nf.path, file_size=nf.size, file_mtime=nf.mtime,
-                        session_dir=nf.session_dir, session_name=nf.session_name,
-                        chunk_datetime=nf.chunk_datetime,
-                    )
-                logger.info("Registered %d new files", len(new_files))
+            # Scan for new files every 10 processed files or when queue is empty
+            if files_since_scan >= 10 or not store.get_pending_files(limit=1):
+                new_files = watcher.scan(known_paths)
+                if new_files:
+                    new_files.sort(key=lambda f: f.chunk_datetime)
+                    for nf in new_files:
+                        known_paths.add(nf.path)
+                        store.register_file(
+                            file_path=nf.path, file_size=nf.size, file_mtime=nf.mtime,
+                            session_dir=nf.session_dir, session_name=nf.session_name,
+                            chunk_datetime=nf.chunk_datetime,
+                        )
+                    logger.info("Registered %d new files", len(new_files))
+                files_since_scan = 0
 
-            # Process ONE pending file per loop iteration
-            # This way the watcher rescans between files and picks up new arrivals
+            # Process pending files in batch (up to 10), then rescan
             pending = store.get_pending_files(limit=1)
             if pending:
                 pf = pending[0]
@@ -201,6 +203,7 @@ def main():
                     chunk_datetime=pf.get("chunk_datetime", ""),
                 )
                 dispatcher.process_file(nf, version_id=version_id)
+                files_since_scan += 1
             else:
                 # Nothing to process — sleep until next poll
                 time.sleep(poll_interval)
