@@ -362,6 +362,16 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
             return;
         end
 
+        % Cap candidates to prevent hanging on noisy signals with no stim
+        % At 0.5 Hz for 1 hour = 1800 stimuli. Allow 5x margin = 9000 max.
+        MAX_CANDIDATES = 9000;
+        if length(candidates) > MAX_CANDIDATES
+            fprintf('[STIM DETECT] Too many candidates (%d > %d) — likely noise, no stimulation\n', ...
+                length(candidates), MAX_CANDIDATES);
+            stimulusIndices = [];
+            return;
+        end
+
         alignedIndices = zeros(length(candidates), 1);
         peakAmplitudes = zeros(length(candidates), 1);
 

@@ -146,7 +146,7 @@ class Dispatcher:
                 matlab_exe = self.config.get("matlab_exe", "matlab")
                 result = matlab_run_pipeline(
                     new_file.path, matlab_exe=matlab_exe,
-                    timeout=600, config=matlab_config
+                    timeout=300, config=matlab_config
                 )
                 t2_elapsed = time.time() - t2_start
 
