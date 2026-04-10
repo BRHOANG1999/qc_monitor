@@ -56,9 +56,14 @@ class Dispatcher:
                                     f"Starting: {os.path.basename(new_file.path)}",
                                     file_id=file_id, file_path=new_file.path)
 
-            # --- Tier 1: Python QC (channel-aware) ---
+            # --- Tier 1: Python QC (channel-aware) with per-step timing ---
             t1_start = time.time()
+            timings = {}
+
+            t = time.time()
             chunk = load_mat(new_file.path)
+            timings["load"] = time.time() - t
+
             self.store.update_file_status(file_id, "processing",
                                           num_channels=chunk.num_channels,
                                           num_samples=chunk.num_samples,
@@ -68,14 +73,19 @@ class Dispatcher:
             qc_cfg = self.config.get("qc_thresholds", {})
             art_cfg = self.config.get("artifact", {})
 
+            t = time.time()
             basic_results = analyze_basic_qc(
                 chunk,
                 clipping_voltage=qc_cfg.get("clipping_voltage", 10.0),
                 flatline_std_threshold=qc_cfg.get("flatline_std", 1e-6),
             )
+            timings["basic_qc"] = time.time() - t
 
+            t = time.time()
             spectral_results = analyze_spectral(chunk, line_noise_freq=60.0)
+            timings["spectral"] = time.time() - t
 
+            t = time.time()
             artifact_results = analyze_artifact(
                 chunk,
                 method=art_cfg.get("method", "fixed"),
@@ -83,8 +93,9 @@ class Dispatcher:
                 mad_k=art_cfg.get("mad_k", 4.0),
                 merge_gap_sec=art_cfg.get("merge_gap_sec", 2.0),
             )
+            timings["artifact"] = time.time() - t
 
-            # Store per-channel with names and roles
+            t = time.time()
             for ch in range(chunk.num_channels):
                 metrics = {}
                 if ch < len(basic_results):
@@ -94,25 +105,29 @@ class Dispatcher:
                 if ch < len(artifact_results):
                     metrics.update(artifact_results[ch])
 
-                # Channel name and role from auto-discovery
                 ch_name = sess_cfg.channel_names[ch] if ch < len(sess_cfg.channel_names) else f"Ch{ch}"
                 ch_role = "unknown"
                 if ch in sess_cfg.eeg_channels:
                     ch_role = "eeg"
                 elif ch in sess_cfg.stim_copy_channels:
                     ch_role = "stim_copy"
-                elif ch in sess_cfg.reference_channels:
-                    ch_role = "reference"
 
                 self.store.insert_chunk_qc(file_id, ch, metrics,
                                            channel_name=ch_name,
                                            channel_role=ch_role,
                                            version_id=version_id)
+            timings["db_store"] = time.time() - t
 
             t1_elapsed = time.time() - t1_start
-            logger.info("Tier 1: %s (%.1fs, %d ch: %s)",
-                        os.path.basename(new_file.path), t1_elapsed,
-                        chunk.num_channels, sess_cfg.channel_names[:chunk.num_channels])
+            timing_str = " | ".join(f"{k}={v:.1f}s" for k, v in timings.items())
+            logger.info("Tier 1: %s (%.1fs: %s)",
+                        os.path.basename(new_file.path), t1_elapsed, timing_str)
+
+            # Log detailed timings to activity log
+            self.store.log_activity("INFO", "TIER1_TIMING",
+                                    f"{os.path.basename(new_file.path)} — {timing_str}",
+                                    file_id=file_id, file_path=new_file.path,
+                                    duration_sec=t1_elapsed)
 
             # Free the large signal array before MATLAB runs
             del chunk
@@ -151,9 +166,21 @@ class Dispatcher:
                 t2_elapsed = time.time() - t2_start
 
                 exit_status = result.get("exit_status", "unknown")
-                logger.info("Tier 2: %s (%.1fs): %s, %d stimuli, %d traces",
-                            os.path.basename(new_file.path), t2_elapsed, exit_status,
-                            result.get("num_stimuli", 0), result.get("num_traces", 0))
+                matlab_dur = result.get("pipeline_duration_sec", t2_elapsed)
+                n_stim = result.get("num_stimuli", 0)
+                n_traces = result.get("num_traces", 0)
+                n_feat = result.get("num_features", 0)
+                logger.info("Tier 2: %s (%.1fs, MATLAB=%.1fs): %s, %d stimuli, %d traces, %d features",
+                            os.path.basename(new_file.path), t2_elapsed, matlab_dur,
+                            exit_status, n_stim, n_traces, n_feat)
+
+                self.store.log_activity("INFO", "TIER2_TIMING",
+                                        f"{os.path.basename(new_file.path)} — "
+                                        f"total={t2_elapsed:.1f}s, matlab={matlab_dur:.1f}s, "
+                                        f"stim={n_stim}, traces={n_traces}, feat={n_feat}, "
+                                        f"status={exit_status}",
+                                        file_id=file_id, file_path=new_file.path,
+                                        duration_sec=t2_elapsed)
 
                 # Store MATLAB results
                 self.store.insert_matlab_result(file_id, result, version_id=version_id)
