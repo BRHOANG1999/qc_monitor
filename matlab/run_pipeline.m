@@ -222,19 +222,22 @@ function run_pipeline(input_file, output_json, config_json)
             end
         end
 
-        % --- Step 5: Criticality ---
+        % --- Step 5: Criticality (skip if no stimuli detected — noise-only file) ---
         result.criticality = struct();
         result.criticality.time_points = [];
         result.criticality.db_values = [];
         result.criticality.db_stds = [];
         result.criticality.sigmas = [];
 
-        try
-            primary_lfp = lfp_channels(1);
-            eeg_signal = sbuf(:, primary_lfp);
-            result.criticality_channel = primary_lfp;
-            analyzer = CriticalityAnalyzer([]);
-            crit = analyzer.analyzeCriticalityFromEEG(eeg_signal, fs, crit_win, crit_overlap);
+        if result.evoked_success && result.num_traces > 0
+            fprintf('[PIPELINE] Running criticality analysis...\n');
+            t_crit = tic;
+            try
+                primary_lfp = lfp_channels(1);
+                eeg_signal = sbuf(:, primary_lfp);
+                result.criticality_channel = primary_lfp;
+                analyzer = CriticalityAnalyzer([]);
+                crit = analyzer.analyzeCriticalityFromEEG(eeg_signal, fs, crit_win, crit_overlap);
 
             if isfield(crit, 'criticalityDB')
                 result.criticality.time_points = crit.timePoints(:)';
@@ -250,10 +253,14 @@ function run_pipeline(input_file, output_json, config_json)
                 result.criticality_std = std(valid_db);
                 fprintf('[PIPELINE] Criticality: %d/%d valid\n', length(valid_db), length(crit.criticalityDB));
             end
-        catch e
-            fprintf('[PIPELINE] Criticality failed: %s\n', e.message);
-            result.criticality_mean = NaN;
-            result.criticality_std = NaN;
+            catch e
+                fprintf('[PIPELINE] Criticality failed: %s\n', e.message);
+                result.criticality_mean = NaN;
+                result.criticality_std = NaN;
+            end
+            fprintf('[PIPELINE] Criticality took %.1f sec\n', toc(t_crit));
+        else
+            fprintf('[PIPELINE] Skipping criticality (no stimuli detected)\n');
         end
 
         % --- Step 6: LFP summary ---

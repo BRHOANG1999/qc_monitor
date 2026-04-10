@@ -86,13 +86,29 @@ class Dispatcher:
             timings["spectral"] = time.time() - t
 
             t = time.time()
-            artifact_results = analyze_artifact(
-                chunk,
+            # Only run artifact detection on LFP channels (skip stimCopy — saves ~30s)
+            from src.utils.mat_loader import ChunkData
+            import numpy as np
+            lfp_only_signal = chunk.signal[:, sess_cfg.eeg_channels] if sess_cfg.eeg_channels else chunk.signal
+            lfp_chunk = ChunkData(
+                signal=lfp_only_signal, fs=chunk.fs,
+                num_channels=lfp_only_signal.shape[1],
+                num_samples=chunk.num_samples,
+                duration_sec=chunk.duration_sec,
+                source_path=chunk.source_path,
+            )
+            lfp_artifact = analyze_artifact(
+                lfp_chunk,
                 method=art_cfg.get("method", "fixed"),
                 threshold=art_cfg.get("fixed_threshold", 500.0),
                 mad_k=art_cfg.get("mad_k", 4.0),
                 merge_gap_sec=art_cfg.get("merge_gap_sec", 2.0),
             )
+            # Map back: stimCopy channels get 0% artifact, LFP channels get real values
+            artifact_results = [{"artifact_pct": 0.0}] * chunk.num_channels
+            for li, ch_idx in enumerate(sess_cfg.eeg_channels):
+                if li < len(lfp_artifact) and ch_idx < chunk.num_channels:
+                    artifact_results[ch_idx] = lfp_artifact[li]
             timings["artifact"] = time.time() - t
 
             t = time.time()
