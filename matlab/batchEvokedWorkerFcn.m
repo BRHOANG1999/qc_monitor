@@ -350,6 +350,24 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
     try
         stimMean = mean(stimChannel);
         stimStd = std(stimChannel);
+
+        % Check if stim channel has any real stimulus artifact
+        % Real biphasic pulses have peak-to-peak >> noise floor
+        % If the stim channel looks like flat noise, skip detection
+        stimP2P = max(stimChannel) - min(stimChannel);
+        stimMAD = median(abs(stimChannel - stimMean));
+        if stimMAD > 0
+            stimPeakRatio = stimP2P / (stimMAD * 1.4826);  % p2p / estimated std
+        else
+            stimPeakRatio = 0;
+        end
+
+        if stimPeakRatio < 10
+            % No clear stimulus artifact — stim channel is just noise
+            fprintf('[STIM DETECT] No stimulus artifact found (p2p/noise = %.1f < 10)\n', stimPeakRatio);
+            return;
+        end
+
         threshold = stimMean + params.StimulusThreshold * stimStd;
 
         minDistanceSamples = round(params.MinStimulusDistance * samplingRate);
