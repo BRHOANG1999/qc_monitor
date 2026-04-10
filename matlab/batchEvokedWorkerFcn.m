@@ -402,6 +402,29 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
         end
 
         stimulusIndices = sort(selectedIndices(:));
+
+        % --- Validate: reject if detections look like noise, not real stimuli ---
+        if length(stimulusIndices) < 3
+            % Too few detections to be periodic stimulation
+            stimulusIndices = [];
+            return;
+        end
+
+        % Check ISI consistency: real stimulation has regular intervals
+        isis = diff(stimulusIndices) / samplingRate;  % in seconds
+        isi_cv = std(isis) / mean(isis);  % coefficient of variation
+
+        % Also check: peak amplitudes should be well above noise
+        % If median peak is < 5x the std of the stim channel, it's noise
+        medianPeak = median(peakAmplitudes(peakAmplitudes > 0));
+        snr = (medianPeak - stimMean) / stimStd;
+
+        if isi_cv > 0.5 && snr < 5
+            % Irregular timing AND low SNR = noise, not stimulation
+            fprintf('[STIM DETECT] Rejected: CV=%.2f, SNR=%.1f — likely no stimulation\n', isi_cv, snr);
+            stimulusIndices = [];
+            return;
+        end
     catch
         % Return empty if detection fails
     end
