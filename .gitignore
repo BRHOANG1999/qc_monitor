@@ -4,3 +4,4 @@ data/
 logs/
 config/email_config.yaml
 .env
+tools/nssm/
