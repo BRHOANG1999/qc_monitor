@@ -5,3 +5,7 @@ logs/
 config/email_config.yaml
 .env
 tools/nssm/
+tools/ffmpeg/
+notebooks/.ipynb_checkpoints/
+notebooks/data_cache/
+notebooks/models/
