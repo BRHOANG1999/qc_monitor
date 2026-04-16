@@ -1,0 +1,27 @@
+# ML/AI PoC dependencies — install separately from the service
+# pip install -r notebooks/requirements-ml.txt
+
+# Core data science
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+seaborn>=0.13
+jupyter>=1.0
+ipykernel>=6.29
+
+# PoC 1 — Seizure classifier
+torch>=2.2
+scikit-learn>=1.4
+
+# PoC 2 — Evoked anomaly detection
+umap-learn>=0.5
+
+# PoC 3 — Video behavior
+opencv-python>=4.9
+
+# PoC 3 — Pose estimation (optional, install if needed)
+# deeplabcut-live>=1.0
+# sleap>=1.3
+
+# PoC 4 — LLM summary + chat
+anthropic>=0.40
