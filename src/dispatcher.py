@@ -14,6 +14,7 @@ from src.analyzers.spectral import analyze_spectral
 from src.analyzers.artifact import analyze_artifact
 from src.analyzers.stim_qc import analyze_stim_report
 from src.utils.matlab_bridge import run_pipeline as matlab_run_pipeline
+from src.utils.video import video_path_for_mat
 from src.watcher import NewFile
 
 logger = logging.getLogger("qc_monitor.dispatcher")
@@ -157,8 +158,7 @@ class Dispatcher:
                     self.store.insert_stim_qc(file_id, sr["stim_channel"], sr)
 
             # Video check
-            video_path = new_file.path.rsplit(".", 1)[0] + "_v1.mp4"
-            if os.path.isfile(video_path):
+            if video_path_for_mat(new_file.path) is not None:
                 self.store.update_file_status(file_id, "processing", has_video=1)
 
             # --- Tier 2: MATLAB Pipeline (channel-aware, configurable) ---

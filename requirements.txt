@@ -1,0 +1,9 @@
+dash>=2.14
+plotly>=5.18
+flask>=2.3
+pyjwt[crypto]>=2.8
+cryptography>=41
+psutil>=5.9
+pyyaml>=6.0
+numpy>=1.24
+scipy>=1.11

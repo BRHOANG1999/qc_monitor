@@ -16,6 +16,9 @@ from plotly.subplots import make_subplots
 
 from src.db.store import Store
 from src.utils.mat_loader import load_mat
+from src.dashboard.auth import register_auth, current_user_email
+from src.dashboard.media_routes import register_media_routes
+from src.dashboard.tabs import video as tabs_video
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -218,11 +221,18 @@ def create_app(config: dict, store: Store) -> Dash:
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
                assets_folder=assets_dir)
 
+    # Identity gate (Cloudflare Access JWT) + media-streaming routes both
+    # attach to the underlying Flask server.
+    register_auth(app.server, store, config)
+    register_media_routes(app.server, store, config)
+
     app.layout = html.Div([
         # Header
         html.Div([
             html.H1("QC Monitor", style={"margin": "0", "fontSize": "18px", "fontWeight": "600",
-                                          "letterSpacing": "1px"}),
+                                          "letterSpacing": "1px", "display": "inline-block"}),
+            html.Span(id="logged-in-as",
+                      style={"marginLeft": "16px", "color": "#888", "fontSize": "12px"}),
         ], id="app-header",
            style={"padding": "10px 24px",
                   "background": "linear-gradient(135deg, #0d0d2b 0%, #1a1035 50%, #0d1a2e 100%)",
@@ -243,6 +253,8 @@ def create_app(config: dict, store: Store) -> Dash:
             dcc.Tab(label="Criticality", value="criticality",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="LFP Browser", value="lfp",
+                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
+            dcc.Tab(label="Video Review", value="video",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Electrode Health", value="electrode_health",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
@@ -346,6 +358,8 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _criticality_tab_layout(store)
             elif tab == "lfp":
                 return _lfp_browser_tab_layout(store)
+            elif tab == "video":
+                return tabs_video.layout(store)
             elif tab == "electrode_health":
                 return _electrode_health_tab_layout(store)
             elif tab == "session_compare":
@@ -989,6 +1003,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 note=note.strip(),
                 category=category or "observation",
                 session_dir=session_dir or None,
+                user_email=current_user_email(),
             )
             all_ann = store.get_annotations()
             table_data = _annotations_table_data(all_ann)
@@ -1326,6 +1341,24 @@ def create_app(config: dict, store: Store) -> Dash:
                             style={"color": "#FFA15A", "marginTop": "10px"})
         except Exception as e:
             return html.Div(f"Error: {e}", style={"color": "#EF553B", "marginTop": "10px"})
+
+    # ------------------------------------------------------------------ #
+    #  Logged-in indicator in the header
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("logged-in-as", "children"),
+        Input("tabs", "value"),
+    )
+    def show_user(_tab):
+        email = current_user_email()
+        if not email:
+            return ""
+        return f"signed in as {email}"
+
+    # ------------------------------------------------------------------ #
+    #  Video Review tab callbacks (modular)
+    # ------------------------------------------------------------------ #
+    tabs_video.register_callbacks(app, store, config)
 
     return app
 
@@ -2425,6 +2458,7 @@ def _annotations_tab_layout(store: Store):
                 {"name": "Category", "id": "category"},
                 {"name": "Note", "id": "note"},
                 {"name": "Session", "id": "session_dir"},
+                {"name": "User", "id": "user"},
                 {"name": "Created At", "id": "created_at"},
             ],
             **DARK_TABLE_STYLE,
@@ -2510,6 +2544,7 @@ def _annotations_table_data(annotations: list[dict]) -> list[dict]:
             "category": a.get("category", ""),
             "note": a.get("note", ""),
             "session_dir": os.path.basename(a.get("session_dir") or ""),
+            "user": a.get("user_email", "") or "",
             "created_at": (a.get("created_at") or "")[:19],
         }
         for a in annotations

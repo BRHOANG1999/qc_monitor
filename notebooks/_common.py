@@ -19,6 +19,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.utils.mat_loader import load_mat, ChunkData  # noqa: E402
+from src.utils.video import video_path_for_mat as _video_path_for_mat  # noqa: E402
 from src.db.schema import SCHEMA_SQL  # noqa: E402
 
 # Default paths — override in notebooks if needed
@@ -143,17 +144,9 @@ def load_lfp_window(
 #  Video helpers
 # ------------------------------------------------------------------ #
 
-def video_path_for_mat(mat_path: str) -> str | None:
-    """Derive the companion video path from a .mat file path.
-
-    Returns the path if the file exists, None otherwise.
-    Convention: sessionname___YYYY_MM_DD__HH_MM_SS_v1.mp4
-    """
-    assert isinstance(mat_path, str), "mat_path must be a string"
-    video_path = mat_path.rsplit(".", 1)[0] + "_v1.mp4"
-    if os.path.isfile(video_path):
-        return video_path
-    return None
+# Re-export the canonical helper from src.utils.video so notebook callers
+# keep working without importing the production module directly.
+video_path_for_mat = _video_path_for_mat
 
 
 def load_video_frames(

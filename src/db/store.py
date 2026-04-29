@@ -24,6 +24,13 @@ class Store:
     def _init_db(self):
         conn = self._connect()
         conn.executescript(SCHEMA_SQL)
+        # Idempotent forward-compat migrations: add columns to old DBs
+        # that pre-date the audit-trail work.
+        existing_ann_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(annotations)")
+        }
+        if "user_email" not in existing_ann_cols:
+            conn.execute("ALTER TABLE annotations ADD COLUMN user_email TEXT")
         conn.commit()
         conn.close()
 
@@ -1098,14 +1105,17 @@ class Store:
     def add_annotation(self, timestamp: str, note: str,
                        category: str = "observation",
                        session_dir: str | None = None,
-                       file_id: int | None = None) -> int:
+                       file_id: int | None = None,
+                       user_email: str | None = None) -> int:
         """Insert a user annotation / note and return its id."""
+        assert isinstance(timestamp, str), "timestamp must be a string"
+        assert isinstance(note, str) and note.strip(), "note must be a non-empty string"
         conn = self._connect()
         try:
             cursor = conn.execute(
                 """INSERT INTO annotations
-                   (timestamp, created_at, session_dir, file_id, note, category)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (timestamp, created_at, session_dir, file_id, note, category, user_email)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     timestamp,
                     datetime.now().isoformat(),
@@ -1113,6 +1123,7 @@ class Store:
                     file_id,
                     note,
                     category,
+                    user_email,
                 ),
             )
             conn.commit()
@@ -1154,6 +1165,59 @@ class Store:
         conn = self._connect()
         try:
             conn.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  users (identity supplied by Cloudflare Access)
+    # ------------------------------------------------------------------ #
+
+    def upsert_user(self, email: str, display_name: str | None = None) -> int:
+        """Record/refresh a user; called from the auth hook on every request.
+
+        Returns the user's row id. Updates last_seen_at on every call so the
+        Users table doubles as an activity ledger.
+        """
+        assert isinstance(email, str) and "@" in email, "valid email required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """INSERT INTO users (email, display_name, role, first_seen_at, last_seen_at)
+                   VALUES (?, ?, 'reviewer', ?, ?)
+                   ON CONFLICT(email) DO UPDATE SET
+                       last_seen_at = excluded.last_seen_at,
+                       display_name = COALESCE(users.display_name, excluded.display_name)""",
+                (email, display_name, now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT id FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            return row["id"] if row else cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_user_role(self, email: str) -> str:
+        """Return the user's role ('mentor' or 'reviewer'); 'reviewer' if unknown."""
+        if not email:
+            return "reviewer"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT role FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            return (row["role"] if row else "reviewer") or "reviewer"
+        finally:
+            conn.close()
+
+    def set_user_role(self, email: str, role: str):
+        """Promote/demote a user. Only used by an out-of-band admin action."""
+        assert role in ("mentor", "reviewer"), "role must be 'mentor' or 'reviewer'"
+        conn = self._connect()
+        try:
+            conn.execute("UPDATE users SET role = ? WHERE email = ?", (role, email))
             conn.commit()
         finally:
             conn.close()

@@ -284,4 +284,16 @@ CREATE TABLE IF NOT EXISTS system_health (
     queue_depth INTEGER,
     files_processed_last_hour INTEGER
 );
+
+-- Authenticated users (identity comes from Cloudflare Access)
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    display_name TEXT,
+    role TEXT DEFAULT 'reviewer',  -- 'mentor' | 'reviewer'
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 """

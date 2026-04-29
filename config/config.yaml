@@ -131,6 +131,16 @@ dashboard:
   host: 0.0.0.0
   port: 8050
   refresh_interval_sec: 10
+auth:
+  # Identity gate for the dashboard. Cloudflare Access sits in front of
+  # the Cloudflare Tunnel and performs SSO; this app verifies the JWT
+  # Cloudflare injects so that only authenticated users can read or
+  # write data. See docs/REMOTE_ACCESS.md for the operator runbook.
+  enabled: true
+  cf_team_domain: ''                 # e.g. yourteam.cloudflareaccess.com (required in prod)
+  cf_audience: ''                    # AUD tag from the Access app (required in prod)
+  dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
+  dev_bypass_email: hoang392@umn.edu
 database:
   path: D:/code/qc_monitor/data/monitor.db
 logging:
