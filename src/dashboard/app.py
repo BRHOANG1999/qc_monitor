@@ -52,8 +52,62 @@ EVOKED_FEATURE_LABELS = {
     "is_ictal": "Is Ictal", "epoch_time_sec": "Epoch Time (sec)",
 }
 
-# Channel role colors
-ROLE_COLORS = {"eeg": "#636EFA", "stim_copy": "#888888", "reference": "#00CC96"}
+# --------------------------------------------------------------------- #
+#  Design tokens (Apple HIG-inspired)
+#
+#  Semantic colors first, raw hex values second. Every component below
+#  references these tokens so the whole app re-skins from one place.
+# --------------------------------------------------------------------- #
+
+# Surfaces — flat layers, darker in front
+COLOR_SURFACE_0 = "#0a0a14"   # page background (deepest)
+COLOR_SURFACE_1 = "#13131f"   # primary card / section background
+COLOR_SURFACE_2 = "#1c1c2c"   # elevated card / hover state
+COLOR_SURFACE_3 = "#262638"   # input field background
+
+# Text — three-step ramp; nothing pure white (easier on the eyes)
+COLOR_TEXT_PRIMARY = "#f0f0f5"
+COLOR_TEXT_SECONDARY = "#a0a0b0"
+COLOR_TEXT_TERTIARY = "#6c6c80"
+
+# Hairline divider — softer than #333; honors the "deference" principle
+COLOR_DIVIDER = "rgba(255,255,255,0.07)"
+
+# Semantic accents — only four meanings, used consistently
+COLOR_ACCENT = "#5e7ce2"      # interactive: buttons, focus, selected
+COLOR_SUCCESS = "#30d158"     # ok / confirmed (Apple's systemGreen)
+COLOR_WARNING = "#ff9f0a"     # warning (Apple's systemOrange)
+COLOR_DANGER = "#ff453a"      # error / critical (Apple's systemRed)
+
+# Channel role uses the accent + a neutral so plots stay quiet
+ROLE_COLORS = {
+    "eeg": COLOR_ACCENT,
+    "stim_copy": COLOR_TEXT_TERTIARY,
+    "reference": COLOR_SUCCESS,
+}
+
+# Typography — SF first, then Windows variable fonts, then web-safe.
+FONT_STACK = ('-apple-system, BlinkMacSystemFont, "SF Pro Text", '
+              '"Segoe UI Variable", "Segoe UI", "Helvetica Neue", '
+              "Helvetica, Arial, sans-serif")
+
+# Type ramp (px). Resist the urge to invent more steps.
+FONT_SIZE_TITLE = "22px"
+FONT_SIZE_HEADER = "15px"
+FONT_SIZE_BODY = "13px"
+FONT_SIZE_CAPTION = "11px"
+
+# Spacing scale — multiples of 4. Generous because deference > density.
+SPACE_1 = "4px"
+SPACE_2 = "8px"
+SPACE_3 = "12px"
+SPACE_4 = "16px"
+SPACE_5 = "24px"
+SPACE_6 = "32px"
+
+# Corner radius — one value, used everywhere.
+RADIUS_SM = "6px"
+RADIUS_MD = "10px"
 
 # Config file path
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "config.yaml")
@@ -68,49 +122,100 @@ TIME_RANGE_OPTIONS = [
     {"label": "All time", "value": 0},
 ]
 
-# Dark card style
+# --------------------------------------------------------------------- #
+#  Component styles built from tokens
+# --------------------------------------------------------------------- #
+
 CARD_STYLE = {
-    "borderRadius": "10px",
-    "padding": "15px 20px",
+    "borderRadius": RADIUS_MD,
+    "padding": f"{SPACE_4} {SPACE_5}",
     "minWidth": "130px",
     "textAlign": "center",
-    "border": "1px solid rgba(255,255,255,0.06)",
-    "background": "linear-gradient(180deg, #1e1e2f 0%, #181828 100%)",
-    "boxShadow": "0 2px 8px rgba(0,0,0,0.3)",
-    "transition": "transform 0.15s, box-shadow 0.15s",
+    "background": COLOR_SURFACE_1,
+    "border": f"1px solid {COLOR_DIVIDER}",
+    "transition": "transform 0.15s ease, background 0.15s ease",
 }
 
-TAB_STYLE = {"backgroundColor": "#0d0d1a", "color": "#777", "padding": "10px 20px",
-             "border": "1px solid #222", "borderBottom": "none",
-             "borderRadius": "6px 6px 0 0", "fontSize": "13px"}
-TAB_SELECTED_STYLE = {"backgroundColor": "#1a1a2e", "color": "white", "padding": "10px 20px",
-                      "border": "1px solid #444", "borderBottom": "2px solid #636EFA",
-                      "borderRadius": "6px 6px 0 0", "fontWeight": "bold", "fontSize": "13px",
-                      "boxShadow": "0 2px 8px rgba(99,110,250,0.15)"}
+TAB_STYLE = {
+    "backgroundColor": "transparent",
+    "color": COLOR_TEXT_TERTIARY,
+    "padding": f"{SPACE_3} {SPACE_4}",
+    "border": "none",
+    "borderBottom": "2px solid transparent",
+    "borderRadius": "0",
+    "fontSize": FONT_SIZE_BODY,
+    "fontWeight": "500",
+    "letterSpacing": "0.1px",
+}
+TAB_SELECTED_STYLE = {
+    **TAB_STYLE,
+    "color": COLOR_TEXT_PRIMARY,
+    "borderBottom": f"2px solid {COLOR_ACCENT}",
+    "fontWeight": "600",
+}
 
 DARK_TABLE_STYLE = {
-    "style_header": {"backgroundColor": "#16162a", "color": "white", "fontWeight": "bold",
-                     "border": "1px solid #333", "fontSize": "12px"},
-    "style_data": {"backgroundColor": "#0f0f1a", "color": "#ccc", "border": "1px solid #222",
-                   "fontSize": "12px"},
-    "style_cell": {"textAlign": "left", "padding": "8px 12px", "fontSize": "12px"},
-    "style_filter": {"backgroundColor": "#16162a", "color": "white"},
+    "style_header": {
+        "backgroundColor": COLOR_SURFACE_2,
+        "color": COLOR_TEXT_PRIMARY,
+        "fontWeight": "600",
+        "border": "none",
+        "borderBottom": f"1px solid {COLOR_DIVIDER}",
+        "fontSize": FONT_SIZE_CAPTION,
+        "textTransform": "uppercase",
+        "letterSpacing": "0.5px",
+    },
+    "style_data": {
+        "backgroundColor": COLOR_SURFACE_1,
+        "color": COLOR_TEXT_SECONDARY,
+        "border": "none",
+        "borderBottom": f"1px solid {COLOR_DIVIDER}",
+        "fontSize": FONT_SIZE_BODY,
+    },
+    "style_cell": {
+        "textAlign": "left",
+        "padding": f"{SPACE_3} {SPACE_4}",
+        "fontSize": FONT_SIZE_BODY,
+        "fontFamily": FONT_STACK,
+    },
+    "style_filter": {
+        "backgroundColor": COLOR_SURFACE_2,
+        "color": COLOR_TEXT_PRIMARY,
+    },
 }
 
-# Zebra stripe base — merge with table-specific conditional styles
-ZEBRA_STRIPE = {"if": {"row_index": "odd"}, "backgroundColor": "#141425"}
+# Zebra stripe — very subtle, just a lighter surface.
+ZEBRA_STRIPE = {"if": {"row_index": "odd"}, "backgroundColor": COLOR_SURFACE_2}
 
-SECTION_STYLE = {"background": "linear-gradient(180deg, #1e1e2f 0%, #181828 100%)",
-                 "padding": "16px 20px", "borderRadius": "10px",
-                 "border": "1px solid #2a2a3e", "marginBottom": "16px",
-                 "boxShadow": "0 1px 6px rgba(0,0,0,0.3)"}
-LABEL_STYLE = {"color": "#888", "fontSize": "11px", "marginBottom": "3px", "display": "block",
-               "letterSpacing": "0.3px"}
-INPUT_STYLE = {"backgroundColor": "#0f0f1a", "color": "white", "border": "1px solid #333",
-               "borderRadius": "6px", "padding": "6px 10px", "width": "100%",
-               "transition": "border-color 0.2s, box-shadow 0.2s"}
-FIELD_STYLE = {"flex": "1", "minWidth": "180px"}
-DROPDOWN_STYLE = {"backgroundColor": "#1e1e2f", "color": "white"}
+SECTION_STYLE = {
+    "background": COLOR_SURFACE_1,
+    "padding": f"{SPACE_5} {SPACE_5}",
+    "borderRadius": RADIUS_MD,
+    "border": f"1px solid {COLOR_DIVIDER}",
+    "marginBottom": SPACE_4,
+}
+LABEL_STYLE = {
+    "color": COLOR_TEXT_TERTIARY,
+    "fontSize": FONT_SIZE_CAPTION,
+    "marginBottom": SPACE_2,
+    "display": "block",
+    "letterSpacing": "0.4px",
+    "textTransform": "uppercase",
+    "fontWeight": "600",
+}
+INPUT_STYLE = {
+    "backgroundColor": COLOR_SURFACE_3,
+    "color": COLOR_TEXT_PRIMARY,
+    "border": f"1px solid {COLOR_DIVIDER}",
+    "borderRadius": RADIUS_SM,
+    "padding": f"{SPACE_2} {SPACE_3}",
+    "width": "100%",
+    "fontSize": FONT_SIZE_BODY,
+    "fontFamily": FONT_STACK,
+    "transition": "border-color 0.15s ease, box-shadow 0.15s ease",
+}
+FIELD_STYLE = {"flex": "1", "minWidth": "200px"}
+DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMARY}
 
 # ====================================================================== #
 #  Helpers
@@ -227,18 +332,22 @@ def create_app(config: dict, store: Store) -> Dash:
     register_media_routes(app.server, store, config)
 
     app.layout = html.Div([
-        # Header
+        # Header — quiet chrome, content-first.
         html.Div([
-            html.H1("QC Monitor", style={"margin": "0", "fontSize": "18px", "fontWeight": "600",
-                                          "letterSpacing": "1px", "display": "inline-block"}),
+            html.H1("QC Monitor",
+                    style={"margin": "0", "fontSize": FONT_SIZE_TITLE,
+                           "fontWeight": "600", "letterSpacing": "-0.2px",
+                           "display": "inline-block",
+                           "color": COLOR_TEXT_PRIMARY}),
             html.Span(id="logged-in-as",
-                      style={"marginLeft": "16px", "color": "#888", "fontSize": "12px"}),
+                      style={"marginLeft": SPACE_4,
+                             "color": COLOR_TEXT_TERTIARY,
+                             "fontSize": FONT_SIZE_CAPTION,
+                             "letterSpacing": "0.2px"}),
         ], id="app-header",
-           style={"padding": "10px 24px",
-                  "background": "linear-gradient(135deg, #0d0d2b 0%, #1a1035 50%, #0d1a2e 100%)",
-                  "color": "white",
-                  "borderBottom": "1px solid rgba(99,110,250,0.3)",
-                  "boxShadow": "0 2px 12px rgba(0,0,0,0.5)"}),
+           style={"padding": f"{SPACE_4} {SPACE_6}",
+                  "background": COLOR_SURFACE_0,
+                  "borderBottom": f"1px solid {COLOR_DIVIDER}"}),
 
         # Tabs — ordered as specified
         dcc.Tabs(id="tabs", value="overview", children=[
@@ -272,37 +381,55 @@ def create_app(config: dict, store: Store) -> Dash:
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
             dcc.Tab(label="Sessions", value="sessions",
                     style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-        ], style={"borderBottom": "none"}),
+        ], style={"borderBottom": f"1px solid {COLOR_DIVIDER}",
+                  "padding": f"0 {SPACE_5}",
+                  "backgroundColor": COLOR_SURFACE_0}),
 
-        html.Div(id="tab-content", style={"padding": "24px", "backgroundColor": "#0f0f1a",
-                                           "minHeight": "80vh"}),
+        html.Div(id="tab-content",
+                 style={"padding": f"{SPACE_6} {SPACE_5}",
+                        "backgroundColor": COLOR_SURFACE_0,
+                        "minHeight": "80vh"}),
 
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
                      disabled=True),  # auto-refresh OFF by default
         html.Div([
             html.Button("Refresh", id="manual-refresh-btn",
-                        style={"backgroundColor": "#333", "color": "white", "border": "1px solid #555",
-                               "borderRadius": "4px", "padding": "4px 12px", "cursor": "pointer",
-                               "marginRight": "8px"}),
+                        style={"backgroundColor": COLOR_SURFACE_2,
+                               "color": COLOR_TEXT_PRIMARY,
+                               "border": f"1px solid {COLOR_DIVIDER}",
+                               "borderRadius": RADIUS_SM,
+                               "padding": f"{SPACE_1} {SPACE_3}",
+                               "cursor": "pointer",
+                               "marginRight": SPACE_2,
+                               "fontSize": FONT_SIZE_CAPTION,
+                               "fontFamily": FONT_STACK}),
             html.Span(id="last-refresh-label",
-                      style={"color": "#555", "fontSize": "11px", "marginRight": "10px"}),
+                      style={"color": COLOR_TEXT_TERTIARY,
+                             "fontSize": FONT_SIZE_CAPTION,
+                             "marginRight": SPACE_3}),
             dcc.Checklist(id="auto-refresh-toggle",
                           options=[{"label": " Auto-refresh", "value": True}],
                           value=[], inline=True,
-                          style={"color": "#888", "display": "inline-block", "fontSize": "12px"}),
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "display": "inline-block",
+                                 "fontSize": FONT_SIZE_CAPTION}),
         ], id="refresh-bar",
-           style={"position": "fixed", "top": "6px", "right": "20px", "zIndex": "9999",
+           style={"position": "fixed", "top": SPACE_2, "right": SPACE_5, "zIndex": "9999",
                   "display": "flex", "alignItems": "center",
-                  "background": "rgba(15,15,26,0.85)", "backdropFilter": "blur(8px)",
-                  "padding": "4px 12px", "borderRadius": "8px",
-                  "border": "1px solid rgba(255,255,255,0.06)"}),
+                  "background": "rgba(19,19,31,0.85)", "backdropFilter": "blur(12px)",
+                  "padding": f"{SPACE_1} {SPACE_3}", "borderRadius": RADIUS_SM,
+                  "border": f"1px solid {COLOR_DIVIDER}"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
-    ], style={"backgroundColor": "#0f0f1a", "fontFamily": "'Segoe UI', -apple-system, sans-serif",
-              "color": "#ddd", "minHeight": "100vh"})
+    ], style={"backgroundColor": COLOR_SURFACE_0,
+              "fontFamily": FONT_STACK,
+              "color": COLOR_TEXT_PRIMARY,
+              "minHeight": "100vh",
+              "fontSize": FONT_SIZE_BODY,
+              "letterSpacing": "0.1px"})
 
     # ------------------------------------------------------------------ #
     #  Refresh controls
