@@ -105,6 +105,48 @@ def _file_path_for_id(store: Store, file_id: int) -> str | None:
         conn.close()
 
 
+def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
+    """Return stim onset times (sec) detected by the MATLAB pipeline.
+
+    Reads ``evoked_features.epoch_time_sec`` — each epoch corresponds
+    to one detected stim event, so this is exactly the list of onsets.
+    Returns an empty array for files that haven't been MATLAB-processed.
+    """
+    conn = store._connect()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT epoch_time_sec
+               FROM evoked_features
+               WHERE file_id = ? AND epoch_time_sec IS NOT NULL
+               ORDER BY epoch_time_sec""",
+            (file_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return np.asarray([r["epoch_time_sec"] for r in rows], dtype=np.float64)
+
+
+def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
+    """Return the set of channel indices flagged as stim-copy.
+
+    Stim-copy channels record the stimulator output itself; blanking
+    them out would erase the only signal worth seeing, so we leave
+    them as-is.
+    """
+    if not session_dir:
+        return set()
+    cfg = store.get_session_config(session_dir) or {}
+    raw = cfg.get("stim_copy_channels")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    if isinstance(raw, list):
+        return {int(c) for c in raw}
+    return set()
+
+
 def _session_dir_for_file(store: Store, file_id: int) -> str | None:
     conn = store._connect()
     try:
@@ -139,13 +181,19 @@ def _channel_options(store: Store, session_dir: str | None,
     return options
 
 
-def _decimated_lfp(file_path: str, channel: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _decimated_lfp(file_path: str, channel: int,
+                   stim_times: np.ndarray | None = None,
+                   blank_pre_ms: float = -5.0,
+                   blank_post_ms: float = 15.0,
+                   ) -> tuple[np.ndarray, np.ndarray, float, int]:
     """Load one channel of LFP and decimate for display.
 
-    Returns (time_sec, signal_uV, duration_sec). Uses simple stride
-    decimation — anti-aliasing isn't a clinical concern for visual
-    review here, and the alternative (scipy.signal.decimate) is much
-    slower on long files.
+    If *stim_times* is provided, samples within
+    [stim + blank_pre_ms, stim + blank_post_ms] are replaced with NaN
+    BEFORE decimation, so Plotly draws gaps where the stim artifacts
+    were. This is the "stim-blanked" display the reviewer asked for.
+
+    Returns (time_sec, signal_uV, duration_sec, n_blanked_pulses).
     """
     chunk = load_mat(file_path)
     fs = float(chunk.fs)
@@ -154,12 +202,29 @@ def _decimated_lfp(file_path: str, channel: int) -> tuple[np.ndarray, np.ndarray
         raise ValueError(
             f"Channel {channel} not in file with shape {sig.shape}"
         )
-    series = sig[:, channel]
+    series = sig[:, channel].astype(np.float32, copy=True)
+
+    n_blanked = 0
+    if stim_times is not None and len(stim_times) > 0:
+        # Convert window edges to integer sample offsets. blank_pre_ms
+        # is typically negative (e.g. -5 ms), so pre_samples is also
+        # negative — that's the start offset relative to onset.
+        pre = int(round(blank_pre_ms * 1e-3 * fs))
+        post = int(round(blank_post_ms * 1e-3 * fs))
+        n = len(series)
+        for t_sec in stim_times:
+            center = int(round(t_sec * fs))
+            lo = max(0, center + pre)
+            hi = min(n, center + post)
+            if hi > lo:
+                series[lo:hi] = np.nan
+                n_blanked += 1
+
     factor = max(1, int(round(fs / DISPLAY_SR_HZ)))
-    display = series[::factor].astype(np.float32)
+    display = series[::factor]
     t = np.arange(len(display), dtype=np.float32) * (factor / fs)
     duration = float(len(series) / fs)
-    return t, display, duration
+    return t, display, duration, n_blanked
 
 
 def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figure:
@@ -363,6 +428,9 @@ def layout(store: Store):
 # ===================================================================== #
 
 def register_callbacks(app, store: Store, config: dict) -> None:
+    fa = (config or {}).get("feature_analysis", {}) or {}
+    blank_pre_ms = float(fa.get("stim_artifact_start_ms", -5.0))
+    blank_post_ms = float(fa.get("stim_artifact_end_ms", 15.0))
     # ---- file/channel options ---- #
     @app.callback(
         Output("video-file-dropdown", "options"),
@@ -445,15 +513,41 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         file_path = _file_path_for_id(store, file_id)
         if not file_path:
             return _empty_lfp_fig("File not found in DB."), ""
+
+        # Decide whether to apply stim blanking. Only blank channels
+        # that aren't themselves the stim source — and only if there
+        # are actually detected stim events on this file.
+        session_dir = _session_dir_for_file(store, file_id)
+        stim_copy = _stim_copy_channels(store, session_dir)
+        is_stim_copy = channel in stim_copy
+        stim_times = (np.asarray([], dtype=np.float64)
+                      if is_stim_copy
+                      else _stim_times_for_file(store, file_id))
+
         try:
-            t, signal, duration = _decimated_lfp(file_path, channel)
+            t, signal, duration, n_blanked = _decimated_lfp(
+                file_path, channel,
+                stim_times=stim_times if len(stim_times) else None,
+                blank_pre_ms=blank_pre_ms,
+                blank_post_ms=blank_post_ms,
+            )
         except Exception as e:
             logger.warning("LFP load failed file=%s ch=%s: %s",
                            file_id, channel, e)
             return _empty_lfp_fig(f"LFP load error: {e}"), ""
+
         fig = _build_lfp_figure(t, signal, label=f"Ch{channel}")
-        status = f"{duration:.1f}s · {len(t):,} display points"
-        return fig, status
+        status_bits = [f"{duration:.1f}s", f"{len(t):,} display points"]
+        if is_stim_copy:
+            status_bits.append("stim-copy channel · not blanked")
+        elif n_blanked:
+            status_bits.append(
+                f"stim-blanked: {n_blanked} pulses "
+                f"({blank_pre_ms:+.0f}–{blank_post_ms:+.0f} ms)"
+            )
+        elif len(_stim_times_for_file(store, file_id)) == 0:
+            status_bits.append("no stim events on file")
+        return fig, " · ".join(status_bits)
 
     # ---- Note save (unchanged) ---- #
     @app.callback(
