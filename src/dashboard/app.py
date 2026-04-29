@@ -123,6 +123,64 @@ TIME_RANGE_OPTIONS = [
 ]
 
 # --------------------------------------------------------------------- #
+#  Navigation taxonomy — top-level groups with sub-tabs.
+#
+#  The sub-tab ``id`` is what the existing ``render_tab`` callback
+#  switches on, so adding a new tab means: (1) add an entry below,
+#  (2) add a branch to the existing render_tab, (3) build a layout.
+# --------------------------------------------------------------------- #
+NAV_GROUPS = [
+    {"id": "overview", "label": "Overview", "subs": [
+        {"id": "overview", "label": "Overview"},
+    ]},
+    {"id": "sessions", "label": "Sessions", "subs": [
+        {"id": "sessions", "label": "All sessions"},
+        {"id": "session_compare", "label": "Compare"},
+    ]},
+    {"id": "analysis", "label": "Analysis", "subs": [
+        {"id": "waveforms", "label": "Evoked waveforms"},
+        {"id": "evoked", "label": "Evoked features"},
+        {"id": "criticality", "label": "Criticality"},
+        {"id": "lfp", "label": "LFP browser"},
+        {"id": "video", "label": "Video review"},
+    ]},
+    {"id": "quality", "label": "Quality", "subs": [
+        {"id": "signal", "label": "Signal quality"},
+        {"id": "electrode_health", "label": "Electrode health"},
+        {"id": "stim", "label": "Stim QC"},
+    ]},
+    {"id": "system", "label": "System", "subs": [
+        {"id": "annotations", "label": "Notes"},
+        {"id": "activity_log", "label": "Activity log"},
+        {"id": "alerts", "label": "Alerts"},
+        {"id": "settings", "label": "Settings"},
+    ]},
+]
+SUBTAB_TO_GROUP: dict[str, str] = {
+    sub["id"]: g["id"] for g in NAV_GROUPS for sub in g["subs"]
+}
+GROUP_BY_ID: dict[str, dict] = {g["id"]: g for g in NAV_GROUPS}
+
+# Sub-tab styling — slightly smaller / quieter than the top group tabs.
+SUBTAB_STYLE = {
+    "backgroundColor": "transparent",
+    "color": COLOR_TEXT_TERTIARY,
+    "padding": f"{SPACE_2} {SPACE_3}",
+    "border": "none",
+    "borderBottom": "2px solid transparent",
+    "borderRadius": "0",
+    "fontSize": FONT_SIZE_CAPTION,
+    "fontWeight": "500",
+    "letterSpacing": "0.3px",
+    "textTransform": "uppercase",
+}
+SUBTAB_SELECTED_STYLE = {
+    **SUBTAB_STYLE,
+    "color": COLOR_TEXT_PRIMARY,
+    "borderBottom": f"2px solid {COLOR_TEXT_PRIMARY}",
+}
+
+# --------------------------------------------------------------------- #
 #  Component styles built from tokens
 # --------------------------------------------------------------------- #
 
@@ -275,13 +333,58 @@ def _status_card(title: str, value: str, color: str = "#636EFA"):
     ], style=CARD_STYLE)
 
 
-def _empty_fig(text: str = "No data", height: int = 400) -> go.Figure:
+def _empty_fig(text: str = "Nothing to show yet",
+               hint: str | None = None,
+               height: int = 400) -> go.Figure:
+    """Friendly empty figure used in place of a plot when there's no data.
+
+    *text* is the headline. *hint* is an optional one-liner explaining
+    what the user can do next, rendered below the headline in a quieter
+    color. Apple HIG: empty states should be informative, not silent.
+    """
     fig = go.Figure()
+    annotations = [dict(
+        text=f"<b>{text}</b>", showarrow=False, xref="paper", yref="paper",
+        x=0.5, y=0.55, font=dict(size=14, color=COLOR_TEXT_SECONDARY),
+    )]
+    if hint:
+        annotations.append(dict(
+            text=hint, showarrow=False, xref="paper", yref="paper",
+            x=0.5, y=0.42, font=dict(size=11, color=COLOR_TEXT_TERTIARY),
+        ))
     fig.update_layout(
         template="plotly_dark", height=height,
-        annotations=[dict(text=text, showarrow=False, font=dict(size=16, color="#888"))],
+        plot_bgcolor=COLOR_SURFACE_1, paper_bgcolor=COLOR_SURFACE_1,
+        annotations=annotations,
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        margin=dict(l=20, r=20, t=20, b=20),
     )
     return fig
+
+
+def _empty_state(headline: str, hint: str = "",
+                 glyph: str = "·") -> html.Div:
+    """Tab-level empty state: small glyph, headline, and a friendly hint.
+
+    Used by tabs that have no data to render at all (e.g. no sessions
+    discovered, no files with videos). Looks consistent across the app.
+    """
+    return html.Div([
+        html.Div(glyph, style={"fontSize": "32px",
+                               "color": COLOR_TEXT_TERTIARY,
+                               "marginBottom": SPACE_3,
+                               "letterSpacing": "0"}),
+        html.Div(headline, style={"fontSize": FONT_SIZE_HEADER,
+                                  "fontWeight": "600",
+                                  "color": COLOR_TEXT_PRIMARY,
+                                  "marginBottom": SPACE_2}),
+        html.Div(hint, style={"fontSize": FONT_SIZE_BODY,
+                              "color": COLOR_TEXT_SECONDARY,
+                              "maxWidth": "520px",
+                              "lineHeight": "1.5"}),
+    ], style={"textAlign": "center",
+              "padding": f"{SPACE_6} {SPACE_5}",
+              "marginTop": SPACE_6})
 
 
 def _session_dropdown_options(store: Store) -> list[dict]:
@@ -289,12 +392,22 @@ def _session_dropdown_options(store: Store) -> list[dict]:
     return [{"label": s["session_name"], "value": s["session_dir"]} for s in sessions]
 
 
-def _default_session(store: Store) -> str | None:
-    """Return the session with the most processed files (not just the newest)."""
+def _default_session(store: Store, hint: str | None = None) -> str | None:
+    """Return a default session_dir for tab dropdowns.
+
+    *hint* is an explicit choice from the click-through Store (set when
+    a user clicks a row in the Sessions table). If the hint matches a
+    real session it wins, so the destination tab opens with that
+    session pre-selected. Otherwise we fall back to the session with
+    the most processed files.
+    """
     sessions = store.get_sessions()
     if not sessions:
         return None
-    # Pick session with most processed files
+    if hint:
+        valid = {s["session_dir"] for s in sessions}
+        if hint in valid:
+            return hint
     best = max(sessions, key=lambda s: s.get("processed", 0))
     return best["session_dir"] if best.get("processed", 0) > 0 else sessions[0]["session_dir"]
 
@@ -349,41 +462,31 @@ def create_app(config: dict, store: Store) -> Dash:
                   "background": COLOR_SURFACE_0,
                   "borderBottom": f"1px solid {COLOR_DIVIDER}"}),
 
-        # Tabs — ordered as specified
-        dcc.Tabs(id="tabs", value="overview", children=[
-            dcc.Tab(label="Overview", value="overview",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Evoked Waveforms", value="waveforms",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Evoked Features", value="evoked",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Signal Quality", value="signal",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Criticality", value="criticality",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="LFP Browser", value="lfp",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Video Review", value="video",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Electrode Health", value="electrode_health",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Session Compare", value="session_compare",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Stim QC", value="stim",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Settings", value="settings",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Activity Log", value="activity_log",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Annotations", value="annotations",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Alerts", value="alerts",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-            dcc.Tab(label="Sessions", value="sessions",
-                    style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE),
-        ], style={"borderBottom": f"1px solid {COLOR_DIVIDER}",
-                  "padding": f"0 {SPACE_5}",
-                  "backgroundColor": COLOR_SURFACE_0}),
+        # Top-level nav: 5 groups. Apple HIG "reduce" — each group fits
+        # comfortably without horizontal scrolling.
+        dcc.Tabs(
+            id="group-tabs", value="overview",
+            children=[
+                dcc.Tab(label=g["label"], value=g["id"],
+                        style=TAB_STYLE, selected_style=TAB_SELECTED_STYLE)
+                for g in NAV_GROUPS
+            ],
+            style={"borderBottom": f"1px solid {COLOR_DIVIDER}",
+                   "padding": f"0 {SPACE_5}",
+                   "backgroundColor": COLOR_SURFACE_0},
+        ),
+
+        # Second-level nav: sub-tabs within the active group. Children
+        # are populated by a callback when the group changes; the
+        # ``tabs`` id is preserved so all existing sub-tab callbacks
+        # (Input("tabs", "value")) continue to work unchanged.
+        dcc.Tabs(
+            id="tabs", value="overview", children=[],
+            style={"borderBottom": f"1px solid {COLOR_DIVIDER}",
+                   "padding": f"{SPACE_2} {SPACE_5} 0",
+                   "backgroundColor": COLOR_SURFACE_0,
+                   "minHeight": "36px"},
+        ),
 
         html.Div(id="tab-content",
                  style={"padding": f"{SPACE_6} {SPACE_5}",
@@ -465,18 +568,68 @@ def create_app(config: dict, store: Store) -> Dash:
         return f"Last refresh {elapsed // 60}m {elapsed % 60}s ago"
 
     # ------------------------------------------------------------------ #
+    #  Direct-manipulation: click a Sessions row -> jump to Analysis
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("selected-session-dir", "data"),
+        Output("group-tabs", "value"),
+        Output("tabs", "value", allow_duplicate=True),
+        Input("sessions-table", "active_cell"),
+        State("sessions-table", "data"),
+        prevent_initial_call=True,
+    )
+    def jump_to_session(active_cell, table_data):
+        if not active_cell or not table_data:
+            return no_update, no_update, no_update
+        row_idx = active_cell.get("row")
+        if row_idx is None or row_idx >= len(table_data):
+            return no_update, no_update, no_update
+        session_dir = table_data[row_idx].get("dir")
+        if not session_dir:
+            return no_update, no_update, no_update
+        # Take the user to Evoked Waveforms with the session pre-filled.
+        return session_dir, "analysis", "waveforms"
+
+    # ------------------------------------------------------------------ #
+    #  Two-tier nav: top groups -> sub-tabs
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("tabs", "children"),
+        Output("tabs", "value"),
+        Input("group-tabs", "value"),
+        State("tabs", "value"),
+    )
+    def populate_subtabs(group_id, current_sub):
+        """Render the sub-tab strip for the active group.
+
+        Preserves the current sub-tab if it belongs to the new group;
+        otherwise falls back to the first sub-tab of the group.
+        """
+        group = GROUP_BY_ID.get(group_id) or NAV_GROUPS[0]
+        subs = group["subs"]
+        valid = {s["id"] for s in subs}
+        new_sub = current_sub if current_sub in valid else subs[0]["id"]
+        children = [
+            dcc.Tab(label=s["label"], value=s["id"],
+                    style=SUBTAB_STYLE, selected_style=SUBTAB_SELECTED_STYLE)
+            for s in subs
+        ]
+        return children, new_sub
+
+    # ------------------------------------------------------------------ #
     #  Main tab router — re-renders on tab change AND manual refresh
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("tab-content", "children"),
-        [Input("tabs", "value"), Input("refresh-trigger", "data")]
+        [Input("tabs", "value"), Input("refresh-trigger", "data")],
+        State("selected-session-dir", "data"),
     )
-    def render_tab(tab, _refresh):
+    def render_tab(tab, _refresh, session_hint):
         try:
             if tab == "overview":
                 return _overview_tab(store)
             elif tab == "waveforms":
-                return _waveforms_tab_layout(store)
+                return _waveforms_tab_layout(store, default_session=session_hint)
             elif tab == "signal":
                 return _signal_quality_tab(store)
             elif tab == "evoked":
@@ -484,11 +637,11 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "criticality":
                 return _criticality_tab_layout(store)
             elif tab == "lfp":
-                return _lfp_browser_tab_layout(store)
+                return _lfp_browser_tab_layout(store, default_session=session_hint)
             elif tab == "video":
                 return tabs_video.layout(store)
             elif tab == "electrode_health":
-                return _electrode_health_tab_layout(store)
+                return _electrode_health_tab_layout(store, default_session=session_hint)
             elif tab == "session_compare":
                 return _session_compare_tab_layout(store)
             elif tab == "stim":
@@ -506,7 +659,7 @@ def create_app(config: dict, store: Store) -> Dash:
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
-                            style={"color": "#ff6b6b", "padding": "20px"})
+                            style={"color": COLOR_DANGER, "padding": SPACE_5})
 
     # ------------------------------------------------------------------ #
     #  Evoked Features callback — separate row per selected feature
@@ -1705,9 +1858,9 @@ def _overview_tab(store: Store):
 #  Evoked Waveforms tab (NEW)
 # ------------------------------------------------------------------ #
 
-def _waveforms_tab_layout(store: Store):
+def _waveforms_tab_layout(store: Store, default_session: str | None = None):
     session_options = _session_dropdown_options(store)
-    default = _default_session(store)
+    default = _default_session(store, hint=default_session)
 
     # Build file options for the default session
     file_options = []
@@ -1912,9 +2065,9 @@ def _criticality_tab_layout(store: Store):
 #  LFP Browser tab (NEW)
 # ------------------------------------------------------------------ #
 
-def _lfp_browser_tab_layout(store: Store):
+def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
     session_options = _session_dropdown_options(store)
-    default = _default_session(store)
+    default = _default_session(store, hint=default_session)
 
     return html.Div([
         html.H3("LFP Browser", style={"color": "white", "marginBottom": "12px"}),
@@ -1959,9 +2112,9 @@ def _lfp_browser_tab_layout(store: Store):
 #  Electrode Health tab (NEW)
 # ------------------------------------------------------------------ #
 
-def _electrode_health_tab_layout(store: Store):
+def _electrode_health_tab_layout(store: Store, default_session: str | None = None):
     session_options = _session_dropdown_options(store)
-    default = _default_session(store)
+    default = _default_session(store, hint=default_session)
 
     return html.Div([
         html.H3("Electrode Health", style={"color": "white", "marginBottom": "12px"}),
@@ -2716,6 +2869,13 @@ def _alerts_tab(store: Store):
 
 def _sessions_tab(store: Store):
     sessions = store.get_sessions()
+    if not sessions:
+        return _empty_state(
+            "No sessions yet",
+            "Sessions appear here once the watcher discovers .mat files in "
+            "the network share configured under watch.paths.",
+        )
+
     all_configs = store.get_all_session_configs()
     config_by_dir = {c["session_dir"]: c for c in all_configs}
 
@@ -2743,9 +2903,22 @@ def _sessions_tab(store: Store):
         })
 
     return html.Div([
-        html.H3(f"Sessions ({len(sessions)})",
-                 style={"color": "white", "marginBottom": "12px"}),
+        html.Div([
+            html.H3(f"Sessions ({len(sessions)})",
+                    style={"color": COLOR_TEXT_PRIMARY,
+                           "fontSize": FONT_SIZE_HEADER,
+                           "fontWeight": "600",
+                           "margin": "0"}),
+            html.Span(
+                "Click any row to open that session in Evoked Waveforms.",
+                style={"color": COLOR_TEXT_TERTIARY,
+                       "fontSize": FONT_SIZE_CAPTION,
+                       "marginLeft": SPACE_3},
+            ),
+        ], style={"display": "flex", "alignItems": "baseline",
+                  "marginBottom": SPACE_4}),
         dash_table.DataTable(
+            id="sessions-table",
             data=rows,
             columns=[
                 {"name": "Session", "id": "name"},
@@ -2763,11 +2936,22 @@ def _sessions_tab(store: Store):
             **DARK_TABLE_STYLE,
             style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{errors} > 0"},
-                 "backgroundColor": "#3d1111", "color": "#ff6b6b"},
+                 "backgroundColor": "rgba(255,69,58,0.10)",
+                 "color": COLOR_DANGER},
+                {"if": {"state": "active"},
+                 "backgroundColor": "rgba(94,124,226,0.18)",
+                 "border": f"1px solid {COLOR_ACCENT}"},
+            ],
+            style_cell_conditional=[
+                {"if": {"column_id": "name"},
+                 "cursor": "pointer", "fontWeight": "600",
+                 "color": COLOR_ACCENT},
             ],
             page_size=20,
             sort_action="native",
             filter_action="native",
+            cell_selectable=True,
+            active_cell=None,
         ),
     ])
 

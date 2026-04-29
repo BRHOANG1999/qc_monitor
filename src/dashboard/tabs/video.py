@@ -79,14 +79,19 @@ def layout(store: Store):
 
     if not sessions:
         return html.Div([
-            html.H3("Video Review", style={"color": "white", "marginBottom": "12px"}),
-            html.P(
-                "No files with companion videos have been processed yet. "
+            html.Div("No videos to review yet",
+                     style={"fontSize": "15px", "fontWeight": "600",
+                            "color": "#f0f0f5", "marginBottom": "8px",
+                            "textAlign": "center"}),
+            html.Div(
                 "Videos appear here once the dispatcher detects a "
-                "<basename>_v1.mp4 alongside an .mat file.",
-                style={"color": "#888"},
+                "_v1.mp4 file alongside a processed .mat file.",
+                style={"color": "#a0a0b0", "fontSize": "13px",
+                       "textAlign": "center", "maxWidth": "520px",
+                       "margin": "0 auto"},
             ),
-        ])
+        ], style={"textAlign": "center", "padding": "32px 24px",
+                  "marginTop": "32px"})
 
     return html.Div([
         html.H3("Video Review", style={"color": "white", "marginBottom": "12px"}),
