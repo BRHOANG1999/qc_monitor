@@ -996,8 +996,8 @@ def create_app(config: dict, store: Store) -> Dash:
 
         fs = chunk.fs
         signal = chunk.signal
-        n_ch = signal.shape[1]
-        time_sec = np.arange(signal.shape[0]) / fs
+        n_samples, n_ch = signal.shape
+        duration_sec = n_samples / fs
 
         # Prefer per-file fnstr (matches the actual channels in this .mat);
         # fall back to session config only if the file lacks fnstr.
@@ -1011,14 +1011,44 @@ def create_app(config: dict, store: Store) -> Dash:
                 return {"name": name, "role": role}
             return sess_map.get(ch_idx, {"name": f"Ch{ch_idx}", "role": "eeg"})
 
+        # --- Min/max envelope decimation -----------------------------------
+        # A 150 us biphasic stim pulse at 20 kHz is only ~3 samples wide.
+        # Naive every-Nth subsampling drops most pulses; the (min, max) of
+        # each bin preserves the peak so even a single-sample spike survives.
+        target_bins = 60000  # ~60k bins -> 120k points per channel
+        decim = max(1, n_samples // target_bins)
+        n_bins = n_samples // decim
+
+        if decim == 1:
+            x_plot = np.arange(n_samples) / fs
+        else:
+            trimmed_len = n_bins * decim
+            bin_left_t = (np.arange(n_bins) * decim) / fs
+            bin_right_t = ((np.arange(n_bins) + 1) * decim - 1) / fs
+            # Interleave bin-left, bin-right per sample pair (vertical line per bin)
+            x_plot = np.empty(n_bins * 2)
+            x_plot[0::2] = bin_left_t
+            x_plot[1::2] = bin_right_t
+
         fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
                             vertical_spacing=0.005)
 
         for ch_idx in range(n_ch):
             info = _info_for(ch_idx)
             color = _color_for_role(info["role"])
+
+            if decim == 1:
+                y_plot = signal[:, ch_idx]
+            else:
+                binned = signal[: n_bins * decim, ch_idx].reshape(n_bins, decim)
+                mins = binned.min(axis=1)
+                maxs = binned.max(axis=1)
+                y_plot = np.empty(n_bins * 2)
+                y_plot[0::2] = mins
+                y_plot[1::2] = maxs
+
             fig.add_trace(go.Scattergl(
-                x=time_sec, y=signal[:, ch_idx],
+                x=x_plot, y=y_plot,
                 mode="lines", name=info["name"],
                 line=dict(color=color, width=0.8),
             ), row=ch_idx + 1, col=1)
@@ -1027,10 +1057,15 @@ def create_app(config: dict, store: Store) -> Dash:
                              tickfont=dict(size=8))
 
         fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
-        duration_sec = signal.shape[0] / fs
+        if decim > 1:
+            bin_ms = decim / fs * 1000.0
+            title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} ch @ {fs:.0f} Hz "
+                     f"-- min/max envelope, {bin_ms:.2f} ms/bin (pulses preserved)")
+        else:
+            title = f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels @ {fs:.0f} Hz"
         fig.update_layout(
             template="plotly_dark",
-            title=f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels @ {fs:.0f} Hz",
+            title=title,
             height=max(600, n_ch * 80),
             showlegend=False,
         )
@@ -2111,7 +2146,7 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
             ], style={"flex": "0 0 120px", "display": "flex", "alignItems": "flex-end"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
-        html.P("Loads the entire raw LFP from the selected .mat file. Channel names come from the file's fnstr.",
+        html.P("Loads the entire raw LFP from the selected .mat file. Long files are min/max envelope-decimated so 150 us stim pulses remain visible. Channel names come from the file's fnstr.",
                style={"color": "#888", "fontSize": "12px", "marginBottom": "8px"}),
 
         dcc.Graph(id="lfp-plot", figure=_empty_fig("Select a session and file, then click Load", 600)),
