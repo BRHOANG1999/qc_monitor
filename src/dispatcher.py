@@ -263,12 +263,17 @@ class Dispatcher:
                 tp = crit.get("time_points", [])
                 db = crit.get("db_values", [])
                 if tp and db:
+                    # MATLAB jsonencode collapses a 1-element vector to a scalar,
+                    # so lfp_channels may be either an int or a list. Normalize.
+                    lfp_ch_raw = result.get("lfp_channels", [1])
+                    lfp_ch_first = lfp_ch_raw[0] if isinstance(lfp_ch_raw, (list, tuple)) else lfp_ch_raw
+                    crit_channel_1based = result.get("criticality_channel", lfp_ch_first)
                     windows = []
                     stds = crit.get("db_stds", [])
                     sigs = crit.get("sigmas", [])
                     for wi in range(len(tp)):
                         windows.append({
-                            "channel": result.get("criticality_channel", result.get("lfp_channels", [1])[0]) - 1,
+                            "channel": crit_channel_1based - 1,
                             "window_index": wi,
                             "time_sec": tp[wi],
                             "db_value": db[wi] if db[wi] == db[wi] else None,  # NaN check
