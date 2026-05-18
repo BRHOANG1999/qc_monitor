@@ -1,6 +1,13 @@
 watch:
   paths:
-  - //100.106.104.22/bhz/database/
+  # As close to the SMB server root as Windows allows -- the literal share
+  # root cannot be enumerated. We list every share with session data; the
+  # watcher recurses from each and OSError-skips $RECYCLE.BIN and
+  # System Volume Information automatically. The two shares overlap on
+  # recent sessions; main.py dedups overlapping content by
+  # (basename, size, mtime) so nothing gets processed twice.
+  - //100.106.104.22/database/
+  - //100.106.104.22/bhz/
   poll_interval_sec: 30
   min_file_age_sec: 60
 channel_mapping:

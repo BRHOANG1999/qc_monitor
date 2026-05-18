@@ -126,18 +126,23 @@ def main():
         logger.info("Dashboard thread started on port %s",
                      config.get("dashboard", {}).get("port", 8050))
 
-    # Build set of already-known file paths
+    # Build set of already-known file paths + content fingerprints.
+    # The same physical .mat is reachable from two SMB shares (//.../bhz/
+    # and //.../database/), so dedup by both path AND (basename, size, mtime)
+    # to avoid processing the same recording twice through different paths.
     logger.info("Building known file index...")
     known_paths = set()
-    for row in store.get_pending_files(limit=999999):
-        known_paths.add(row["file_path"])
-    # Also include done/error files
+    known_fingerprints = set()
+
     import sqlite3
     conn = sqlite3.connect(db_path)
-    for row in conn.execute("SELECT file_path FROM processed_files"):
-        known_paths.add(row[0])
+    for row in conn.execute("SELECT file_path, file_size, file_mtime FROM processed_files"):
+        fp, fsize, fmt = row[0], row[1], row[2]
+        known_paths.add(fp)
+        known_fingerprints.add((os.path.basename(fp), fsize, fmt))
     conn.close()
-    logger.info("Known files: %d", len(known_paths))
+    logger.info("Known files: %d (unique fingerprints: %d)",
+                len(known_paths), len(known_fingerprints))
 
     # Main loop
     last_health_time = 0
@@ -177,14 +182,27 @@ def main():
                 new_files = watcher.scan(known_paths)
                 if new_files:
                     new_files.sort(key=lambda f: f.chunk_datetime)
+                    registered = 0
+                    deduped = 0
                     for nf in new_files:
+                        fp = (os.path.basename(nf.path), nf.size, nf.mtime)
+                        if fp in known_fingerprints:
+                            # Same physical file already known under a different
+                            # share path. Remember the duplicate path so we don't
+                            # rediscover it every scan, but don't register/process.
+                            known_paths.add(nf.path)
+                            deduped += 1
+                            continue
                         known_paths.add(nf.path)
+                        known_fingerprints.add(fp)
                         store.register_file(
                             file_path=nf.path, file_size=nf.size, file_mtime=nf.mtime,
                             session_dir=nf.session_dir, session_name=nf.session_name,
                             chunk_datetime=nf.chunk_datetime,
                         )
-                    logger.info("Registered %d new files", len(new_files))
+                        registered += 1
+                    logger.info("Registered %d new files (%d deduped by fingerprint)",
+                                registered, deduped)
                 files_since_scan = 0
 
             # Process pending files in batch (up to 10), then rescan
