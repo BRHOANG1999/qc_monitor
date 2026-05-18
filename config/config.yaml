@@ -10,6 +10,10 @@ epoch_extraction:
   post_stimulus_ms: 500.0
   stimulus_threshold_std: 3.0
   min_stimulus_distance_sec: 0.1
+  # Lower bound on stim-copy peak-to-peak / robust-noise ratio. Below this,
+  # the stim channel is assumed to be pure noise and detection is skipped.
+  # Lower for low-charge protocols (e.g. 5 nC) where the stim copy is small.
+  stim_peak_ratio_min: 4.0
   baseline_correction: true
   baseline_start_ms: -60.0
   baseline_end_ms: -10.0

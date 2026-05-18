@@ -995,20 +995,29 @@ def create_app(config: dict, store: Store) -> Dash:
             return _empty_fig(f"Error loading file: {e}", 600)
 
         fs = chunk.fs
-        n_samples = int(5 * fs)
-        signal = chunk.signal[:n_samples, :]
+        signal = chunk.signal
         n_ch = signal.shape[1]
         time_sec = np.arange(signal.shape[0]) / fs
 
-        ch_map = _get_channel_map(store, session_dir) if session_dir else {}
+        # Prefer per-file fnstr (matches the actual channels in this .mat);
+        # fall back to session config only if the file lacks fnstr.
+        sess_map = _get_channel_map(store, session_dir) if session_dir else {}
+        file_names = chunk.channel_names or []
+
+        def _info_for(ch_idx: int) -> dict:
+            if ch_idx < len(file_names) and file_names[ch_idx]:
+                name = file_names[ch_idx]
+                role = "stim_copy" if "stim" in name.lower() else "eeg"
+                return {"name": name, "role": role}
+            return sess_map.get(ch_idx, {"name": f"Ch{ch_idx}", "role": "eeg"})
 
         fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
                             vertical_spacing=0.005)
 
         for ch_idx in range(n_ch):
-            info = ch_map.get(ch_idx, {"name": f"Ch{ch_idx}", "role": "eeg"})
+            info = _info_for(ch_idx)
             color = _color_for_role(info["role"])
-            fig.add_trace(go.Scatter(
+            fig.add_trace(go.Scattergl(
                 x=time_sec, y=signal[:, ch_idx],
                 mode="lines", name=info["name"],
                 line=dict(color=color, width=0.8),
@@ -1018,9 +1027,10 @@ def create_app(config: dict, store: Store) -> Dash:
                              tickfont=dict(size=8))
 
         fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
+        duration_sec = signal.shape[0] / fs
         fig.update_layout(
             template="plotly_dark",
-            title=f"Raw LFP (first 5 sec) -- {n_ch} channels @ {fs:.0f} Hz",
+            title=f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels @ {fs:.0f} Hz",
             height=max(600, n_ch * 80),
             showlegend=False,
         )
@@ -2101,7 +2111,7 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
             ], style={"flex": "0 0 120px", "display": "flex", "alignItems": "flex-end"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
-        html.P("Loads the first 5 seconds of raw LFP from the selected .mat file.",
+        html.P("Loads the entire raw LFP from the selected .mat file. Channel names come from the file's fnstr.",
                style={"color": "#888", "fontSize": "12px", "marginBottom": "8px"}),
 
         dcc.Graph(id="lfp-plot", figure=_empty_fig("Select a session and file, then click Load", 600)),

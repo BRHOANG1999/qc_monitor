@@ -30,6 +30,7 @@ function run_pipeline(input_file, output_json, config_json)
     post_ms = get_cfg(cfg, 'post_stimulus_ms', 500);
     stim_thresh = get_cfg(cfg, 'stimulus_threshold_std', 3.0);
     min_stim_dist = get_cfg(cfg, 'min_stimulus_distance_sec', 0.1);
+    stim_peak_ratio_min = get_cfg(cfg, 'stim_peak_ratio_min', 4.0);
     baseline_on = get_cfg(cfg, 'baseline_correction', true);
     bl_start = get_cfg(cfg, 'baseline_start_ms', -60);
     bl_end = get_cfg(cfg, 'baseline_end_ms', -10);
@@ -117,6 +118,7 @@ function run_pipeline(input_file, output_json, config_json)
         evParams.EndMS = post_ms;
         evParams.StimulusThreshold = stim_thresh;
         evParams.MinStimulusDistance = min_stim_dist;
+        evParams.StimPeakRatioMin = stim_peak_ratio_min;
         evParams.BaselineCorrection = baseline_on;
         evParams.BaselineWindow = [bl_start, bl_end];
         evParams.HighPassEnabled = hp_on;

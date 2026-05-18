@@ -362,13 +362,27 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
             stimPeakRatio = 0;
         end
 
-        if stimPeakRatio < 10
-            % No clear stimulus artifact — stim channel is just noise
-            fprintf('[STIM DETECT] No stimulus artifact found (p2p/noise = %.1f < 10)\n', stimPeakRatio);
+        % Permissive gate: low-charge stim (e.g. 5 nC) produces a small
+        % stim-copy excursion, so a strict ratio rejects real stimulation.
+        % Override via params.StimPeakRatioMin.
+        if isfield(params, 'StimPeakRatioMin') && ~isempty(params.StimPeakRatioMin)
+            peakRatioMin = params.StimPeakRatioMin;
+        else
+            peakRatioMin = 4;
+        end
+
+        fprintf('[STIM DETECT] stim ch: mean=%.4g std=%.4g p2p=%.4g MAD=%.4g p2p/noise=%.1f (gate=%.1f)\n', ...
+            stimMean, stimStd, stimP2P, stimMAD, stimPeakRatio, peakRatioMin);
+
+        if stimPeakRatio < peakRatioMin
+            fprintf('[STIM DETECT] No stimulus artifact found (p2p/noise = %.1f < %.1f)\n', ...
+                stimPeakRatio, peakRatioMin);
             return;
         end
 
         threshold = stimMean + params.StimulusThreshold * stimStd;
+        fprintf('[STIM DETECT] threshold = mean + %.1f*std = %.4g\n', ...
+            params.StimulusThreshold, threshold);
 
         minDistanceSamples = round(params.MinStimulusDistance * samplingRate);
 
@@ -430,10 +444,12 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
         end
 
         stimulusIndices = sort(selectedIndices(:));
+        fprintf('[STIM DETECT] %d candidates -> %d after dedup (min gap %.3fs)\n', ...
+            length(candidates), length(stimulusIndices), params.MinStimulusDistance);
 
         % --- Validate: reject if detections look like noise, not real stimuli ---
         if length(stimulusIndices) < 3
-            % Too few detections to be periodic stimulation
+            fprintf('[STIM DETECT] Rejected: only %d detections (need >= 3)\n', length(stimulusIndices));
             stimulusIndices = [];
             return;
         end
@@ -447,14 +463,17 @@ function stimulusIndices = detectStimuliCore(stimChannel, samplingRate, params)
         medianPeak = median(peakAmplitudes(peakAmplitudes > 0));
         snr = (medianPeak - stimMean) / stimStd;
 
+        fprintf('[STIM DETECT] %d stimuli kept, ISI CV=%.2f, median SNR=%.1f\n', ...
+            length(stimulusIndices), isi_cv, snr);
+
         if isi_cv > 0.5 && snr < 5
             % Irregular timing AND low SNR = noise, not stimulation
             fprintf('[STIM DETECT] Rejected: CV=%.2f, SNR=%.1f — likely no stimulation\n', isi_cv, snr);
             stimulusIndices = [];
             return;
         end
-    catch
-        % Return empty if detection fails
+    catch ME
+        fprintf('[STIM DETECT] Detection threw error: %s\n', ME.message);
     end
 end
 

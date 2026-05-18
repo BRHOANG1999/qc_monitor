@@ -15,6 +15,7 @@ class ChunkData:
     source_path: str
     timestamps: np.ndarray | None = None
     trdata: dict = field(default_factory=dict)
+    channel_names: list = field(default_factory=list)
 
 
 def load_mat(path: str) -> ChunkData:
@@ -53,6 +54,8 @@ def load_mat(path: str) -> ChunkData:
     num_samples, num_channels = sbuf.shape
     duration_sec = num_samples / fs
 
+    channel_names = _parse_fnstr(data.get("fnstr"), num_channels)
+
     return ChunkData(
         signal=sbuf,
         fs=fs,
@@ -61,7 +64,27 @@ def load_mat(path: str) -> ChunkData:
         duration_sec=duration_sec,
         source_path=path,
         trdata=trdata,
+        channel_names=channel_names,
     )
+
+
+def _parse_fnstr(fnstr, num_channels: int) -> list:
+    """Extract per-channel names from a MATLAB fnstr field. Trim to num_channels."""
+    if fnstr is None:
+        return []
+    names: list = []
+    try:
+        if isinstance(fnstr, str):
+            names = [fnstr]
+        elif hasattr(fnstr, "__len__"):
+            for item in fnstr:
+                if isinstance(item, np.ndarray):
+                    names.append(str(item.flat[0]) if item.size > 0 else "")
+                else:
+                    names.append(str(item))
+    except (AttributeError, TypeError):
+        return []
+    return [n.strip() for n in names[:num_channels]]
 
 
 def _load_hdf5(path: str) -> dict:
