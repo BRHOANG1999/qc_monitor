@@ -181,28 +181,32 @@ def discover_session_config(mat_path: str) -> SessionConfig:
 def discover_from_session_dir(session_dir: str) -> SessionConfig:
     """Try to discover config from a session directory.
 
-    Looks for recorder_settings.mat in parent dirs, then falls back to
-    reading the first .mat data file in the session.
+    Prefers the first actual data .mat in the session dir, because its fnstr
+    reflects what was *recorded* in this session. A shared recorder_settings.mat
+    upstream may carry a stale channel layout from a previous rig configuration
+    and would mislabel channels (e.g. naming a stimCopy electrode as an LFP).
+    Falls back to recorder_settings.mat only when no data file is readable.
     """
-    # Try recorder_settings.mat in parent directory
-    parent = os.path.dirname(session_dir)
-    settings_path = os.path.join(parent, "recorder_settings.mat")
-    if os.path.isfile(settings_path):
-        return discover_session_config(settings_path)
-
-    # Try recorder_settings.mat in grandparent
-    grandparent = os.path.dirname(parent)
-    settings_path = os.path.join(grandparent, "recorder_settings.mat")
-    if os.path.isfile(settings_path):
-        return discover_session_config(settings_path)
-
-    # Fall back to first .mat in the session dir
+    # Prefer the first data .mat in the session dir — it has fnstr, stim_params,
+    # spike1, power, coast, plus the channel layout actually used for this recording.
     try:
         for entry in sorted(os.scandir(session_dir), key=lambda e: e.name):
             if entry.name.endswith(".mat") and not entry.name.startswith("metadata"):
-                return discover_session_config(entry.path)
+                cfg = discover_session_config(entry.path)
+                if cfg.channel_names:
+                    return cfg
+                break  # data file existed but had no fnstr; try settings fallback
     except OSError:
         pass
+
+    # Fall back to recorder_settings.mat in parent / grandparent
+    parent = os.path.dirname(session_dir)
+    for candidate in (
+        os.path.join(parent, "recorder_settings.mat"),
+        os.path.join(os.path.dirname(parent), "recorder_settings.mat"),
+    ):
+        if os.path.isfile(candidate):
+            return discover_session_config(candidate)
 
     logger.warning("No settings found for session %s, using defaults", session_dir)
     return SessionConfig()
