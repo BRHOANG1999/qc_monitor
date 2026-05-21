@@ -24,7 +24,7 @@ from threading import RLock
 
 import pandas as pd
 import requests
-from dash import Input, Output, dash_table, dcc, html
+from dash import Input, Output, callback_context, dash_table, dcc, html
 
 from src.db.store import Store
 
@@ -607,6 +607,11 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
         Input("surgeries-tick", "n_intervals"),
     )
     def _render(_n_clicks, _n_intervals):
+        # Manual Refresh forces a fresh pull (bypass cache TTL); the
+        # interval tick respects the cache so we don't hammer Sheets.
+        triggered = (callback_context.triggered_id
+                     if callback_context.triggered else None)
+        effective_ttl = 0.0 if triggered == "surgeries-refresh-btn" else ttl_sec
         today = date.today()
         grouped: dict[str, list[dict]] = {g: [] for g in _GROUP_ORDER}
         upcoming_all: list[dict] = []
@@ -626,11 +631,12 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
                     )
                     continue
                 df = _load_sheet_via_api(
-                    s["sheet_id"], s["tab_name"], sa_file, ttl_sec,
+                    s["sheet_id"], s["tab_name"], sa_file, effective_ttl,
                     header_row=header_row,
                 )
             elif s.get("url"):
-                df = _load_sheet(s["url"], ttl_sec, header_row=header_row)
+                df = _load_sheet(s["url"], effective_ttl,
+                                 header_row=header_row)
             else:
                 logger.warning("Sheet '%s' has neither url nor sheet_id", label)
                 continue

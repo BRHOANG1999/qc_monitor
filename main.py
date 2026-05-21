@@ -30,6 +30,7 @@ from src.watcher import FileWatcher
 from src.dispatcher import Dispatcher
 from src.alerting.email_alert import EmailAlerter
 from src.alerting.rules import AlertRuleEngine
+from src.notifications.scheduler import DigestScheduler
 from src.utils.logging_config import setup_logging
 
 
@@ -115,6 +116,7 @@ def main():
 
     emailer = EmailAlerter(config)
     alert_engine = AlertRuleEngine(store, emailer, config)
+    digest_scheduler = DigestScheduler(config, emailer)
 
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
@@ -154,6 +156,13 @@ def main():
     while True:
         try:
             loop_start = time.time()
+
+            # Daily surgery digest -- fires once per day at/after the
+            # configured hour. Cheap no-op when disabled or already sent.
+            try:
+                digest_scheduler.tick()
+            except Exception as e:
+                logger.error("Digest scheduler tick failed: %s", e)
 
             # Health check
             if (loop_start - last_health_time) > health_interval:

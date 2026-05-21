@@ -152,6 +152,26 @@ auth:
   cf_audience: ''                    # AUD tag from the Access app (required in prod)
   dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
   dev_bypass_email: hoang392@umn.edu
+surgery_digest:
+  # Once-a-day email + SMS summary of the same view the Surgeries tab
+  # renders -- today's pre-op / surgery / post-op tasks plus a 7-day
+  # outlook. Fires the first poll-loop tick after `send_hour:` local
+  # time; idempotent across restarts via state_file.
+  #
+  # SMS goes through the recipient's carrier email-to-SMS gateway --
+  # paste an address like 9092036361@<carrier-gateway>. Common gateways:
+  #   Verizon  ->  9092036361@vtext.com
+  #   AT&T     ->  9092036361@txt.att.net
+  #   T-Mobile ->  9092036361@tmomail.net
+  #   Sprint   ->  9092036361@messaging.sprintpcs.com
+  #   Google Fi->  9092036361@msg.fi.google.com
+  # SMTP credentials come from the alerting.smtp block below.
+  enabled: true
+  send_hour: 8                  # 24h local clock; fires once on/after this hour
+  email_recipients:
+    - hoang392@umn.edu
+  sms_recipients: []            # add the right gateway address after picking your carrier
+  state_file: data/surgery_digest_state.json
 surgeries:
   # Renders "today's pre-op / surgery / post-op tasks" pulled from
   # Google Sheets. Two auth paths supported per-sheet:
