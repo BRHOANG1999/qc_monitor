@@ -127,7 +127,7 @@ alerting:
   smtp:
     server: smtp.gmail.com
     port: 587
-    from_email: underflowbot@gmail.com
+    from_email: kmrecorder.alert@gmail.com
     password_env_var: QC_MONITOR_EMAIL_PASSWORD
     recipients:
     - hoang392@umn.edu
