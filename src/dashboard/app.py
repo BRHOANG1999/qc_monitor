@@ -23,6 +23,7 @@ from src.utils.decimate import (
 from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
+from src.dashboard.tabs import surgeries as tabs_surgeries
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -152,6 +153,9 @@ NAV_GROUPS = [
         {"id": "signal", "label": "Signal quality"},
         {"id": "electrode_health", "label": "Electrode health"},
         {"id": "stim", "label": "Stim QC"},
+    ]},
+    {"id": "lab", "label": "Lab", "subs": [
+        {"id": "surgeries", "label": "Surgeries"},
     ]},
     {"id": "system", "label": "System", "subs": [
         {"id": "annotations", "label": "Notes"},
@@ -660,6 +664,8 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _alerts_tab(store)
             elif tab == "sessions":
                 return _sessions_tab(store)
+            elif tab == "surgeries":
+                return tabs_surgeries.layout(store, config)
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
@@ -1699,6 +1705,7 @@ def create_app(config: dict, store: Store) -> Dash:
     #  Video Review tab callbacks (modular)
     # ------------------------------------------------------------------ #
     tabs_video.register_callbacks(app, store, config)
+    tabs_surgeries.register_callbacks(app, store, config)
 
     return app
 
