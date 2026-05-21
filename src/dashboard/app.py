@@ -26,6 +26,9 @@ from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
+from src.dashboard.components import (
+    card as _card, pill as _pill, section_header as _section_header,
+)
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -1751,26 +1754,10 @@ def create_app(config: dict, store: Store) -> Dash:
 #  Tab builders
 # ====================================================================== #
 
-def _home_section_header(title: str, target_tab: str, target_group: str,
-                          btn_id: str) -> html.Div:
-    """A row with the section title on the left and an 'Open >' button
-    on the right that switches the dashboard to *target_tab*."""
-    return html.Div([
-        html.Div(title, style={
-            "fontSize": "11px", "color": "#a0a0b0",
-            "textTransform": "uppercase", "letterSpacing": "0.6px",
-            "fontWeight": "600",
-        }),
-        html.Button("Open >", id=btn_id, n_clicks=0,
-                    **{"data-group": target_group, "data-tab": target_tab},
-                    style={
-                        "backgroundColor": "transparent", "color": "#5e7ce2",
-                        "border": "none", "cursor": "pointer",
-                        "fontSize": "11px", "fontWeight": "600",
-                        "letterSpacing": "0.3px",
-                    }),
-    ], style={"display": "flex", "justifyContent": "space-between",
-              "alignItems": "center", "marginBottom": "8px"})
+_HOME_ROW_STYLE = {
+    "display": "flex", "alignItems": "center",
+    "padding": f"{SPACE_1} 0",
+}
 
 
 def _home_surgery_block(store: Store, config: dict | None,
@@ -1799,48 +1786,36 @@ def _home_surgery_block(store: Store, config: dict | None,
             items = grouped.get(key, [])
         n = len(items)
         animals = ", ".join(t["animal"] for t in items[:6])
-        color = "#f0f0f5" if n else "#6c6c80"
+        color = COLOR_TEXT_PRIMARY if n else COLOR_TEXT_TERTIARY
         rows.append(html.Div([
             html.Span(label, style={"flex": "0 0 200px", "color": color}),
             html.Span(str(n), style={"flex": "0 0 32px",
                                      "color": color, "fontWeight": "600"}),
             html.Span(animals, style={"flex": "1",
-                                       "color": "#a0a0b0",
-                                       "fontSize": "12px"}),
-        ], style={"display": "flex", "alignItems": "center",
-                  "padding": "4px 0"}))
+                                       "color": COLOR_TEXT_SECONDARY,
+                                       "fontSize": FONT_SIZE_CAPTION}),
+        ], style=_HOME_ROW_STYLE))
 
-    return html.Div([
-        _home_section_header("Surgeries today", "surgeries", "lab",
-                              "home-open-surgeries"),
+    return _card(
+        _section_header("Surgeries today",
+                         on_open_id="home-open-surgeries"),
         html.Div(rows),
-    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
-              "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)"})
-
-
-_MAINT_HOME_COLOR = {
-    "done": "#30d158",
-    "pending": "#ff9f0a",
-    "overdue": "#ff453a",
-    "not_scheduled": "#5e7ce2",
-    "not_active": "#6c6c80",
-}
+    )
 
 
 def _home_maintenance_block(config: dict | None) -> html.Div:
     """Today's maintenance status, mirroring the Apps Script truth."""
     try:
-        from src.dashboard.tabs.maintenance import rig_status, _task_pretty
+        from src.dashboard.tabs.maintenance import rig_status
         rows = rig_status(config or {})
     except Exception as e:
         logger.warning("Home: maintenance block failed: %s", e)
         rows = []
-        _task_pretty = lambda t: t  # noqa: E731
 
     if not rows:
         body = html.Div("Maintenance tracker disabled or no data.",
-                        style={"color": "#6c6c80", "fontSize": "13px"})
+                        style={"color": COLOR_TEXT_TERTIARY,
+                               "fontSize": FONT_SIZE_BODY})
     else:
         attention = [r for r in rows
                      if r.status in ("pending", "overdue")]
@@ -1848,22 +1823,22 @@ def _home_maintenance_block(config: dict | None) -> html.Div:
         if nothing_active:
             body = html.Div(
                 "No active rigs today.",
-                style={"color": "#6c6c80", "fontSize": "13px"},
+                style={"color": COLOR_TEXT_TERTIARY,
+                       "fontSize": FONT_SIZE_BODY},
             )
         elif not attention:
-            # everything scheduled today is done, or nothing is scheduled
             done_count = sum(1 for r in rows if r.status == "done")
             if done_count:
                 msg = f"All {done_count} scheduled task(s) done today."
-                color = "#30d158"
+                color = COLOR_SUCCESS
             else:
                 msg = "Nothing scheduled today."
-                color = "#5e7ce2"
+                color = COLOR_ACCENT
             body = html.Div(msg, style={
-                "color": color, "fontSize": "13px", "fontWeight": "600",
+                "color": color, "fontSize": FONT_SIZE_BODY,
+                "fontWeight": "600",
             })
         else:
-            # Group attention items by rig for compact display
             by_rig: dict[str, list] = {}
             for r in attention:
                 by_rig.setdefault(r.rig, []).append(r)
@@ -1872,35 +1847,29 @@ def _home_maintenance_block(config: dict | None) -> html.Div:
                 chunks = []
                 for r in by_rig[rig]:
                     short = ("battery" if r.task == "battery" else "cage")
-                    color = _MAINT_HOME_COLOR.get(r.status, "#a0a0b0")
-                    tag = r.status.upper()
+                    label = short
                     if r.task == "battery" and r.pending_shelves:
-                        suffix = (" shelf "
+                        label += (" shelf "
                                   + ",".join(map(str, r.pending_shelves)))
-                    else:
-                        suffix = ""
                     chunks.append(html.Span(
-                        f"{short}{suffix} ({tag})  ",
-                        style={"color": color, "marginRight": "12px"},
+                        _pill(r.status, label=label),
+                        style={"marginRight": SPACE_2},
                     ))
                 body_rows.append(html.Div([
                     html.Span(f"Rig {rig}", style={
                         "flex": "0 0 80px", "fontWeight": "600",
-                        "color": "#f0f0f5",
+                        "color": COLOR_TEXT_PRIMARY,
                     }),
                     html.Span(chunks, style={"flex": "1",
-                                              "fontSize": "12px"}),
-                ], style={"display": "flex", "alignItems": "center",
-                          "padding": "4px 0"}))
+                                              "fontSize": FONT_SIZE_CAPTION}),
+                ], style=_HOME_ROW_STYLE))
             body = html.Div(body_rows)
 
-    return html.Div([
-        _home_section_header("Maintenance", "maintenance", "lab",
-                              "home-open-maintenance"),
+    return _card(
+        _section_header("Maintenance",
+                         on_open_id="home-open-maintenance"),
         body,
-    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
-              "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)"})
+    )
 
 
 def _home_schedule_block(config: dict | None) -> html.Div:
@@ -1916,35 +1885,34 @@ def _home_schedule_block(config: dict | None) -> html.Div:
     if not rows:
         body = html.Div(
             "Nothing scheduled today.",
-            style={"color": "#6c6c80", "fontSize": "13px"},
+            style={"color": COLOR_TEXT_TERTIARY,
+                   "fontSize": FONT_SIZE_BODY},
         )
     else:
-        # Group by task
         by_task: dict[str, list] = {}
         for r in rows:
             by_task.setdefault(r["task"], []).append(r)
         items = []
         for task in sorted(by_task.keys()):
             names = ", ".join(r["name"] or r["email"]
-                              for r in by_task[task] if (r["name"] or r["email"]))
+                              for r in by_task[task]
+                              if (r["name"] or r["email"]))
             items.append(html.Div([
                 html.Span(task, style={"flex": "0 0 200px",
-                                        "color": "#f0f0f5",
+                                        "color": COLOR_TEXT_PRIMARY,
                                         "fontWeight": "600"}),
                 html.Span(names or "-",
-                          style={"flex": "1", "color": "#a0a0b0",
-                                  "fontSize": "12px"}),
-            ], style={"display": "flex", "alignItems": "center",
-                      "padding": "4px 0"}))
+                          style={"flex": "1",
+                                 "color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION}),
+            ], style=_HOME_ROW_STYLE))
         body = html.Div(items)
 
-    return html.Div([
-        _home_section_header("Today's schedule", "maintenance", "lab",
-                              "home-open-schedule"),
+    return _card(
+        _section_header("Today's schedule",
+                         on_open_id="home-open-schedule"),
         body,
-    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
-              "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)"})
+    )
 
 
 def _home_incidents_block(config: dict | None) -> html.Div:
@@ -1959,7 +1927,8 @@ def _home_incidents_block(config: dict | None) -> html.Div:
     if not rows:
         body = html.Div(
             "No incident reports.",
-            style={"color": "#6c6c80", "fontSize": "13px"},
+            style={"color": COLOR_TEXT_TERTIARY,
+                   "fontSize": FONT_SIZE_BODY},
         )
     else:
         items = []
@@ -1972,28 +1941,26 @@ def _home_incidents_block(config: dict | None) -> html.Div:
             items.append(html.Div([
                 html.Div([
                     html.Span(when, style={
-                        "color": "#a0a0b0", "fontSize": "11px",
-                        "marginRight": "12px",
+                        "color": COLOR_TEXT_SECONDARY,
+                        "fontSize": FONT_SIZE_CAPTION,
+                        "marginRight": SPACE_3,
                     }),
-                    html.Span(who, style={"color": "#5e7ce2",
-                                           "fontSize": "11px",
+                    html.Span(who, style={"color": COLOR_ACCENT,
+                                           "fontSize": FONT_SIZE_CAPTION,
                                            "fontWeight": "600"}),
                 ]),
-                html.Div(report, style={"color": "#d0d0da",
-                                         "fontSize": "13px",
+                html.Div(report, style={"color": COLOR_TEXT_PRIMARY,
+                                         "fontSize": FONT_SIZE_BODY,
                                          "marginTop": "2px"}),
-            ], style={"padding": "6px 0",
-                      "borderBottom":
-                      "1px solid rgba(255,255,255,0.05)"}))
+            ], style={"padding": f"{SPACE_2} 0",
+                      "borderBottom": f"1px solid {COLOR_DIVIDER}"}))
         body = html.Div(items)
 
-    return html.Div([
-        _home_section_header("Recent incidents", "maintenance", "lab",
-                              "home-open-incidents"),
+    return _card(
+        _section_header("Recent incidents",
+                         on_open_id="home-open-incidents"),
         body,
-    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
-              "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)"})
+    )
 
 
 def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
@@ -2006,36 +1973,38 @@ def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
 
     if not counts.get("enabled"):
         body = html.Div("Data log cross-reference disabled.",
-                        style={"color": "#6c6c80", "fontSize": "13px"})
+                        style={"color": COLOR_TEXT_TERTIARY,
+                               "fontSize": FONT_SIZE_BODY})
     else:
         ln = counts.get("logged_not_qcd", 0)
         qn = counts.get("qcd_not_logged", 0)
         if ln == 0 and qn == 0:
             body = html.Div("Sheet and DB are in sync.",
-                            style={"color": "#30d158", "fontSize": "13px",
+                            style={"color": COLOR_SUCCESS,
+                                   "fontSize": FONT_SIZE_BODY,
                                    "fontWeight": "600"})
         else:
             body = html.Div([
-                html.Span(f"{ln} ", style={"color": "#ff9f0a",
+                html.Span(f"{ln} ", style={"color": COLOR_WARNING,
                                             "fontWeight": "700",
                                             "fontSize": "16px"}),
                 html.Span("logged, not QC'd",
-                         style={"color": "#a0a0b0", "marginRight": "24px",
-                                "fontSize": "13px"}),
-                html.Span(f"{qn} ", style={"color": "#5e7ce2",
+                         style={"color": COLOR_TEXT_SECONDARY,
+                                "marginRight": SPACE_5,
+                                "fontSize": FONT_SIZE_BODY}),
+                html.Span(f"{qn} ", style={"color": COLOR_ACCENT,
                                             "fontWeight": "700",
                                             "fontSize": "16px"}),
                 html.Span("QC'd, not logged",
-                         style={"color": "#a0a0b0", "fontSize": "13px"}),
+                         style={"color": COLOR_TEXT_SECONDARY,
+                                "fontSize": FONT_SIZE_BODY}),
             ])
 
-    return html.Div([
-        _home_section_header("Data log diff", "data_log_xref", "lab",
-                              "home-open-datalog"),
+    return _card(
+        _section_header("Data log diff",
+                         on_open_id="home-open-datalog"),
         body,
-    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
-              "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)"})
+    )
 
 
 def _build_overview_cards(store: Store):

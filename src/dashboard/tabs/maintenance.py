@@ -28,6 +28,14 @@ import pandas as pd
 from dash import Input, Output, callback_context, dash_table, dcc, html
 
 from src.db.store import Store
+from src.dashboard.components import (
+    TABLE_STYLE, empty_state, pill, refresh_bar,
+)
+from src.dashboard.design import (
+    COLOR_DIVIDER, COLOR_SURFACE_1, COLOR_TEXT_PRIMARY,
+    COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, FONT_SIZE_BODY,
+    FONT_SIZE_CAPTION, RADIUS_MD, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+)
 from src.dashboard.tabs.surgeries import (
     _load_sheet_via_api, _resolve_sa_path, _last_fetched,
     _find_column, _normalize_text,
@@ -444,48 +452,6 @@ def recent_incidents(config: dict, limit: int = 10,
 #  Rendering
 # ===================================================================== #
 
-_STATUS_COLOR = {
-    "done": "#30d158",
-    "pending": "#ff9f0a",
-    "overdue": "#ff453a",
-    "not_scheduled": "#5e7ce2",
-    "not_active": "#6c6c80",
-}
-_STATUS_LABEL = {
-    "done": "DONE",
-    "pending": "PENDING",
-    "overdue": "OVERDUE",
-    "not_scheduled": "NOT SCHEDULED",
-    "not_active": "NOT ACTIVE",
-}
-
-_TABLE_STYLE = {
-    "style_table": {"overflowX": "auto"},
-    "style_header": {
-        "backgroundColor": "#1a1a2e", "color": "#e0e0ea",
-        "fontWeight": "600",
-        "border": "1px solid rgba(255,255,255,0.07)",
-    },
-    "style_cell": {
-        "backgroundColor": "#13131f", "color": "#f0f0f5",
-        "padding": "8px", "fontSize": "13px",
-        "border": "1px solid rgba(255,255,255,0.05)",
-        "textAlign": "left", "whiteSpace": "normal", "height": "auto",
-    },
-}
-
-
-def _pill(status: str) -> html.Span:
-    color = _STATUS_COLOR.get(status, "#a0a0b0")
-    label = _STATUS_LABEL.get(status, status.upper())
-    return html.Span(label, style={
-        "backgroundColor": color, "color": "white",
-        "padding": "2px 10px", "borderRadius": "12px",
-        "fontSize": "11px", "fontWeight": "600",
-        "letterSpacing": "0.5px",
-    })
-
-
 def _detail_text(r: RigTaskStatus) -> str:
     if r.task == "battery":
         if not r.is_active:
@@ -510,8 +476,7 @@ def _detail_text(r: RigTaskStatus) -> str:
 
 def _status_grid(rows: list[RigTaskStatus]) -> html.Div:
     if not rows:
-        return html.Div("No rigs configured.",
-                        style={"color": "#a0a0b0", "padding": "12px"})
+        return empty_state("No rigs configured.")
     children = []
     for r in rows:
         who = (", ".join(n for n, _e in r.assignees)
@@ -519,35 +484,33 @@ def _status_grid(rows: list[RigTaskStatus]) -> html.Div:
         children.append(html.Div([
             html.Div(f"Rig {r.rig}", style={
                 "flex": "0 0 70px", "fontWeight": "600",
-                "color": "#f0f0f5",
+                "color": COLOR_TEXT_PRIMARY,
             }),
             html.Div(_task_pretty(r.task),
-                     style={"flex": "0 0 130px", "color": "#d0d0da"}),
+                     style={"flex": "0 0 130px",
+                            "color": COLOR_TEXT_PRIMARY}),
             html.Div(_detail_text(r),
-                     style={"flex": "1", "color": "#a0a0b0",
-                            "fontSize": "12px"}),
-            html.Div(who, style={"flex": "0 0 110px", "color": "#a0a0b0",
-                                  "fontSize": "12px"}),
-            _pill(r.status),
+                     style={"flex": "1", "color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION}),
+            html.Div(who, style={"flex": "0 0 110px",
+                                  "color": COLOR_TEXT_SECONDARY,
+                                  "fontSize": FONT_SIZE_CAPTION}),
+            pill(r.status),
         ], style={
-            "display": "flex", "alignItems": "center", "gap": "12px",
-            "padding": "10px 12px",
-            "borderBottom": "1px solid rgba(255,255,255,0.05)",
-            "backgroundColor": "#13131f",
+            "display": "flex", "alignItems": "center", "gap": SPACE_3,
+            "padding": f"{SPACE_3} {SPACE_3}",
+            "borderBottom": f"1px solid {COLOR_DIVIDER}",
+            "backgroundColor": COLOR_SURFACE_1,
         }))
     return html.Div(children, style={
-        "borderRadius": "8px", "overflow": "hidden",
-        "border": "1px solid rgba(255,255,255,0.08)",
+        "borderRadius": RADIUS_MD, "overflow": "hidden",
+        "border": f"1px solid {COLOR_DIVIDER}",
     })
 
 
 def _recent_table(events: list[dict]) -> html.Div:
     if not events:
-        return html.Div(
-            "No recent events.",
-            style={"color": "#6c6c80", "fontSize": "13px",
-                   "padding": "12px 0", "fontStyle": "italic"},
-        )
+        return empty_state("No recent events.")
     rows = [{
         "when": e["when"].strftime("%Y-%m-%d %H:%M"),
         "rig": f"Rig {e['rig']}",
@@ -564,17 +527,13 @@ def _recent_table(events: list[dict]) -> html.Div:
         {"name": "Notes", "id": "notes"},
     ]
     return html.Div([dash_table.DataTable(
-        data=rows, columns=columns, page_size=10, **_TABLE_STYLE,
+        data=rows, columns=columns, page_size=10, **TABLE_STYLE,
     )])
 
 
 def _incidents_table(events: list[dict]) -> html.Div:
     if not events:
-        return html.Div(
-            "No incident reports.",
-            style={"color": "#6c6c80", "fontSize": "13px",
-                   "padding": "12px 0", "fontStyle": "italic"},
-        )
+        return empty_state("No incident reports.")
     rows = [{
         "when": e["when"].strftime("%Y-%m-%d %H:%M"),
         "by": e["by"] or "-",
@@ -586,7 +545,7 @@ def _incidents_table(events: list[dict]) -> html.Div:
         {"name": "Report", "id": "report"},
     ]
     return html.Div([dash_table.DataTable(
-        data=rows, columns=columns, page_size=10, **_TABLE_STYLE,
+        data=rows, columns=columns, page_size=10, **TABLE_STYLE,
     )])
 
 
@@ -601,42 +560,38 @@ def _footer(rows: list[RigTaskStatus], sheet_id: str) -> html.Div:
                 if ts else "never")
         lines.append(html.Div(
             f"Rig {r.rig} {_task_pretty(r.task)} -- fetched {when}",
-            style={"color": "#6c6c80", "fontSize": "11px",
+            style={"color": COLOR_TEXT_TERTIARY,
+                   "fontSize": FONT_SIZE_CAPTION,
                    "marginBottom": "2px"},
         ))
-    return html.Div(lines, style={"marginTop": "16px"})
+    return html.Div(lines, style={"marginTop": SPACE_4})
 
 
 def _render(rows: list[RigTaskStatus], events: list[dict],
             incidents: list[dict], sheet_id: str, today: date) -> html.Div:
+    section_h = {
+        "color": COLOR_TEXT_SECONDARY, "marginTop": SPACE_5,
+        "marginBottom": SPACE_2, "fontSize": FONT_SIZE_CAPTION,
+        "textTransform": "uppercase", "letterSpacing": "0.5px",
+    }
     return html.Div([
         html.H3(f"Maintenance -- {today.isoformat()}",
-                style={"color": "#f0f0f5", "marginBottom": "12px"}),
+                style={"color": COLOR_TEXT_PRIMARY,
+                       "marginBottom": SPACE_3}),
         html.P(
             "Mirrors the lab's Apps Script: today's scheduled tasks + "
             "per-shelf completion, read live from the same sheet. The "
             "QC Monitor doesn't send maintenance reminders -- the Apps "
             "Script does that.",
-            style={"color": "#6c6c80", "fontSize": "12px",
-                   "marginBottom": "16px"},
+            style={"color": COLOR_TEXT_TERTIARY,
+                   "fontSize": FONT_SIZE_CAPTION,
+                   "marginBottom": SPACE_4},
         ),
-        html.H4("Today's status", style={
-            "color": "#a0a0b0", "marginTop": "8px",
-            "marginBottom": "8px", "fontSize": "13px",
-            "textTransform": "uppercase", "letterSpacing": "0.5px",
-        }),
+        html.H4("Today's status", style=section_h),
         _status_grid(rows),
-        html.H4("Recent activity", style={
-            "color": "#a0a0b0", "marginTop": "24px",
-            "marginBottom": "8px", "fontSize": "13px",
-            "textTransform": "uppercase", "letterSpacing": "0.5px",
-        }),
+        html.H4("Recent activity", style=section_h),
         _recent_table(events),
-        html.H4("Incident reports", style={
-            "color": "#a0a0b0", "marginTop": "24px",
-            "marginBottom": "8px", "fontSize": "13px",
-            "textTransform": "uppercase", "letterSpacing": "0.5px",
-        }),
+        html.H4("Incident reports", style=section_h),
         _incidents_table(incidents),
         _footer(rows, sheet_id),
     ])
@@ -650,32 +605,22 @@ def layout(store: Store, config: dict | None = None) -> html.Div:
     cfg = _maintenance_cfg(config or {})
     if not cfg.get("enabled", False):
         return html.Div([
-            html.H3("Maintenance", style={"color": "#f0f0f5"}),
+            html.H3("Maintenance",
+                    style={"color": COLOR_TEXT_PRIMARY}),
             html.P(
                 "Maintenance tracking is disabled. Enable it in "
                 "config.yaml -> maintenance.enabled and configure the "
                 "Sheet ID + rigs.",
-                style={"color": "#a0a0b0"},
+                style={"color": COLOR_TEXT_SECONDARY},
             ),
-        ], style={"padding": "24px"})
+        ], style={"padding": SPACE_5})
     refresh_min = float(cfg.get("refresh_minutes", 10))
     return html.Div([
-        html.Div([
-            html.Button(
-                "Refresh", id="maintenance-refresh-btn", n_clicks=0,
-                style={
-                    "backgroundColor": "#262638", "color": "#f0f0f5",
-                    "border": "1px solid rgba(255,255,255,0.1)",
-                    "padding": "8px 14px", "borderRadius": "6px",
-                    "cursor": "pointer", "fontSize": "13px",
-                },
-            ),
-        ], style={"display": "flex", "justifyContent": "flex-end",
-                  "marginBottom": "12px"}),
+        refresh_bar("maintenance-refresh-btn"),
         dcc.Interval(id="maintenance-tick",
                      interval=int(refresh_min * 60_000), n_intervals=0),
         html.Div(id="maintenance-pane"),
-    ], style={"padding": "24px"})
+    ], style={"padding": SPACE_5})
 
 
 def register_callbacks(app, store: Store, config: dict | None = None) -> None:

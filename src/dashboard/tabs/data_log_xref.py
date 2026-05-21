@@ -24,6 +24,14 @@ import pandas as pd
 from dash import Input, Output, callback_context, dash_table, dcc, html
 
 from src.db.store import Store
+from src.dashboard.components import (
+    TABLE_STYLE, empty_state, kpi, refresh_bar,
+)
+from src.dashboard.design import (
+    COLOR_ACCENT, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
+    COLOR_TEXT_TERTIARY, COLOR_WARNING, FONT_SIZE_CAPTION, SPACE_3,
+    SPACE_4, SPACE_5,
+)
 from src.dashboard.tabs.surgeries import (
     _load_sheet_via_api, _resolve_sa_path, _last_fetched,
     _find_column, _normalize_text,
@@ -155,30 +163,10 @@ def diff_counts(store: Store, config: dict,
 #  Rendering
 # ===================================================================== #
 
-_TABLE_STYLE = {
-    "style_table": {"overflowX": "auto"},
-    "style_header": {
-        "backgroundColor": "#1a1a2e", "color": "#e0e0ea",
-        "fontWeight": "600",
-        "border": "1px solid rgba(255,255,255,0.07)",
-    },
-    "style_cell": {
-        "backgroundColor": "#13131f", "color": "#f0f0f5",
-        "padding": "8px", "fontSize": "12px",
-        "border": "1px solid rgba(255,255,255,0.05)",
-        "textAlign": "left",
-        "whiteSpace": "normal",
-        "height": "auto",
-    },
-}
-
-
 def _logged_not_qcd_table(rows: list[dict]) -> html.Div:
     if not rows:
-        return html.Div(
-            "None -- every Sheet row has a matching QC'd file.",
-            style={"color": "#6c6c80", "fontSize": "13px",
-                   "padding": "12px 0", "fontStyle": "italic"},
+        return empty_state(
+            "Every Sheet row has a matching QC'd file.",
         )
     data = [{
         "ts": r["key"],
@@ -200,16 +188,14 @@ def _logged_not_qcd_table(rows: list[dict]) -> html.Div:
         {"name": "Filename (tail)", "id": "filename"},
     ]
     return html.Div([dash_table.DataTable(
-        data=data, columns=columns, page_size=10, **_TABLE_STYLE,
+        data=data, columns=columns, page_size=10, **TABLE_STYLE,
     )])
 
 
 def _qcd_not_logged_table(rows: list[dict]) -> html.Div:
     if not rows:
-        return html.Div(
-            "None -- every QC'd file has a matching Sheet row.",
-            style={"color": "#6c6c80", "fontSize": "13px",
-                   "padding": "12px 0", "fontStyle": "italic"},
+        return empty_state(
+            "Every QC'd file has a matching Sheet row.",
         )
     data = [{
         "ts": r.get("chunk_datetime") or "",
@@ -226,26 +212,8 @@ def _qcd_not_logged_table(rows: list[dict]) -> html.Div:
         {"name": "File (tail)", "id": "file_path"},
     ]
     return html.Div([dash_table.DataTable(
-        data=data, columns=columns, page_size=10, **_TABLE_STYLE,
+        data=data, columns=columns, page_size=10, **TABLE_STYLE,
     )])
-
-
-def _counter_card(label: str, value: int, color: str) -> html.Div:
-    return html.Div([
-        html.Div(label, style={
-            "fontSize": "11px", "color": "#a0a0b0",
-            "textTransform": "uppercase", "letterSpacing": "0.5px",
-            "marginBottom": "4px",
-        }),
-        html.Div(str(value), style={
-            "fontSize": "26px", "fontWeight": "700", "color": color,
-        }),
-    ], style={
-        "backgroundColor": "#13131f", "padding": "16px 22px",
-        "borderRadius": "8px",
-        "border": "1px solid rgba(255,255,255,0.07)",
-        "flex": "0 0 200px",
-    })
 
 
 def _render(today: date, sheet_records: dict[str, dict],
@@ -264,38 +232,37 @@ def _render(today: date, sheet_records: dict[str, dict],
     fetched_str = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                    if ts else "never")
 
+    section_h = {
+        "color": COLOR_TEXT_SECONDARY, "marginTop": SPACE_4,
+        "marginBottom": SPACE_3, "fontSize": FONT_SIZE_CAPTION,
+        "textTransform": "uppercase", "letterSpacing": "0.5px",
+    }
     return html.Div([
         html.H3(f"Data log diff -- {today.isoformat()}",
-                style={"color": "#f0f0f5", "marginBottom": "12px"}),
+                style={"color": COLOR_TEXT_PRIMARY,
+                       "marginBottom": SPACE_3}),
         html.Div([
-            _counter_card("Logged, not QC'd", len(logged_not_qcd_rows),
-                          "#ff9f0a"),
-            _counter_card("QC'd, not logged", len(qcd_not_logged_rows),
-                          "#5e7ce2"),
-            _counter_card("Sheet rows", sheet_total, "#a0a0b0"),
-            _counter_card("DB rows", len(db_records), "#a0a0b0"),
-        ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap",
-                  "marginBottom": "20px"}),
+            kpi("Logged, not QC'd", len(logged_not_qcd_rows),
+                color=COLOR_WARNING),
+            kpi("QC'd, not logged", len(qcd_not_logged_rows),
+                color=COLOR_ACCENT),
+            kpi("Sheet rows", sheet_total, color=COLOR_TEXT_SECONDARY),
+            kpi("DB rows", len(db_records), color=COLOR_TEXT_SECONDARY),
+        ], style={"display": "flex", "gap": SPACE_3, "flexWrap": "wrap",
+                  "marginBottom": SPACE_5}),
 
-        html.H4("Logged but not QC'd", style={
-            "color": "#a0a0b0", "marginTop": "16px", "marginBottom": "8px",
-            "fontSize": "13px", "textTransform": "uppercase",
-            "letterSpacing": "0.5px",
-        }),
+        html.H4("Logged but not QC'd", style=section_h),
         _logged_not_qcd_table(logged_not_qcd_rows),
 
-        html.H4("QC'd but not logged", style={
-            "color": "#a0a0b0", "marginTop": "24px", "marginBottom": "8px",
-            "fontSize": "13px", "textTransform": "uppercase",
-            "letterSpacing": "0.5px",
-        }),
+        html.H4("QC'd but not logged", style=section_h),
         _qcd_not_logged_table(qcd_not_logged_rows),
 
         html.Div(
             f"Sheet fetched {fetched_str} -- {sheet_dropped} sheet rows "
             f"dropped (no parseable timestamp).",
-            style={"color": "#6c6c80", "fontSize": "11px",
-                   "marginTop": "16px"},
+            style={"color": COLOR_TEXT_TERTIARY,
+                   "fontSize": FONT_SIZE_CAPTION,
+                   "marginTop": SPACE_4},
         ),
     ])
 
@@ -319,22 +286,11 @@ def layout(store: Store, config: dict | None = None) -> html.Div:
 
     refresh_min = float(cfg.get("refresh_minutes", 15))
     return html.Div([
-        html.Div([
-            html.Button(
-                "Refresh", id="dlx-refresh-btn", n_clicks=0,
-                style={
-                    "backgroundColor": "#262638", "color": "#f0f0f5",
-                    "border": "1px solid rgba(255,255,255,0.1)",
-                    "padding": "8px 14px", "borderRadius": "6px",
-                    "cursor": "pointer", "fontSize": "13px",
-                },
-            ),
-        ], style={"display": "flex", "justifyContent": "flex-end",
-                  "marginBottom": "12px"}),
+        refresh_bar("dlx-refresh-btn"),
         dcc.Interval(id="dlx-tick",
                      interval=int(refresh_min * 60_000), n_intervals=0),
         html.Div(id="dlx-pane"),
-    ], style={"padding": "24px"})
+    ], style={"padding": SPACE_5})
 
 
 def register_callbacks(app, store: Store, config: dict | None = None) -> None:

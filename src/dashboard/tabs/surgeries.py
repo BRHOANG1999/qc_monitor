@@ -27,6 +27,13 @@ import requests
 from dash import Input, Output, callback_context, dash_table, dcc, html
 
 from src.db.store import Store
+from src.dashboard.components import (
+    TABLE_STYLE as _SHARED_TABLE_STYLE, empty_state, refresh_bar,
+)
+from src.dashboard.design import (
+    COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
+    FONT_SIZE_CAPTION, SPACE_3, SPACE_5,
+)
 
 # Google Sheets API client is optional -- only required when a sheet entry
 # uses the service-account path. Imported lazily so the published-CSV path
@@ -416,31 +423,8 @@ _GROUP_ORDER = [
     "Post-op day 3",
 ]
 
-_TABLE_STYLE = {
-    "style_table": {"overflowX": "auto"},
-    "style_header": {
-        "backgroundColor": "#1a1a2e", "color": "#e0e0ea",
-        "fontWeight": "600", "border": "1px solid rgba(255,255,255,0.07)",
-    },
-    "style_cell": {
-        "backgroundColor": "#13131f", "color": "#f0f0f5",
-        "padding": "8px", "fontSize": "13px",
-        "border": "1px solid rgba(255,255,255,0.05)",
-        "textAlign": "left",
-    },
-    "style_data_conditional": [{
-        "if": {"row_index": "odd"},
-        "backgroundColor": "#16162a",
-    }],
-}
-
-
 def _empty_group(label: str) -> html.Div:
-    return html.Div(
-        f"No animals due for {label.lower()} today.",
-        style={"color": "#6c6c80", "fontSize": "13px",
-               "padding": "12px 0", "fontStyle": "italic"},
-    )
+    return empty_state(f"No animals due for {label.lower()} today.")
 
 
 def _task_table(tasks: list[dict]) -> html.Div:
@@ -452,17 +436,14 @@ def _task_table(tasks: list[dict]) -> html.Div:
         {"name": "Notes", "id": "notes"},
     ]
     return html.Div([dash_table.DataTable(
-        data=tasks, columns=columns, page_size=20, **_TABLE_STYLE,
+        data=tasks, columns=columns, page_size=20,
+        **_SHARED_TABLE_STYLE,
     )])
 
 
 def _upcoming_table(rows: list[dict]) -> html.Div:
     if not rows:
-        return html.Div(
-            "No surgeries scheduled in the next 7 days.",
-            style={"color": "#6c6c80", "fontSize": "13px",
-                   "padding": "12px 0", "fontStyle": "italic"},
-        )
+        return empty_state("No surgeries scheduled in the next 7 days.")
     columns = [
         {"name": "Animal", "id": "animal"},
         {"name": "Type", "id": "type"},
@@ -471,7 +452,8 @@ def _upcoming_table(rows: list[dict]) -> html.Div:
         {"name": "Sheet", "id": "sheet"},
     ]
     return html.Div([dash_table.DataTable(
-        data=rows, columns=columns, page_size=20, **_TABLE_STYLE,
+        data=rows, columns=columns, page_size=20,
+        **_SHARED_TABLE_STYLE,
     )])
 
 
@@ -497,37 +479,36 @@ def _footer(sheets_cfg: list[dict], dropped_by_sheet: dict[str, int]
         msg = f"{s.get('label', key)} ({via}) -- fetched {when}"
         if dropped:
             msg += f" -- {dropped} row(s) dropped (missing date/animal)"
-        rows.append(html.Div(msg, style={"color": "#6c6c80",
-                                         "fontSize": "12px",
-                                         "marginBottom": "4px"}))
-    return html.Div(rows, style={"marginTop": "24px"})
+        rows.append(html.Div(msg, style={
+            "color": COLOR_TEXT_TERTIARY,
+            "fontSize": FONT_SIZE_CAPTION, "marginBottom": "4px",
+        }))
+    return html.Div(rows, style={"marginTop": SPACE_5})
 
 
 def _render_panels(today: date, grouped: dict[str, list[dict]],
                    upcoming: list[dict],
                    sheets_cfg: list[dict],
                    dropped_by_sheet: dict[str, int]) -> html.Div:
+    section_h = {
+        "color": COLOR_TEXT_SECONDARY, "marginTop": SPACE_5,
+        "marginBottom": SPACE_3, "fontSize": FONT_SIZE_CAPTION,
+        "textTransform": "uppercase", "letterSpacing": "0.5px",
+    }
     children = [
         html.H3(f"Today's checklist -- {today.isoformat()}",
-                style={"color": "#f0f0f5", "marginBottom": "12px"}),
+                style={"color": COLOR_TEXT_PRIMARY,
+                       "marginBottom": SPACE_3}),
     ]
     for group in _GROUP_ORDER:
-        children.append(html.H4(group, style={
-            "color": "#a0a0b0", "marginTop": "16px",
-            "marginBottom": "8px", "fontSize": "14px",
-            "textTransform": "uppercase", "letterSpacing": "0.5px",
-        }))
+        children.append(html.H4(group, style=section_h))
         bucket = grouped.get(group, [])
         if bucket:
             children.append(_task_table(bucket))
         else:
             children.append(_empty_group(group))
 
-    children.append(html.H4("Next 7 days", style={
-        "color": "#a0a0b0", "marginTop": "24px",
-        "marginBottom": "8px", "fontSize": "14px",
-        "textTransform": "uppercase", "letterSpacing": "0.5px",
-    }))
+    children.append(html.H4("Next 7 days", style=section_h))
     children.append(_upcoming_table(upcoming))
 
     children.append(_footer(sheets_cfg, dropped_by_sheet))
@@ -562,32 +543,21 @@ def layout(store: Store, config: dict | None = None) -> html.Div:
     cfg = _surgeries_cfg(config or {})
     if not cfg.get("enabled", False):
         return html.Div([
-            html.H3("Surgeries", style={"color": "#f0f0f5"}),
+            html.H3("Surgeries", style={"color": COLOR_TEXT_PRIMARY}),
             html.P(
                 "Surgery tracker is disabled. Enable it in "
                 "config.yaml -> surgeries.enabled and add sheet URLs.",
-                style={"color": "#a0a0b0"},
+                style={"color": COLOR_TEXT_SECONDARY},
             ),
-        ], style={"padding": "24px"})
+        ], style={"padding": SPACE_5})
 
     refresh_min = float(cfg.get("refresh_minutes", 10))
     return html.Div([
-        html.Div([
-            html.Button(
-                "Refresh", id="surgeries-refresh-btn", n_clicks=0,
-                style={
-                    "backgroundColor": "#262638", "color": "#f0f0f5",
-                    "border": "1px solid rgba(255,255,255,0.1)",
-                    "padding": "8px 14px", "borderRadius": "6px",
-                    "cursor": "pointer", "fontSize": "13px",
-                },
-            ),
-        ], style={"display": "flex", "justifyContent": "flex-end",
-                  "marginBottom": "12px"}),
+        refresh_bar("surgeries-refresh-btn"),
         dcc.Interval(id="surgeries-tick",
                      interval=int(refresh_min * 60_000), n_intervals=0),
         html.Div(id="surgeries-pane"),
-    ], style={"padding": "24px"})
+    ], style={"padding": SPACE_5})
 
 
 def register_callbacks(app, store: Store, config: dict | None = None) -> None:
