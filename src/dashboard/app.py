@@ -578,11 +578,17 @@ def create_app(config: dict, store: Store) -> Dash:
     @app.callback(
         Output("overview-cards", "children"),
         Output("overview-queue", "children"),
+        Output("overview-home-grid", "children"),
         Input("refresh-trigger", "data"),
         prevent_initial_call=True,
     )
     def refresh_overview_dynamic(_n):
-        return _build_overview_cards(store), _build_overview_queue(store)
+        from datetime import date as _date
+        return (
+            _build_overview_cards(store),
+            _build_overview_queue(store),
+            _build_home_grid_children(store, config, _date.today()),
+        )
 
     @app.callback(
         Output("header-status-dot", "style"),
@@ -1812,20 +1818,6 @@ _HOME_ROW_STYLE = {
 def _home_surgery_block(store: Store, config: dict | None,
                          today: date) -> html.Div:
     """Today's surgery checklist in compact form."""
-    # Cold-cache: surgery sheets haven't been fetched yet -> show
-    # skeleton placeholder instead of an empty checklist that looks
-    # like "no surgeries today" when really we just don't know yet.
-    from src.dashboard.components import skeleton_rows
-    from src.dashboard.tabs.surgeries import cache_has_entry, _cache_key_for
-    cfg = (config or {}).get("surgeries", {}) or {}
-    sheets = cfg.get("sheets", []) or []
-    if sheets and not any(cache_has_entry(_cache_key_for(s)) for s in sheets):
-        return _card(
-            _section_header("Surgeries today",
-                             on_open_id="home-open-surgeries"),
-            skeleton_rows(4),
-        )
-
     try:
         from src.notifications.surgery_digest import _build_today
         grouped, _upcoming, _ = _build_today(today, config or {})
@@ -2070,6 +2062,20 @@ def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
     )
 
 
+def _build_home_grid_children(store: Store, config: dict | None,
+                                today: date) -> list:
+    """The five lab-side home blocks. Extracted so the refresh
+    callback can rebuild them in place without re-rendering the
+    cards / queue / waveform thumbnail above and below."""
+    return [
+        _home_surgery_block(store, config, today),
+        _home_schedule_block(config),
+        _home_maintenance_block(config),
+        _home_incidents_block(config),
+        _home_data_log_block(store, config),
+    ]
+
+
 def _build_overview_cards(store: Store):
     """Inner content for the system-health card strip. Returned without
     a wrapping Div so a callback can swap it via Patch / children."""
@@ -2299,18 +2305,16 @@ def _overview_tab(store: Store, config: dict | None = None):
     # Two-column responsive grid -- collapses to one column under ~880px.
     # 440 px is wide enough that the maintenance status pills stay on
     # one line and the data-log counter cards don't wrap awkwardly.
-    home_grid = html.Div([
-        _home_surgery_block(store, config, today),
-        _home_schedule_block(config),
-        _home_maintenance_block(config),
-        _home_incidents_block(config),
-        _home_data_log_block(store, config),
-    ], style={
-        "display": "grid",
-        "gridTemplateColumns": "repeat(auto-fit, minmax(440px, 1fr))",
-        "gap": "12px",
-        "marginTop": "16px",
-    })
+    home_grid = html.Div(
+        _build_home_grid_children(store, config, today),
+        id="overview-home-grid",
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(auto-fit, minmax(440px, 1fr))",
+            "gap": "12px",
+            "marginTop": "16px",
+        },
+    )
 
     return html.Div([
         cards, queue_section, home_grid,
