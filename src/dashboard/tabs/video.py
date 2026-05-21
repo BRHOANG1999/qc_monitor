@@ -27,20 +27,31 @@ from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Input, Output, State, dcc, html, no_update
+from collections import OrderedDict
+from threading import RLock
+from dash import Input, Output, State, dcc, html, no_update, Patch
 from dash.dependencies import ClientsideFunction
 
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
-from src.utils.mat_loader import load_mat
+from src.utils.chunk_cache import get_chunk
+from src.utils.decimate import (
+    envelope, window_slice, choose_target_bins, parse_relayout,
+)
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
-# Visual decimation target — how many display samples per second of
-# LFP we plot. 500 Hz catches everything under the gamma band visually
-# without choking Plotly. 60s file ~> 30k points; 600s file ~> 300k
-# points (still OK for Plotly WebGL). We use scattergl for safety.
-DISPLAY_SR_HZ = 500
+# Initial-render decimation target. The zoom callback re-decimates the
+# visible window dynamically, so this only governs the first paint and
+# the auto-reset view.
+INITIAL_TARGET_BINS = 60_000
+
+# Stim-blanked per-channel series cache. Re-blanking on every zoom is
+# wasteful when only the visible window changed; keyed by
+# (file_path, channel, blank_pre_ms, blank_post_ms, stim_fingerprint).
+_BLANKED_MAX = 8
+_blanked_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
+_blanked_lock = RLock()
 
 LABEL_STYLE = {
     "color": "#6c6c80", "fontSize": "11px", "marginBottom": "8px",
@@ -181,21 +192,41 @@ def _channel_options(store: Store, session_dir: str | None,
     return options
 
 
-def _decimated_lfp(file_path: str, channel: int,
-                   stim_times: np.ndarray | None = None,
-                   blank_pre_ms: float = -5.0,
-                   blank_post_ms: float = 15.0,
-                   ) -> tuple[np.ndarray, np.ndarray, float, int]:
-    """Load one channel of LFP and decimate for display.
+def _stim_fingerprint(stim_times: np.ndarray | None) -> tuple:
+    """Cheap stable fingerprint for use as a cache key."""
+    if stim_times is None or len(stim_times) == 0:
+        return (0, 0.0, 0.0)
+    arr = np.asarray(stim_times, dtype=np.float64)
+    return (int(arr.size), float(arr[0]), float(arr[-1]))
 
-    If *stim_times* is provided, samples within
-    [stim + blank_pre_ms, stim + blank_post_ms] are replaced with NaN
-    BEFORE decimation, so Plotly draws gaps where the stim artifacts
-    were. This is the "stim-blanked" display the reviewer asked for.
 
-    Returns (time_sec, signal_uV, duration_sec, n_blanked_pulses).
+def _get_blanked_series(file_path: str, channel: int,
+                        stim_times: np.ndarray | None,
+                        blank_pre_ms: float,
+                        blank_post_ms: float,
+                        ) -> tuple[np.ndarray, float, int]:
+    """Return the full single-channel series with stim windows NaN-blanked.
+
+    Cached because zoom callbacks would otherwise redo the blanking on
+    every relayout event. Returns (series, fs, n_blanked_pulses).
     """
-    chunk = load_mat(file_path)
+    assert isinstance(file_path, str) and file_path, "file_path required"
+    assert channel >= 0, "channel must be non-negative"
+
+    key = (file_path, int(channel), float(blank_pre_ms), float(blank_post_ms),
+           _stim_fingerprint(stim_times))
+
+    with _blanked_lock:
+        hit = _blanked_cache.pop(key, None)
+        if hit is not None:
+            _blanked_cache[key] = hit
+            series, fs = hit
+            # n_blanked is only consumed by the status line; on cache hit
+            # report the requested event count (close enough for display).
+            n_blanked = 0 if stim_times is None else int(len(stim_times))
+            return series, fs, n_blanked
+
+    chunk = get_chunk(file_path)
     fs = float(chunk.fs)
     sig = chunk.signal
     if sig.ndim != 2 or sig.shape[1] <= channel:
@@ -206,9 +237,6 @@ def _decimated_lfp(file_path: str, channel: int,
 
     n_blanked = 0
     if stim_times is not None and len(stim_times) > 0:
-        # Convert window edges to integer sample offsets. blank_pre_ms
-        # is typically negative (e.g. -5 ms), so pre_samples is also
-        # negative — that's the start offset relative to onset.
         pre = int(round(blank_pre_ms * 1e-3 * fs))
         post = int(round(blank_post_ms * 1e-3 * fs))
         n = len(series)
@@ -220,9 +248,32 @@ def _decimated_lfp(file_path: str, channel: int,
                 series[lo:hi] = np.nan
                 n_blanked += 1
 
-    factor = max(1, int(round(fs / DISPLAY_SR_HZ)))
-    display = series[::factor]
-    t = np.arange(len(display), dtype=np.float32) * (factor / fs)
+    with _blanked_lock:
+        _blanked_cache[key] = (series, fs)
+        while len(_blanked_cache) > _BLANKED_MAX:
+            _blanked_cache.popitem(last=False)
+
+    return series, fs, n_blanked
+
+
+def _decimated_lfp(file_path: str, channel: int,
+                   stim_times: np.ndarray | None = None,
+                   blank_pre_ms: float = -5.0,
+                   blank_post_ms: float = 15.0,
+                   ) -> tuple[np.ndarray, np.ndarray, float, int]:
+    """Load one channel of LFP and decimate for the initial render.
+
+    Delegates blanking + caching to ``_get_blanked_series`` and the
+    decimation to the shared envelope helper, so the zoom callback can
+    use the same path on a sub-window.
+
+    Returns (time_sec, signal_uV, duration_sec, n_blanked_pulses).
+    """
+    series, fs, n_blanked = _get_blanked_series(
+        file_path, channel, stim_times, blank_pre_ms, blank_post_ms,
+    )
+    target_bins = choose_target_bins(len(series)) or INITIAL_TARGET_BINS
+    t, display, _decim = envelope(series, fs, target_bins, t_start=0.0)
     duration = float(len(series) / fs)
     return t, display, duration, n_blanked
 
@@ -472,11 +523,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         ch_value = 0
         if file_path:
             try:
-                # Cheap probe — load_mat is fast enough; we re-load in
-                # the LFP callback. Avoid double-load by caching? For
-                # now keep it simple.
-                from src.utils.mat_loader import load_mat as _lm
-                chunk = _lm(file_path)
+                # Route the channel-count probe through the chunk cache
+                # so the subsequent LFP callback hits a warm entry.
+                chunk = get_chunk(file_path)
                 n_ch = int(chunk.signal.shape[1])
                 session_dir = _session_dir_for_file(store, file_id)
                 ch_options = _channel_options(store, session_dir, n_ch)
@@ -500,10 +549,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     # ---- LFP trace ---- #
     @app.callback(
-        Output("video-lfp-trace", "figure"),
+        Output("video-lfp-trace", "figure", allow_duplicate=True),
         Output("video-lfp-status", "children"),
         Input("video-file-dropdown", "value"),
         Input("video-channel-dropdown", "value"),
+        prevent_initial_call="initial_duplicate",
     )
     def _update_lfp(file_id, channel):
         if not file_id:
@@ -548,6 +598,66 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         elif len(_stim_times_for_file(store, file_id)) == 0:
             status_bits.append("no stim events on file")
         return fig, " · ".join(status_bits)
+
+    # ---- Zoom-driven dynamic decimation ----
+    # When the reviewer zooms in, re-decimate just the visible window so
+    # narrow features (e.g. 150 us stim pulses) resolve to real samples.
+    # The orange cursor lives in figure.layout.shapes[0] and the clientside
+    # cursor callback writes layout only, so patching figure.data here is
+    # safe -- the cursor and zoom callbacks edit disjoint paths.
+    @app.callback(
+        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        Input("video-lfp-trace", "relayoutData"),
+        State("video-file-dropdown", "value"),
+        State("video-channel-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _video_lfp_zoom(relayout, file_id, channel):
+        if not file_id or channel is None or not relayout:
+            return no_update
+        x0, x1, is_reset = parse_relayout(relayout)
+        if x0 is None and x1 is None and not is_reset:
+            return no_update
+
+        file_path = _file_path_for_id(store, file_id)
+        if not file_path:
+            return no_update
+
+        session_dir = _session_dir_for_file(store, file_id)
+        stim_copy = _stim_copy_channels(store, session_dir)
+        is_stim_copy = channel in stim_copy
+        stim_times = (np.asarray([], dtype=np.float64)
+                      if is_stim_copy
+                      else _stim_times_for_file(store, file_id))
+
+        try:
+            series, fs, _ = _get_blanked_series(
+                file_path, channel,
+                stim_times if len(stim_times) else None,
+                blank_pre_ms, blank_post_ms,
+            )
+        except Exception as e:
+            logger.warning("zoom blanked-series load failed file=%s ch=%s: %s",
+                           file_id, channel, e)
+            return no_update
+
+        n = len(series)
+        if is_reset:
+            lo, hi = 0, n
+        else:
+            lo, hi = window_slice(n, fs, x0, x1)
+        if hi <= lo:
+            return no_update
+
+        target_bins = choose_target_bins(hi - lo) or INITIAL_TARGET_BINS
+        x_p, y_p, _decim = envelope(
+            series[lo:hi], fs, target_bins, t_start=lo / fs,
+        )
+
+        p = Patch()
+        p["data"][0]["x"] = x_p
+        p["data"][0]["y"] = y_p
+        return p
 
     # ---- Note save (unchanged) ---- #
     @app.callback(

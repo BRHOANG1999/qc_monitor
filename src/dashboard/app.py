@@ -9,13 +9,17 @@ from datetime import datetime
 
 import numpy as np
 import yaml
-from dash import Dash, html, dcc, dash_table, callback_context, no_update, ALL
+from dash import Dash, html, dcc, dash_table, callback_context, no_update, ALL, Patch
 from dash.dependencies import Input, Output, State
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src.db.store import Store
 from src.utils.mat_loader import load_mat
+from src.utils.chunk_cache import get_chunk
+from src.utils.decimate import (
+    envelope_channel, window_slice, choose_target_bins, parse_relayout,
+)
 from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
@@ -990,7 +994,7 @@ def create_app(config: dict, store: Store) -> Dash:
             return _empty_fig("Select a file and click Load", 600)
 
         try:
-            chunk = load_mat(file_path)
+            chunk = get_chunk(file_path)
         except Exception as e:
             return _empty_fig(f"Error loading file: {e}", 600)
 
@@ -1011,42 +1015,17 @@ def create_app(config: dict, store: Store) -> Dash:
                 return {"name": name, "role": role}
             return sess_map.get(ch_idx, {"name": f"Ch{ch_idx}", "role": "eeg"})
 
-        # --- Min/max envelope decimation -----------------------------------
-        # A 150 us biphasic stim pulse at 20 kHz is only ~3 samples wide.
-        # Naive every-Nth subsampling drops most pulses; the (min, max) of
-        # each bin preserves the peak so even a single-sample spike survives.
-        target_bins = 60000  # ~60k bins -> 120k points per channel
-        decim = max(1, n_samples // target_bins)
-        n_bins = n_samples // decim
-
-        if decim == 1:
-            x_plot = np.arange(n_samples) / fs
-        else:
-            trimmed_len = n_bins * decim
-            bin_left_t = (np.arange(n_bins) * decim) / fs
-            bin_right_t = ((np.arange(n_bins) + 1) * decim - 1) / fs
-            # Interleave bin-left, bin-right per sample pair (vertical line per bin)
-            x_plot = np.empty(n_bins * 2)
-            x_plot[0::2] = bin_left_t
-            x_plot[1::2] = bin_right_t
-
+        target_bins = choose_target_bins(n_samples) or 60_000
         fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
                             vertical_spacing=0.005)
 
+        decim_used = 1
         for ch_idx in range(n_ch):
             info = _info_for(ch_idx)
             color = _color_for_role(info["role"])
-
-            if decim == 1:
-                y_plot = signal[:, ch_idx]
-            else:
-                binned = signal[: n_bins * decim, ch_idx].reshape(n_bins, decim)
-                mins = binned.min(axis=1)
-                maxs = binned.max(axis=1)
-                y_plot = np.empty(n_bins * 2)
-                y_plot[0::2] = mins
-                y_plot[1::2] = maxs
-
+            x_plot, y_plot, decim_used = envelope_channel(
+                signal, ch_idx, fs, 0, n_samples, target_bins,
+            )
             fig.add_trace(go.Scattergl(
                 x=x_plot, y=y_plot,
                 mode="lines", name=info["name"],
@@ -1057,12 +1036,13 @@ def create_app(config: dict, store: Store) -> Dash:
                              tickfont=dict(size=8))
 
         fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
-        if decim > 1:
-            bin_ms = decim / fs * 1000.0
+        if decim_used > 1:
+            bin_ms = decim_used / fs * 1000.0
             title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} ch @ {fs:.0f} Hz "
-                     f"-- min/max envelope, {bin_ms:.2f} ms/bin (pulses preserved)")
+                     f"-- min/max envelope, {bin_ms:.2f} ms/bin (zoom to refine)")
         else:
-            title = f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels @ {fs:.0f} Hz"
+            title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels "
+                     f"@ {fs:.0f} Hz -- raw samples")
         fig.update_layout(
             template="plotly_dark",
             title=title,
@@ -1070,6 +1050,41 @@ def create_app(config: dict, store: Store) -> Dash:
             showlegend=False,
         )
         return fig
+
+    @app.callback(
+        Output("lfp-plot", "figure", allow_duplicate=True),
+        Input("lfp-plot", "relayoutData"),
+        State("lfp-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _lfp_zoom(relayout, file_path):
+        if not file_path or not relayout:
+            return no_update
+        x0, x1, is_reset = parse_relayout(relayout)
+        if x0 is None and x1 is None and not is_reset:
+            return no_update
+        try:
+            chunk = get_chunk(file_path)
+        except Exception:
+            return no_update
+
+        n_samples, n_ch = chunk.signal.shape
+        if is_reset:
+            lo, hi = 0, n_samples
+        else:
+            lo, hi = window_slice(n_samples, chunk.fs, x0, x1)
+        if hi <= lo:
+            return no_update
+
+        target_bins = choose_target_bins(hi - lo) or 60_000
+        patch = Patch()
+        for ch in range(n_ch):
+            x_p, y_p, _ = envelope_channel(
+                chunk.signal, ch, chunk.fs, lo, hi, target_bins,
+            )
+            patch["data"][ch]["x"] = x_p
+            patch["data"][ch]["y"] = y_p
+        return patch
 
     @app.callback(
         Output("lfp-file-dropdown", "options"),
