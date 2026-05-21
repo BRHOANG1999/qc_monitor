@@ -29,6 +29,8 @@ from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
 from src.dashboard.components import (
     card as _card, pill as _pill, section_header as _section_header,
 )
+# Side-effect import: registers the qc_dark Plotly template as default
+from src.dashboard import plotly_template  # noqa: F401
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -332,7 +334,7 @@ def _empty_fig(text: str = "Nothing to show yet",
             x=0.5, y=0.42, font=dict(size=11, color=COLOR_TEXT_TERTIARY),
         ))
     fig.update_layout(
-        template="plotly_dark", height=height,
+        height=height,
         plot_bgcolor=COLOR_SURFACE_1, paper_bgcolor=COLOR_SURFACE_1,
         annotations=annotations,
         xaxis=dict(visible=False), yaxis=dict(visible=False),
@@ -786,7 +788,6 @@ def create_app(config: dict, store: Store) -> Dash:
                                          marker=dict(color="#FFA15A", size=5, opacity=0.7)))
 
             fig.update_layout(
-                template="plotly_dark",
                 title=label,
                 xaxis_title="Time",
                 yaxis_title=label,
@@ -963,7 +964,6 @@ def create_app(config: dict, store: Store) -> Dash:
             row += 1
 
         fig.update_layout(
-            template="plotly_dark",
             height=250 * n_rows,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
@@ -1014,7 +1014,6 @@ def create_app(config: dict, store: Store) -> Dash:
             ))
 
         fig.update_layout(
-            template="plotly_dark",
             title="Criticality (dB) Over Time -- EEG Channels",
             xaxis_title="Time",
             yaxis_title="dB Value",
@@ -1088,7 +1087,6 @@ def create_app(config: dict, store: Store) -> Dash:
             title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels "
                      f"@ {fs:.0f} Hz -- raw samples")
         fig.update_layout(
-            template="plotly_dark",
             title=title,
             height=max(600, n_ch * 80),
             showlegend=False,
@@ -1210,8 +1208,7 @@ def create_app(config: dict, store: Store) -> Dash:
             ), row=3, col=1)
 
         fig.update_layout(
-            height=700, template="plotly_dark",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=700, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         fig.update_annotations(font=dict(color="white"))
         return fig
@@ -1277,7 +1274,6 @@ def create_app(config: dict, store: Store) -> Dash:
 
         wf_fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
         wf_fig.update_layout(
-            template="plotly_dark",
             title="Mean Evoked Waveform Overlay",
             xaxis_title="Time (ms)", yaxis_title="Amplitude",
             height=450,
@@ -1326,7 +1322,6 @@ def create_app(config: dict, store: Store) -> Dash:
             ))
 
         feat_fig.update_layout(
-            template="plotly_dark",
             title="Feature Distribution Comparison (top 5)",
             xaxis_title="Feature", yaxis_title="Value",
             barmode="group", height=450,
@@ -2134,7 +2129,6 @@ def _overview_tab(store: Store, config: dict | None = None):
 
                     thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
                     thumb_fig.update_layout(
-                        template="plotly_dark",
                         title=f"Latest Evoked — {latest_datetime[:16]}",
                         height=180 * n_ch, margin=dict(l=60, r=20, t=40, b=30),
                         showlegend=True,
@@ -2351,8 +2345,7 @@ def _signal_quality_tab(store: Store):
         ), row=3, col=1)
 
     fig.update_layout(
-        height=750, template="plotly_dark",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=750, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_annotations(font=dict(color="white"))
 

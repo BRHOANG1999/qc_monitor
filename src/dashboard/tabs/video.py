@@ -289,7 +289,6 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
     ))
     # Cursor placeholder — clientside callback updates the x position.
     fig.update_layout(
-        template="plotly_dark",
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         height=220,
         margin=dict(l=60, r=20, t=10, b=40),
@@ -311,7 +310,7 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
 def _empty_lfp_fig(text: str) -> go.Figure:
     fig = go.Figure()
     fig.update_layout(
-        template="plotly_dark", height=220,
+        height=220,
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         annotations=[dict(text=text, showarrow=False, x=0.5, y=0.5,
                           xref="paper", yref="paper",
