@@ -153,41 +153,41 @@ auth:
   dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
   dev_bypass_email: hoang392@umn.edu
 maintenance:
-  # Per-rig cleaning + battery-swap status pulled from the Maintenance
-  # Tracker Google Sheet. Cage cleaning is weekly; battery swaps land
-  # on Mon/Wed/Fri. Tab names are listed literally because the emoji
-  # prefixes are inconsistent across the sheet (note the missing space
-  # after the ant on Rig A Cage Cleaning).
+  # Mirrors the lab's Apps Script semantics: today's status is read from
+  # the '📅 Schedule' tab (which weekdays each task runs on, who's
+  # assigned) + the 'Active Shelves' tab (which rig+shelf slots count)
+  # + the per-rig event tabs. The QC Monitor does NOT send maintenance
+  # reminders -- the Apps Script owns operational alerts, escalation,
+  # and incident notifications.
   enabled: true
   refresh_minutes: 10
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   sheet_id: "1EyECDE7Uk-a2o9YDtTL3zvIZ6xH-OCfN_ZT7vvB-m4U"
-  default_grace_hours: 24
+  # Tab names (override if you rename them in the Sheet)
+  schedule_tab_name: "📅 Schedule"
+  active_shelves_tab_name: "Active Shelves"
+  incident_tab_name: "⚠️ Incident Report form"
+  # Task labels in the Schedule tab's Task column -- must match exactly
+  task_label_battery: "Battery Change"
+  task_label_cage: "Cage Cleaning"
+  # When a scheduled task crosses these hours without being done, status
+  # flips from PENDING (yellow) to OVERDUE (red). Same defaults as the
+  # Apps Script CONFIG (BATTERY_ESCALATION_START_HOUR / CAGE_...).
+  escalation_hours:
+    battery: 15.5    # 3:30 PM
+    cage: 17.0       # 5:00 PM
+  # Per-rig event tabs -- emoji prefix spacing is inconsistent across
+  # the sheet so list each name literally.
   rigs:
     - name: A
-      tasks:
-        cage_cleaning:
-          tab_name: "🐜Rig A Cage Cleaning"
-          cadence: weekly
-        battery_replacement:
-          tab_name: "🐜 Rig A Battery Replacement"
-          cadence: mwf
+      battery_tab: "🐜 Rig A Battery Replacement"
+      cage_tab: "🐜Rig A Cage Cleaning"
     - name: B
-      tasks:
-        cage_cleaning:
-          tab_name: "🐻 Rig B Cage Cleaning"
-          cadence: weekly
-        battery_replacement:
-          tab_name: "🐻 Rig B Battery Replacement"
-          cadence: mwf
+      battery_tab: "🐻 Rig B Battery Replacement"
+      cage_tab: "🐻 Rig B Cage Cleaning"
     - name: C
-      tasks:
-        cage_cleaning:
-          tab_name: "🐱 Rig C Cage Cleaning"
-          cadence: weekly
-        battery_replacement:
-          tab_name: "🐱 Rig C Battery Replacement"
-          cadence: mwf
+      battery_tab: "🐱 Rig C Battery Replacement"
+      cage_tab: "🐱 Rig C Cage Cleaning"
 
 data_log_xref:
   # Reconciles the KMrecorder Data Log Sheet against monitor.db -- shows
