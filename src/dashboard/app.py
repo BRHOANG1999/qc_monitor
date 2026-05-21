@@ -456,6 +456,19 @@ def create_app(config: dict, store: Store) -> Dash:
                            "fontWeight": "600", "letterSpacing": "-0.2px",
                            "display": "inline-block",
                            "color": COLOR_TEXT_PRIMARY}),
+            html.Span(
+                id="header-status-dot",
+                className="status-dot",
+                title="Health: unknown",
+                style={
+                    "display": "inline-block",
+                    "width": "8px", "height": "8px",
+                    "borderRadius": "50%",
+                    "backgroundColor": COLOR_TEXT_TERTIARY,
+                    "marginLeft": SPACE_3,
+                    "verticalAlign": "middle",
+                },
+            ),
             html.Span(id="logged-in-as",
                       style={"marginLeft": SPACE_4,
                              "color": COLOR_TEXT_TERTIARY,
@@ -570,6 +583,47 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def refresh_overview_dynamic(_n):
         return _build_overview_cards(store), _build_overview_queue(store)
+
+    @app.callback(
+        Output("header-status-dot", "style"),
+        Output("header-status-dot", "title"),
+        Output("header-status-dot", "className"),
+        Input("refresh-trigger", "data"),
+    )
+    def update_header_status_dot(_n):
+        """One-glance health indicator beside the title. Green +
+        pulsing when the SMB share is up and the queue isn't stuck;
+        red + pulsing otherwise."""
+        try:
+            history = store.get_health_history(hours=1)
+        except Exception:
+            history = []
+        latest = history[-1] if history else {}
+        net_ok = bool(latest.get("network_share_accessible"))
+        # Crude queue-stalled heuristic: 0 files processed in the last
+        # hour while there's a non-empty pending queue. Cheap to compute.
+        files_hour = int(latest.get("files_processed_last_hour", 0) or 0)
+        try:
+            pending = bool(store.get_pending_files(limit=1))
+        except Exception:
+            pending = False
+        queue_stalled = pending and files_hour == 0
+        ok = net_ok and not queue_stalled
+        color = COLOR_SUCCESS if ok else COLOR_DANGER
+        title = ("Healthy: network up, queue moving"
+                 if ok
+                 else ("Network share unreachable" if not net_ok
+                       else "Queue stalled (no files processed last hour)"))
+        cls = "status-dot " + ("pulse-ok" if ok else "pulse-bad")
+        style = {
+            "display": "inline-block",
+            "width": "8px", "height": "8px",
+            "borderRadius": "50%",
+            "backgroundColor": color,
+            "marginLeft": SPACE_3,
+            "verticalAlign": "middle",
+        }
+        return style, title, cls
 
     @app.callback(
         Output("last-refresh-label", "children"),

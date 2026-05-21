@@ -21,6 +21,7 @@ from src.dashboard.design import (
     COLOR_WARNING, FONT_SIZE_BODY, FONT_SIZE_CAPTION, FONT_SIZE_HEADER,
     RADIUS_MD, RADIUS_SM, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
 )
+from src.dashboard.icons import icon
 
 # --------------------------------------------------------------------- #
 #  Card -- the universal "panel" wrapper used everywhere on the home
@@ -70,16 +71,22 @@ def section_header(title: str, on_open_id: str | None = None,
         html.Div(extras or [], style={"flex": "1"}),
     ]
     if on_open_id:
-        parts.append(html.Button(
-            on_open_label, id=on_open_id, n_clicks=0,
-            style={
-                "backgroundColor": "transparent",
-                "color": COLOR_ACCENT,
-                "border": "none", "cursor": "pointer",
-                "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600",
-                "letterSpacing": "0.3px", "padding": "0",
-            },
-        ))
+        # Strip the trailing " >" from the legacy default label; the
+        # icon does that job now.
+        clean_label = on_open_label.rstrip(" >")
+        parts.append(html.Button([
+            clean_label,
+            icon("arrow-right", size=12, color=COLOR_ACCENT,
+                 style={"marginLeft": SPACE_1}),
+        ], id=on_open_id, n_clicks=0, style={
+            "backgroundColor": "transparent",
+            "color": COLOR_ACCENT,
+            "border": "none", "cursor": "pointer",
+            "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600",
+            "letterSpacing": "0.3px", "padding": "0",
+            "display": "inline-flex", "alignItems": "center",
+            "gap": SPACE_1,
+        }))
     return html.Div(parts, style={
         "display": "flex", "alignItems": "center",
         "gap": SPACE_3,
@@ -180,12 +187,17 @@ def kpi(label: str, value: Any, color: str | None = None) -> html.Div:
 # --------------------------------------------------------------------- #
 
 def refresh_button(id_: str, label: str = "Refresh") -> html.Button:
-    return html.Button(label, id=id_, n_clicks=0, style={
+    return html.Button([
+        icon("refresh", size=13, color=COLOR_TEXT_PRIMARY,
+             style={"marginRight": SPACE_2}),
+        label,
+    ], id=id_, n_clicks=0, style={
         "backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMARY,
         "border": f"1px solid {COLOR_DIVIDER}",
         "padding": f"{SPACE_2} {SPACE_4}",
         "borderRadius": RADIUS_SM,
         "cursor": "pointer", "fontSize": FONT_SIZE_BODY,
+        "display": "inline-flex", "alignItems": "center",
     })
 
 
@@ -203,8 +215,16 @@ def refresh_bar(refresh_btn_id: str) -> html.Div:
 #  Empty state -- replace italic-gray "Nothing to show" text everywhere.
 # --------------------------------------------------------------------- #
 
-def empty_state(label: str, hint: str | None = None) -> html.Div:
+def empty_state(label: str, hint: str | None = None,
+                 icon_name: str = "inbox") -> html.Div:
+    """Friendly empty placeholder with a faded icon + label.
+
+    *icon_name* picks the SVG -- choose "inbox" / "clock" / "check-
+    circle" / "file-text" based on what's empty.
+    """
     children: list = [
+        icon(icon_name, size=22, color=COLOR_TEXT_TERTIARY,
+             style={"marginBottom": SPACE_2, "opacity": "0.7"}),
         html.Div(label, style={
             "fontSize": FONT_SIZE_BODY, "color": COLOR_TEXT_SECONDARY,
         }),
@@ -217,6 +237,8 @@ def empty_state(label: str, hint: str | None = None) -> html.Div:
     return html.Div(children, style={
         "padding": f"{SPACE_5} 0",
         "textAlign": "center",
+        "display": "flex", "flexDirection": "column",
+        "alignItems": "center",
     })
 
 
