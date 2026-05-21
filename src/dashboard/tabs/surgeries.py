@@ -58,33 +58,37 @@ _FETCH_TIMEOUT_SEC = 10
 #  Data path
 # ===================================================================== #
 
-def _load_sheet(url: str, ttl_sec: float) -> pd.DataFrame | None:
+def _load_sheet(url: str, ttl_sec: float, header_row: int = 1
+                ) -> pd.DataFrame | None:
     """Return a DataFrame for *url*, hitting the cache when fresh.
 
-    Network errors fall back to the previous cached frame (if any) so a
-    flaky Google response doesn't blank the tab.
+    *header_row* is 1-indexed; rows above it are skipped so banded
+    headers (group label on row 1, real names on row 2) still produce
+    a clean frame.
     """
     assert isinstance(url, str) and url, "url required"
     assert ttl_sec >= 0, "ttl_sec must be non-negative"
+    assert header_row >= 1, "header_row is 1-indexed"
 
+    cache_key = f"csv:{url}:h{header_row}"
     now = time.time()
     with _cache_lock:
-        hit = _cache.get(url)
+        hit = _cache.get(cache_key)
         if hit is not None and (now - hit[0]) < ttl_sec:
             return hit[1]
 
     try:
         resp = requests.get(url, timeout=_FETCH_TIMEOUT_SEC)
         resp.raise_for_status()
-        df = pd.read_csv(BytesIO(resp.content))
+        df = pd.read_csv(BytesIO(resp.content), header=header_row - 1)
     except Exception as e:
         logger.warning("Surgery sheet fetch failed: %s (url=%s)", e, url)
         with _cache_lock:
-            stale = _cache.get(url)
+            stale = _cache.get(cache_key)
         return stale[1] if stale is not None else None
 
     with _cache_lock:
-        _cache[url] = (now, df)
+        _cache[cache_key] = (now, df)
     return df
 
 
@@ -120,15 +124,18 @@ def _sheets_api(service_account_file: str):
 
 def _load_sheet_via_api(sheet_id: str, tab_name: str,
                         service_account_file: str,
-                        ttl_sec: float) -> pd.DataFrame | None:
+                        ttl_sec: float,
+                        header_row: int = 1) -> pd.DataFrame | None:
     """Read a sheet via the Sheets API using a service-account key.
 
-    Returns the same DataFrame shape as ``_load_sheet`` (first row =
-    columns). Falls back to the previous cached value on network /
-    auth errors.
+    *header_row* is 1-indexed. Rows above it are dropped so two-row
+    banded headers (group label / real name) still produce a clean
+    frame. Falls back to the previous cached value on network / auth
+    errors.
     """
     assert sheet_id and tab_name, "sheet_id and tab_name required"
-    cache_key = f"api:{sheet_id}:{tab_name}"
+    assert header_row >= 1, "header_row is 1-indexed"
+    cache_key = f"api:{sheet_id}:{tab_name}:h{header_row}"
 
     now = time.time()
     with _cache_lock:
@@ -149,13 +156,26 @@ def _load_sheet_via_api(sheet_id: str, tab_name: str,
         return stale[1] if stale is not None else None
 
     values = resp.get("values", [])
-    if not values:
+    if len(values) < header_row:
         df = pd.DataFrame()
     else:
-        header = [str(h) for h in values[0]]
-        # Pad short rows so DataFrame construction doesn't drop tail columns
-        width = len(header)
-        rows = [r + [""] * (width - len(r)) for r in values[1:]]
+        header = [str(h) for h in values[header_row - 1]]
+        data_rows = values[header_row:]
+        # Some rows may be longer than the header (stray cells past the
+        # rightmost named column) or shorter (trailing blanks dropped by
+        # the API). Normalize to the max width seen, padding header with
+        # placeholder names so no data is silently lost.
+        max_w = max([len(header)] + [len(r) for r in data_rows])
+        if len(header) < max_w:
+            header = header + [f"_extra_{i}" for i in
+                                range(len(header), max_w)]
+        # Disambiguate duplicate column names. Lab sheets often repeat
+        # "Notes" / "A/P" / etc. across injection-target blocks, and
+        # itertuples()._asdict() returns None for every field when any
+        # name repeats. Keep the first occurrence canonical so
+        # _find_column still resolves it.
+        header = _dedupe(header)
+        rows = [r + [""] * (max_w - len(r)) for r in data_rows]
         df = pd.DataFrame(rows, columns=header)
 
     with _cache_lock:
@@ -178,13 +198,31 @@ def _resolve_sa_path(config: dict, raw_path: str) -> str:
 #  Column discovery and parsing
 # ===================================================================== #
 
+def _norm_colname(name: str) -> str:
+    """Normalize a column name for matching: lowercase, strip, collapse
+    runs of underscores / dashes / whitespace to a single space."""
+    s = str(name).lower().strip()
+    out = []
+    last_space = False
+    for ch in s:
+        if ch in (" ", "_", "-", "\t"):
+            if not last_space:
+                out.append(" ")
+                last_space = True
+        else:
+            out.append(ch)
+            last_space = False
+    return "".join(out)
+
+
 def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Return the first matching column (case-insensitive), else None."""
+    """Return the first matching column (case-insensitive,
+    underscore-/dash-/space-insensitive), else None."""
     if df is None or df.empty:
         return None
-    lower_map = {c.lower().strip(): c for c in df.columns}
+    norm_map = {_norm_colname(c): c for c in df.columns}
     for cand in candidates:
-        hit = lower_map.get(cand.lower().strip())
+        hit = norm_map.get(_norm_colname(cand))
         if hit is not None:
             return hit
     return None
@@ -211,6 +249,21 @@ def _normalize_text(value) -> str:
     return str(value).strip()
 
 
+def _dedupe(names: list[str]) -> list[str]:
+    """Return a copy with duplicates suffixed `.1`, `.2`, ... First
+    occurrence of each name is kept canonical."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for n in names:
+        if n in seen:
+            seen[n] += 1
+            out.append(f"{n}.{seen[n]}")
+        else:
+            seen[n] = 0
+            out.append(n)
+    return out
+
+
 # ===================================================================== #
 #  Compute today's tasks
 # ===================================================================== #
@@ -226,80 +279,127 @@ def _step_for_delta(delta_days: int, is_implant: bool) -> str | None:
     return None
 
 
-def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
-                      aliases: dict, implant_kw: list[str]
-                      ) -> tuple[list[dict], int]:
-    """Walk a DataFrame and emit task dicts for rows due today/in window.
+def _resolve_date_columns(df: pd.DataFrame, date_columns_cfg: list[dict] | None,
+                          aliases: dict) -> list[dict]:
+    """Return a list of {column_name, is_implant, event_label} for every
+    date column the user wants tracked on this sheet.
 
-    Returns (tasks, dropped) where *dropped* counts rows skipped because a
-    required column was missing or unparseable.
+    Per-sheet *date_columns_cfg* (if given) wins. Otherwise we fall back
+    to a single date column found via the global ``surgery_date`` alias
+    list, with ``is_implant`` inferred row-by-row from the surgery-type
+    column in the caller. The returned event_label is None in that
+    fallback so the caller knows to use the row's surgery-type value.
+    """
+    out: list[dict] = []
+    if date_columns_cfg:
+        for entry in date_columns_cfg:
+            name = entry.get("name") or entry.get("col")
+            if not name or name not in df.columns:
+                continue
+            out.append({
+                "column": name,
+                "is_implant": bool(entry.get("is_implant", False)),
+                "event_label": entry.get("event_label") or name,
+            })
+        return out
+    col_date = _find_column(df, aliases["surgery_date"])
+    if col_date is not None:
+        out.append({"column": col_date, "is_implant": None,
+                    "event_label": None})
+    return out
+
+
+def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
+                      aliases: dict, implant_kw: list[str],
+                      date_columns_cfg: list[dict] | None = None
+                      ) -> tuple[list[dict], int]:
+    """Walk a DataFrame and emit task dicts for rows due today.
+
+    A row can contribute multiple events when *date_columns_cfg* lists
+    more than one date column (e.g. injection + implant on the same
+    animal). Returns ``(tasks, dropped)``; *dropped* counts rows that
+    had neither an animal id nor any parseable date.
     """
     assert isinstance(today, date), "today must be a date"
-
     if df is None or df.empty:
         return [], 0
 
     col_animal = _find_column(df, aliases["animal_id"])
-    col_date = _find_column(df, aliases["surgery_date"])
     col_type = _find_column(df, aliases["surgery_type"])
     col_notes = _find_column(df, aliases["notes"])
+    date_cols = _resolve_date_columns(df, date_columns_cfg, aliases)
 
-    if col_date is None or col_animal is None:
+    if col_animal is None or not date_cols:
         return [], len(df)
 
     tasks: list[dict] = []
     dropped = 0
-    for r in df.itertuples(index=False):
-        rd = r._asdict()
-        animal = _normalize_text(rd.get(col_animal))
-        d = _safe_date(rd.get(col_date))
-        if not animal or d is None:
+    # iterrows preserves the original column labels -- itertuples mangles
+    # any name that isn't a valid Python identifier (spaces, "/" , "(s)")
+    # to _0, _1, ... which breaks lookups by the real name.
+    for _idx, row in df.iterrows():
+        animal = _normalize_text(row.get(col_animal))
+        if not animal:
             dropped += 1
             continue
-        type_str = _normalize_text(rd.get(col_type)) if col_type else ""
-        notes = _normalize_text(rd.get(col_notes)) if col_notes else ""
-        is_implant = any(k in type_str.lower() for k in implant_kw)
-        delta = (today - d).days
-        step = _step_for_delta(delta, is_implant)
-        if step is None:
-            continue
-        tasks.append({
-            "step": step,
-            "animal": animal,
-            "type": type_str or "—",
-            "surgery_date": d.isoformat(),
-            "sheet": sheet_label,
-            "notes": notes,
-        })
+        type_str = _normalize_text(row.get(col_type)) if col_type else ""
+        notes = _normalize_text(row.get(col_notes)) if col_notes else ""
+        any_event = False
+        for dc in date_cols:
+            d = _safe_date(row.get(dc["column"]))
+            if d is None:
+                continue
+            any_event = True
+            if dc["is_implant"] is None:
+                is_implant = any(k in type_str.lower() for k in implant_kw)
+            else:
+                is_implant = dc["is_implant"]
+            step = _step_for_delta((today - d).days, is_implant)
+            if step is None:
+                continue
+            tasks.append({
+                "step": step,
+                "animal": animal,
+                "type": dc["event_label"] or type_str or "—",
+                "surgery_date": d.isoformat(),
+                "sheet": sheet_label,
+                "notes": notes,
+            })
+        if not any_event:
+            dropped += 1
     return tasks, dropped
 
 
 def _upcoming(df: pd.DataFrame, sheet_label: str, today: date,
-              aliases: dict, days_ahead: int = 7) -> list[dict]:
+              aliases: dict, date_columns_cfg: list[dict] | None = None,
+              days_ahead: int = 7) -> list[dict]:
     """Surgeries scheduled in (today, today+days_ahead]."""
     if df is None or df.empty:
         return []
     col_animal = _find_column(df, aliases["animal_id"])
-    col_date = _find_column(df, aliases["surgery_date"])
     col_type = _find_column(df, aliases["surgery_type"])
-    if col_date is None or col_animal is None:
+    date_cols = _resolve_date_columns(df, date_columns_cfg, aliases)
+    if col_animal is None or not date_cols:
         return []
     horizon = today + timedelta(days=days_ahead)
     out: list[dict] = []
-    for r in df.itertuples(index=False):
-        rd = r._asdict()
-        d = _safe_date(rd.get(col_date))
-        animal = _normalize_text(rd.get(col_animal))
-        if d is None or not animal:
+    for _idx, row in df.iterrows():
+        animal = _normalize_text(row.get(col_animal))
+        if not animal:
             continue
-        if today < d <= horizon:
-            out.append({
-                "animal": animal,
-                "type": _normalize_text(rd.get(col_type)) if col_type else "",
-                "surgery_date": d.isoformat(),
-                "in_days": (d - today).days,
-                "sheet": sheet_label,
-            })
+        type_str = _normalize_text(row.get(col_type)) if col_type else ""
+        for dc in date_cols:
+            d = _safe_date(row.get(dc["column"]))
+            if d is None:
+                continue
+            if today < d <= horizon:
+                out.append({
+                    "animal": animal,
+                    "type": dc["event_label"] or type_str or "",
+                    "surgery_date": d.isoformat(),
+                    "in_days": (d - today).days,
+                    "sheet": sheet_label,
+                })
     out.sort(key=lambda x: x["in_days"])
     return out
 
@@ -377,9 +477,11 @@ def _upcoming_table(rows: list[dict]) -> html.Div:
 
 def _cache_key_for(entry: dict) -> str:
     """Return the cache key string used to track last-fetched time."""
+    header_row = int(entry.get("header_row", 1))
     if entry.get("sheet_id") and entry.get("tab_name"):
-        return f"api:{entry['sheet_id']}:{entry['tab_name']}"
-    return entry.get("url", "")
+        return f"api:{entry['sheet_id']}:{entry['tab_name']}:h{header_row}"
+    url = entry.get("url", "")
+    return f"csv:{url}:h{header_row}" if url else ""
 
 
 def _footer(sheets_cfg: list[dict], dropped_by_sheet: dict[str, int]
@@ -391,7 +493,7 @@ def _footer(sheets_cfg: list[dict], dropped_by_sheet: dict[str, int]
         when = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                 if ts else "never")
         dropped = dropped_by_sheet.get(s.get("label", ""), 0)
-        via = "API" if key.startswith("api:") else "CSV"
+        via = "API" if key.startswith("api:") else "CSV" if key.startswith("csv:") else "?"
         msg = f"{s.get('label', key)} ({via}) -- fetched {when}"
         if dropped:
             msg += f" -- {dropped} row(s) dropped (missing date/animal)"
@@ -512,6 +614,8 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
 
         for s in sheets_cfg:
             label = s.get("label") or s.get("url") or s.get("sheet_id", "?")
+            header_row = int(s.get("header_row", 1))
+            date_cols_cfg = s.get("date_columns") or None
             df: pd.DataFrame | None = None
 
             if s.get("sheet_id") and s.get("tab_name"):
@@ -523,20 +627,24 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
                     continue
                 df = _load_sheet_via_api(
                     s["sheet_id"], s["tab_name"], sa_file, ttl_sec,
+                    header_row=header_row,
                 )
             elif s.get("url"):
-                df = _load_sheet(s["url"], ttl_sec)
+                df = _load_sheet(s["url"], ttl_sec, header_row=header_row)
             else:
                 logger.warning("Sheet '%s' has neither url nor sheet_id", label)
                 continue
 
             tasks, n_drop = _tasks_from_frame(
                 df, label, today, aliases, implant_kw,
+                date_columns_cfg=date_cols_cfg,
             )
             dropped[label] = n_drop
             for t in tasks:
                 grouped.setdefault(t["step"], []).append(t)
-            upcoming_all.extend(_upcoming(df, label, today, aliases))
+            upcoming_all.extend(_upcoming(
+                df, label, today, aliases, date_columns_cfg=date_cols_cfg,
+            ))
 
         upcoming_all.sort(key=lambda x: x["in_days"])
         return _render_panels(today, grouped, upcoming_all,

@@ -167,14 +167,21 @@ surgeries:
   enabled: true                 # tab renders empty until sheets are listed
   refresh_minutes: 10
   implant_keywords: ["implant", "headstage", "headcap"]
-  service_account_file: secrets/sheets-sa.json
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   sheets:
     - label: "Injection/Implant Log"
       sheet_id: "17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E"
       tab_name: "BCH Log"
-    - label: "KM Lab Mice"
-      sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
-      tab_name: "JAX Cages"
+      header_row: 2              # banded headers: row 1 is group labels
+      date_columns:
+        - name: "Date of Injection"
+          is_implant: false
+          event_label: "Injection"
+        - name: "Date of Implant"
+          is_implant: true
+          event_label: "Implant"
+  # KM Lab Mice (tab "JAX Cages") is a cage roster, not a surgery log
+  # (grant labels + locations in non-tabular form). Not included here.
   #  # Published-CSV path (works without GCP setup, URL is a low-grade secret)
   #  - label: "Public log"
   #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
