@@ -682,6 +682,18 @@ def create_app(config: dict, store: Store) -> Dash:
         prevent_initial_call=True,
     )
     def _home_open(_s, _sch, _m, _inc, _d):
+        # Gate on a real button press. The home grid is re-instantiated
+        # by refresh_overview_dynamic on every refresh-trigger tick;
+        # without this check Dash interprets the fresh n_clicks=0 buttons
+        # as a triggering event and would tab-switch the user out of
+        # Overview into Lab on every poll. Also covers the initial-page
+        # load case (Dash sometimes ignores prevent_initial_call when
+        # multiple callbacks share Output via allow_duplicate).
+        if not callback_context.triggered:
+            return no_update, no_update
+        trig_payload = callback_context.triggered[0]
+        if not trig_payload.get("value"):  # n_clicks 0 / None
+            return no_update, no_update
         trig = callback_context.triggered_id
         mapping = {
             "home-open-surgeries": ("lab", "surgeries"),
