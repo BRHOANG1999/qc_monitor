@@ -565,6 +565,20 @@ def create_app(config: dict, store: Store) -> Dash:
         import time as _time
         return (current or 0) + 1, _time.time()
 
+    # Fine-grained refresh: replace just the volatile Overview cards +
+    # queue children instead of re-rendering the whole tab. Eliminates
+    # the white flash that used to happen on every refresh tick. The
+    # callback is a no-op when the user's on any other tab (the target
+    # divs don't exist in the rendered tree).
+    @app.callback(
+        Output("overview-cards", "children"),
+        Output("overview-queue", "children"),
+        Input("refresh-trigger", "data"),
+        prevent_initial_call=True,
+    )
+    def refresh_overview_dynamic(_n):
+        return _build_overview_cards(store), _build_overview_queue(store)
+
     @app.callback(
         Output("last-refresh-label", "children"),
         [Input("elapsed-ticker", "n_intervals")],
@@ -659,10 +673,10 @@ def create_app(config: dict, store: Store) -> Dash:
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("tab-content", "children"),
-        [Input("tabs", "value"), Input("refresh-trigger", "data")],
+        Input("tabs", "value"),
         State("selected-session-dir", "data"),
     )
-    def render_tab(tab, _refresh, session_hint):
+    def render_tab(tab, session_hint):
         try:
             if tab == "overview":
                 return _overview_tab(store, config)
@@ -2037,25 +2051,17 @@ def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
               "border": "1px solid rgba(255,255,255,0.07)"})
 
 
-def _overview_tab(store: Store, config: dict | None = None):
+def _build_overview_cards(store: Store):
+    """Inner content for the system-health card strip. Returned without
+    a wrapping Div so a callback can swap it via Patch / children."""
     health = store.get_health_history(hours=1)
     latest = health[-1] if health else {}
-
-    sessions = store.get_sessions()
-    active_session = sessions[0] if sessions else {}
-    session_dir = active_session.get("session_dir", "")
-
-    ch_map = _get_channel_map(store, session_dir) if session_dir else {}
-
-    recent_alerts = store.get_recent_alerts(hours=24)
-
     net_ok = latest.get("network_share_accessible")
     cpu = latest.get("cpu_pct", 0)
     mem = latest.get("memory_pct", 0)
     disk = latest.get("disk_free_gb", 0)
     fph = latest.get("files_processed_last_hour", 0)
-
-    cards = html.Div([
+    return [
         _status_card("Network", "OK" if net_ok else "DOWN",
                      "#00CC96" if net_ok else "#EF553B"),
         _status_card("CPU", f"{cpu:.0f}%",
@@ -2065,18 +2071,22 @@ def _overview_tab(store: Store, config: dict | None = None):
         _status_card("Disk Free", f"{disk:.1f} GB",
                      "#00CC96" if disk > 50 else "#EF553B"),
         _status_card("Files/Hour", str(fph), "#636EFA"),
-    ], style={"display": "flex", "gap": "12px", "flexWrap": "wrap"})
+    ]
 
-    # File queue progress across all sessions
+
+def _build_overview_queue(store: Store):
+    """Inner content (children list) for the processing-queue block."""
+    sessions = store.get_sessions()
     total_files = sum(s.get("num_files", 0) for s in sessions)
     total_done = sum(s.get("processed", 0) for s in sessions)
     total_errors = sum(s.get("errors", 0) for s in sessions)
     total_pending = total_files - total_done - total_errors
     pct_done = (100 * total_done / total_files) if total_files > 0 else 0
-
-    queue_section = html.Div([
-        html.H4("Processing Queue", style={"color": "#aaa", "marginTop": "16px", "marginBottom": "8px",
-                                            "fontSize": "14px", "letterSpacing": "0.5px"}),
+    return [
+        html.H4("Processing Queue", style={
+            "color": "#aaa", "marginTop": "16px", "marginBottom": "8px",
+            "fontSize": "14px", "letterSpacing": "0.5px",
+        }),
         html.Div([
             html.Div(
                 f"{pct_done:.0f}%" if pct_done > 5 else "",
@@ -2085,19 +2095,45 @@ def _overview_tab(store: Store, config: dict | None = None):
                     "background": "linear-gradient(90deg, #00CC96 0%, #00AA80 100%)",
                     "height": "28px", "borderRadius": "6px",
                     "transition": "width 0.8s cubic-bezier(0.4, 0, 0.2, 1)",
-                    "display": "flex", "alignItems": "center", "justifyContent": "center",
+                    "display": "flex", "alignItems": "center",
+                    "justifyContent": "center",
                     "fontSize": "11px", "fontWeight": "bold", "color": "white",
                     "textShadow": "0 1px 2px rgba(0,0,0,0.5)",
                 }),
-        ], style={"backgroundColor": "#1a1a2e", "borderRadius": "6px", "overflow": "hidden",
-                  "marginBottom": "8px", "boxShadow": "inset 0 1px 4px rgba(0,0,0,0.4)"}),
+        ], style={"backgroundColor": "#1a1a2e", "borderRadius": "6px",
+                  "overflow": "hidden", "marginBottom": "8px",
+                  "boxShadow": "inset 0 1px 4px rgba(0,0,0,0.4)"}),
         html.Div([
-            html.Span(f"{total_done} done", style={"color": "#00CC96", "marginRight": "16px"}),
-            html.Span(f"{total_pending} queued", style={"color": "#FFA15A", "marginRight": "16px"}),
-            html.Span(f"{total_errors} errors", style={"color": "#EF553B", "marginRight": "16px"}),
-            html.Span(f"{total_files} total detected", style={"color": "#666"}),
+            html.Span(f"{total_done} done",
+                      style={"color": "#00CC96", "marginRight": "16px"}),
+            html.Span(f"{total_pending} queued",
+                      style={"color": "#FFA15A", "marginRight": "16px"}),
+            html.Span(f"{total_errors} errors",
+                      style={"color": "#EF553B", "marginRight": "16px"}),
+            html.Span(f"{total_files} total detected",
+                      style={"color": "#666"}),
         ], style={"fontSize": "13px"}),
-    ], style=SECTION_STYLE)
+    ]
+
+
+def _overview_tab(store: Store, config: dict | None = None):
+    sessions = store.get_sessions()
+    active_session = sessions[0] if sessions else {}
+    session_dir = active_session.get("session_dir", "")
+
+    ch_map = _get_channel_map(store, session_dir) if session_dir else {}
+    recent_alerts = store.get_recent_alerts(hours=24)
+
+    cards = html.Div(
+        _build_overview_cards(store),
+        id="overview-cards",
+        style={"display": "flex", "gap": "12px", "flexWrap": "wrap"},
+    )
+
+    queue_section = html.Div(
+        _build_overview_queue(store),
+        id="overview-queue", style=SECTION_STYLE,
+    )
 
     # Evoked waveform thumbnail — show latest file, ALL channels
     waveform_thumbnail = html.Div()
