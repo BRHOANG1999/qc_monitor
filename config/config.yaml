@@ -153,20 +153,33 @@ auth:
   dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
   dev_bypass_email: hoang392@umn.edu
 surgeries:
-  # Reads Google Sheets published as CSV (File -> Share -> Publish to web
-  # -> CSV) and renders "today's pre-op / surgery / post-op tasks". The
-  # live sheet stays private; the /pub?output=csv URL is a separate
-  # one-way export. Treat each URL as a low-grade secret -- anyone with
-  # the link can read it.
-  enabled: false                # set true after pasting URLs below
+  # Renders "today's pre-op / surgery / post-op tasks" pulled from
+  # Google Sheets. Two auth paths supported per-sheet:
+  #
+  # (a) Service account (private sheets, recommended) -- set
+  #     service_account_file below, share each sheet with the SA's
+  #     email as Viewer, then list sheets by sheet_id + tab_name.
+  #     See docs/SHEETS_SERVICE_ACCOUNT.md.
+  #
+  # (b) Published CSV -- File > Share > Publish to web > CSV, paste
+  #     the /pub?output=csv URL. No GCP setup but the URL is readable
+  #     by anyone who has it.
+  enabled: false                # set true after configuring sheets below
   refresh_minutes: 10
   implant_keywords: ["implant", "headstage", "headcap"]
-  sheets: []                    # add entries like:
+  service_account_file: ""      # absolute path or relative to project root
+  sheets: []                    # add entries -- mix and match as needed:
+  #  # Service-account path (sheet stays private)
   #  - label: "Surgery log"
-  #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
+  #    sheet_id: "17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E"
+  #    tab_name: "Surgeries"     # exact tab name shown in the sheet
   #  - label: "Animal roster"
-  #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=954724279"
-  # column_aliases:             # optional -- extends the defaults
+  #    sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
+  #    tab_name: "Roster"
+  #  # Published-CSV path (works without GCP setup, URL is a low-grade secret)
+  #  - label: "Public log"
+  #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
+  # column_aliases:               # optional -- extends the defaults
   #   animal_id:    ["Animal", "Animal #"]
   #   surgery_date: ["Date", "Surgery date"]
   #   surgery_type: ["Type", "Procedure"]

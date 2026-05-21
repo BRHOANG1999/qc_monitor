@@ -16,6 +16,7 @@ Google's endpoint.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -26,6 +27,13 @@ import requests
 from dash import Input, Output, dash_table, dcc, html
 
 from src.db.store import Store
+
+# Google Sheets API client is optional -- only required when a sheet entry
+# uses the service-account path. Imported lazily so the published-CSV path
+# still works on machines without the package set installed.
+_SHEETS_API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+_sa_service_cache: dict = {}  # service_account_file -> Sheets API client
+_sa_service_lock = RLock()
 
 logger = logging.getLogger("qc_monitor.dashboard.surgeries")
 
@@ -80,10 +88,90 @@ def _load_sheet(url: str, ttl_sec: float) -> pd.DataFrame | None:
     return df
 
 
-def _last_fetched(url: str) -> float | None:
+def _last_fetched(key: str) -> float | None:
     with _cache_lock:
-        hit = _cache.get(url)
+        hit = _cache.get(key)
     return hit[0] if hit is not None else None
+
+
+def _sheets_api(service_account_file: str):
+    """Lazy-build a Sheets API client keyed by the SA JSON path.
+
+    Cached so we don't re-parse the JSON / re-handshake on every fetch.
+    Raises if google-api-python-client / google-auth aren't installed.
+    """
+    assert service_account_file, "service_account_file required"
+    with _sa_service_lock:
+        svc = _sa_service_cache.get(service_account_file)
+        if svc is not None:
+            return svc
+
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials.from_service_account_file(
+        service_account_file, scopes=_SHEETS_API_SCOPES,
+    )
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    with _sa_service_lock:
+        _sa_service_cache[service_account_file] = svc
+    return svc
+
+
+def _load_sheet_via_api(sheet_id: str, tab_name: str,
+                        service_account_file: str,
+                        ttl_sec: float) -> pd.DataFrame | None:
+    """Read a sheet via the Sheets API using a service-account key.
+
+    Returns the same DataFrame shape as ``_load_sheet`` (first row =
+    columns). Falls back to the previous cached value on network /
+    auth errors.
+    """
+    assert sheet_id and tab_name, "sheet_id and tab_name required"
+    cache_key = f"api:{sheet_id}:{tab_name}"
+
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(cache_key)
+        if hit is not None and (now - hit[0]) < ttl_sec:
+            return hit[1]
+
+    try:
+        svc = _sheets_api(service_account_file)
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=tab_name,
+        ).execute()
+    except Exception as e:
+        logger.warning("Sheets API fetch failed: %s (sheet=%s tab=%s)",
+                       e, sheet_id, tab_name)
+        with _cache_lock:
+            stale = _cache.get(cache_key)
+        return stale[1] if stale is not None else None
+
+    values = resp.get("values", [])
+    if not values:
+        df = pd.DataFrame()
+    else:
+        header = [str(h) for h in values[0]]
+        # Pad short rows so DataFrame construction doesn't drop tail columns
+        width = len(header)
+        rows = [r + [""] * (width - len(r)) for r in values[1:]]
+        df = pd.DataFrame(rows, columns=header)
+
+    with _cache_lock:
+        _cache[cache_key] = (now, df)
+    return df
+
+
+def _resolve_sa_path(config: dict, raw_path: str) -> str:
+    """Make the SA path absolute relative to the project root if needed."""
+    if not raw_path:
+        return ""
+    if os.path.isabs(raw_path):
+        return raw_path
+    here = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    return os.path.normpath(os.path.join(project_root, raw_path))
 
 
 # ===================================================================== #
@@ -287,16 +375,24 @@ def _upcoming_table(rows: list[dict]) -> html.Div:
     )])
 
 
+def _cache_key_for(entry: dict) -> str:
+    """Return the cache key string used to track last-fetched time."""
+    if entry.get("sheet_id") and entry.get("tab_name"):
+        return f"api:{entry['sheet_id']}:{entry['tab_name']}"
+    return entry.get("url", "")
+
+
 def _footer(sheets_cfg: list[dict], dropped_by_sheet: dict[str, int]
             ) -> html.Div:
     rows = []
     for s in sheets_cfg:
-        url = s.get("url", "")
-        ts = _last_fetched(url)
+        key = _cache_key_for(s)
+        ts = _last_fetched(key) if key else None
         when = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                 if ts else "never")
         dropped = dropped_by_sheet.get(s.get("label", ""), 0)
-        msg = f"{s.get('label', url)} -- fetched {when}"
+        via = "API" if key.startswith("api:") else "CSV"
+        msg = f"{s.get('label', key)} ({via}) -- fetched {when}"
         if dropped:
             msg += f" -- {dropped} row(s) dropped (missing date/animal)"
         rows.append(html.Div(msg, style={"color": "#6c6c80",
@@ -401,6 +497,7 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
     ttl_sec = float(cfg.get("refresh_minutes", 10)) * 60.0
     aliases = _aliases(config or {})
     implant_kw = _implant_kw(config or {})
+    sa_file = _resolve_sa_path(config or {}, cfg.get("service_account_file", ""))
 
     @app.callback(
         Output("surgeries-pane", "children"),
@@ -414,11 +511,25 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
         dropped: dict[str, int] = {}
 
         for s in sheets_cfg:
-            label = s.get("label") or s.get("url", "")
-            url = s.get("url", "")
-            if not url:
+            label = s.get("label") or s.get("url") or s.get("sheet_id", "?")
+            df: pd.DataFrame | None = None
+
+            if s.get("sheet_id") and s.get("tab_name"):
+                if not sa_file:
+                    logger.warning(
+                        "Sheet '%s' uses sheet_id+tab_name but no "
+                        "service_account_file is configured", label,
+                    )
+                    continue
+                df = _load_sheet_via_api(
+                    s["sheet_id"], s["tab_name"], sa_file, ttl_sec,
+                )
+            elif s.get("url"):
+                df = _load_sheet(s["url"], ttl_sec)
+            else:
+                logger.warning("Sheet '%s' has neither url nor sheet_id", label)
                 continue
-            df = _load_sheet(url, ttl_sec)
+
             tasks, n_drop = _tasks_from_frame(
                 df, label, today, aliases, implant_kw,
             )
