@@ -164,7 +164,7 @@ surgeries:
   # (b) Published CSV -- File > Share > Publish to web > CSV, paste
   #     the /pub?output=csv URL. No GCP setup but the URL is readable
   #     by anyone who has it.
-  enabled: false                # set true after configuring sheets below
+  enabled: true                 # tab renders empty until sheets are listed
   refresh_minutes: 10
   implant_keywords: ["implant", "headstage", "headcap"]
   service_account_file: ""      # absolute path or relative to project root
