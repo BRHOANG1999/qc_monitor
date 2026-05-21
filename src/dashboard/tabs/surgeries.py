@@ -105,6 +105,12 @@ def _last_fetched(key: str) -> float | None:
     return hit[0] if hit is not None else None
 
 
+def cache_has_entry(key: str) -> bool:
+    """True when *key* has already been fetched (warm cache)."""
+    with _cache_lock:
+        return key in _cache
+
+
 def _sheets_api(service_account_file: str):
     """Lazy-build a Sheets API client keyed by the SA JSON path.
 

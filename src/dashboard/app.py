@@ -1812,6 +1812,20 @@ _HOME_ROW_STYLE = {
 def _home_surgery_block(store: Store, config: dict | None,
                          today: date) -> html.Div:
     """Today's surgery checklist in compact form."""
+    # Cold-cache: surgery sheets haven't been fetched yet -> show
+    # skeleton placeholder instead of an empty checklist that looks
+    # like "no surgeries today" when really we just don't know yet.
+    from src.dashboard.components import skeleton_rows
+    from src.dashboard.tabs.surgeries import cache_has_entry, _cache_key_for
+    cfg = (config or {}).get("surgeries", {}) or {}
+    sheets = cfg.get("sheets", []) or []
+    if sheets and not any(cache_has_entry(_cache_key_for(s)) for s in sheets):
+        return _card(
+            _section_header("Surgeries today",
+                             on_open_id="home-open-surgeries"),
+            skeleton_rows(4),
+        )
+
     try:
         from src.notifications.surgery_digest import _build_today
         grouped, _upcoming, _ = _build_today(today, config or {})
