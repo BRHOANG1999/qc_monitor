@@ -35,7 +35,9 @@ from src.utils.logging_config import setup_logging
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r") as f:
+    # Force UTF-8 -- config contains emoji in maintenance tab names and
+    # Windows' default cp1252 codec chokes on them.
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import statistics
-from datetime import datetime
+from datetime import datetime, date
 
 import numpy as np
 import yaml
@@ -24,6 +24,8 @@ from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
+from src.dashboard.tabs import maintenance as tabs_maintenance
+from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
@@ -156,6 +158,8 @@ NAV_GROUPS = [
     ]},
     {"id": "lab", "label": "Lab", "subs": [
         {"id": "surgeries", "label": "Surgeries"},
+        {"id": "maintenance", "label": "Maintenance"},
+        {"id": "data_log_xref", "label": "Data log diff"},
     ]},
     {"id": "system", "label": "System", "subs": [
         {"id": "annotations", "label": "Notes"},
@@ -599,6 +603,28 @@ def create_app(config: dict, store: Store) -> Dash:
         return session_dir, "analysis", "waveforms"
 
     # ------------------------------------------------------------------ #
+    #  Home page "Open >" buttons -> jump to the matching tab
+    # ------------------------------------------------------------------ #
+    @app.callback(
+        Output("group-tabs", "value", allow_duplicate=True),
+        Output("tabs", "value", allow_duplicate=True),
+        Input("home-open-surgeries", "n_clicks"),
+        Input("home-open-maintenance", "n_clicks"),
+        Input("home-open-datalog", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _home_open(_s, _m, _d):
+        trig = callback_context.triggered_id
+        mapping = {
+            "home-open-surgeries": ("lab", "surgeries"),
+            "home-open-maintenance": ("lab", "maintenance"),
+            "home-open-datalog": ("lab", "data_log_xref"),
+        }
+        if trig in mapping:
+            return mapping[trig]
+        return no_update, no_update
+
+    # ------------------------------------------------------------------ #
     #  Two-tier nav: top groups -> sub-tabs
     # ------------------------------------------------------------------ #
     @app.callback(
@@ -635,7 +661,7 @@ def create_app(config: dict, store: Store) -> Dash:
     def render_tab(tab, _refresh, session_hint):
         try:
             if tab == "overview":
-                return _overview_tab(store)
+                return _overview_tab(store, config)
             elif tab == "waveforms":
                 return _waveforms_tab_layout(store, default_session=session_hint)
             elif tab == "signal":
@@ -666,6 +692,10 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _sessions_tab(store)
             elif tab == "surgeries":
                 return tabs_surgeries.layout(store, config)
+            elif tab == "maintenance":
+                return tabs_maintenance.layout(store, config)
+            elif tab == "data_log_xref":
+                return tabs_data_log_xref.layout(store, config)
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
@@ -1706,6 +1736,8 @@ def create_app(config: dict, store: Store) -> Dash:
     # ------------------------------------------------------------------ #
     tabs_video.register_callbacks(app, store, config)
     tabs_surgeries.register_callbacks(app, store, config)
+    tabs_maintenance.register_callbacks(app, store, config)
+    tabs_data_log_xref.register_callbacks(app, store, config)
 
     return app
 
@@ -1714,7 +1746,177 @@ def create_app(config: dict, store: Store) -> Dash:
 #  Tab builders
 # ====================================================================== #
 
-def _overview_tab(store: Store):
+def _home_section_header(title: str, target_tab: str, target_group: str,
+                          btn_id: str) -> html.Div:
+    """A row with the section title on the left and an 'Open >' button
+    on the right that switches the dashboard to *target_tab*."""
+    return html.Div([
+        html.Div(title, style={
+            "fontSize": "11px", "color": "#a0a0b0",
+            "textTransform": "uppercase", "letterSpacing": "0.6px",
+            "fontWeight": "600",
+        }),
+        html.Button("Open >", id=btn_id, n_clicks=0,
+                    **{"data-group": target_group, "data-tab": target_tab},
+                    style={
+                        "backgroundColor": "transparent", "color": "#5e7ce2",
+                        "border": "none", "cursor": "pointer",
+                        "fontSize": "11px", "fontWeight": "600",
+                        "letterSpacing": "0.3px",
+                    }),
+    ], style={"display": "flex", "justifyContent": "space-between",
+              "alignItems": "center", "marginBottom": "8px"})
+
+
+def _home_surgery_block(store: Store, config: dict | None,
+                         today: date) -> html.Div:
+    """Today's surgery checklist in compact form."""
+    try:
+        from src.notifications.surgery_digest import _build_today
+        grouped, _upcoming, _ = _build_today(today, config or {})
+    except Exception as e:
+        logger.warning("Home: surgery block failed: %s", e)
+        grouped = {}
+
+    rows = []
+    bucket_labels = [
+        ("Pre-op (Motrin)", "Pre-op (Motrin)"),
+        ("Surgery day", "Surgery day"),
+        ("Post-op day 1", "Post-op day 1"),
+        ("Post-op day 2–3", ["Post-op day 2", "Post-op day 3"]),
+    ]
+    for label, key in bucket_labels:
+        if isinstance(key, list):
+            items = []
+            for k in key:
+                items.extend(grouped.get(k, []))
+        else:
+            items = grouped.get(key, [])
+        n = len(items)
+        animals = ", ".join(t["animal"] for t in items[:6])
+        color = "#f0f0f5" if n else "#6c6c80"
+        rows.append(html.Div([
+            html.Span(label, style={"flex": "0 0 200px", "color": color}),
+            html.Span(str(n), style={"flex": "0 0 32px",
+                                     "color": color, "fontWeight": "600"}),
+            html.Span(animals, style={"flex": "1",
+                                       "color": "#a0a0b0",
+                                       "fontSize": "12px"}),
+        ], style={"display": "flex", "alignItems": "center",
+                  "padding": "4px 0"}))
+
+    return html.Div([
+        _home_section_header("Surgeries today", "surgeries", "lab",
+                              "home-open-surgeries"),
+        html.Div(rows),
+    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
+              "borderRadius": "8px",
+              "border": "1px solid rgba(255,255,255,0.07)",
+              "marginTop": "16px"})
+
+
+def _home_maintenance_block(config: dict | None) -> html.Div:
+    try:
+        from src.dashboard.tabs.maintenance import rig_status
+        rows = rig_status(config or {})
+    except Exception as e:
+        logger.warning("Home: maintenance block failed: %s", e)
+        rows = []
+
+    if not rows:
+        body = html.Div("Maintenance tracker disabled or no data.",
+                        style={"color": "#6c6c80", "fontSize": "13px"})
+    elif all(not r.overdue for r in rows):
+        body = html.Div("All rigs ok.",
+                        style={"color": "#30d158", "fontSize": "13px",
+                               "fontWeight": "600"})
+    else:
+        # Group by rig
+        by_rig: dict[str, list] = {}
+        for r in rows:
+            by_rig.setdefault(r.rig, []).append(r)
+        body_rows = []
+        for rig in sorted(by_rig.keys()):
+            chunks = []
+            for r in by_rig[rig]:
+                short = ("cage" if "cage" in r.task
+                          else "battery" if "battery" in r.task else r.task)
+                if r.last_ts is None:
+                    chunks.append(html.Span(f"{short} never ",
+                                             style={"color": "#ff453a"}))
+                else:
+                    color = "#ff453a" if r.overdue else "#30d158"
+                    tag = "OVERDUE" if r.overdue else "ok"
+                    label = (f"{short} {r.days_since:.0f}d"
+                             if r.days_since >= 1 else f"{short} today")
+                    chunks.append(html.Span(
+                        f"{label} ({tag})  ",
+                        style={"color": color, "marginRight": "16px"},
+                    ))
+            body_rows.append(html.Div([
+                html.Span(f"Rig {rig}", style={
+                    "flex": "0 0 80px", "fontWeight": "600",
+                    "color": "#f0f0f5",
+                }),
+                html.Span(chunks, style={"flex": "1", "fontSize": "12px"}),
+            ], style={"display": "flex", "alignItems": "center",
+                      "padding": "4px 0"}))
+        body = html.Div(body_rows)
+
+    return html.Div([
+        _home_section_header("Maintenance", "maintenance", "lab",
+                              "home-open-maintenance"),
+        body,
+    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
+              "borderRadius": "8px",
+              "border": "1px solid rgba(255,255,255,0.07)",
+              "marginTop": "12px"})
+
+
+def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
+    try:
+        from src.dashboard.tabs.data_log_xref import diff_counts
+        counts = diff_counts(store, config or {})
+    except Exception as e:
+        logger.warning("Home: data log block failed: %s", e)
+        counts = {"enabled": False}
+
+    if not counts.get("enabled"):
+        body = html.Div("Data log cross-reference disabled.",
+                        style={"color": "#6c6c80", "fontSize": "13px"})
+    else:
+        ln = counts.get("logged_not_qcd", 0)
+        qn = counts.get("qcd_not_logged", 0)
+        if ln == 0 and qn == 0:
+            body = html.Div("Sheet and DB are in sync.",
+                            style={"color": "#30d158", "fontSize": "13px",
+                                   "fontWeight": "600"})
+        else:
+            body = html.Div([
+                html.Span(f"{ln} ", style={"color": "#ff9f0a",
+                                            "fontWeight": "700",
+                                            "fontSize": "16px"}),
+                html.Span("logged, not QC'd",
+                         style={"color": "#a0a0b0", "marginRight": "24px",
+                                "fontSize": "13px"}),
+                html.Span(f"{qn} ", style={"color": "#5e7ce2",
+                                            "fontWeight": "700",
+                                            "fontSize": "16px"}),
+                html.Span("QC'd, not logged",
+                         style={"color": "#a0a0b0", "fontSize": "13px"}),
+            ])
+
+    return html.Div([
+        _home_section_header("Data log diff", "data_log_xref", "lab",
+                              "home-open-datalog"),
+        body,
+    ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
+              "borderRadius": "8px",
+              "border": "1px solid rgba(255,255,255,0.07)",
+              "marginTop": "12px"})
+
+
+def _overview_tab(store: Store, config: dict | None = None):
     health = store.get_health_history(hours=1)
     latest = health[-1] if health else {}
 
@@ -1918,7 +2120,16 @@ def _overview_tab(store: Store):
             html.P("No alerts in the last 24 hours", style={"color": "#888"}),
         ])
 
-    return html.Div([cards, queue_section, waveform_thumbnail, session_info, channel_table, alerts_section])
+    today = date.today()
+    surgery_home = _home_surgery_block(store, config, today)
+    maintenance_home = _home_maintenance_block(config)
+    data_log_home = _home_data_log_block(store, config)
+
+    return html.Div([
+        cards, queue_section,
+        surgery_home, maintenance_home, data_log_home,
+        waveform_thumbnail, session_info, channel_table, alerts_section,
+    ])
 
 
 # ------------------------------------------------------------------ #

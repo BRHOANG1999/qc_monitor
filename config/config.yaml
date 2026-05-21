@@ -152,6 +152,54 @@ auth:
   cf_audience: ''                    # AUD tag from the Access app (required in prod)
   dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
   dev_bypass_email: hoang392@umn.edu
+maintenance:
+  # Per-rig cleaning + battery-swap status pulled from the Maintenance
+  # Tracker Google Sheet. Cage cleaning is weekly; battery swaps land
+  # on Mon/Wed/Fri. Tab names are listed literally because the emoji
+  # prefixes are inconsistent across the sheet (note the missing space
+  # after the ant on Rig A Cage Cleaning).
+  enabled: true
+  refresh_minutes: 10
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  sheet_id: "1EyECDE7Uk-a2o9YDtTL3zvIZ6xH-OCfN_ZT7vvB-m4U"
+  default_grace_hours: 24
+  rigs:
+    - name: A
+      tasks:
+        cage_cleaning:
+          tab_name: "🐜Rig A Cage Cleaning"
+          cadence: weekly
+        battery_replacement:
+          tab_name: "🐜 Rig A Battery Replacement"
+          cadence: mwf
+    - name: B
+      tasks:
+        cage_cleaning:
+          tab_name: "🐻 Rig B Cage Cleaning"
+          cadence: weekly
+        battery_replacement:
+          tab_name: "🐻 Rig B Battery Replacement"
+          cadence: mwf
+    - name: C
+      tasks:
+        cage_cleaning:
+          tab_name: "🐱 Rig C Cage Cleaning"
+          cadence: weekly
+        battery_replacement:
+          tab_name: "🐱 Rig C Battery Replacement"
+          cadence: mwf
+
+data_log_xref:
+  # Reconciles the KMrecorder Data Log Sheet against monitor.db -- shows
+  # sessions logged-but-not-QC'd (missed file?) and QC'd-but-not-logged
+  # (forgot to log?). Matches on the trailing ___YYYY_MM_DD__HH_MM_SS
+  # substring in each side.
+  enabled: true
+  refresh_minutes: 15
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  sheet_id: "1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0"
+  tab_name: "Sessions"
+
 surgery_digest:
   # Once-a-day email + SMS summary of the same view the Surgeries tab
   # renders -- today's pre-op / surgery / post-op tasks plus a 7-day
