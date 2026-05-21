@@ -66,55 +66,19 @@ EVOKED_FEATURE_LABELS = {
 #  references these tokens so the whole app re-skins from one place.
 # --------------------------------------------------------------------- #
 
-# Surfaces — flat layers, darker in front
-COLOR_SURFACE_0 = "#0a0a14"   # page background (deepest)
-COLOR_SURFACE_1 = "#13131f"   # primary card / section background
-COLOR_SURFACE_2 = "#1c1c2c"   # elevated card / hover state
-COLOR_SURFACE_3 = "#262638"   # input field background
-
-# Text — three-step ramp; nothing pure white (easier on the eyes)
-COLOR_TEXT_PRIMARY = "#f0f0f5"
-COLOR_TEXT_SECONDARY = "#a0a0b0"
-COLOR_TEXT_TERTIARY = "#6c6c80"
-
-# Hairline divider — softer than #333; honors the "deference" principle
-COLOR_DIVIDER = "rgba(255,255,255,0.07)"
-
-# Semantic accents — only four meanings, used consistently
-COLOR_ACCENT = "#5e7ce2"      # interactive: buttons, focus, selected
-COLOR_SUCCESS = "#30d158"     # ok / confirmed (Apple's systemGreen)
-COLOR_WARNING = "#ff9f0a"     # warning (Apple's systemOrange)
-COLOR_DANGER = "#ff453a"      # error / critical (Apple's systemRed)
-
-# Channel role uses the accent + a neutral so plots stay quiet
-ROLE_COLORS = {
-    "eeg": COLOR_ACCENT,
-    "stim_copy": COLOR_TEXT_TERTIARY,
-    "reference": COLOR_SUCCESS,
-}
-
-# Typography — SF first, then Windows variable fonts, then web-safe.
-FONT_STACK = ('-apple-system, BlinkMacSystemFont, "SF Pro Text", '
-              '"Segoe UI Variable", "Segoe UI", "Helvetica Neue", '
-              "Helvetica, Arial, sans-serif")
-
-# Type ramp (px). Resist the urge to invent more steps.
-FONT_SIZE_TITLE = "22px"
-FONT_SIZE_HEADER = "15px"
-FONT_SIZE_BODY = "13px"
-FONT_SIZE_CAPTION = "11px"
-
-# Spacing scale — multiples of 4. Generous because deference > density.
-SPACE_1 = "4px"
-SPACE_2 = "8px"
-SPACE_3 = "12px"
-SPACE_4 = "16px"
-SPACE_5 = "24px"
-SPACE_6 = "32px"
-
-# Corner radius — one value, used everywhere.
-RADIUS_SM = "6px"
-RADIUS_MD = "10px"
+# Design tokens live in src/dashboard/design.py (single source of truth
+# for the Python side; CSS reads the same values via :root variables
+# injected through index_string below).
+from src.dashboard.design import (
+    COLOR_SURFACE_0, COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_SURFACE_3,
+    COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
+    COLOR_DIVIDER, COLOR_ACCENT, COLOR_SUCCESS, COLOR_WARNING,
+    COLOR_DANGER, ROLE_COLORS, FONT_STACK,
+    FONT_SIZE_TITLE, FONT_SIZE_HEADER, FONT_SIZE_BODY, FONT_SIZE_CAPTION,
+    SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SPACE_6,
+    RADIUS_SM, RADIUS_MD,
+    as_css_root_block,
+)
 
 # Config file path
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "config.yaml")
@@ -450,6 +414,29 @@ def create_app(config: dict, store: Store) -> Dash:
     assets_dir = os.path.join(os.path.dirname(__file__), "assets")
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
                assets_folder=assets_dir)
+
+    # Inject design tokens as CSS custom properties on :root so theme.css
+    # and ad-hoc inline `var(--*)` references stay in sync with Python.
+    app.index_string = (
+        """<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        """ + as_css_root_block() + """
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>"""
+    )
 
     # Identity gate (Cloudflare Access JWT) + media-streaming routes both
     # attach to the underlying Flask server.

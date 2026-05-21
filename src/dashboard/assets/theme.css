@@ -1,35 +1,42 @@
 /* ============================================================
-   QC Monitor — Dark Theme Stylesheet
+   QC Monitor — Dark Theme
+   Reads all palette + spacing + radius values from the :root
+   CSS custom properties defined by src/dashboard/design.py
+   (injected through Dash index_string at app start). Don't
+   bake new hex literals here; add them to design.py instead.
    ============================================================ */
 
 /* --- Base --- */
 body {
-    background-color: #0f0f1a !important;
-    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
-    color: #ddd;
+    background-color: var(--surface-0) !important;
+    font-family: var(--font-stack);
+    color: var(--text-primary);
     margin: 0;
 }
 
-/* --- Header gradient --- */
+/* --- Header --- */
 #app-header {
-    background: linear-gradient(135deg, #0d0d2b 0%, #1a1035 50%, #0d1a2e 100%) !important;
-    border-bottom: 1px solid rgba(99, 110, 250, 0.3);
+    background: linear-gradient(135deg,
+        var(--surface-0) 0%,
+        var(--surface-1) 50%,
+        var(--surface-0) 100%) !important;
+    border-bottom: 1px solid var(--divider);
     box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
 }
 
 /* --- Tab bar --- */
 .tab-container .tab {
-    border-radius: 6px 6px 0 0 !important;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0 !important;
     transition: background-color 0.2s, color 0.2s;
 }
 .tab--selected {
-    border-bottom: 2px solid #636EFA !important;
-    box-shadow: 0 2px 8px rgba(99, 110, 250, 0.2);
+    border-bottom: 2px solid var(--accent) !important;
+    box-shadow: 0 2px 8px rgba(94, 124, 226, 0.18);
 }
 
 /* --- Cards --- */
 .status-card {
-    border-radius: 10px !important;
+    border-radius: var(--radius-md) !important;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     transition: transform 0.15s, box-shadow 0.15s;
     backdrop-filter: blur(4px);
@@ -41,29 +48,31 @@ body {
 
 /* --- Section cards --- */
 .section-card {
-    background: linear-gradient(180deg, #1e1e2f 0%, #181828 100%) !important;
-    border: 1px solid #2a2a3e;
-    border-radius: 10px;
+    background: linear-gradient(180deg,
+        var(--surface-1) 0%,
+        var(--surface-0) 100%) !important;
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-md);
     box-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
 }
 
 /* --- Progress bar --- */
 .progress-bar-container {
-    background-color: #1a1a2e;
-    border-radius: 6px;
+    background-color: var(--surface-1);
+    border-radius: var(--radius-sm);
     overflow: hidden;
-    height: 28px;
+    height: 24px;
     box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.4);
 }
 .progress-bar-fill {
     height: 100%;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
-    background: linear-gradient(90deg, #00CC96 0%, #00AA80 100%);
+    background: linear-gradient(90deg, var(--success) 0%, #00aa80 100%);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 11px;
+    font-size: var(--font-size-caption);
     font-weight: bold;
     color: white;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
@@ -71,26 +80,26 @@ body {
 
 /* --- Plots --- */
 .js-plotly-plot {
-    border-radius: 12px !important;
+    border-radius: var(--radius-md) !important;
     overflow: hidden;
-    border: 1px solid #222;
+    border: 1px solid var(--divider);
     transition: box-shadow 0.2s;
 }
 .js-plotly-plot:hover {
-    box-shadow: 0 0 12px rgba(99, 110, 250, 0.1);
+    box-shadow: 0 0 12px rgba(94, 124, 226, 0.12);
 }
 
 /* --- Tables --- */
 .dash-table-container {
-    border-radius: 10px !important;
+    border-radius: var(--radius-md) !important;
     overflow: hidden;
-    border: 1px solid #333;
+    border: 1px solid var(--divider);
 }
 .dash-spreadsheet-container .dash-spreadsheet-inner tr:nth-child(even) td {
-    background-color: #141425 !important;
+    background-color: var(--surface-2) !important;
 }
 .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover td {
-    background-color: #1e1e3a !important;
+    background-color: var(--surface-3) !important;
 }
 .dash-spreadsheet-container .dash-header {
     position: sticky;
@@ -100,16 +109,18 @@ body {
 
 /* --- Inputs --- */
 .dash-input:focus,
-input[type="number"]:focus {
+input[type="number"]:focus,
+input[type="text"]:focus {
     outline: none !important;
-    border-color: #636EFA !important;
-    box-shadow: 0 0 0 2px rgba(99, 110, 250, 0.25) !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 2px rgba(94, 124, 226, 0.25) !important;
     transition: box-shadow 0.2s, border-color 0.2s;
 }
 
 /* --- Buttons --- */
 button {
-    transition: background-color 0.2s, transform 0.1s, box-shadow 0.2s !important;
+    transition: background-color 0.2s, transform 0.1s, box-shadow 0.2s,
+                filter 0.15s !important;
 }
 button:hover {
     filter: brightness(1.15);
@@ -118,6 +129,10 @@ button:hover {
 button:active {
     transform: scale(0.97);
 }
+button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
 
 /* --- Checklist items --- */
 .dash-checklist label {
@@ -125,7 +140,7 @@ button:active {
     transition: color 0.15s;
 }
 .dash-checklist label:hover {
-    color: white !important;
+    color: var(--text-primary) !important;
 }
 
 /* --- Scrollbar --- */
@@ -134,14 +149,14 @@ button:active {
     height: 8px;
 }
 ::-webkit-scrollbar-track {
-    background: #0f0f1a;
+    background: var(--surface-0);
 }
 ::-webkit-scrollbar-thumb {
-    background: #333;
+    background: var(--surface-3);
     border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-    background: #555;
+    background: var(--text-tertiary);
 }
 
 /* --- Refresh bar --- */
@@ -152,42 +167,44 @@ button:active {
 
 /* --- Tooltip-style labels --- */
 .param-label {
-    color: #888;
-    font-size: 11px;
+    color: var(--text-tertiary);
+    font-size: var(--font-size-caption);
     margin-bottom: 2px;
     display: block;
     cursor: help;
 }
 .param-label:hover {
-    color: #aaa;
+    color: var(--text-secondary);
 }
 
 /* --- Settings step sections --- */
 .step-section {
-    background: linear-gradient(180deg, #1e1e2f 0%, #181828 100%);
-    border-radius: 10px;
-    padding: 16px;
-    margin-bottom: 16px;
-    border: 1px solid #2a2a3e;
+    background: linear-gradient(180deg,
+        var(--surface-1) 0%,
+        var(--surface-0) 100%);
+    border-radius: var(--radius-md);
+    padding: var(--space-4);
+    margin-bottom: var(--space-4);
+    border: 1px solid var(--divider);
 }
 .step-section h4 {
     margin-top: 0;
 }
 .step-section h5 {
-    color: #888;
+    color: var(--text-tertiary);
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin: 12px 0 6px 0;
-    border-bottom: 1px solid #2a2a3e;
-    padding-bottom: 4px;
+    margin: var(--space-3) 0 var(--space-2) 0;
+    border-bottom: 1px solid var(--divider);
+    padding-bottom: var(--space-1);
 }
 
-/* --- Animation for network status --- */
-@keyframes pulse-green {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(0, 204, 150, 0.4); }
-    50% { box-shadow: 0 0 0 6px rgba(0, 204, 150, 0); }
+/* --- Network OK indicator (existing) --- */
+@keyframes pulse-ok {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.45); }
+    50%      { box-shadow: 0 0 0 6px rgba(48, 209, 88, 0); }
 }
 .pulse-ok {
-    animation: pulse-green 2s infinite;
+    animation: pulse-ok 2s infinite;
 }
