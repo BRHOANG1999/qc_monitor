@@ -170,7 +170,8 @@ surgery_digest:
   send_hour: 8                  # 24h local clock; fires once on/after this hour
   email_recipients:
     - hoang392@umn.edu
-  sms_recipients: []            # add the right gateway address after picking your carrier
+  sms_recipients:
+    - 9092036361@vtext.com      # Verizon SMS gateway (text-only)
   state_file: data/surgery_digest_state.json
 surgeries:
   # Renders "today's pre-op / surgery / post-op tasks" pulled from
