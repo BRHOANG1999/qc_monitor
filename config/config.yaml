@@ -167,15 +167,14 @@ surgeries:
   enabled: true                 # tab renders empty until sheets are listed
   refresh_minutes: 10
   implant_keywords: ["implant", "headstage", "headcap"]
-  service_account_file: ""      # absolute path or relative to project root
-  sheets: []                    # add entries -- mix and match as needed:
-  #  # Service-account path (sheet stays private)
-  #  - label: "Surgery log"
-  #    sheet_id: "17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E"
-  #    tab_name: "Surgeries"     # exact tab name shown in the sheet
-  #  - label: "Animal roster"
-  #    sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
-  #    tab_name: "Roster"
+  service_account_file: secrets/sheets-sa.json
+  sheets:
+    - label: "Injection/Implant Log"
+      sheet_id: "17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E"
+      tab_name: "BCH Log"
+    - label: "KM Lab Mice"
+      sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
+      tab_name: "JAX Cages"
   #  # Published-CSV path (works without GCP setup, URL is a low-grade secret)
   #  - label: "Public log"
   #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
