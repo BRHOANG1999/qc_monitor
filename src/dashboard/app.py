@@ -1815,8 +1815,7 @@ def _home_surgery_block(store: Store, config: dict | None,
         html.Div(rows),
     ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
               "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)",
-              "marginTop": "16px"})
+              "border": "1px solid rgba(255,255,255,0.07)"})
 
 
 _MAINT_HOME_COLOR = {
@@ -1900,8 +1899,7 @@ def _home_maintenance_block(config: dict | None) -> html.Div:
         body,
     ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
               "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)",
-              "marginTop": "12px"})
+              "border": "1px solid rgba(255,255,255,0.07)"})
 
 
 def _home_schedule_block(config: dict | None) -> html.Div:
@@ -1945,8 +1943,7 @@ def _home_schedule_block(config: dict | None) -> html.Div:
         body,
     ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
               "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)",
-              "marginTop": "12px"})
+              "border": "1px solid rgba(255,255,255,0.07)"})
 
 
 def _home_incidents_block(config: dict | None) -> html.Div:
@@ -1995,8 +1992,7 @@ def _home_incidents_block(config: dict | None) -> html.Div:
         body,
     ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
               "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)",
-              "marginTop": "12px"})
+              "border": "1px solid rgba(255,255,255,0.07)"})
 
 
 def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
@@ -2038,8 +2034,7 @@ def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
         body,
     ], style={"backgroundColor": "#1e1e2f", "padding": "16px 20px",
               "borderRadius": "8px",
-              "border": "1px solid rgba(255,255,255,0.07)",
-              "marginTop": "12px"})
+              "border": "1px solid rgba(255,255,255,0.07)"})
 
 
 def _overview_tab(store: Store, config: dict | None = None):
@@ -2247,16 +2242,24 @@ def _overview_tab(store: Store, config: dict | None = None):
         ])
 
     today = date.today()
-    surgery_home = _home_surgery_block(store, config, today)
-    schedule_home = _home_schedule_block(config)
-    maintenance_home = _home_maintenance_block(config)
-    incidents_home = _home_incidents_block(config)
-    data_log_home = _home_data_log_block(store, config)
+    # Two-column responsive grid -- collapses to one column under ~880px.
+    # 440 px is wide enough that the maintenance status pills stay on
+    # one line and the data-log counter cards don't wrap awkwardly.
+    home_grid = html.Div([
+        _home_surgery_block(store, config, today),
+        _home_schedule_block(config),
+        _home_maintenance_block(config),
+        _home_incidents_block(config),
+        _home_data_log_block(store, config),
+    ], style={
+        "display": "grid",
+        "gridTemplateColumns": "repeat(auto-fit, minmax(440px, 1fr))",
+        "gap": "12px",
+        "marginTop": "16px",
+    })
 
     return html.Div([
-        cards, queue_section,
-        surgery_home, schedule_home, maintenance_home,
-        incidents_home, data_log_home,
+        cards, queue_section, home_grid,
         waveform_thumbnail, session_info, channel_table, alerts_section,
     ])
 
