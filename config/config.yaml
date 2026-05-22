@@ -218,8 +218,11 @@ surgery_digest:
   send_hour: 8                  # 24h local clock; fires once on/after this hour
   email_recipients:
     - hoang392@umn.edu
-  sms_recipients:
-    - 9092036361@vtext.com      # Verizon SMS gateway (text-only)
+  # Verizon shut down its email-to-SMS gateway (vtext.com / vzwpix.com)
+  # in May 2026 -- bounces 550 "Decommission of Email to Text". Leaving
+  # this empty so the digest goes email-only. If you ever want SMS back
+  # the path is Pushover / Twilio / ntfy, not a carrier gateway.
+  sms_recipients: []
   state_file: data/surgery_digest_state.json
 surgeries:
   # Renders "today's pre-op / surgery / post-op tasks" pulled from
