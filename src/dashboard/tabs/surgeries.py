@@ -349,6 +349,24 @@ def _animal_lookup_variants(animal: str) -> list[str]:
     return out
 
 
+_NOTE_JUNK = {"true", "false", "0", "1", "n/a", "na",
+              "none", "null", "-", "—"}
+
+
+def _clean_note(value: str) -> str:
+    """Strip boolean-like / placeholder junk from a Notes cell.
+
+    Operators sometimes leave a literal 'FALSE' in the Notes column
+    (probably an auto-fill from a checkbox the cell used to hold).
+    Treat such junk as empty so the digest and DataTable stay clean.
+    """
+    if not value:
+        return ""
+    if value.strip().lower() in _NOTE_JUNK:
+        return ""
+    return value
+
+
 def _cage_for(cage_index, animal: str) -> str:
     """Look up a cage descriptor for *animal* in the cage_index, if any.
 
@@ -405,7 +423,8 @@ def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
             dropped += 1
             continue
         type_str = _normalize_text(row.get(col_type)) if col_type else ""
-        notes = _normalize_text(row.get(col_notes)) if col_notes else ""
+        notes = _clean_note(_normalize_text(row.get(col_notes))
+                             if col_notes else "")
         strain = _normalize_text(row.get(col_strain)) if col_strain else ""
         dob = _normalize_text(row.get(col_dob)) if col_dob else ""
         ear = _normalize_text(row.get(col_ear)) if col_ear else ""
