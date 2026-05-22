@@ -52,6 +52,11 @@ _DEFAULT_ALIASES = {
                       "date of surgery"],
     "surgery_type": ["surgery_type", "type", "surgery", "procedure"],
     "notes":        ["notes", "comment", "comments", "note"],
+    "strain":       ["litter ID,etc", "litter id,etc", "strain",
+                      "strain id", "genotype"],
+    "dob":          ["dob", "date of birth", "birth date"],
+    "ear":          ["ear punch", "ear mark", "earpunch", "earmark",
+                      "ear"],
 }
 _DEFAULT_IMPLANT_KEYWORDS = ["implant", "headstage", "headcap", "electrode"]
 
@@ -322,16 +327,57 @@ def _resolve_date_columns(df: pd.DataFrame, date_columns_cfg: list[dict] | None,
     return out
 
 
+_ANIMAL_NORM_RE = __import__("re").compile(r'^([A-Za-z]+)(\d+)$')
+
+
+def _animal_lookup_variants(animal: str) -> list[str]:
+    """Try a few zero-padding variants so BCH Log's 'BCH062' matches
+    JAX Cages' 'BCH62' (and vice-versa). Operators use both forms
+    interchangeably."""
+    a = animal.upper().strip()
+    out = [a]
+    m = _ANIMAL_NORM_RE.match(a)
+    if m:
+        prefix, digits = m.group(1), m.group(2)
+        # Stripped form (BCH062 -> BCH62)
+        stripped = digits.lstrip("0") or "0"
+        if stripped != digits:
+            out.append(prefix + stripped)
+        # 3-digit zero-padded form (BCH62 -> BCH062), only when shorter
+        if len(digits) < 3:
+            out.append(prefix + digits.zfill(3))
+    return out
+
+
+def _cage_for(cage_index, animal: str) -> str:
+    """Look up a cage descriptor for *animal* in the cage_index, if any.
+
+    Tries multiple zero-pad variants since the BCH Log and JAX Cages
+    use different conventions ('BCH062' vs 'BCH62').
+    """
+    if not cage_index:
+        return ""
+    from src.dashboard.tabs.cage_index import cage_descriptor
+    for key in _animal_lookup_variants(animal):
+        cage = cage_index.get(key)
+        if cage is not None:
+            return cage_descriptor(cage)
+    return ""
+
+
 def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
                       aliases: dict, implant_kw: list[str],
-                      date_columns_cfg: list[dict] | None = None
+                      date_columns_cfg: list[dict] | None = None,
+                      cage_index: dict | None = None,
                       ) -> tuple[list[dict], int]:
     """Walk a DataFrame and emit task dicts for rows due today.
 
     A row can contribute multiple events when *date_columns_cfg* lists
     more than one date column (e.g. injection + implant on the same
     animal). Returns ``(tasks, dropped)``; *dropped* counts rows that
-    had neither an animal id nor any parseable date.
+    had neither an animal id nor any parseable date. When *cage_index*
+    is provided, each emitted task gets a "cage" descriptor pulled
+    from the JAX Cages walker.
     """
     assert isinstance(today, date), "today must be a date"
     if df is None or df.empty:
@@ -340,6 +386,9 @@ def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
     col_animal = _find_column(df, aliases["animal_id"])
     col_type = _find_column(df, aliases["surgery_type"])
     col_notes = _find_column(df, aliases["notes"])
+    col_strain = _find_column(df, aliases.get("strain", []))
+    col_dob = _find_column(df, aliases.get("dob", []))
+    col_ear = _find_column(df, aliases.get("ear", []))
     date_cols = _resolve_date_columns(df, date_columns_cfg, aliases)
 
     if col_animal is None or not date_cols:
@@ -357,6 +406,10 @@ def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
             continue
         type_str = _normalize_text(row.get(col_type)) if col_type else ""
         notes = _normalize_text(row.get(col_notes)) if col_notes else ""
+        strain = _normalize_text(row.get(col_strain)) if col_strain else ""
+        dob = _normalize_text(row.get(col_dob)) if col_dob else ""
+        ear = _normalize_text(row.get(col_ear)) if col_ear else ""
+        cage = _cage_for(cage_index, animal)
         any_event = False
         for dc in date_cols:
             d = _safe_date(row.get(dc["column"]))
@@ -373,6 +426,10 @@ def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
             tasks.append({
                 "step": step,
                 "animal": animal,
+                "strain": strain,
+                "dob": dob,
+                "ear": ear,
+                "cage": cage,
                 "type": dc["event_label"] or type_str or "—",
                 "surgery_date": d.isoformat(),
                 "sheet": sheet_label,
@@ -385,12 +442,14 @@ def _tasks_from_frame(df: pd.DataFrame, sheet_label: str, today: date,
 
 def _upcoming(df: pd.DataFrame, sheet_label: str, today: date,
               aliases: dict, date_columns_cfg: list[dict] | None = None,
+              cage_index: dict | None = None,
               days_ahead: int = 7) -> list[dict]:
     """Surgeries scheduled in (today, today+days_ahead]."""
     if df is None or df.empty:
         return []
     col_animal = _find_column(df, aliases["animal_id"])
     col_type = _find_column(df, aliases["surgery_type"])
+    col_strain = _find_column(df, aliases.get("strain", []))
     date_cols = _resolve_date_columns(df, date_columns_cfg, aliases)
     if col_animal is None or not date_cols:
         return []
@@ -401,6 +460,8 @@ def _upcoming(df: pd.DataFrame, sheet_label: str, today: date,
         if not animal:
             continue
         type_str = _normalize_text(row.get(col_type)) if col_type else ""
+        strain = _normalize_text(row.get(col_strain)) if col_strain else ""
+        cage = _cage_for(cage_index, animal)
         for dc in date_cols:
             d = _safe_date(row.get(dc["column"]))
             if d is None:
@@ -408,6 +469,8 @@ def _upcoming(df: pd.DataFrame, sheet_label: str, today: date,
             if today < d <= horizon:
                 out.append({
                     "animal": animal,
+                    "strain": strain,
+                    "cage": cage,
                     "type": dc["event_label"] or type_str or "",
                     "surgery_date": d.isoformat(),
                     "in_days": (d - today).days,
@@ -436,9 +499,12 @@ def _empty_group(label: str) -> html.Div:
 def _task_table(tasks: list[dict]) -> html.Div:
     columns = [
         {"name": "Animal", "id": "animal"},
+        {"name": "Strain", "id": "strain"},
+        {"name": "DOB", "id": "dob"},
+        {"name": "Ear", "id": "ear"},
+        {"name": "Cage", "id": "cage"},
         {"name": "Type", "id": "type"},
         {"name": "Surgery date", "id": "surgery_date"},
-        {"name": "Sheet", "id": "sheet"},
         {"name": "Notes", "id": "notes"},
     ]
     return html.Div([dash_table.DataTable(
@@ -452,6 +518,8 @@ def _upcoming_table(rows: list[dict]) -> html.Div:
         return empty_state("No surgeries scheduled in the next 7 days.")
     columns = [
         {"name": "Animal", "id": "animal"},
+        {"name": "Strain", "id": "strain"},
+        {"name": "Cage", "id": "cage"},
         {"name": "Type", "id": "type"},
         {"name": "Surgery date", "id": "surgery_date"},
         {"name": "In days", "id": "in_days"},
@@ -593,6 +661,15 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
         upcoming_all: list[dict] = []
         dropped: dict[str, int] = {}
 
+        # JAX Cages lookup -- loaded once, shared across all surgery
+        # sheets. Lazy import keeps cage_index a soft dependency.
+        try:
+            from src.dashboard.tabs.cage_index import load_cage_index
+            cage_index = load_cage_index(config, ttl_sec=effective_ttl)
+        except Exception as e:
+            logger.warning("Cage index load failed: %s", e)
+            cage_index = {}
+
         for s in sheets_cfg:
             label = s.get("label") or s.get("url") or s.get("sheet_id", "?")
             header_row = int(s.get("header_row", 1))
@@ -620,12 +697,14 @@ def register_callbacks(app, store: Store, config: dict | None = None) -> None:
             tasks, n_drop = _tasks_from_frame(
                 df, label, today, aliases, implant_kw,
                 date_columns_cfg=date_cols_cfg,
+                cage_index=cage_index,
             )
             dropped[label] = n_drop
             for t in tasks:
                 grouped.setdefault(t["step"], []).append(t)
             upcoming_all.extend(_upcoming(
                 df, label, today, aliases, date_columns_cfg=date_cols_cfg,
+                cage_index=cage_index,
             ))
 
         upcoming_all.sort(key=lambda x: x["in_days"])

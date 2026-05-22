@@ -252,8 +252,15 @@ surgeries:
         - name: "Date of Implant"
           is_implant: true
           event_label: "Implant"
-  # KM Lab Mice (tab "JAX Cages") is a cage roster, not a surgery log
-  # (grant labels + locations in non-tabular form). Not included here.
+  # KM Lab Mice -> JAX Cages: per-animal cage lookup for the
+  # Surgeries DataTable "Cage" column. The tab is non-tabular (operator
+  # sections with per-cage rows); cage_index.py walks it and builds
+  # {animal_id: cage_descriptor}. Set enabled: false to leave the Cage
+  # column blank.
+  cage_index:
+    enabled: true
+    sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
+    tab_name: "JAX Cages"
   #  # Published-CSV path (works without GCP setup, URL is a low-grade secret)
   #  - label: "Public log"
   #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
