@@ -18,10 +18,17 @@ class EmailAlerter:
         self.from_email = smtp_cfg.get("from_email", "")
         self.recipients = smtp_cfg.get("recipients", [])
         self.enabled = config.get("alerting", {}).get("enabled", True)
+        # Remember the env-var name so we can re-read it on every send
+        # instead of caching the value at startup. This lets the user
+        # rotate the App Password (or set the env var post-launch) and
+        # have the digest pick it up at the next tick, without having
+        # to restart the long-running watcher.
+        self._pw_env_var = smtp_cfg.get(
+            "password_env_var", "QC_MONITOR_EMAIL_PASSWORD")
 
-        # Password from environment variable
-        pw_env = smtp_cfg.get("password_env_var", "QC_MONITOR_EMAIL_PASSWORD")
-        self.password = os.environ.get(pw_env, "")
+    @property
+    def password(self) -> str:
+        return os.environ.get(self._pw_env_var, "")
 
     def send(self, subject: str, body: str, severity: str = "info",
              recipients: list[str] | None = None,

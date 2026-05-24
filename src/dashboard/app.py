@@ -262,13 +262,19 @@ DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMAR
 
 
 def _load_config() -> dict:
-    with open(CONFIG_PATH, "r") as f:
+    # Force UTF-8 -- config contains emoji in the maintenance tab names
+    # and Windows' default cp1252 codec chokes on them. (Same fix that
+    # was applied to main.py's load_config.)
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def _save_config(cfg: dict):
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    # UTF-8 + allow_unicode keep emoji intact through a round-trip
+    # (matters for the maintenance tab names in the config block).
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
 
 
 def _parse_json_field(val):
