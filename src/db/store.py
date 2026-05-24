@@ -696,6 +696,61 @@ class Store:
     #  matlab_results
     # ------------------------------------------------------------------ #
 
+    def insert_video_qc(self, file_id: int, result: dict,
+                         version_id: int | None = None) -> int:
+        """Persist a video_qc.VideoQCResult dict. Returns the new row id."""
+        import json
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """INSERT INTO video_qc
+                   (file_id, version_id, video_path, analyzed_at, fps,
+                    n_frames_total, n_frames_sampled, sample_every_n,
+                    duration_sec, duration_analyzed_sec,
+                    mean_global, var_global,
+                    mean_min, mean_max, var_min, var_max,
+                    n_dark, n_bright, n_low_var, n_bad, pct_bad,
+                    first_bad_idx, first_bad_reason,
+                    status, error, thresholds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    file_id, version_id,
+                    result.get("video_path"),
+                    datetime.now().isoformat(),
+                    result.get("fps"),
+                    result.get("n_frames_total"),
+                    result.get("n_frames_sampled"),
+                    result.get("sample_every_n"),
+                    result.get("duration_sec"),
+                    result.get("duration_analyzed_sec"),
+                    result.get("mean_global"),
+                    result.get("var_global"),
+                    result.get("mean_min"),
+                    result.get("mean_max"),
+                    result.get("var_min"),
+                    result.get("var_max"),
+                    result.get("n_dark"),
+                    result.get("n_bright"),
+                    result.get("n_low_var"),
+                    result.get("n_bad"),
+                    result.get("pct_bad"),
+                    result.get("first_bad_idx"),
+                    result.get("first_bad_reason"),
+                    result.get("status"),
+                    result.get("error"),
+                    json.dumps(result.get("thresholds") or {}),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  matlab_results
+    # ------------------------------------------------------------------ #
+
     def insert_matlab_result(self, file_id: int, result: dict,
                              version_id: int | None = None):
         conn = self._connect()

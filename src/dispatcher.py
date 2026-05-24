@@ -13,6 +13,7 @@ from src.analyzers.qc_basic import analyze_basic_qc
 from src.analyzers.spectral import analyze_spectral
 from src.analyzers.artifact import analyze_artifact
 from src.analyzers.stim_qc import analyze_stim_report
+from src.analyzers.video_qc import analyze_video
 from src.utils.matlab_bridge import run_pipeline as matlab_run_pipeline
 from src.utils.video import video_path_for_mat
 from src.watcher import NewFile
@@ -283,6 +284,19 @@ class Dispatcher:
                         })
                     self.store.bulk_insert_criticality(file_id, windows, version_id)
 
+            # --- Tier 3: Video frame QC ---
+            # Walks the companion mp4/avi (if present), classifies each
+            # sampled frame as dark/bright/uniform, emails an alert when
+            # a configured percentage of frames are bad. Cheap-ish:
+            # OpenCV + numpy on a 160x120 thumbnail, typically <5 s for a
+            # 60-second clip at 30 fps with 1 fps sampling.
+            video_cfg = self.config.get("video_qc", {}) or {}
+            if video_cfg.get("enabled", True):
+                video_path = video_path_for_mat(new_file.path)
+                if video_path is not None:
+                    self._run_video_qc(file_id, new_file.path, video_path,
+                                        video_cfg, version_id)
+
             total_elapsed = time.time() - t1_start
             self.store.update_file_status(file_id, "done")
             self.store.log_activity("INFO", "PROCESSING_DONE",
@@ -298,6 +312,118 @@ class Dispatcher:
                                     f"Failed: {os.path.basename(new_file.path)}: {e}",
                                     file_id=file_id, file_path=new_file.path)
             return False
+
+    # ------------------------------------------------------------------ #
+    #  Tier 3: Video frame QC + email alert
+    # ------------------------------------------------------------------ #
+
+    def _run_video_qc(self, file_id: int, mat_path: str, video_path: str,
+                       cfg: dict, version_id: int | None) -> None:
+        """Sample frames of *video_path*, persist results, and email an
+        alert when the bad-frame percentage exceeds the configured
+        threshold. Failures here never kill the parent processing run --
+        they're logged and dropped."""
+        t = time.time()
+        try:
+            result = analyze_video(
+                video_path,
+                sample_every_n=cfg.get("sample_every_n"),
+                downsample_to=tuple(cfg.get("downsample_to", (160, 120))),
+                min_mean=float(cfg.get("min_mean", 25.0)),
+                max_mean=float(cfg.get("max_mean", 230.0)),
+                min_variance=float(cfg.get("min_variance", 50.0)),
+                alert_pct_bad=float(cfg.get("alert_pct_bad", 25.0)),
+            )
+        except Exception as e:
+            logger.error("Video QC failed for %s: %s", video_path, e,
+                          exc_info=True)
+            return
+
+        elapsed = time.time() - t
+        logger.info(
+            "Tier 3: %s (%.1fs): %s, sampled %d/%d frames, "
+            "%.1f%% bad (%s)",
+            os.path.basename(video_path), elapsed, result.status,
+            result.n_frames_sampled, result.n_frames_total,
+            result.pct_bad, result.first_bad_reason or "—",
+        )
+        try:
+            self.store.insert_video_qc(file_id, result.to_dict(),
+                                        version_id=version_id)
+        except Exception as e:
+            logger.warning("Could not persist video_qc row: %s", e)
+
+        # Alert on critical only. The AlertRuleEngine handles
+        # rate limiting per-type so we don't email the same recipient
+        # 50 times in a row if a session has many bad recordings.
+        if result.status != "critical" or not cfg.get(
+                "alert_on_critical", True):
+            return
+        self._send_video_alert(mat_path, video_path, result)
+
+    def _send_video_alert(self, mat_path: str, video_path: str,
+                           result) -> None:
+        """Render and dispatch the bad-video email through the existing
+        alerting block's EmailAlerter."""
+        try:
+            from src.alerting.email_alert import EmailAlerter
+            emailer = EmailAlerter(self.config)
+        except Exception as e:
+            logger.warning("Could not build EmailAlerter for video QC: %s", e)
+            return
+        if not emailer.enabled or not emailer.password:
+            logger.debug("Video alert suppressed (alerting disabled "
+                          "or password missing)")
+            return
+
+        # Rate-limit through processing_log: if we sent an alert for
+        # this file within the last hour, skip.
+        recent = (self.store.get_recent_alerts(hours=1)
+                  if hasattr(self.store, "get_recent_alerts") else [])
+        if any(a.get("alert_type") == "video_qc"
+               and os.path.basename(video_path) in (a.get("message") or "")
+               for a in (recent or [])):
+            logger.debug("Video alert rate-limited for %s", video_path)
+            return
+
+        subject = (f"Video QC alert -- {os.path.basename(video_path)} "
+                   f"({result.pct_bad:.0f}% bad frames)")
+        text_lines = [
+            f"Video: {video_path}",
+            f"Companion .mat: {mat_path}",
+            "",
+            f"Status: {result.status.upper()}",
+            f"Sampled {result.n_frames_sampled} of {result.n_frames_total} "
+            f"frames (1 per {result.sample_every_n}).",
+            f"Bad frames: {result.n_bad} ({result.pct_bad:.1f}%)",
+            f"  dark     : {result.n_dark}",
+            f"  bright   : {result.n_bright}",
+            f"  low_var  : {result.n_low_var}",
+            f"First bad frame: idx {result.first_bad_idx} "
+            f"({result.first_bad_reason})"
+            if result.first_bad_idx is not None
+            else "First bad frame: —",
+            "",
+            "Per-frame thresholds:",
+            f"  min_mean = {result.thresholds.get('min_mean')}",
+            f"  max_mean = {result.thresholds.get('max_mean')}",
+            f"  min_variance = {result.thresholds.get('min_variance')}",
+        ]
+        text_body = "\n".join(text_lines)
+        ok = emailer.send(
+            subject=subject, body=text_body, severity="warning",
+        )
+        try:
+            self.store.insert_alert(
+                alert_type="video_qc",
+                severity="warning",
+                message=f"{os.path.basename(video_path)}: "
+                        f"{result.pct_bad:.0f}% bad frames "
+                        f"({result.first_bad_reason})",
+                sent_at_iso=None, sent=int(bool(ok)),
+            ) if hasattr(self.store, "insert_alert") else None
+        except Exception as e:
+            logger.debug("insert_alert skipped: %s", e)
 
 
 # Map MATLAB feature struct field names to DB column names

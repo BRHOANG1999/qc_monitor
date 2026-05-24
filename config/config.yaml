@@ -85,6 +85,21 @@ artifact:
   fixed_threshold: 500.0
   mad_k: 4.0
   merge_gap_sec: 2.0
+video_qc:
+  # Tier 3: open the companion mp4/avi and walk every Nth frame,
+  # computing the grayscale mean + variance on a downsampled thumbnail.
+  # Flags frames as dark / bright / uniform; emails a 'critical' alert
+  # when the bad-frame % exceeds alert_pct_bad. ~5s on a 60s 30 fps
+  # clip with 1 fps sampling.
+  enabled: true
+  alert_on_critical: true
+  sample_every_n: null         # null = 1 frame per second (uses fps)
+  downsample_to: [160, 120]    # smaller = faster, slightly noisier
+  # Pixel mean is 0..255 (8-bit grayscale)
+  min_mean: 25.0               # below = too dark (camera covered, IR off)
+  max_mean: 230.0              # above = over-exposed
+  min_variance: 50.0           # below = uniform field (lens fogged, etc.)
+  alert_pct_bad: 25.0          # email when >=25% of sampled frames bad
 qc_thresholds:
   artifact_pct_warning: 50.0
   flatline_std: 1.0e-06

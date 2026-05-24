@@ -296,4 +296,41 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- Video QC: one row per processed video. Captures frame-level
+-- brightness/variance stats so the dispatcher can decide whether to
+-- alert (too dark, too bright, or uniform footage).
+CREATE TABLE IF NOT EXISTS video_qc (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    version_id INTEGER,
+    video_path TEXT NOT NULL,
+    analyzed_at TEXT NOT NULL,
+    fps REAL,
+    n_frames_total INTEGER,
+    n_frames_sampled INTEGER,
+    sample_every_n INTEGER,
+    duration_sec REAL,
+    duration_analyzed_sec REAL,
+    mean_global REAL,
+    var_global REAL,
+    mean_min REAL,
+    mean_max REAL,
+    var_min REAL,
+    var_max REAL,
+    n_dark INTEGER,
+    n_bright INTEGER,
+    n_low_var INTEGER,
+    n_bad INTEGER,
+    pct_bad REAL,
+    first_bad_idx INTEGER,
+    first_bad_reason TEXT,
+    status TEXT,
+    error TEXT,
+    thresholds TEXT,
+    FOREIGN KEY (file_id) REFERENCES processed_files(id),
+    FOREIGN KEY (version_id) REFERENCES settings_versions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_video_qc_file ON video_qc(file_id);
+CREATE INDEX IF NOT EXISTS idx_video_qc_status ON video_qc(status);
 """
