@@ -18,17 +18,41 @@ class EmailAlerter:
         self.from_email = smtp_cfg.get("from_email", "")
         self.recipients = smtp_cfg.get("recipients", [])
         self.enabled = config.get("alerting", {}).get("enabled", True)
-        # Remember the env-var name so we can re-read it on every send
-        # instead of caching the value at startup. This lets the user
-        # rotate the App Password (or set the env var post-launch) and
-        # have the digest pick it up at the next tick, without having
-        # to restart the long-running watcher.
+        # Password lookup order, re-evaluated on every send so the user
+        # can rotate the App Password without restarting the watcher:
+        #   1. env var QC_MONITOR_EMAIL_PASSWORD (or `password_env_var`)
+        #   2. file at `password_file` (default secrets/smtp_password.txt)
+        # The file path falls back to the project-root relative form
+        # when not absolute. Windows services don't inherit interactive-
+        # shell env vars cleanly, so the file is the reliable channel.
         self._pw_env_var = smtp_cfg.get(
             "password_env_var", "QC_MONITOR_EMAIL_PASSWORD")
+        self._pw_file = smtp_cfg.get(
+            "password_file", "secrets/smtp_password.txt")
 
     @property
     def password(self) -> str:
-        return os.environ.get(self._pw_env_var, "")
+        # Env var first -- still useful for interactive testing and
+        # ephemeral overrides without touching files.
+        env_pw = os.environ.get(self._pw_env_var, "")
+        if env_pw:
+            return env_pw.strip()
+        # File fallback. The service inherits whatever filesystem
+        # state the project root contains, no env-var dance required.
+        if not self._pw_file:
+            return ""
+        path = self._pw_file
+        if not os.path.isabs(path):
+            project_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", ".."))
+            path = os.path.normpath(os.path.join(project_root, path))
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+        except OSError as e:
+            logger.warning("SMTP password_file %s unreadable: %s", path, e)
+        return ""
 
     def send(self, subject: str, body: str, severity: str = "info",
              recipients: list[str] | None = None,

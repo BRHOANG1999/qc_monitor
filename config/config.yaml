@@ -128,7 +128,16 @@ alerting:
     server: smtp.gmail.com
     port: 587
     from_email: kmrecorder.alert@gmail.com
+    # EmailAlerter looks up the password in this order on every send:
+    #   1. env var $QC_MONITOR_EMAIL_PASSWORD (good for interactive
+    #      testing). Windows services started by NSSM don't inherit
+    #      from your shell, so this often misses.
+    #   2. file `password_file` (project-root relative or absolute).
+    #      Put the 16-char Gmail App Password (no spaces) in this
+    #      file. secrets/ is already gitignored. To rotate: edit the
+    #      file, no service restart needed -- next tick re-reads.
     password_env_var: QC_MONITOR_EMAIL_PASSWORD
+    password_file: secrets/smtp_password.txt
     recipients:
     - hoang392@umn.edu
   rules:
