@@ -74,9 +74,28 @@ def _build_today(today: date, config: dict) -> tuple[dict, list[dict], list[dict
 #  Formatting
 # ===================================================================== #
 
+# Pre-op (Motrin) is the first bucket in surg._GROUP_ORDER. We pull
+# from this single source so a label change in surgeries.py flows
+# automatically into the digest banners without a rename here.
+_MOTRIN_KEY = surg._GROUP_ORDER[0]  # "Pre-op (Motrin)"
+
+
+def _motrin_animals(grouped: dict) -> list[str]:
+    """Animal IDs that need Motrin today, in their original order."""
+    return [t["animal"] for t in grouped.get(_MOTRIN_KEY, [])]
+
+
 def _format_text(today: date, grouped: dict, upcoming: list[dict]) -> str:
     """Plain-text digest body, used for both email fallback and SMS."""
-    lines = [f"Surgery digest -- {today.isoformat()}", ""]
+    lines: list[str] = []
+    motrin = _motrin_animals(grouped)
+    if motrin:
+        animals = ", ".join(motrin)
+        lines.append(f"** MOTRIN today: {animals} **")
+        lines.append("=" * 42)
+        lines.append("")
+    lines.append(f"Surgery digest -- {today.isoformat()}")
+    lines.append("")
     any_today = False
     for group in surg._GROUP_ORDER:
         bucket = grouped.get(group, [])
@@ -108,8 +127,22 @@ def _format_html(today: date, grouped: dict, upcoming: list[dict]) -> str:
     parts = [
         '<html><body style="font-family:-apple-system,sans-serif;'
         'color:#1a1a2e">',
-        f'<h2>Surgery digest -- {today.isoformat()}</h2>',
     ]
+    motrin = _motrin_animals(grouped)
+    if motrin:
+        animals_html = ", ".join(f"<b>{escape(a)}</b>" for a in motrin)
+        # Inline-styled callout. Border + bg color survive every major
+        # email client's CSS stripping (Gmail, Outlook, Apple Mail).
+        parts.append(
+            '<div style="background:#fff7e6;border:2px solid #ff9f0a;'
+            'border-radius:8px;padding:14px 18px;margin:0 0 18px 0;'
+            'font-size:15px;color:#7a4a00">'
+            '<span style="font-size:18px;font-weight:700">'
+            '⚕️ Motrin today</span><br>'
+            f'<span style="font-size:14px">{animals_html}</span>'
+            '</div>'
+        )
+    parts.append(f'<h2>Surgery digest -- {today.isoformat()}</h2>')
     any_today = False
     for group in surg._GROUP_ORDER:
         bucket = grouped.get(group, [])
@@ -153,14 +186,26 @@ def _format_html(today: date, grouped: dict, upcoming: list[dict]) -> str:
 
 
 def _format_sms(today: date, grouped: dict, upcoming: list[dict]) -> str:
-    """Sub-160-char summary suitable for an SMS gateway."""
+    """Sub-160-char summary suitable for an SMS gateway.
+
+    When Motrin is due, the message leads with `MOTRIN today: ANIM1,
+    ANIM2 | ` so the most operationally important field reaches the
+    eye first. The Motrin lead is never truncated -- the trailing
+    surgery/post-op summary gives up bytes if we'd otherwise overflow.
+    """
+    motrin = _motrin_animals(grouped)
     counts = [(g, len(grouped.get(g, []))) for g in surg._GROUP_ORDER]
     counts = [(g, n) for g, n in counts if n > 0]
+
     if not counts:
+        if motrin:
+            return (f"MOTRIN today: {', '.join(motrin)} "
+                    f"| QC {today.isoformat()}: no surgeries")[:155]
         return f"QC: {today.isoformat()} -- no surgery tasks today."
+
     bits = [f"QC {today.isoformat()}:"]
     for g, n in counts:
-        if g == "Pre-op (Motrin)":
+        if g == _MOTRIN_KEY:
             bits.append(f"Pre={n}")
         elif g == "Surgery day":
             bits.append(f"Surg={n}")
@@ -171,7 +216,19 @@ def _format_sms(today: date, grouped: dict, upcoming: list[dict]) -> str:
     for g, _ in counts:
         for t in grouped[g][:3]:
             animals.append(f"{t['animal']}({g.split()[0][:3]})")
-    return (head + " " + ",".join(animals))[:155]
+    tail = head + " " + ",".join(animals)
+
+    if not motrin:
+        return tail[:155]
+
+    # Motrin lead. Build inside-out so we can shave the tail (not the
+    # lead) when the total exceeds the 160-char SMS budget.
+    motrin_lead = f"MOTRIN today: {', '.join(motrin)} | "
+    budget = 155 - len(motrin_lead)
+    if budget < 20:
+        # Motrin animal list alone is huge; keep just the lead.
+        return (motrin_lead + f"QC {today.isoformat()}")[:155]
+    return motrin_lead + tail[:budget]
 
 
 # ===================================================================== #

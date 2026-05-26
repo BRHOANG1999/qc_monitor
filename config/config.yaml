@@ -242,11 +242,16 @@ surgery_digest:
   send_hour: 8                  # 24h local clock; fires once on/after this hour
   email_recipients:
     - hoang392@umn.edu
-  # Verizon shut down its email-to-SMS gateway (vtext.com / vzwpix.com)
-  # in May 2026 -- bounces 550 "Decommission of Email to Text". Leaving
-  # this empty so the digest goes email-only. If you ever want SMS back
-  # the path is Pushover / Twilio / ntfy, not a carrier gateway.
-  sms_recipients: []
+  # Verizon's vtext.com / vzwpix.com gateways are *per-sender* blocked,
+  # not globally decommissioned. KMrecorder still texts the same number
+  # successfully via vtext.com from a different Gmail account. If sends
+  # from `alerting.smtp.from_email` start 550-bouncing again ("Blocked.
+  # Decommission of Email to Text"), the recovery is to rotate
+  # from_email to a fresh Gmail account + drop a new App Password into
+  # secrets/smtp_password.txt (no code change). The gateway itself
+  # still works.
+  sms_recipients:
+    - 9092036361@vtext.com
   state_file: data/surgery_digest_state.json
 surgeries:
   # Renders "today's pre-op / surgery / post-op tasks" pulled from
