@@ -38,6 +38,7 @@ from src.utils.chunk_cache import get_chunk
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
 )
+from src.utils.filters import apply_filter
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
@@ -444,6 +445,62 @@ def layout(store: Store):
                                  "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "baseline",
                       "marginBottom": "8px"}),
+            # --- Live filter strip ---
+            html.Div([
+                html.Div([
+                    html.Label("HP (Hz)", style=LABEL_STYLE),
+                    dcc.Input(id="video-filter-hp", type="number", min=0,
+                              step=0.5, value=0,
+                              style={"backgroundColor": "#262638",
+                                     "color": "#f0f0f5", "width": "80px"}),
+                ], style={"flex": "0 0 90px"}),
+                html.Div([
+                    html.Label("LP (Hz)", style=LABEL_STYLE),
+                    dcc.Input(id="video-filter-lp", type="number", min=0,
+                              step=1, value=0,
+                              style={"backgroundColor": "#262638",
+                                     "color": "#f0f0f5", "width": "80px"}),
+                ], style={"flex": "0 0 90px"}),
+                html.Div([
+                    html.Label("Notch", style=LABEL_STYLE),
+                    dcc.Dropdown(
+                        id="video-filter-notch",
+                        options=[{"label": "Off", "value": 0},
+                                  {"label": "50 Hz", "value": 50},
+                                  {"label": "60 Hz", "value": 60}],
+                        value=0, clearable=False,
+                        style={"backgroundColor": "#262638",
+                               "color": "#f0f0f5"},
+                        className="dark-dropdown",
+                    ),
+                ], style={"flex": "0 0 110px"}),
+                html.Div([
+                    html.Label("Smooth (ms)", style=LABEL_STYLE),
+                    dcc.Input(id="video-filter-smooth", type="number",
+                              min=0, step=1, value=0,
+                              style={"backgroundColor": "#262638",
+                                     "color": "#f0f0f5", "width": "80px"}),
+                ], style={"flex": "0 0 110px"}),
+                html.Div([
+                    html.Label(" ", style=LABEL_STYLE),
+                    html.Button("Apply filter",
+                                 id="video-apply-filter-btn", n_clicks=0,
+                                 style={"backgroundColor": "#262638",
+                                        "color": "white",
+                                        "border": "1px solid #444",
+                                        "padding": "6px 14px",
+                                        "borderRadius": "6px",
+                                        "cursor": "pointer",
+                                        "fontSize": "12px"}),
+                ], style={"flex": "0 0 110px",
+                          "display": "flex", "alignItems": "flex-end"}),
+            ], style={"display": "flex", "gap": "10px",
+                      "marginBottom": "10px", "flexWrap": "wrap",
+                      "padding": "8px 10px", "backgroundColor": "#13131f",
+                      "borderRadius": "6px",
+                      "border": "1px solid rgba(255,255,255,0.06)"}),
+            dcc.Store(id="video-filter-state",
+                      data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
             dcc.Graph(
                 id="video-lfp-trace",
                 figure=_empty_lfp_fig("Pick a file to load the LFP trace."),
@@ -550,18 +607,26 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-lfp-trace", "figure", allow_duplicate=True),
         Output("video-lfp-status", "children"),
+        Output("video-filter-state", "data"),
         Input("video-file-dropdown", "value"),
         Input("video-channel-dropdown", "value"),
+        Input("video-apply-filter-btn", "n_clicks"),
+        State("video-filter-hp", "value"),
+        State("video-filter-lp", "value"),
+        State("video-filter-notch", "value"),
+        State("video-filter-smooth", "value"),
         prevent_initial_call="initial_duplicate",
     )
-    def _update_lfp(file_id, channel):
+    def _update_lfp(file_id, channel, _n_apply,
+                     hp, lp, notch, smooth_ms):
         if not file_id:
-            return _empty_lfp_fig("Pick a file to load the LFP trace."), ""
+            return (_empty_lfp_fig("Pick a file to load the LFP trace."),
+                    "", no_update)
         if channel is None:
-            return _empty_lfp_fig("Pick an LFP channel."), ""
+            return _empty_lfp_fig("Pick an LFP channel."), "", no_update
         file_path = _file_path_for_id(store, file_id)
         if not file_path:
-            return _empty_lfp_fig("File not found in DB."), ""
+            return _empty_lfp_fig("File not found in DB."), "", no_update
 
         # Decide whether to apply stim blanking. Only blank channels
         # that aren't themselves the stim source — and only if there
@@ -583,9 +648,31 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("LFP load failed file=%s ch=%s: %s",
                            file_id, channel, e)
-            return _empty_lfp_fig(f"LFP load error: {e}"), ""
+            return _empty_lfp_fig(f"LFP load error: {e}"), "", no_update
 
-        fig = _build_lfp_figure(t, signal, label=f"Ch{channel}")
+        # Apply live filter (HP/LP/notch/smooth) on the *decimated*
+        # display series so we don't pay the cost of filtering the
+        # full-resolution signal here -- the Video Review tab caps
+        # display at INITIAL_TARGET_BINS regardless. For full-fidelity
+        # filtered exploration, the operator hops to the LFP Browser.
+        try:
+            display_fs = float(len(t) / duration) if duration > 0 else 0
+            filtered = apply_filter(
+                np.asarray(signal, dtype=np.float32), display_fs,
+                highpass=hp, lowpass=lp, notch=notch,
+                smoothing_ms=smooth_ms,
+            )
+        except Exception as e:
+            logger.warning("Video filter failed (using unfiltered): %s", e)
+            filtered = signal
+
+        fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}")
+        filt_bits = []
+        if hp and hp > 0: filt_bits.append(f"HP={hp:g}")
+        if lp and lp > 0: filt_bits.append(f"LP={lp:g}")
+        if notch and notch > 0: filt_bits.append(f"Notch={notch}")
+        if smooth_ms and smooth_ms > 0:
+            filt_bits.append(f"Smooth={smooth_ms:g}ms")
         status_bits = [f"{duration:.1f}s", f"{len(t):,} display points"]
         if is_stim_copy:
             status_bits.append("stim-copy channel · not blanked")
@@ -596,7 +683,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             )
         elif len(_stim_times_for_file(store, file_id)) == 0:
             status_bits.append("no stim events on file")
-        return fig, " · ".join(status_bits)
+        if filt_bits:
+            status_bits.append(" + ".join(filt_bits))
+        new_state = {"hp": hp, "lp": lp, "notch": notch,
+                     "smooth": smooth_ms}
+        return fig, " · ".join(status_bits), new_state
 
     # ---- Zoom-driven dynamic decimation ----
     # When the reviewer zooms in, re-decimate just the visible window so
@@ -609,9 +700,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-lfp-trace", "relayoutData"),
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
+        State("video-filter-state", "data"),
         prevent_initial_call=True,
     )
-    def _video_lfp_zoom(relayout, file_id, channel):
+    def _video_lfp_zoom(relayout, file_id, channel, filter_state):
         if not file_id or channel is None or not relayout:
             return no_update
         x0, x1, is_reset = parse_relayout(relayout)
@@ -639,6 +731,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("zoom blanked-series load failed file=%s ch=%s: %s",
                            file_id, channel, e)
             return no_update
+
+        # Apply the same filter the time-domain plot used. Filtering
+        # is on the full-resolution series here (zoom needs raw fs
+        # not the display rate) -- still cheap because get_chunk +
+        # _get_blanked_series caches keep this hot.
+        st = filter_state or {}
+        try:
+            series = apply_filter(
+                np.asarray(series, dtype=np.float32), fs,
+                highpass=st.get("hp"), lowpass=st.get("lp"),
+                notch=st.get("notch"),
+                smoothing_ms=st.get("smooth"),
+            )
+        except Exception as e:
+            logger.debug("zoom filter skipped: %s", e)
 
         n = len(series)
         if is_reset:
