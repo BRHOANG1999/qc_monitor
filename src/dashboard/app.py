@@ -20,6 +20,9 @@ from src.utils.chunk_cache import get_chunk
 from src.utils.decimate import (
     envelope_channel, window_slice, choose_target_bins, parse_relayout,
 )
+from src.utils.filters import (
+    SUPPORTED_NOTCH, apply_filter, compute_psd, get_filtered,
+)
 from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
@@ -1101,31 +1104,75 @@ def create_app(config: dict, store: Store) -> Dash:
         return fig
 
     # ------------------------------------------------------------------ #
-    #  LFP Browser callback
+    #  LFP Browser callbacks
     # ------------------------------------------------------------------ #
+
+    # Preset -> (HP, LP) lookup. Selecting a preset populates the
+    # number inputs (via the clientside dispatch below) before the
+    # user clicks Apply.
+    _LFP_PRESETS = {
+        "raw":   (0, 0),
+        "delta": (1, 4),
+        "theta": (4, 8),
+        "alpha": (8, 13),
+        "beta":  (13, 30),
+        "gamma": (30, 100),
+        "spike": (300, 3000),
+    }
+
     @app.callback(
-        Output("lfp-plot", "figure"),
-        [Input("lfp-load-btn", "n_clicks")],
-        [State("lfp-session-dropdown", "value"),
-         State("lfp-file-dropdown", "value")],
+        Output("lfp-filter-hp", "value"),
+        Output("lfp-filter-lp", "value"),
+        Input("lfp-filter-preset", "value"),
+        State("lfp-filter-hp", "value"),
+        State("lfp-filter-lp", "value"),
         prevent_initial_call=True,
     )
-    def load_lfp(n_clicks, session_dir, file_path):
-        if not n_clicks or not file_path:
-            return _empty_fig("Select a file and click Load", 600)
+    def _lfp_apply_preset(preset, current_hp, current_lp):
+        if preset == "custom" or preset not in _LFP_PRESETS:
+            return no_update, no_update
+        hp, lp = _LFP_PRESETS[preset]
+        return hp, lp
+
+    @app.callback(
+        Output("lfp-plot", "figure"),
+        Output("lfp-psd-plot", "figure"),
+        Output("lfp-psd-row", "style"),
+        Output("lfp-filter-state", "data"),
+        Input("lfp-load-btn", "n_clicks"),
+        Input("lfp-apply-filter-btn", "n_clicks"),
+        State("lfp-session-dropdown", "value"),
+        State("lfp-file-dropdown", "value"),
+        State("lfp-filter-hp", "value"),
+        State("lfp-filter-lp", "value"),
+        State("lfp-filter-notch", "value"),
+        State("lfp-filter-smooth", "value"),
+        State("lfp-show-psd", "value"),
+        prevent_initial_call=True,
+    )
+    def load_lfp(n_load, n_apply, session_dir, file_path,
+                  hp, lp, notch, smooth_ms, show_psd_val):
+        psd_hidden_style = {"display": "none", "marginTop": "12px"}
+        if not file_path:
+            return (_empty_fig("Select a file and click Load", 600),
+                    no_update, psd_hidden_style, no_update)
 
         try:
             chunk = get_chunk(file_path)
         except Exception as e:
-            return _empty_fig(f"Error loading file: {e}", 600)
+            return (_empty_fig(f"Error loading file: {e}", 600),
+                    no_update, psd_hidden_style, no_update)
 
         fs = chunk.fs
-        signal = chunk.signal
+        # Apply the cached filter to the full signal. get_filtered
+        # is cheap on a cache hit (typical for zoom callbacks) and
+        # ~1s on a miss for an hour-long 20kHz dual-channel chunk.
+        signal = get_filtered(file_path, chunk.signal, fs,
+                               highpass=hp, lowpass=lp,
+                               notch=notch, smoothing_ms=smooth_ms)
         n_samples, n_ch = signal.shape
         duration_sec = n_samples / fs
 
-        # Prefer per-file fnstr (matches the actual channels in this .mat);
-        # fall back to session config only if the file lacks fnstr.
         sess_map = _get_channel_map(store, session_dir) if session_dir else {}
         file_names = chunk.channel_names or []
 
@@ -1157,27 +1204,84 @@ def create_app(config: dict, store: Store) -> Dash:
                              tickfont=dict(size=8))
 
         fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
+        filt_bits = []
+        if hp and hp > 0: filt_bits.append(f"HP={hp:g}")
+        if lp and lp > 0: filt_bits.append(f"LP={lp:g}")
+        if notch and notch > 0: filt_bits.append(f"Notch={notch}")
+        if smooth_ms and smooth_ms > 0: filt_bits.append(f"Smooth={smooth_ms:g}ms")
+        filt_label = " | ".join(filt_bits) if filt_bits else "Raw"
+
         if decim_used > 1:
             bin_ms = decim_used / fs * 1000.0
-            title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} ch @ {fs:.0f} Hz "
-                     f"-- min/max envelope, {bin_ms:.2f} ms/bin (zoom to refine)")
+            title = (f"LFP ({duration_sec:.1f} s) -- {n_ch} ch @ {fs:.0f} Hz "
+                     f"-- envelope {bin_ms:.2f} ms/bin -- {filt_label}")
         else:
-            title = (f"Raw LFP ({duration_sec:.1f} s) -- {n_ch} channels "
-                     f"@ {fs:.0f} Hz -- raw samples")
+            title = (f"LFP ({duration_sec:.1f} s) -- {n_ch} ch @ {fs:.0f} Hz "
+                     f"-- raw samples -- {filt_label}")
         fig.update_layout(
             title=title,
             height=max(600, n_ch * 80),
             showlegend=False,
         )
-        return fig
+
+        # Persisted filter state -- used by the zoom callback so it
+        # decimates from the same filtered cache entry.
+        state = {"hp": hp, "lp": lp, "notch": notch,
+                 "smooth": smooth_ms,
+                 "show_psd": bool(show_psd_val)}
+
+        show_psd = bool(show_psd_val)
+        if not show_psd:
+            return fig, no_update, psd_hidden_style, state
+
+        # --- PSD figure ------------------------------------------- #
+        psd_fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
+                                vertical_spacing=0.06)
+        for ch_idx in range(n_ch):
+            info = _info_for(ch_idx)
+            color = _color_for_role(info["role"])
+            sig_ch = signal[:, ch_idx]
+            freqs, psd = compute_psd(sig_ch, fs)
+            if len(freqs) == 0:
+                continue
+            # Clip x to 0..1000 Hz so the operationally interesting
+            # band is centered; user can zoom plotly to see higher.
+            x_cap = min(1000.0, fs / 2.0)
+            mask = freqs <= x_cap
+            psd_fig.add_trace(go.Scattergl(
+                x=freqs[mask], y=psd[mask],
+                mode="lines", name=info["name"],
+                line=dict(color=color, width=1.2),
+            ), row=ch_idx + 1, col=1)
+            psd_fig.update_yaxes(type="log", title_text=info["name"],
+                                  row=ch_idx + 1, col=1,
+                                  title_font=dict(size=9, color="#aaa"),
+                                  tickfont=dict(size=8))
+            # Line-noise guides
+            for line_hz in (50, 60, 120, 180):
+                if line_hz < x_cap:
+                    psd_fig.add_vline(
+                        x=line_hz, line_width=1,
+                        line_dash="dot", line_color="#666",
+                        row=ch_idx + 1, col=1,
+                    )
+        psd_fig.update_xaxes(title_text="Hz", row=n_ch, col=1)
+        psd_fig.update_layout(
+            title=f"Power spectral density (Welch) -- {filt_label}",
+            height=max(220, n_ch * 140),
+            showlegend=False,
+        )
+        return fig, psd_fig, {"display": "block",
+                              "marginTop": "12px"}, state
 
     @app.callback(
         Output("lfp-plot", "figure", allow_duplicate=True),
         Input("lfp-plot", "relayoutData"),
         State("lfp-file-dropdown", "value"),
+        State("lfp-filter-state", "data"),
         prevent_initial_call=True,
     )
-    def _lfp_zoom(relayout, file_path):
+    def _lfp_zoom(relayout, file_path, filter_state):
         if not file_path or not relayout:
             return no_update
         x0, x1, is_reset = parse_relayout(relayout)
@@ -1188,11 +1292,20 @@ def create_app(config: dict, store: Store) -> Dash:
         except Exception:
             return no_update
 
-        n_samples, n_ch = chunk.signal.shape
+        fs = chunk.fs
+        # Use the persisted filter settings so zoom re-decimates from
+        # the same filtered cache the time-domain plot built from.
+        st = filter_state or {}
+        signal = get_filtered(
+            file_path, chunk.signal, fs,
+            highpass=st.get("hp"), lowpass=st.get("lp"),
+            notch=st.get("notch"), smoothing_ms=st.get("smooth"),
+        )
+        n_samples, n_ch = signal.shape
         if is_reset:
             lo, hi = 0, n_samples
         else:
-            lo, hi = window_slice(n_samples, chunk.fs, x0, x1)
+            lo, hi = window_slice(n_samples, fs, x0, x1)
         if hi <= lo:
             return no_update
 
@@ -1200,7 +1313,7 @@ def create_app(config: dict, store: Store) -> Dash:
         patch = Patch()
         for ch in range(n_ch):
             x_p, y_p, _ = envelope_channel(
-                chunk.signal, ch, chunk.fs, lo, hi, target_bins,
+                signal, ch, fs, lo, hi, target_bins,
             )
             patch["data"][ch]["x"] = x_p
             patch["data"][ch]["y"] = y_p
@@ -2589,7 +2702,99 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
         html.P("Loads the entire raw LFP from the selected .mat file. Long files are min/max envelope-decimated so 150 us stim pulses remain visible. Channel names come from the file's fnstr.",
                style={"color": "#888", "fontSize": "12px", "marginBottom": "8px"}),
 
+        # --- Live filter strip ------------------------------------- #
+        html.Div([
+            html.Div([
+                html.Label("Preset", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="lfp-filter-preset",
+                    options=[
+                        {"label": "Raw (no filter)", "value": "raw"},
+                        {"label": "Delta (1-4 Hz)", "value": "delta"},
+                        {"label": "Theta (4-8 Hz)", "value": "theta"},
+                        {"label": "Alpha (8-13 Hz)", "value": "alpha"},
+                        {"label": "Beta (13-30 Hz)", "value": "beta"},
+                        {"label": "Gamma (30-100 Hz)", "value": "gamma"},
+                        {"label": "Spike band (300-3000 Hz)",
+                         "value": "spike"},
+                        {"label": "Custom", "value": "custom"},
+                    ],
+                    value="raw",
+                    clearable=False,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "1 1 200px", "minWidth": "180px"}),
+            html.Div([
+                html.Label("HP (Hz)", style=LABEL_STYLE),
+                dcc.Input(id="lfp-filter-hp", type="number", min=0,
+                          step=0.5, value=0, style=DROPDOWN_STYLE),
+            ], style={"flex": "0 0 90px"}),
+            html.Div([
+                html.Label("LP (Hz)", style=LABEL_STYLE),
+                dcc.Input(id="lfp-filter-lp", type="number", min=0,
+                          step=1, value=0, style=DROPDOWN_STYLE),
+            ], style={"flex": "0 0 90px"}),
+            html.Div([
+                html.Label("Notch", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="lfp-filter-notch",
+                    options=[
+                        {"label": "Off", "value": 0},
+                        {"label": "50 Hz", "value": 50},
+                        {"label": "60 Hz", "value": 60},
+                    ],
+                    value=0,
+                    clearable=False,
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+            ], style={"flex": "0 0 110px"}),
+            html.Div([
+                html.Label("Smooth (ms)", style=LABEL_STYLE),
+                dcc.Input(id="lfp-filter-smooth", type="number", min=0,
+                          step=1, value=0, style=DROPDOWN_STYLE),
+            ], style={"flex": "0 0 110px"}),
+            html.Div([
+                html.Label("PSD", style=LABEL_STYLE),
+                dcc.Checklist(
+                    id="lfp-show-psd",
+                    options=[{"label": " Show", "value": "on"}],
+                    value=[],
+                    style={"color": "white", "paddingTop": "6px"},
+                ),
+            ], style={"flex": "0 0 90px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
+                html.Button("Apply", id="lfp-apply-filter-btn",
+                            n_clicks=0,
+                            style={"backgroundColor": "#262638",
+                                   "color": "white", "border": "1px solid #444",
+                                   "padding": "8px 16px",
+                                   "borderRadius": "6px", "cursor": "pointer",
+                                   "fontSize": "13px"}),
+            ], style={"flex": "0 0 100px", "display": "flex",
+                      "alignItems": "flex-end"}),
+        ], style={"display": "flex", "gap": "12px",
+                  "marginBottom": "12px", "flexWrap": "wrap",
+                  "padding": "10px 12px", "backgroundColor": "#13131f",
+                  "borderRadius": "8px",
+                  "border": "1px solid rgba(255,255,255,0.06)"}),
+
+        # Persists the last-applied filter tuple so the zoom callback
+        # uses the same settings without re-reading the inputs.
+        dcc.Store(id="lfp-filter-state",
+                  data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0,
+                        "show_psd": False}),
+
         dcc.Graph(id="lfp-plot", figure=_empty_fig("Select a session and file, then click Load", 600)),
+
+        html.Div(
+            dcc.Graph(id="lfp-psd-plot",
+                      figure=_empty_fig("Toggle 'Show PSD' and click Apply", 280)),
+            id="lfp-psd-row",
+            style={"display": "none", "marginTop": "12px"},
+        ),
     ])
 
 
