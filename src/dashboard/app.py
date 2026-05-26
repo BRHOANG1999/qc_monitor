@@ -912,10 +912,11 @@ def create_app(config: dict, store: Store) -> Dash:
 
     @app.callback(
         Output("waveform-plot", "figure"),
-        [Input("waveform-file-dropdown", "value")],
+        [Input("waveform-file-dropdown", "value"),
+         Input("waveform-smooth", "value")],
         [State("waveform-session-dropdown", "value")],
     )
-    def update_waveform_plot(file_id, session_dir):
+    def update_waveform_plot(file_id, smooth_ms, session_dir):
         if not file_id:
             return _empty_fig("Select a file", 400)
 
@@ -929,12 +930,14 @@ def create_app(config: dict, store: Store) -> Dash:
             return _empty_fig("No evoked waveforms for this file", 400)
 
         try:
-            return _build_waveform_figure(waveforms, store, session_dir)
+            return _build_waveform_figure(waveforms, store, session_dir,
+                                            smooth_ms=smooth_ms or 0)
         except Exception as e:
             logger.error("Waveform plot error: %s", e, exc_info=True)
             return _empty_fig(f"Plot error: {e}", 400)
 
-    def _build_waveform_figure(waveforms, store, session_dir):
+    def _build_waveform_figure(waveforms, store, session_dir,
+                                smooth_ms: float = 0.0):
 
         cfg = _load_config()
         fa = cfg.get("feature_analysis", {})
@@ -980,6 +983,27 @@ def create_app(config: dict, store: Store) -> Dash:
             s = wf.get("sem_trace")
             stim_tr = wf.get("stim_mean_trace")
             n_ep = wf.get("n_epochs", 0)
+
+            # Optional smoothing (Gaussian, in display-ms). Apply to
+            # mean + SEM + stim mean so the band stays consistent.
+            if smooth_ms and smooth_ms > 0 and m and len(t) > 1:
+                try:
+                    dt_ms = float(t[1] - t[0])
+                    if dt_ms > 0:
+                        fs_proxy = 1000.0 / dt_ms
+                        m = apply_filter(
+                            np.asarray(m, dtype=np.float32),
+                            fs_proxy, smoothing_ms=smooth_ms).tolist()
+                        if s and len(s) == len(m):
+                            s = apply_filter(
+                                np.asarray(s, dtype=np.float32),
+                                fs_proxy, smoothing_ms=smooth_ms).tolist()
+                        if stim_tr and len(stim_tr) > 1:
+                            stim_tr = apply_filter(
+                                np.asarray(stim_tr, dtype=np.float32),
+                                fs_proxy, smoothing_ms=smooth_ms).tolist()
+                except Exception as e:
+                    logger.debug("Smoothing skipped: %s", e)
 
             # Helper: compute y-range from data within x-range
             def _yrange(times, values, x0, x1):
@@ -1411,12 +1435,15 @@ def create_app(config: dict, store: Store) -> Dash:
         [Output("session-compare-waveform-plot", "figure"),
          Output("session-compare-features-plot", "figure")],
         [Input("compare-session-a-dropdown", "value"),
-         Input("compare-session-b-dropdown", "value")],
+         Input("compare-session-b-dropdown", "value"),
+         Input("compare-smooth", "value")],
     )
-    def update_session_compare(session_a, session_b):
+    def update_session_compare(session_a, session_b, smooth_ms):
         if not session_a or not session_b:
             return (_empty_fig("Select two sessions", 450),
                     _empty_fig("Select two sessions", 450))
+
+        smooth_ms = float(smooth_ms or 0)
 
         # --- Waveform overlay ---
         wf_fig = go.Figure()
@@ -1433,6 +1460,24 @@ def create_app(config: dict, store: Store) -> Dash:
                 time_ms = wf["time_axis_ms"]
                 mean_tr = wf["mean_trace"]
                 sem_tr = wf["sem_trace"]
+
+                # Optional smoothing -- Gaussian filter in display-ms.
+                if smooth_ms > 0 and mean_tr and len(time_ms) > 1:
+                    try:
+                        dt_ms = float(time_ms[1] - time_ms[0])
+                        if dt_ms > 0:
+                            fs_proxy = 1000.0 / dt_ms
+                            mean_tr = apply_filter(
+                                np.asarray(mean_tr, dtype=np.float32),
+                                fs_proxy, smoothing_ms=smooth_ms,
+                            ).tolist()
+                            if sem_tr and len(sem_tr) == len(mean_tr):
+                                sem_tr = apply_filter(
+                                    np.asarray(sem_tr, dtype=np.float32),
+                                    fs_proxy, smoothing_ms=smooth_ms,
+                                ).tolist()
+                    except Exception as e:
+                        logger.debug("Compare smoothing skipped: %s", e)
 
                 sessions = store.get_sessions()
                 sname = sess_dir
@@ -2493,6 +2538,13 @@ def _waveforms_tab_layout(store: Store, default_session: str | None = None):
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "300px"}),
+            html.Div([
+                html.Label("Smooth (ms)", style=LABEL_STYLE),
+                dcc.Input(id="waveform-smooth", type="number", min=0,
+                          step=0.5, value=0,
+                          style={"backgroundColor": "#262638",
+                                 "color": "#f0f0f5", "width": "80px"}),
+            ], style={"flex": "0 0 110px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
         dcc.Graph(id="waveform-plot"),
@@ -2863,6 +2915,13 @@ def _session_compare_tab_layout(store: Store):
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "300px"}),
+            html.Div([
+                html.Label("Smooth (ms)", style=LABEL_STYLE),
+                dcc.Input(id="compare-smooth", type="number", min=0,
+                          step=0.5, value=0,
+                          style={"backgroundColor": "#262638",
+                                 "color": "#f0f0f5", "width": "80px"}),
+            ], style={"flex": "0 0 110px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
 
         dcc.Graph(id="session-compare-waveform-plot", style={"height": "450px"}),
