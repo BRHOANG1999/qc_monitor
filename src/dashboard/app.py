@@ -3663,7 +3663,15 @@ def _overview_tab(store: Store, config: dict | None = None):
         ops_col,
     ], style={
         "display": "grid",
-        "gridTemplateColumns": "280px 1fr 1fr",
+        # minmax(0, 1fr) instead of plain 1fr. Without the 0-min,
+        # CSS Grid sizes a 1fr column at minmax(auto, 1fr), and
+        # the "auto" minimum expands the column to the widest piece
+        # of unwrappable content inside (nowrap KM log filenames,
+        # the active-session name). That made Today+KM bleed into
+        # the Latest Evoked column. minmax(0, 1fr) ignores
+        # min-content and gives each 1fr column exactly half the
+        # remaining width.
+        "gridTemplateColumns": "280px minmax(0, 1fr) minmax(0, 1fr)",
         "gap": "12px",
         "alignItems": "start",
         "marginBottom": "10px",
