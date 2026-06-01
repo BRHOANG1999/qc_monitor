@@ -2361,17 +2361,96 @@ def _home_data_log_block(store: Store, config: dict | None) -> html.Div:
     )
 
 
+def _home_quick_links_block(config: dict | None) -> html.Div:
+    """One tile holding every external resource the Overview cards
+    point at (Google Sheets, drives, dashboards) so the operator
+    doesn't have to dig into config or a separate doc to find a URL.
+
+    Apple HIG: grouped list of related entry points. Each row is a
+    plain anchor opening in a new tab; the sheet_id comes from
+    config (same source the digest / data-log tabs already use).
+    """
+    cfg = config or {}
+    links: list[tuple[str, str, str]] = []
+
+    def _sheet_url(sid: str) -> str:
+        return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
+
+    # Maintenance + incidents (one sheet, multiple tabs)
+    maint_id = (cfg.get("maintenance", {}) or {}).get("sheet_id")
+    if maint_id:
+        links.append(("Maintenance tracker", "sheet",
+                      _sheet_url(maint_id)))
+
+    # Surgery / implant sheets
+    for s in (cfg.get("surgeries", {}) or {}).get("sheets", []) or []:
+        sid = s.get("sheet_id")
+        label = s.get("label") or "Surgery log"
+        if sid:
+            links.append((label, "sheet", _sheet_url(sid)))
+
+    # JAX cage index
+    cage_cfg = ((cfg.get("surgeries", {}) or {})
+                 .get("cage_index", {}) or {})
+    cage_id = cage_cfg.get("sheet_id")
+    if cage_id and cage_cfg.get("enabled"):
+        links.append(("JAX cage index", "sheet", _sheet_url(cage_id)))
+
+    # KMrecorder Data Log
+    xref_id = (cfg.get("data_log_xref", {}) or {}).get("sheet_id")
+    if xref_id:
+        links.append(("KMrecorder Data Log", "sheet",
+                      _sheet_url(xref_id)))
+
+    if not links:
+        body = html.Div(
+            "No external resources configured.",
+            style={"color": COLOR_TEXT_TERTIARY,
+                    "fontSize": FONT_SIZE_BODY},
+        )
+    else:
+        items = []
+        for label, kind, href in links:
+            tag_color = ("#5e7ce2" if kind == "sheet"
+                          else COLOR_TEXT_TERTIARY)
+            items.append(html.A([
+                html.Span(label, style={
+                    "color": COLOR_TEXT_PRIMARY,
+                    "fontSize": FONT_SIZE_BODY,
+                    "flex": "1",
+                }),
+                html.Span(kind.upper(), style={
+                    "color": tag_color,
+                    "fontSize": "10px", "letterSpacing": "0.5px",
+                    "fontWeight": "600",
+                    "marginLeft": SPACE_3,
+                }),
+            ], href=href, target="_blank", rel="noopener",
+               style={
+                   "display": "flex", "alignItems": "center",
+                   "padding": f"{SPACE_2} 0",
+                   "borderBottom": f"1px solid {COLOR_DIVIDER}",
+                   "textDecoration": "none",
+               }))
+        body = html.Div(items)
+
+    return _card(
+        _section_header("Quick links"),
+        body,
+    )
+
+
 def _build_home_grid_children(store: Store, config: dict | None,
                                 today: date) -> list:
-    """The five lab-side home blocks. Extracted so the refresh
-    callback can rebuild them in place without re-rendering the
-    cards / queue / waveform thumbnail above and below."""
+    """Lab-side home tiles. Extracted so the refresh callback can
+    rebuild them in place without re-rendering everything else."""
     return [
         _home_surgery_block(store, config, today),
         _home_schedule_block(config),
         _home_maintenance_block(config),
         _home_incidents_block(config),
         _home_data_log_block(store, config),
+        _home_quick_links_block(config),
     ]
 
 
@@ -3353,10 +3432,17 @@ def _overview_tab(store: Store, config: dict | None = None):
     ch_map = _get_channel_map(store, session_dir) if session_dir else {}
     recent_alerts = store.get_recent_alerts(hours=24)
 
+    # Status pills as a flat horizontal strip -- NOT wrapped in a
+    # grid cell, NOT inside a collapsible. Inside a 320px grid cell
+    # six 130-px-min cards stack vertically and inflate every other
+    # grid cell to match -- that was the wasted-space culprit. As a
+    # standalone flex row they wrap horizontally on narrow viewports
+    # and stay one line on wide ones.
     cards = html.Div(
         _build_overview_cards(store),
         id="overview-cards",
-        style={"display": "flex", "gap": "12px", "flexWrap": "wrap"},
+        style={"display": "flex", "gap": "8px", "flexWrap": "wrap",
+                "marginBottom": "8px"},
     )
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
@@ -3498,52 +3584,41 @@ def _overview_tab(store: Store, config: dict | None = None):
             else "#FFA15A" if recent_alerts else "rgba(255,255,255,0.08)"),
     )
 
-    # Operational sections in a 3-col grid (KM log, queue/today,
-    # latest-evoked thumbnail, channel map, alerts). Each is a
-    # collapsible <details>; the user can hide anything they don't
-    # care about. minmax(380px, 1fr) keeps 3 cols on wide monitors.
-    cards_wrapped = _collapsible(
-        "System Status", cards,
-        open_default=True,
-    )
     km_wrapped = _collapsible(
-        "KM Recorder log", km_section,
-        open_default=True,
+        "KM Recorder log", km_section, open_default=True,
     )
     queue_wrapped = _collapsible(
-        "Today · Recording uptime", queue_section,
-        open_default=True,
+        "Today · Recording uptime", queue_section, open_default=True,
     )
-    # Latest Evoked spans the full grid row so the 3 channels get
-    # real horizontal room. Cramped panels were why this commit
-    # exists.
+    # Latest Evoked is the headliner: full-row span + lives at the
+    # TOP of the operational grid. Apple's "feature card at top,
+    # supporting tiles below" pattern.
     thumb_wrapped = _collapsible(
         "Latest Evoked", waveform_thumbnail,
         open_default=True, full_width=True,
     )
     channel_wrapped = _collapsible(
         "Channel Map", channel_table,
-        open_default=False,   # rarely changes; default closed
+        open_default=False,
     )
-    # Order: status row → KM → queue → Latest Evoked (full row) →
-    # channel map + alerts (bottom). The auto-fit grid wraps the
-    # short cards into 1-3 columns per viewport; full_width forces
-    # the thumbnail onto its own row so it gets every available px.
+    # alignItems: start so short tiles don't stretch to match a tall
+    # neighbour -- that was inflating every grid cell to the height
+    # of the worst offender, producing acres of empty space.
     upper_grid = html.Div([
-        cards_wrapped, km_wrapped, queue_wrapped,
-        thumb_wrapped,
-        channel_wrapped, alerts_collapsible,
+        thumb_wrapped,            # row 1 — full width, the visual
+        queue_wrapped, km_wrapped,  # row 2 — operational pair
+        channel_wrapped, alerts_collapsible,  # row 3 — reference
     ], style={
         "display": "grid",
         "gridTemplateColumns":
             "repeat(auto-fit, minmax(320px, 1fr))",
         "gap": "8px",
+        "alignItems": "start",
     })
 
-    # Order: lab tiles at the very top per user request, operational
-    # tiles below.
     return html.Div([
         home_grid,
+        cards,
         upper_grid,
     ])
 
