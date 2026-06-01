@@ -264,6 +264,46 @@ DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMAR
 # ====================================================================== #
 
 
+def _qc_monitor_version() -> str:
+    """Short, human-readable version string for the dashboard header.
+
+    There is no setup.py / pyproject.toml here, so we derive from git:
+    ``<short-sha>[-dirty]  <YYYY-MM-DD>``. If git isn't reachable
+    (deployed without .git, no PATH entry), returns ``unknown``.
+    Computed once at import so the subprocess cost doesn't repeat on
+    every page render.
+    """
+    import subprocess
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return "unknown"
+    try:
+        dirty = bool(subprocess.check_output(
+            ["git", "-C", repo_root, "status", "--porcelain"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip())
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        dirty = False
+    try:
+        ts = subprocess.check_output(
+            ["git", "-C", repo_root, "log", "-1", "--format=%cs"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        ts = ""
+    label = sha + ("-dirty" if dirty else "")
+    return f"{label}  {ts}".strip() if ts else label
+
+
+_QC_MONITOR_VERSION = _qc_monitor_version()
+
+
 def _load_config() -> dict:
     # Force UTF-8 -- config contains emoji in the maintenance tab names
     # and Windows' default cp1252 codec chokes on them. (Same fix that
@@ -465,6 +505,22 @@ def create_app(config: dict, store: Store) -> Dash:
                            "fontWeight": "600", "letterSpacing": "-0.2px",
                            "display": "inline-block",
                            "color": COLOR_TEXT_PRIMARY}),
+            html.Span(_QC_MONITOR_VERSION,
+                       id="header-version",
+                       title="git commit + date "
+                              "(dirty = uncommitted local changes)",
+                       style={
+                           "display": "inline-block",
+                           "marginLeft": SPACE_3,
+                           "padding": "2px 8px",
+                           "borderRadius": "10px",
+                           "background": COLOR_SURFACE_2,
+                           "color": COLOR_TEXT_TERTIARY,
+                           "fontSize": FONT_SIZE_CAPTION,
+                           "fontFamily": "ui-monospace, monospace",
+                           "letterSpacing": "0.2px",
+                           "verticalAlign": "middle",
+                       }),
             html.Span(
                 id="header-status-dot",
                 className="status-dot",
