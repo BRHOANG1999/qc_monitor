@@ -32,27 +32,28 @@ class EmailAlerter:
 
     @property
     def password(self) -> str:
-        # Env var first -- still useful for interactive testing and
-        # ephemeral overrides without touching files.
-        env_pw = os.environ.get(self._pw_env_var, "")
-        if env_pw:
-            return env_pw.strip()
-        # File fallback. The service inherits whatever filesystem
-        # state the project root contains, no env-var dance required.
-        if not self._pw_file:
-            return ""
-        path = self._pw_file
-        if not os.path.isabs(path):
-            project_root = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", ".."))
-            path = os.path.normpath(os.path.join(project_root, path))
-        try:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return f.read().strip()
-        except OSError as e:
-            logger.warning("SMTP password_file %s unreadable: %s", path, e)
-        return ""
+        # File first: the explicit, user-written secret beats whatever
+        # env var the NSSM service may have captured at install time.
+        # Lets the user rotate the App Password by overwriting the
+        # file -- no env-var dance, no service restart needed.
+        if self._pw_file:
+            path = self._pw_file
+            if not os.path.isabs(path):
+                project_root = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", ".."))
+                path = os.path.normpath(os.path.join(project_root, path))
+            try:
+                if os.path.isfile(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        pw = f.read().strip()
+                    if pw:
+                        return pw
+            except OSError as e:
+                logger.warning("SMTP password_file %s unreadable: %s",
+                                path, e)
+        # Env var fallback -- still useful for interactive testing
+        # without touching files.
+        return os.environ.get(self._pw_env_var, "").strip()
 
     def send(self, subject: str, body: str, severity: str = "info",
              recipients: list[str] | None = None,
