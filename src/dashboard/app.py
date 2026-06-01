@@ -2485,21 +2485,31 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
                    "sem": "mean ± SEM",
                    "overlay": "mean + per-file overlay"}.get(
         trace_mode, "mean")
-    # Tight per-channel row so all channels + the rest of the
-    # Overview fit a 1080p screen without scrolling. Title font and
-    # legend pulled inward to claw back vertical space.
+    # Viewport-aware: autosize=True + a CSS calc() height on the
+    # Graph container makes Plotly redraw to fill whatever vertical
+    # space the viewport allows. minHeight keeps each channel row
+    # readable on a 1080p screen; maxHeight prevents the figure from
+    # going absurdly tall on a 4K monitor.
     thumb_fig.update_layout(
         title=dict(
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
             font=dict(size=12)),
-        height=max(140, 110 * n_ch),
+        autosize=True,
         margin=dict(l=50, r=10, t=36, b=22),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      xanchor="right", x=1, font_size=9),
     )
     thumb_fig.update_annotations(font_size=10)
-    return [dcc.Graph(figure=thumb_fig, style={"marginTop": "4px"})]
+    return [dcc.Graph(
+        figure=thumb_fig, responsive=True,
+        style={
+            "marginTop": "4px",
+            "height": f"calc(100vh - 320px)",
+            "minHeight": f"{max(440, 110 * n_ch)}px",
+            "maxHeight": "1200px",
+        },
+    )]
 
 
 def _km_log_summary(config: dict | None) -> dict:
@@ -2625,60 +2635,89 @@ def _parse_chunk_dt(ts: str | None) -> datetime | None:
             return None
 
 
-def _recording_arrivals(store: Store, hours: int) -> list[str]:
-    """chunk_datetime strings for every chunk recorded in the last
-    *hours*. Used to drive the Overview recording-uptime timelines.
+def _recording_arrivals(store: Store, hours: int
+                          ) -> list[tuple[str, float]]:
+    """(chunk_datetime, duration_sec) for every chunk whose coverage
+    might overlap the last *hours* window.
 
-    chunk_datetime (filename-derived) is the recording timestamp, not
-    processed_at -- so gaps in this series mean recording was off
-    (or the system was down), not that the QC dispatcher was busy.
-    The format is fixed-width zero-padded, so the SQL lexicographic
-    comparison sorts and filters chronologically once both sides are
-    in the same format.
+    Returns the START time of each chunk + its duration. Each chunk
+    covers ``[chunk_datetime, chunk_datetime + duration_sec]``; the
+    callers union those intervals to render "recorder was on" regions
+    accurately even when chunks are long (~60 min in this lab) and
+    only land once per hour.
+
+    The cutoff is widened by 2h so a chunk that started just before
+    the window and runs INTO it still appears (max chunk duration
+    observed across this DB is ~1.4h).
     """
     assert hours > 0, "hours must be positive"
-    cutoff_dt = datetime.now() - timedelta(hours=hours)
+    cutoff_dt = datetime.now() - timedelta(hours=hours + 2)
     cutoff_str = cutoff_dt.strftime(_CHUNK_DT_FMT)
     conn = store._connect()
     try:
         rows = conn.execute(
-            "SELECT chunk_datetime FROM processed_files "
+            "SELECT chunk_datetime, duration_sec "
+            "FROM processed_files "
             "WHERE chunk_datetime >= ? ORDER BY chunk_datetime",
             (cutoff_str,),
         ).fetchall()
-        return [r["chunk_datetime"] for r in rows
-                if r["chunk_datetime"]]
+        out: list[tuple[str, float]] = []
+        for r in rows:
+            ts = r["chunk_datetime"]
+            if not ts:
+                continue
+            # Default to 3600s when duration is missing/zero -- in this
+            # lab chunks are 1h, and an unknown-duration chunk should
+            # still paint coverage rather than dropping out.
+            dur = float(r["duration_sec"] or 0.0)
+            if dur <= 0:
+                dur = 3600.0
+            out.append((ts, dur))
+        return out
     finally:
         conn.close()
 
 
-def _build_recording_24h_fig(arrivals: list[str]) -> go.Figure:
-    """24-hour recording-uptime band. 15-minute bins; bars green where
-    chunks arrived, gray where they didn't. Compact (~50px tall)."""
+def _build_recording_24h_fig(
+        arrivals: list[tuple[str, float]]) -> go.Figure:
+    """24-hour recording-uptime band. 15-minute bins; bar green when
+    any chunk's [start, start+duration] interval overlaps the bin,
+    gray when nothing was recording. Compact (~50px tall)."""
     now = datetime.now()
     bin_min = 15
     n_bins = 24 * 60 // bin_min   # 96
+    bin_starts = [now - timedelta(minutes=(n_bins - i) * bin_min)
+                   for i in range(n_bins)]
+    bin_ends = [b + timedelta(minutes=bin_min) for b in bin_starts]
+    on = [False] * n_bins
     counts = [0] * n_bins
-    for ts in arrivals:
+    for ts, dur in arrivals:
         dt = _parse_chunk_dt(ts)
         if dt is None:
             continue
-        mins_ago = (now - dt).total_seconds() / 60.0
-        if mins_ago < 0 or mins_ago >= 24 * 60:
+        ch_end = dt + timedelta(seconds=dur)
+        # Skip chunks entirely outside the window.
+        if ch_end <= bin_starts[0] or dt >= bin_ends[-1]:
             continue
-        idx = n_bins - 1 - int(mins_ago // bin_min)
-        counts[idx] += 1
-    bin_starts = [now - timedelta(minutes=(n_bins - i) * bin_min)
-                   for i in range(n_bins)]
+        # Locate first/last bin overlap (linear scan -- 96 bins, fine).
+        for i in range(n_bins):
+            if dt >= bin_ends[i]:
+                continue
+            if ch_end <= bin_starts[i]:
+                break
+            on[i] = True
+            counts[i] += 1
     x_labels = [b.strftime("%H:%M") for b in bin_starts]
-    colors = ["#00CC96" if c > 0 else "#2a2a40" for c in counts]
+    colors = ["#00CC96" if v else "#2a2a40" for v in on]
     fig = go.Figure(go.Bar(
         x=x_labels, y=[1] * n_bins,
         marker=dict(color=colors, line=dict(width=0)),
         hovertext=[
             f"{b.strftime('%a %H:%M')}: "
-            f"{c} chunk{'s' if c != 1 else ''}"
-            for b, c in zip(bin_starts, counts)
+            + ("recording" if v else "no recording")
+            + (f" (covered by {c} chunk{'s' if c != 1 else ''})"
+                if v else "")
+            for b, v, c in zip(bin_starts, on, counts)
         ],
         hoverinfo="text",
     ))
@@ -2700,27 +2739,47 @@ def _build_recording_24h_fig(arrivals: list[str]) -> go.Figure:
     return fig
 
 
-def _build_recording_7d_fig(arrivals: list[str]) -> go.Figure:
+def _build_recording_7d_fig(
+        arrivals: list[tuple[str, float]]) -> go.Figure:
     """7-day recording uptime as a day × hour heatmap. Each cell = one
-    hour on one day; color intensity = chunks recorded that hour."""
+    hour on one day; value = minutes of chunk coverage within that
+    hour (0..60). Color saturates at full-hour coverage so partial-
+    hour chunks still show clearly."""
     today = date.today()
-    z = [[0] * 24 for _ in range(7)]
-    for ts in arrivals:
+    # Coverage in MINUTES per (day, hour) cell.
+    z = [[0.0] * 24 for _ in range(7)]
+    for ts, dur in arrivals:
         dt = _parse_chunk_dt(ts)
         if dt is None:
             continue
-        offset = (today - dt.date()).days
-        if 0 <= offset < 7:
-            z[6 - offset][dt.hour] += 1
+        ch_end = dt + timedelta(seconds=dur)
+        # Walk hour-by-hour from chunk start to end.
+        cur = dt
+        guard = 0
+        while cur < ch_end and guard < 200:   # NASA rule 2
+            guard += 1
+            hour_end = cur.replace(minute=0, second=0,
+                                    microsecond=0) + timedelta(hours=1)
+            seg_end = min(ch_end, hour_end)
+            offset = (today - cur.date()).days
+            if 0 <= offset < 7:
+                mins = (seg_end - cur).total_seconds() / 60.0
+                z[6 - offset][cur.hour] += min(60.0, mins)
+                # Clamp at 60 so two-back-to-back chunks in the same
+                # hour don't shift the colorscale.
+                if z[6 - offset][cur.hour] > 60.0:
+                    z[6 - offset][cur.hour] = 60.0
+            cur = seg_end
     y_labels = [(today - timedelta(days=d)).strftime("%a %m/%d")
                 for d in range(6, -1, -1)]
     x_labels = [f"{h:02d}" for h in range(24)]
     fig = go.Figure(go.Heatmap(
-        z=z, x=x_labels, y=y_labels,
-        colorscale=[[0, "#2a2a40"], [0.01, "#1f5a44"],
+        z=z, x=x_labels, y=y_labels, zmin=0, zmax=60,
+        colorscale=[[0.0, "#2a2a40"], [0.001, "#1f5a44"],
                      [0.5, "#00CC96"], [1.0, "#7be3c0"]],
         showscale=False, xgap=1, ygap=1,
-        hovertemplate="%{y} %{x}:00 — %{z} chunks<extra></extra>",
+        hovertemplate="%{y} %{x}:00 — %{z:.0f} min recorded"
+                       "<extra></extra>",
     ))
     fig.update_layout(
         height=148, margin=dict(l=60, r=10, t=4, b=22),
