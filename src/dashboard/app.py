@@ -413,6 +413,24 @@ def _status_card(title: str, value: str, color: str = "#636EFA"):
     ], style=CARD_STYLE)
 
 
+def _fmt_disk_space(gb: float) -> str:
+    """Format a disk-free value with auto-scaling unit.
+
+    Anything 1024 GB and up reads as TB with one decimal (1.2 TB);
+    smaller values stay as GB without a decimal (543 GB). Matches
+    the "round up to the natural unit" pattern macOS Finder uses.
+    """
+    if gb is None:
+        return "—"
+    try:
+        gb_f = float(gb)
+    except (TypeError, ValueError):
+        return "—"
+    if gb_f >= 1024:
+        return f"{gb_f / 1024:.1f} TB"
+    return f"{gb_f:.0f} GB"
+
+
 def _status_pill(title: str, value: str, color: str = "#636EFA"):
     """Compact single-line pill. ~28px tall instead of _status_card's
     ~72px. Reference info doesn't need to read as a headline; the
@@ -681,11 +699,29 @@ def create_app(config: dict, store: Store) -> Dash:
                              "fontSize": FONT_SIZE_CAPTION,
                              "marginRight": SPACE_3}),
             dcc.Checklist(id="auto-refresh-toggle",
-                          options=[{"label": " Auto-refresh", "value": True}],
+                          options=[{"label": " Auto", "value": True}],
                           value=[], inline=True,
                           style={"color": COLOR_TEXT_SECONDARY,
                                  "display": "inline-block",
-                                 "fontSize": FONT_SIZE_CAPTION}),
+                                 "fontSize": FONT_SIZE_CAPTION,
+                                 "marginRight": SPACE_2}),
+            # Interval picker. Updates the dcc.Interval below via
+            # callback; default matches config.dashboard.
+            # refresh_interval_sec so the dropdown starts in sync.
+            dcc.Dropdown(
+                id="auto-refresh-interval",
+                options=[
+                    {"label": "5s",   "value": 5},
+                    {"label": "10s",  "value": 10},
+                    {"label": "30s",  "value": 30},
+                    {"label": "1min", "value": 60},
+                    {"label": "5min", "value": 300},
+                ],
+                value=int(refresh_sec) if refresh_sec else 10,
+                clearable=False, searchable=False,
+                style={"width": "78px", "fontSize": FONT_SIZE_CAPTION,
+                        "color": COLOR_TEXT_PRIMARY},
+            ),
         ], id="refresh-bar",
            style={"position": "fixed", "top": SPACE_2, "right": SPACE_5, "zIndex": "9999",
                   "display": "flex", "alignItems": "center",
@@ -718,6 +754,17 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def toggle_auto_refresh(val):
         return not bool(val)
+
+    @app.callback(
+        Output("refresh", "interval"),
+        Input("auto-refresh-interval", "value"),
+        prevent_initial_call=True,
+    )
+    def update_auto_refresh_interval(seconds):
+        # dcc.Interval.interval is in ms; clamp to a sane window.
+        s = int(seconds or 10)
+        s = max(1, min(s, 3600))
+        return s * 1000
 
     @app.callback(
         Output("focus-mode", "data"),
@@ -2357,8 +2404,85 @@ def _home_schedule_block(config: dict | None) -> html.Div:
     )
 
 
+import re as _re_incident
+
+# Software is checked FIRST so "dashboard crashed" wins over the
+# substring "board" in the hardware bucket.
+_INCIDENT_TAGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("software", "#AB63FA",
+        ("software", "code", "crash", "freeze", "hang", "deploy",
+         "bug", "version", "update", "script", "matlab", "python",
+         "dashboard", "kmrecord")),
+    ("signal", "#19D3F3",
+        ("noise", "drift", "artifact", "spike", "baseline",
+         "channel", "filter", "60hz", "stim", "amplifier",
+         "amp")),
+    ("hardware", "#FFA15A",
+        ("battery", "batteries", "electrode", "headstage", "cable",
+         "connector", "board", "circuit", "broken", "charge",
+         "charging", "wire", "led", "solder", "pin", "shaft")),
+)
+# Word-boundary regex per word so "dashboard" stops matching "board",
+# "line" stops matching "online", etc. Compiled once.
+_INCIDENT_PATTERNS: list[tuple[str, str, _re_incident.Pattern]] = [
+    (label, color,
+     _re_incident.compile(r"\b(" + "|".join(_re_incident.escape(w)
+                                              for w in words) + r")",
+                           _re_incident.IGNORECASE))
+    for label, color, words in _INCIDENT_TAGS
+]
+
+
+def _classify_incident(text: str) -> tuple[str, str] | None:
+    """First matching (label, color) for a free-form incident report,
+    or None when no keyword family fires. Word-boundary regex --
+    'Dashboard crashed' must not classify as hardware via 'board'."""
+    if not text:
+        return None
+    for label, color, pattern in _INCIDENT_PATTERNS:
+        if pattern.search(text):
+            return (label, color)
+    return None
+
+
+def _incident_age_style(days_old: float | None) -> dict:
+    """Visual aging for incidents based on how long ago they happened.
+
+    Fresh (0-2 d): full opacity, normal weight.
+    Recent (3-14 d): slight fade.
+    Stale (15+ d): heavy fade so old open items don't read identical
+    to fresh ones at a glance.
+    """
+    if days_old is None or days_old < 3:
+        return {"opacity": "1.0"}
+    if days_old < 15:
+        return {"opacity": "0.75"}
+    return {"opacity": "0.5"}
+
+
+def _fmt_days_ago(days_old: float | None) -> tuple[str, str]:
+    """(label, color) for a 'N days ago' badge."""
+    if days_old is None:
+        return "", "#888"
+    if days_old < 1:
+        return "today", "#00CC96"
+    if days_old < 2:
+        return "yesterday", "#00CC96"
+    if days_old < 7:
+        return f"{int(days_old)}d ago", "#FFA15A"
+    if days_old < 30:
+        return f"{int(days_old)}d ago", "#EF553B"
+    return f"{int(days_old)}d ago", "#EF553B"
+
+
 def _home_incidents_block(config: dict | None) -> html.Div:
-    """Latest 3 incident reports from the Maintenance Tracker."""
+    """Latest 3 incident reports from the Maintenance Tracker.
+
+    Stale incidents fade visually so an open battery report from
+    three weeks ago doesn't claim the same attention as a fresh
+    one. Each item gets a keyword-derived severity badge (hardware
+    / signal / software) so the operator can triage at a glance.
+    """
     try:
         from src.dashboard.tabs.maintenance import recent_incidents
         rows = recent_incidents(config or {}, limit=3)
@@ -2373,29 +2497,72 @@ def _home_incidents_block(config: dict | None) -> html.Div:
                    "fontSize": FONT_SIZE_BODY},
         )
     else:
+        now = datetime.now()
         items = []
         for r in rows:
-            when = r["when"].strftime("%Y-%m-%d %H:%M")
+            when_dt = r["when"]
+            when = when_dt.strftime("%Y-%m-%d %H:%M")
             who = r.get("by") or "?"
             report = r.get("report") or ""
             if len(report) > 140:
                 report = report[:137] + "..."
-            items.append(html.Div([
-                html.Div([
-                    html.Span(when, style={
-                        "color": COLOR_TEXT_SECONDARY,
-                        "fontSize": FONT_SIZE_CAPTION,
+            try:
+                days_old = max(0.0,
+                                (now - when_dt).total_seconds() / 86400.0)
+            except (TypeError, ValueError):
+                days_old = None
+            age_label, age_color = _fmt_days_ago(days_old)
+            tag = _classify_incident(report)
+            age_style = _incident_age_style(days_old)
+            header_children = [
+                html.Span(when, style={
+                    "color": COLOR_TEXT_SECONDARY,
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "marginRight": SPACE_3,
+                }),
+                html.Span(who, style={
+                    "color": COLOR_ACCENT,
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "fontWeight": "600",
+                    "marginRight": SPACE_3,
+                }),
+            ]
+            if age_label:
+                header_children.append(html.Span(
+                    age_label,
+                    style={
+                        "color": age_color, "fontSize": "10px",
+                        "fontWeight": "600",
                         "marginRight": SPACE_3,
-                    }),
-                    html.Span(who, style={"color": COLOR_ACCENT,
-                                           "fontSize": FONT_SIZE_CAPTION,
-                                           "fontWeight": "600"}),
-                ]),
-                html.Div(report, style={"color": COLOR_TEXT_PRIMARY,
-                                         "fontSize": FONT_SIZE_BODY,
-                                         "marginTop": "2px"}),
-            ], style={"padding": f"{SPACE_2} 0",
-                      "borderBottom": f"1px solid {COLOR_DIVIDER}"}))
+                    }))
+            if tag is not None:
+                tag_label, tag_color = tag
+                header_children.append(html.Span(
+                    tag_label,
+                    style={
+                        "color": "#fff", "fontSize": "9px",
+                        "fontWeight": "600",
+                        "background": tag_color,
+                        "padding": "1px 6px",
+                        "borderRadius": "8px",
+                        "letterSpacing": "0.3px",
+                        "textTransform": "uppercase",
+                    }))
+            items.append(html.Div([
+                html.Div(header_children, style={
+                    "display": "flex", "alignItems": "center",
+                    "flexWrap": "wrap", "rowGap": "2px",
+                }),
+                html.Div(report, style={
+                    "color": COLOR_TEXT_PRIMARY,
+                    "fontSize": FONT_SIZE_BODY,
+                    "marginTop": "2px",
+                }),
+            ], style={
+                "padding": f"{SPACE_2} 0",
+                "borderBottom": f"1px solid {COLOR_DIVIDER}",
+                **age_style,
+            }))
         body = html.Div(items)
 
     return _card(
@@ -2576,7 +2743,7 @@ def _build_overview_cards(store: Store):
                      "#00CC96" if cpu < 80 else "#FFA15A"),
         _status_pill("Memory", f"{mem:.0f}%",
                      "#00CC96" if mem < 85 else "#FFA15A"),
-        _status_pill("Disk Free", f"{disk:.1f} GB",
+        _status_pill("Disk Free", _fmt_disk_space(disk),
                      "#00CC96" if disk > 50 else "#EF553B"),
         _status_pill("Files/Hour", str(fph), "#636EFA"),
         _status_pill("Videos (24h)", vid_label, vid_color),
@@ -2684,6 +2851,11 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         color = colors_list[(ri - 1) % len(colors_list)]
         band_color = _hex_to_rgba(color, 0.18)
         overlay_color = _hex_to_rgba(color, 0.12)
+        # Group every trace for this channel under one legendgroup so
+        # clicking the legend entry hides stim+evoked+SEM band+overlay
+        # simultaneously. Lets the user isolate one channel cleanly
+        # (Plotly: single-click hide, double-click isolate).
+        lg = f"ch_{ch}"
 
         # Overlay mode: draw every file's mean_trace under this
         # channel's latest mean. Cheap stylized backdrop, no legend.
@@ -2702,6 +2874,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
                         x=pt, y=pm, mode="lines",
                         line=dict(color=overlay_color, width=0.7),
                         hoverinfo="skip", showlegend=False,
+                        legendgroup=lg,
                     ), row=ri, col=col_idx)
 
         # SEM band: filled ribbon mean±sem, mean drawn on top.
@@ -2713,12 +2886,14 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
                     x=time_ms, y=upper, mode="lines",
                     line=dict(color="rgba(0,0,0,0)"),
                     hoverinfo="skip", showlegend=False,
+                    legendgroup=lg,
                 ), row=ri, col=col_idx)
                 thumb_fig.add_trace(go.Scatter(
                     x=time_ms, y=lower, mode="lines",
                     fill="tonexty", fillcolor=band_color,
                     line=dict(color="rgba(0,0,0,0)"),
                     hoverinfo="skip", showlegend=False,
+                    legendgroup=lg,
                 ), row=ri, col=col_idx)
 
         # Left panel: LFP mean, zoomed to ±1 ms around stim.
@@ -2726,7 +2901,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
             x=time_ms, y=mean_tr, mode="lines",
             name=f"{nm} stim",
             line=dict(color=color, width=1.5),
-            showlegend=False,
+            showlegend=False, legendgroup=lg,
         ), row=ri, col=1)
         thumb_fig.add_vline(
             x=0, line=dict(color="white", width=0.5, dash="dash"),
@@ -2738,11 +2913,15 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         if y_left is not None:
             thumb_fig.update_yaxes(range=list(y_left), row=ri, col=1)
 
-        # Right panel: LFP mean, evoked window.
+        # Right panel: LFP mean, evoked window. The visible legend
+        # entry lives on this trace (showlegend=True default) and
+        # carries the channel group so clicking it hides the whole
+        # row across both columns.
         thumb_fig.add_trace(go.Scatter(
             x=time_ms, y=mean_tr, mode="lines",
             name=f"{nm} (n={n_ep})",
             line=dict(color=color, width=1.5),
+            legendgroup=lg,
         ), row=ri, col=2)
         thumb_fig.update_xaxes(range=[evoked_x0, evoked_x1],
                                 row=ri, col=2)
@@ -2769,17 +2948,25 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
     # space the viewport allows. minHeight keeps each channel row
     # readable on a 1080p screen; maxHeight prevents the figure from
     # going absurdly tall on a 4K monitor.
-    # Legend dropped: each channel is already named by its y-axis
-    # label, so the top-right legend was just colliding with the
-    # title strip. Title gets the whole top row to itself.
+    # Legend back on, but as a vertical strip in the right margin --
+    # avoids the title collision the top-right horizontal legend
+    # caused, and Plotly's built-in legend behavior (click to hide,
+    # double-click to isolate) gives the user a way to focus on one
+    # channel when three overlapping traces get noisy.
     thumb_fig.update_layout(
         title=dict(
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
             font=dict(size=11), x=0.5, xanchor="center",
             y=0.985, yanchor="top"),
         autosize=True,
-        margin=dict(l=42, r=8, t=44, b=32),
-        showlegend=False,
+        margin=dict(l=42, r=130, t=44, b=32),
+        showlegend=True,
+        legend=dict(
+            orientation="v", x=1.005, y=1, xanchor="left",
+            yanchor="top", font_size=10, bgcolor="rgba(0,0,0,0)",
+            itemclick="toggle",        # single-click = hide/show
+            itemdoubleclick="toggleothers",  # double = isolate
+        ),
     )
     # Column headers as figure-level annotations, sitting just below
     # the title. x-positions track column_widths=[0.16, 0.84] +
@@ -3271,13 +3458,19 @@ def _build_recording_7d_fig(
     y_labels = [(today - timedelta(days=d)).strftime("%a %m/%d")
                 for d in range(6, -1, -1)]
     x_labels = [f"{h:02d}" for h in range(24)]
+    # customdata is a 7×24 grid of uptime percent (0..100) -- z gives
+    # minutes (0..60) and we want the hover to surface BOTH so a
+    # 45-min hour reads "45 min recorded (75%)".
+    custom = [[round(z[r][c] / 60.0 * 100.0, 0) for c in range(24)]
+               for r in range(7)]
     fig = go.Figure(go.Heatmap(
         z=z, x=x_labels, y=y_labels, zmin=0, zmax=60,
+        customdata=custom,
         colorscale=[[0.0, "#2a2a40"], [0.001, "#1f5a44"],
                      [0.5, "#00CC96"], [1.0, "#7be3c0"]],
         showscale=False, xgap=1, ygap=1,
-        hovertemplate="%{y} %{x}:00 — %{z:.0f} min recorded"
-                       "<extra></extra>",
+        hovertemplate="%{y} %{x}:00 — %{z:.0f} min recorded "
+                       "(%{customdata:.0f}%)<extra></extra>",
     ))
     # Current-hour highlight: a thin gold outline around the cell at
     # (today, current_hour). Using numeric indices because shape
