@@ -266,48 +266,52 @@ DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMAR
 
 def _collapsible(title: str, content, *, open_default: bool = True,
                   badge: str | None = None,
-                  badge_color: str | None = None):
+                  badge_color: str | None = None,
+                  full_width: bool = False):
     """Section wrapped in a native <details> element so the user can
-    collapse anything they don't want to see. *content* is anything
-    Dash will render (a Div, a list of children, etc.).
+    collapse anything they don't want to see.
 
-    Native <details> handles state in the browser without callbacks --
-    cheap, accessible, survives refresh ticks. The summary row gets a
-    subtle background so the title reads as a header strip even when
-    the section is closed.
+    Apple HIG: one container per section, not nested chrome. The
+    collapsible IS the card. Inner content should NOT carry its own
+    border/background/padding -- it'd duplicate the visual frame.
+    The summary row is the title strip; the body just gets a thin
+    horizontal padding so the inner figure / table edges align.
     """
     summary_children = [
         html.Span(title, style={
-            "color": "#ddd", "fontSize": "13px", "fontWeight": "600",
-            "letterSpacing": "0.3px",
+            "color": "#ddd", "fontSize": "12px", "fontWeight": "600",
+            "letterSpacing": "0.2px",
         }),
     ]
     if badge:
         summary_children.append(html.Span(
             badge,
             style={
-                "marginLeft": "8px",
-                "padding": "1px 7px",
-                "borderRadius": "9px",
+                "marginLeft": "6px",
+                "padding": "0 6px",
+                "borderRadius": "8px",
                 "background": (badge_color or "rgba(255,255,255,0.08)"),
                 "color": "#fff", "fontSize": "10px",
-                "fontWeight": "600",
+                "fontWeight": "600", "lineHeight": "16px",
             }))
-    return html.Details([
-        html.Summary(summary_children, style={
-            "cursor": "pointer", "userSelect": "none",
-            "padding": "8px 12px",
-            "background": "rgba(255,255,255,0.04)",
-            "borderRadius": "6px 6px 0 0",
-            "listStyle": "none",
-        }),
-        html.Div(content, style={"padding": "10px 12px"}),
-    ], open=open_default, style={
+    base_style = {
         "background": COLOR_SURFACE_1,
         "border": f"1px solid {COLOR_DIVIDER}",
         "borderRadius": "6px",
-        "marginBottom": "10px",
-    })
+        "marginBottom": "6px",
+    }
+    if full_width:
+        base_style["gridColumn"] = "1 / -1"
+    return html.Details([
+        html.Summary(summary_children, style={
+            "cursor": "pointer", "userSelect": "none",
+            "padding": "5px 10px",
+            "borderBottom":
+                "1px solid rgba(255,255,255,0.04)",
+            "listStyle": "none",
+        }),
+        html.Div(content, style={"padding": "6px 10px"}),
+    ], open=open_default, style=base_style)
 
 
 def _qc_monitor_version() -> str:
@@ -2494,10 +2498,13 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
             f"Stim window {nm} ({stim_x0:g} to {stim_x1:g} ms)")
         subplot_titles.append(
             f"Evoked {nm} ({evoked_x0:g}–{evoked_x1:g} ms)")
+    # Tight subplot grid: ~half the breathing room of the default,
+    # narrower stim column. Wide monitors finally see the evoked
+    # panel as the dominant element it should be.
     thumb_fig = make_subplots(
-        rows=n_ch, cols=2, column_widths=[0.2, 0.8],
+        rows=n_ch, cols=2, column_widths=[0.16, 0.84],
         shared_xaxes=False, subplot_titles=subplot_titles,
-        vertical_spacing=0.08, horizontal_spacing=0.06,
+        vertical_spacing=0.04, horizontal_spacing=0.035,
     )
 
     def _hex_to_rgba(hex_str: str, alpha: float) -> str:
@@ -2595,14 +2602,14 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
     thumb_fig.update_layout(
         title=dict(
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
-            font=dict(size=12)),
+            font=dict(size=11), y=0.98),
         autosize=True,
-        margin=dict(l=50, r=10, t=36, b=22),
+        margin=dict(l=42, r=8, t=28, b=18),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      xanchor="right", x=1, font_size=9),
     )
-    thumb_fig.update_annotations(font_size=10)
+    thumb_fig.update_annotations(font_size=9)
     return [dcc.Graph(
         figure=thumb_fig, responsive=True,
         style={
@@ -2811,20 +2818,16 @@ def _build_km_log_section(config: dict | None) -> html.Div:
 
     return html.Div([
         html.Div([
-            html.Span("KM Recorder log",
-                       style={"color": "#aaa", "fontSize": "12px",
-                               "letterSpacing": "0.5px",
-                               "marginRight": "12px"}),
-            html.Span(f"last recording {rec_text}",
-                       style={"color": rec_color, "fontSize": "12px",
+            html.Span(f"recording {rec_text}",
+                       style={"color": rec_color, "fontSize": "11px",
                                "fontWeight": "600",
-                               "marginRight": "12px"}),
-            html.Span(f"last submitted {sub_text}",
-                       style={"color": sub_color, "fontSize": "12px",
+                               "marginRight": "10px"}),
+            html.Span(f"submitted {sub_text}",
+                       style={"color": sub_color, "fontSize": "11px",
                                "fontWeight": "600"}),
-        ], style={"marginBottom": "6px"}),
+        ], style={"marginBottom": "4px"}),
         html.Div(tail),
-    ], style={**SECTION_STYLE, "padding": "10px 14px"})
+    ])
 
 
 _CHUNK_DT_FMT = "%Y_%m_%d__%H_%M_%S"
@@ -2977,12 +2980,12 @@ def _build_recording_24h_fig(
         hovertext=hovertext, hoverinfo="text",
     ))
     fig.update_layout(
-        height=44, margin=dict(l=10, r=10, t=4, b=18),
+        height=32, margin=dict(l=8, r=8, t=2, b=14),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False, bargap=0,
         xaxis=dict(showgrid=False,
-                    tickfont=dict(size=9, color="#888"),
+                    tickfont=dict(size=8, color="#888"),
                     tickmode="array",
                     tickvals=[x_labels[0],
                               x_labels[n_bins // 2],
@@ -3086,7 +3089,7 @@ def _build_recording_7d_fig(
                        "<extra></extra>",
     ))
     fig.update_layout(
-        height=148, margin=dict(l=60, r=10, t=4, b=22),
+        height=120, margin=dict(l=52, r=8, t=2, b=18),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(showgrid=False,
@@ -3095,7 +3098,7 @@ def _build_recording_7d_fig(
                     tickvals=["00", "06", "12", "18", "23"],
                     ticktext=["00", "06", "12", "18", "23"],
                     title=dict(text="hour of day",
-                                font=dict(size=10, color="#666"))),
+                                font=dict(size=9, color="#666"))),
         yaxis=dict(showgrid=False,
                     tickfont=dict(size=9, color="#aaa"),
                     autorange="reversed"),
@@ -3235,24 +3238,22 @@ def _build_overview_queue(store: Store):
     )
 
     today_section = html.Div([
-        html.H4("Today",
-                style={"color": "#aaa", "marginTop": "0px",
-                        "marginBottom": "4px", "fontSize": "14px",
-                        "letterSpacing": "0.5px"}),
         today_counters,
-        html.Div("Recording uptime (last 24h)",
-                  style={"color": "#888", "fontSize": "11px",
-                          "marginTop": "8px",
-                          "letterSpacing": "0.5px"}),
+        html.Div("24h recording",
+                  style={"color": "#666", "fontSize": "10px",
+                          "marginTop": "6px",
+                          "letterSpacing": "0.4px",
+                          "textTransform": "uppercase"}),
         rec_24h,
         rec_24h_legend,
     ])
 
     recording_7d_section = html.Div([
-        html.H4("Recording uptime (last 7 days)",
-                style={"color": "#aaa", "marginTop": "16px",
-                        "marginBottom": "4px", "fontSize": "14px",
-                        "letterSpacing": "0.5px"}),
+        html.Div("Last 7 days",
+                style={"color": "#666", "marginTop": "10px",
+                        "marginBottom": "2px", "fontSize": "10px",
+                        "letterSpacing": "0.4px",
+                        "textTransform": "uppercase"}),
         rec_7d,
         html.Div([
             html.Span([
@@ -3323,20 +3324,22 @@ def _build_overview_queue(store: Store):
                       style={"color": "#888"}),
         ], style={"fontSize": "12px"})
         active_section = html.Div([
-            html.H4("Active Session",
-                    style={"color": "#aaa", "marginTop": "16px",
-                            "marginBottom": "4px", "fontSize": "14px",
-                            "letterSpacing": "0.5px"}),
+            html.Div("Active session",
+                    style={"color": "#666", "marginTop": "10px",
+                            "marginBottom": "2px", "fontSize": "10px",
+                            "letterSpacing": "0.4px",
+                            "textTransform": "uppercase"}),
             bar, active_counters,
         ])
     else:
         active_section = html.Div([
-            html.H4("Active Session",
-                    style={"color": "#aaa", "marginTop": "16px",
-                            "fontSize": "14px",
-                            "letterSpacing": "0.5px"}),
+            html.Div("Active session",
+                    style={"color": "#666", "marginTop": "10px",
+                            "fontSize": "10px",
+                            "letterSpacing": "0.4px",
+                            "textTransform": "uppercase"}),
             html.Div("No sessions yet",
-                     style={"color": "#888", "fontSize": "12px"}),
+                     style={"color": "#888", "fontSize": "11px"}),
         ])
 
     return [today_section, active_section, recording_7d_section]
@@ -3356,14 +3359,16 @@ def _overview_tab(store: Store, config: dict | None = None):
         style={"display": "flex", "gap": "12px", "flexWrap": "wrap"},
     )
 
+    # No SECTION_STYLE on these wrappers -- the _collapsible they're
+    # placed inside is the visible card. Nested chrome was making
+    # the dashboard read as "card-on-card-on-card."
     km_section = html.Div(
         _build_km_log_section(config),
         id="overview-km-log",
     )
-
     queue_section = html.Div(
         _build_overview_queue(store),
-        id="overview-queue", style=SECTION_STYLE,
+        id="overview-queue",
     )
 
     # Evoked thumbnail: radio-selected trace mode +
@@ -3411,10 +3416,6 @@ def _overview_tab(store: Store, config: dict | None = None):
                     "role": info["role"],
                 })
             channel_table = html.Div([
-                html.H4("Channel Map (Auto-Discovered)",
-                         style={"color": "#aaa",
-                                 "marginTop": "16px",
-                                 "fontSize": "14px"}),
                 dash_table.DataTable(
                     data=ch_rows,
                     columns=[{"name": "Index", "id": "index"},
@@ -3431,7 +3432,7 @@ def _overview_tab(store: Store, config: dict | None = None):
                     ],
                     page_size=8,
                 ),
-            ], style={"maxHeight": "320px", "overflow": "hidden"})
+            ], style={"maxHeight": "300px", "overflow": "hidden"})
         else:
             channel_table = html.Div()
     else:
@@ -3439,13 +3440,10 @@ def _overview_tab(store: Store, config: dict | None = None):
         channel_table = html.Div()
 
     # Recent alerts -- capped + scrollable so it doesn't push the
-    # rest of the Overview off the viewport.
+    # rest of the Overview off the viewport. Title lives in the
+    # collapsible summary so we drop the inner header.
     if recent_alerts:
         alerts_section = html.Div([
-            html.H4(f"Recent Alerts ({len(recent_alerts)})",
-                     style={"color": "#aaa", "marginTop": "16px",
-                             "fontSize": "14px",
-                             "letterSpacing": "0.5px"}),
             dash_table.DataTable(
                 data=[{"time": a["sent_at"][:19], "severity": a["severity"],
                        "type": a["alert_type"], "message": a["message"][:120]}
@@ -3462,16 +3460,12 @@ def _overview_tab(store: Store, config: dict | None = None):
                 ],
                 page_size=5,
             ),
-        ], style={"maxHeight": "240px", "overflow": "hidden"})
+        ], style={"maxHeight": "220px", "overflow": "hidden"})
     else:
-        alerts_section = html.Div([
-            html.H4("Recent Alerts",
-                     style={"color": "#aaa", "marginTop": "16px",
-                             "fontSize": "14px",
-                             "letterSpacing": "0.5px"}),
-            html.P("No alerts in the last 24 hours",
-                    style={"color": "#888", "fontSize": "11px"}),
-        ])
+        alerts_section = html.Div(
+            "No alerts in the last 24 hours",
+            style={"color": "#666", "fontSize": "11px",
+                    "padding": "4px 2px"})
 
     today = date.today()
     # Home grid (surgeries / schedule / maintenance / incidents /
@@ -3485,9 +3479,9 @@ def _overview_tab(store: Store, config: dict | None = None):
         style={
             "display": "grid",
             "gridTemplateColumns":
-                "repeat(auto-fit, minmax(380px, 1fr))",
-            "gap": "12px",
-            "marginBottom": "12px",
+                "repeat(auto-fit, minmax(320px, 1fr))",
+            "gap": "8px",
+            "marginBottom": "8px",
         },
     )
 
@@ -3520,22 +3514,30 @@ def _overview_tab(store: Store, config: dict | None = None):
         "Today · Recording uptime", queue_section,
         open_default=True,
     )
+    # Latest Evoked spans the full grid row so the 3 channels get
+    # real horizontal room. Cramped panels were why this commit
+    # exists.
     thumb_wrapped = _collapsible(
         "Latest Evoked", waveform_thumbnail,
-        open_default=True,
+        open_default=True, full_width=True,
     )
     channel_wrapped = _collapsible(
         "Channel Map", channel_table,
         open_default=False,   # rarely changes; default closed
     )
+    # Order: status row → KM → queue → Latest Evoked (full row) →
+    # channel map + alerts (bottom). The auto-fit grid wraps the
+    # short cards into 1-3 columns per viewport; full_width forces
+    # the thumbnail onto its own row so it gets every available px.
     upper_grid = html.Div([
         cards_wrapped, km_wrapped, queue_wrapped,
-        thumb_wrapped, channel_wrapped, alerts_collapsible,
+        thumb_wrapped,
+        channel_wrapped, alerts_collapsible,
     ], style={
         "display": "grid",
         "gridTemplateColumns":
-            "repeat(auto-fit, minmax(380px, 1fr))",
-        "gap": "12px",
+            "repeat(auto-fit, minmax(320px, 1fr))",
+        "gap": "8px",
     })
 
     # Order: lab tiles at the very top per user request, operational
