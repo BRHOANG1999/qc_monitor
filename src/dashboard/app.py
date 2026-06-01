@@ -2769,15 +2769,17 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
     # space the viewport allows. minHeight keeps each channel row
     # readable on a 1080p screen; maxHeight prevents the figure from
     # going absurdly tall on a 4K monitor.
+    # Legend dropped: each channel is already named by its y-axis
+    # label, so the top-right legend was just colliding with the
+    # title strip. Title gets the whole top row to itself.
     thumb_fig.update_layout(
         title=dict(
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
-            font=dict(size=11), y=0.98),
+            font=dict(size=11), x=0.5, xanchor="center",
+            y=0.985, yanchor="top"),
         autosize=True,
-        margin=dict(l=42, r=8, t=40, b=32),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                     xanchor="right", x=1, font_size=9),
+        margin=dict(l=42, r=8, t=44, b=32),
+        showlegend=False,
     )
     # Column headers as figure-level annotations, sitting just below
     # the title. x-positions track column_widths=[0.16, 0.84] +
@@ -2801,13 +2803,13 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         figure=thumb_fig, responsive=True,
         style={
             "marginTop": "4px",
-            # vh-based so a 1440p / 4K monitor gets a taller chart
-            # without code changes. minHeight keeps each channel
-            # row readable on a small laptop; maxHeight stops
-            # absurdly tall plots on a giant monitor.
-            "height": "62vh",
-            "minHeight": f"{max(440, 110 * n_ch)}px",
-            "maxHeight": "820px",
+            # 58vh (down from 62) keeps the title strip clearly
+            # readable at common viewports without losing channel
+            # legibility. min keeps each row readable on a small
+            # laptop; max caps absurd 4K heights.
+            "height": "58vh",
+            "minHeight": f"{max(420, 108 * n_ch)}px",
+            "maxHeight": "780px",
         },
     )]
 
@@ -3238,8 +3240,10 @@ def _build_recording_7d_fig(
     """7-day recording uptime as a day × hour heatmap. Each cell = one
     hour on one day; value = minutes of chunk coverage within that
     hour (0..60). Color saturates at full-hour coverage so partial-
-    hour chunks still show clearly."""
+    hour chunks still show clearly. The current-hour cell on today's
+    row gets a yellow outline so the user can spot 'now' instantly."""
     today = date.today()
+    now = datetime.now()
     # Coverage in MINUTES per (day, hour) cell.
     z = [[0.0] * 24 for _ in range(7)]
     for ts, dur in arrivals:
@@ -3275,6 +3279,23 @@ def _build_recording_7d_fig(
         hovertemplate="%{y} %{x}:00 — %{z:.0f} min recorded"
                        "<extra></extra>",
     ))
+    # Current-hour highlight: a thin gold outline around the cell at
+    # (today, current_hour). Using numeric indices because shape
+    # x/y on a categorical axis maps to the underlying index, where
+    # hour 17 -> x=17 and row "Mon 06/01" -> y=6 (last row index).
+    days_ago = (today - now.date()).days
+    if 0 <= days_ago < 7:
+        x_idx = now.hour
+        y_idx = 6 - days_ago
+        fig.add_shape(
+            type="rect",
+            xref="x", yref="y",
+            x0=x_idx - 0.5, x1=x_idx + 0.5,
+            y0=y_idx - 0.5, y1=y_idx + 0.5,
+            line=dict(color="#FFD700", width=2),
+            fillcolor="rgba(255, 215, 0, 0.18)",
+            layer="above",
+        )
     fig.update_layout(
         height=120, margin=dict(l=52, r=8, t=2, b=18),
         paper_bgcolor="rgba(0,0,0,0)",
@@ -3725,15 +3746,12 @@ def _overview_tab(store: Store, config: dict | None = None):
         ops_col,
     ], style={
         "display": "grid",
-        # minmax(0, 1fr) instead of plain 1fr. Without the 0-min,
-        # CSS Grid sizes a 1fr column at minmax(auto, 1fr), and
-        # the "auto" minimum expands the column to the widest piece
-        # of unwrappable content inside (nowrap KM log filenames,
-        # the active-session name). That made Today+KM bleed into
-        # the Latest Evoked column. minmax(0, 1fr) ignores
-        # min-content and gives each 1fr column exactly half the
-        # remaining width.
-        "gridTemplateColumns": "280px minmax(0, 1fr) minmax(0, 1fr)",
+        # Sidebar (lab tiles) at 320 px gives the Recent Incidents
+        # blurb + Data Log Diff counters a little breathing room
+        # without robbing the operational columns. minmax(0, 1fr)
+        # on cols 2 and 3 stops nowrap content (KM log filenames,
+        # active-session names) from forcing those columns wider.
+        "gridTemplateColumns": "320px minmax(0, 1fr) minmax(0, 1fr)",
         "gap": "12px",
         "alignItems": "start",
         "marginBottom": "10px",
