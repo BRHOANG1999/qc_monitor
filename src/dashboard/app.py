@@ -2505,90 +2505,198 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         figure=thumb_fig, responsive=True,
         style={
             "marginTop": "4px",
-            "height": f"calc(100vh - 320px)",
+            # vh-based so a 1440p / 4K monitor gets a taller chart
+            # without code changes. minHeight keeps each channel
+            # row readable on a small laptop; maxHeight stops
+            # absurdly tall plots on a giant monitor.
+            "height": "62vh",
             "minHeight": f"{max(440, 110 * n_ch)}px",
-            "maxHeight": "1200px",
+            "maxHeight": "820px",
         },
     )]
+
+
+def _parse_end_datetime(s: str | None) -> datetime | None:
+    """Parse the sheet's End_DateTime column.
+
+    KMrecorder writes the row when the chunk finishes, so the
+    End_DateTime cell is the closest the sheet has to "row submitted
+    at." Values look like '6/1/2026 16:06:27' (no leading zeros) but
+    we accept the ISO form too in case the column gets normalised.
+    """
+    if not s:
+        return None
+    text = str(s).strip()
+    if not text:
+        return None
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace(" ", "T"))
+    except ValueError:
+        return None
 
 
 def _km_log_summary(config: dict | None) -> dict:
     """Most-recent KMrecorder data-log entries + freshness in minutes.
 
     Pulls from the same Google Sheet the data_log_xref tab uses, so
-    they share the existing API + TTL cache. KMrecorder writes a row
-    per file, so freshness ~ time since last chunk landed on any PC.
+    we share the existing TTL cache (no extra API quota cost). The
+    sheet has a Filename column (recording start, derived from the
+    .mat filename) and an End_DateTime column (when the chunk
+    finished -- KMrecorder submits the row at that point, so we
+    use it as "submitted at").
     """
     out = {
         "enabled": False, "rows": [], "latest_iso": None,
         "age_min": None,
+        "latest_submitted_iso": None,
+        "submitted_age_min": None,
     }
-    try:
-        from src.dashboard.tabs.data_log_xref import _sheet_records
-    except Exception:
-        return out
     cfg = (config or {}).get("data_log_xref", {}) or {}
     if not cfg.get("enabled", False):
         return out
+    try:
+        from src.dashboard.tabs.surgeries import (
+            _load_sheet_via_api, _resolve_sa_path, _find_column,
+            _normalize_text,
+        )
+        from src.dashboard.tabs.data_log_xref import _extract_key
+    except Exception:
+        return out
+    sheet_id = cfg.get("sheet_id", "")
+    tab_name = cfg.get("tab_name", "")
+    sa = _resolve_sa_path(config or {},
+                           cfg.get("service_account_file", ""))
+    if not (sheet_id and tab_name and sa):
+        return out
     ttl_sec = float(cfg.get("refresh_minutes", 15)) * 60.0
     try:
-        records, _total, _drop = _sheet_records(config or {}, ttl_sec)
+        df = _load_sheet_via_api(sheet_id, tab_name, sa, ttl_sec)
     except Exception as e:
         logger.debug("KM log fetch failed: %s", e)
         return out
+    if df is None or df.empty:
+        out["enabled"] = True
+        return out
+
+    filename_col = _find_column(df, ["Filename", "File", "Path"])
+    animal_col = _find_column(df, ["Animal_ID", "Animal"])
+    pc_col = _find_column(df, ["PC Name", "PC"])
+    end_dt_col = _find_column(df, ["End_DateTime", "EndDateTime",
+                                      "End"])
+    operator_col = _find_column(df, ["Operator"])
+    date_col = _find_column(df, ["Date"])
+    rec_end_col = _find_column(df, ["Recording_End", "RecordingEnd"])
+    if filename_col is None:
+        out["enabled"] = True
+        return out
+
+    def _resolve_submitted(row) -> datetime | None:
+        """Submission timestamp: prefer End_DateTime column; fall back
+        to Date + Recording_End when the recorder doesn't populate
+        End_DateTime (recent KMrecorder versions leave it blank)."""
+        if end_dt_col:
+            dt = _parse_end_datetime(row.get(end_dt_col))
+            if dt is not None:
+                return dt
+        if not (date_col and rec_end_col):
+            return None
+        date_s = _normalize_text(row.get(date_col))
+        end_s = _normalize_text(row.get(rec_end_col))
+        if not (date_s and end_s):
+            return None
+        # Date is "YYYY-MM-DD"; Recording_End is "HH:MM:SS".
+        try:
+            return datetime.strptime(f"{date_s} {end_s}",
+                                       "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+    # Build records keyed by recording-start (chunk filename key)
+    # so they sort chronologically lexicographically.
+    records: dict[str, dict] = {}
+    for _idx, row in df.iterrows():
+        key = _extract_key(row.get(filename_col))
+        if key is None:
+            continue
+        records[key] = {
+            "key": key,
+            "animal": (_normalize_text(row.get(animal_col))
+                        if animal_col else ""),
+            "pc": (_normalize_text(row.get(pc_col))
+                    if pc_col else ""),
+            "operator": (_normalize_text(row.get(operator_col))
+                          if operator_col else ""),
+            "submitted_dt": _resolve_submitted(row),
+        }
     if not records:
         out["enabled"] = True
         return out
 
-    # Keys sort lexicographically the same as chronologically because
-    # they're YYYY_MM_DD__HH_MM_SS. Take the last 5.
     sorted_keys = sorted(records.keys(), reverse=True)
     rows = [records[k] for k in sorted_keys[:5]]
     latest_key = sorted_keys[0]
     try:
-        latest_dt = datetime.strptime(latest_key, "%Y_%m_%d__%H_%M_%S")
+        latest_dt = datetime.strptime(latest_key, _CHUNK_DT_FMT)
         age_min = (datetime.now() - latest_dt).total_seconds() / 60.0
     except ValueError:
-        latest_dt = None
-        age_min = None
+        latest_dt, age_min = None, None
+    latest_sub_dt = records[latest_key].get("submitted_dt")
+    sub_age_min = ((datetime.now()
+                     - latest_sub_dt).total_seconds() / 60.0
+                    if latest_sub_dt else None)
     out.update({
         "enabled": True, "rows": rows,
         "latest_iso": latest_dt.isoformat() if latest_dt else None,
         "age_min": age_min,
+        "latest_submitted_iso": (latest_sub_dt.isoformat()
+                                    if latest_sub_dt else None),
+        "submitted_age_min": sub_age_min,
     })
     return out
 
 
+def _fmt_age(minutes: float | None) -> tuple[str, str]:
+    """(label, color) for an age in minutes. Green <90 min, orange
+    <24 h, red older. Used for both 'recorded' and 'submitted'."""
+    if minutes is None:
+        return "unknown", "#888"
+    if minutes < 90:
+        return f"{minutes:.0f} min ago", "#00CC96"
+    if minutes < 24 * 60:
+        return f"{minutes / 60:.1f} h ago", "#FFA15A"
+    return f"{minutes / (24 * 60):.1f} d ago", "#EF553B"
+
+
 def _build_km_log_section(config: dict | None) -> html.Div:
-    """KM Recorder freshness pill + last-5-entries strip. Inserted
-    between the status-card row and the queue block. Refreshes on
-    every refresh-trigger tick (sheet API is TTL-cached so cost is
-    negligible)."""
+    """KM Recorder freshness header + last-5-entries strip. Each row
+    shows the recording-start timestamp (from the filename) AND the
+    sheet's End_DateTime, which is when KMrecorder finished the chunk
+    and submitted the row -- the closest proxy this lab has for
+    'last contact' since the recorder is what writes to the sheet."""
     summary = _km_log_summary(config)
     if not summary["enabled"]:
         return html.Div()
 
-    age = summary["age_min"]
-    if age is None:
-        age_text = "unknown"
-        color = "#888"
-    elif age < 90:
-        age_text = f"{age:.0f} min ago"
-        color = "#00CC96"
-    elif age < 24 * 60:
-        age_text = f"{age / 60:.1f} h ago"
-        color = "#FFA15A"
-    else:
-        age_text = f"{age / (24 * 60):.1f} d ago"
-        color = "#EF553B"
+    rec_text, rec_color = _fmt_age(summary["age_min"])
+    sub_text, sub_color = _fmt_age(summary["submitted_age_min"])
 
     rows = summary["rows"]
     if rows:
         tail = []
         for r in rows:
             ts_str = r.get("key", "")[:16].replace("_", "/")
-            label = (f"{ts_str} · {r.get('animal') or '?'} "
-                     f"· {r.get('pc') or '?'}")
+            sub_dt = r.get("submitted_dt")
+            sub_str = (sub_dt.strftime("%m/%d %H:%M")
+                        if sub_dt else "?")
+            label = (
+                f"rec {ts_str}  ->  submitted {sub_str}  ·  "
+                f"{r.get('animal') or '?'}  ·  {r.get('pc') or '?'}"
+            )
             tail.append(html.Div(label, style={
                 "color": "#aaa", "fontSize": "11px",
                 "padding": "2px 0",
@@ -2605,8 +2713,12 @@ def _build_km_log_section(config: dict | None) -> html.Div:
                        style={"color": "#aaa", "fontSize": "12px",
                                "letterSpacing": "0.5px",
                                "marginRight": "12px"}),
-            html.Span(f"last entry {age_text}",
-                       style={"color": color, "fontSize": "13px",
+            html.Span(f"last recording {rec_text}",
+                       style={"color": rec_color, "fontSize": "12px",
+                               "fontWeight": "600",
+                               "marginRight": "12px"}),
+            html.Span(f"last submitted {sub_text}",
+                       style={"color": sub_color, "fontSize": "12px",
                                "fontWeight": "600"}),
         ], style={"marginBottom": "6px"}),
         html.Div(tail),
@@ -2637,18 +2749,19 @@ def _parse_chunk_dt(ts: str | None) -> datetime | None:
 
 def _recording_arrivals(store: Store, hours: int
                           ) -> list[tuple[str, float]]:
-    """(chunk_datetime, duration_sec) for every chunk whose coverage
-    might overlap the last *hours* window.
+    """Back-compat shim returning (chunk_datetime, duration_sec)."""
+    return [(ts, dur) for ts, dur, _sd, _sn
+            in _recording_arrivals_with_session(store, hours)]
 
-    Returns the START time of each chunk + its duration. Each chunk
-    covers ``[chunk_datetime, chunk_datetime + duration_sec]``; the
-    callers union those intervals to render "recorder was on" regions
-    accurately even when chunks are long (~60 min in this lab) and
-    only land once per hour.
+
+def _recording_arrivals_with_session(
+        store: Store, hours: int
+        ) -> list[tuple[str, float, str, str]]:
+    """(chunk_datetime, duration_sec, session_dir, session_name) for
+    every chunk whose coverage might overlap the last *hours* window.
 
     The cutoff is widened by 2h so a chunk that started just before
-    the window and runs INTO it still appears (max chunk duration
-    observed across this DB is ~1.4h).
+    the window and runs INTO it still appears.
     """
     assert hours > 0, "hours must be positive"
     cutoff_dt = datetime.now() - timedelta(hours=hours + 2)
@@ -2656,70 +2769,110 @@ def _recording_arrivals(store: Store, hours: int
     conn = store._connect()
     try:
         rows = conn.execute(
-            "SELECT chunk_datetime, duration_sec "
+            "SELECT chunk_datetime, duration_sec, session_dir, "
+            "       session_name "
             "FROM processed_files "
             "WHERE chunk_datetime >= ? ORDER BY chunk_datetime",
             (cutoff_str,),
         ).fetchall()
-        out: list[tuple[str, float]] = []
+        out: list[tuple[str, float, str, str]] = []
         for r in rows:
             ts = r["chunk_datetime"]
             if not ts:
                 continue
-            # Default to 3600s when duration is missing/zero -- in this
-            # lab chunks are 1h, and an unknown-duration chunk should
-            # still paint coverage rather than dropping out.
             dur = float(r["duration_sec"] or 0.0)
             if dur <= 0:
                 dur = 3600.0
-            out.append((ts, dur))
+            sd = str(r["session_dir"] or "")
+            sn = str(r["session_name"] or sd.rsplit("/", 1)[-1] or "?")
+            out.append((ts, dur, sd, sn))
         return out
     finally:
         conn.close()
 
 
+# Per-session color palette for the 24h band. Cycles when there are
+# more sessions than colors. Greens/blues/oranges/etc. are deliberate
+# -- the "no recording" gray (#2a2a40) stays clearly distinct.
+_SESSION_PALETTE = [
+    "#00CC96", "#636EFA", "#FFA15A", "#EF553B", "#AB63FA",
+    "#19D3F3", "#FF6692", "#FECB52", "#B6E880", "#7be3c0",
+]
+_NO_REC_COLOR = "#2a2a40"
+
+
+def _session_color_map(arrivals_with_session: list[tuple]
+                        ) -> dict[str, str]:
+    """Assign a stable color to each session_dir in arrival order.
+
+    The first session to appear gets the first palette color, etc.
+    Sessions beyond the palette wrap around -- the visual gives a hint
+    that a new session started, even if two distant ones reuse a color.
+    """
+    order: list[str] = []
+    seen: set[str] = set()
+    for _ts, _dur, sd, _sn in arrivals_with_session:
+        if sd and sd not in seen:
+            seen.add(sd)
+            order.append(sd)
+    return {sd: _SESSION_PALETTE[i % len(_SESSION_PALETTE)]
+            for i, sd in enumerate(order)}
+
+
 def _build_recording_24h_fig(
-        arrivals: list[tuple[str, float]]) -> go.Figure:
-    """24-hour recording-uptime band. 15-minute bins; bar green when
-    any chunk's [start, start+duration] interval overlaps the bin,
-    gray when nothing was recording. Compact (~50px tall)."""
+        arrivals_with_session: list[tuple[str, float, str, str]],
+        session_colors: dict[str, str] | None = None
+        ) -> go.Figure:
+    """24-hour recording-uptime band. 5-minute bins (288 across the
+    day) so short interruptions and quick session swaps are visible.
+    Color = the session whose chunk covers that bin; gray = no chunk
+    covered the bin. If a bin is covered by multiple sessions (rare
+    -- only at hand-off seams), the LATEST-starting chunk wins."""
     now = datetime.now()
-    bin_min = 15
-    n_bins = 24 * 60 // bin_min   # 96
+    bin_min = 5
+    n_bins = 24 * 60 // bin_min   # 288
     bin_starts = [now - timedelta(minutes=(n_bins - i) * bin_min)
                    for i in range(n_bins)]
     bin_ends = [b + timedelta(minutes=bin_min) for b in bin_starts]
-    on = [False] * n_bins
-    counts = [0] * n_bins
-    for ts, dur in arrivals:
+    sess_per_bin: list[str | None] = [None] * n_bins
+    # Latest chunk start wins on overlap, so iterate in original
+    # (ascending-by-start) order and overwrite.
+    cover_start: list[datetime | None] = [None] * n_bins
+    for ts, dur, sd, _sn in arrivals_with_session:
         dt = _parse_chunk_dt(ts)
-        if dt is None:
+        if dt is None or not sd:
             continue
         ch_end = dt + timedelta(seconds=dur)
-        # Skip chunks entirely outside the window.
         if ch_end <= bin_starts[0] or dt >= bin_ends[-1]:
             continue
-        # Locate first/last bin overlap (linear scan -- 96 bins, fine).
         for i in range(n_bins):
             if dt >= bin_ends[i]:
                 continue
             if ch_end <= bin_starts[i]:
                 break
-            on[i] = True
-            counts[i] += 1
+            if (cover_start[i] is None or dt >= cover_start[i]):
+                sess_per_bin[i] = sd
+                cover_start[i] = dt
+    colors = (session_colors
+               if session_colors is not None
+               else _session_color_map(arrivals_with_session))
+    sess_short = {sd: sn for ts, dur, sd, sn in arrivals_with_session
+                   if sd}
     x_labels = [b.strftime("%H:%M") for b in bin_starts]
-    colors = ["#00CC96" if v else "#2a2a40" for v in on]
+    bar_colors = [colors.get(s, _SESSION_PALETTE[0])
+                   if s else _NO_REC_COLOR
+                   for s in sess_per_bin]
+    hovertext = []
+    for b, s in zip(bin_starts, sess_per_bin):
+        if s:
+            label = sess_short.get(s, "?")[:48]
+            hovertext.append(f"{b.strftime('%a %H:%M')}: {label}")
+        else:
+            hovertext.append(f"{b.strftime('%a %H:%M')}: no recording")
     fig = go.Figure(go.Bar(
         x=x_labels, y=[1] * n_bins,
-        marker=dict(color=colors, line=dict(width=0)),
-        hovertext=[
-            f"{b.strftime('%a %H:%M')}: "
-            + ("recording" if v else "no recording")
-            + (f" (covered by {c} chunk{'s' if c != 1 else ''})"
-                if v else "")
-            for b, v, c in zip(bin_starts, on, counts)
-        ],
-        hoverinfo="text",
+        marker=dict(color=bar_colors, line=dict(width=0)),
+        hovertext=hovertext, hoverinfo="text",
     ))
     fig.update_layout(
         height=44, margin=dict(l=10, r=10, t=4, b=18),
@@ -2737,6 +2890,55 @@ def _build_recording_24h_fig(
                     zeroline=False, range=[0, 1]),
     )
     return fig
+
+
+def _build_recording_24h_legend(
+        arrivals_with_session: list[tuple[str, float, str, str]],
+        session_colors: dict[str, str]) -> html.Div:
+    """Horizontal swatch strip naming the colors used in the 24h band.
+
+    Always includes "no recording" + one swatch per session that
+    actually appears. Sessions are listed in arrival order; long
+    session names are truncated to 28 chars so the strip fits in
+    the queue block at narrow viewports.
+    """
+    seen: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for _ts, _dur, sd, sn in arrivals_with_session:
+        if sd and sd not in seen_keys:
+            seen_keys.add(sd)
+            seen.append((sd, sn))
+    swatches = [
+        html.Span([
+            html.Span(style={
+                "display": "inline-block",
+                "width": "10px", "height": "10px",
+                "background": _NO_REC_COLOR, "borderRadius": "2px",
+                "marginRight": "4px",
+                "verticalAlign": "middle",
+            }),
+            html.Span("no recording",
+                      style={"verticalAlign": "middle"}),
+        ], style={"marginRight": "12px"}),
+    ]
+    for sd, sn in seen:
+        color = session_colors.get(sd, _SESSION_PALETTE[0])
+        label = sn if len(sn) <= 28 else sn[:25] + "..."
+        swatches.append(html.Span([
+            html.Span(style={
+                "display": "inline-block",
+                "width": "10px", "height": "10px",
+                "background": color, "borderRadius": "2px",
+                "marginRight": "4px",
+                "verticalAlign": "middle",
+            }),
+            html.Span(label, style={"verticalAlign": "middle"}),
+        ], style={"marginRight": "12px"}))
+    return html.Div(swatches, style={
+        "fontSize": "10px", "color": "#aaa", "marginTop": "4px",
+        "display": "flex", "flexWrap": "wrap",
+        "rowGap": "4px",
+    })
 
 
 def _build_recording_7d_fig(
@@ -2908,17 +3110,21 @@ def _build_overview_queue(store: Store):
                   style={"color": "#888"}),
     ], style={"fontSize": "13px", "marginTop": "4px"})
 
-    # 24-hour recording-uptime band. chunk_datetime, not processed_at
-    # — gaps here mean recording was actually off, not that the QC
-    # dispatcher was caught up. Replaces the old processed-per-hour
-    # sparkline which always pinned to a single bin since processing
-    # finishes in minutes.
-    arrivals_24h = _recording_arrivals(store, hours=24)
+    # 24-hour recording-uptime band: chunk_datetime not processed_at;
+    # 5-min bins (288 across the day) so short interruptions and
+    # session-to-session hand-offs are visible. Each session paints a
+    # different color from the palette; gaps where no chunk's coverage
+    # interval touches stay gray.
+    arrivals_24h_full = _recording_arrivals_with_session(store, hours=24)
+    session_colors_24h = _session_color_map(arrivals_24h_full)
     rec_24h = dcc.Graph(
-        figure=_build_recording_24h_fig(arrivals_24h),
+        figure=_build_recording_24h_fig(arrivals_24h_full,
+                                          session_colors_24h),
         config={"displayModeBar": False},
         style={"marginTop": "4px"},
     )
+    rec_24h_legend = _build_recording_24h_legend(arrivals_24h_full,
+                                                   session_colors_24h)
     arrivals_7d = _recording_arrivals(store, hours=24 * 7)
     rec_7d = dcc.Graph(
         figure=_build_recording_7d_fig(arrivals_7d),
@@ -2937,6 +3143,7 @@ def _build_overview_queue(store: Store):
                           "marginTop": "8px",
                           "letterSpacing": "0.5px"}),
         rec_24h,
+        rec_24h_legend,
     ])
 
     recording_7d_section = html.Div([
@@ -2945,6 +3152,34 @@ def _build_overview_queue(store: Store):
                         "marginBottom": "4px", "fontSize": "14px",
                         "letterSpacing": "0.5px"}),
         rec_7d,
+        html.Div([
+            html.Span([
+                html.Span(style={
+                    "display": "inline-block",
+                    "width": "10px", "height": "10px",
+                    "background": _NO_REC_COLOR, "borderRadius": "2px",
+                    "marginRight": "4px",
+                    "verticalAlign": "middle",
+                }),
+                html.Span("no recording",
+                          style={"verticalAlign": "middle"}),
+            ], style={"marginRight": "12px"}),
+            html.Span([
+                html.Span(style={
+                    "display": "inline-block",
+                    "width": "10px", "height": "10px",
+                    "background":
+                        "linear-gradient(90deg, #1f5a44, #7be3c0)",
+                    "borderRadius": "2px", "marginRight": "4px",
+                    "verticalAlign": "middle",
+                }),
+                html.Span("recording (darker = partial hour, "
+                           "brighter = full hour)",
+                          style={"verticalAlign": "middle"}),
+            ]),
+        ], style={"fontSize": "10px", "color": "#aaa",
+                   "marginTop": "4px", "display": "flex",
+                   "flexWrap": "wrap", "rowGap": "4px"}),
     ])
 
     # ----- Active Session section ----- #
@@ -3074,7 +3309,10 @@ def _overview_tab(store: Store, config: dict | None = None):
                     "role": info["role"],
                 })
             channel_table = html.Div([
-                html.H4("Channel Map (Auto-Discovered)", style={"color": "#aaa", "marginTop": "16px"}),
+                html.H4("Channel Map (Auto-Discovered)",
+                         style={"color": "#aaa",
+                                 "marginTop": "16px",
+                                 "fontSize": "14px"}),
                 dash_table.DataTable(
                     data=ch_rows,
                     columns=[{"name": "Index", "id": "index"},
@@ -3089,20 +3327,23 @@ def _overview_tab(store: Store, config: dict | None = None):
                         {"if": {"filter_query": "{role} = reference"},
                          "color": ROLE_COLORS["reference"]},
                     ],
-                    page_size=32,
+                    page_size=8,
                 ),
-            ])
+            ], style={"maxHeight": "320px", "overflow": "hidden"})
         else:
             channel_table = html.Div()
     else:
         session_info = html.P("No sessions yet", style={"color": "#888"})
         channel_table = html.Div()
 
-    # Recent alerts
+    # Recent alerts -- capped + scrollable so it doesn't push the
+    # rest of the Overview off the viewport.
     if recent_alerts:
         alerts_section = html.Div([
-            html.H3(f"Recent Alerts ({len(recent_alerts)})",
-                     style={"color": "white", "marginTop": "24px"}),
+            html.H4(f"Recent Alerts ({len(recent_alerts)})",
+                     style={"color": "#aaa", "marginTop": "16px",
+                             "fontSize": "14px",
+                             "letterSpacing": "0.5px"}),
             dash_table.DataTable(
                 data=[{"time": a["sent_at"][:19], "severity": a["severity"],
                        "type": a["alert_type"], "message": a["message"][:120]}
@@ -3117,27 +3358,40 @@ def _overview_tab(store: Store, config: dict | None = None):
                     {"if": {"filter_query": "{severity} = info"},
                      "backgroundColor": "#112233", "color": "#6bb5ff"},
                 ],
-                page_size=10,
+                page_size=5,
             ),
-        ])
+        ], style={"maxHeight": "240px", "overflow": "hidden"})
     else:
         alerts_section = html.Div([
-            html.H3("Recent Alerts", style={"color": "white", "marginTop": "24px"}),
-            html.P("No alerts in the last 24 hours", style={"color": "#888"}),
+            html.H4("Recent Alerts",
+                     style={"color": "#aaa", "marginTop": "16px",
+                             "fontSize": "14px",
+                             "letterSpacing": "0.5px"}),
+            html.P("No alerts in the last 24 hours",
+                    style={"color": "#888", "fontSize": "11px"}),
         ])
 
     today = date.today()
     # Two-column responsive grid -- collapses to one column under ~880px.
-    # 440 px is wide enough that the maintenance status pills stay on
-    # one line and the data-log counter cards don't wrap awkwardly.
+    # The whole grid is wrapped in a fixed-height scroll container so
+    # the lab tiles don't push the rest of the Overview off-screen --
+    # the user can wheel inside the strip if they want to see more.
     home_grid = html.Div(
-        _build_home_grid_children(store, config, today),
-        id="overview-home-grid",
+        html.Div(
+            _build_home_grid_children(store, config, today),
+            id="overview-home-grid",
+            style={
+                "display": "grid",
+                "gridTemplateColumns":
+                    "repeat(auto-fit, minmax(440px, 1fr))",
+                "gap": "12px",
+            },
+        ),
         style={
-            "display": "grid",
-            "gridTemplateColumns": "repeat(auto-fit, minmax(440px, 1fr))",
-            "gap": "12px",
-            "marginTop": "16px",
+            "marginTop": "12px",
+            "maxHeight": "28vh",
+            "overflowY": "auto",
+            "paddingRight": "4px",
         },
     )
 
