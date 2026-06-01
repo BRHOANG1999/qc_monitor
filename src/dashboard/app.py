@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import statistics
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import numpy as np
 import yaml
@@ -598,6 +598,21 @@ def create_app(config: dict, store: Store) -> Dash:
             _build_overview_queue(store),
             _build_home_grid_children(store, config, _date.today()),
         )
+
+    # Thumbnail has its own callback because the radio adds an
+    # additional Input. Re-renders on either trigger; the figure
+    # is cheap enough (5 channels × 138 files in overlay) that we
+    # don't bother caching.
+    @app.callback(
+        Output("overview-thumbnail", "children"),
+        Input("overview-trace-mode", "value"),
+        Input("refresh-trigger", "data"),
+    )
+    def refresh_overview_thumbnail(trace_mode, _n):
+        sessions = store.get_sessions()
+        session_dir = sessions[0]["session_dir"] if sessions else ""
+        return _build_overview_thumbnail(
+            store, config, session_dir, trace_mode or "mean")
 
     @app.callback(
         Output("header-status-dot", "style"),
@@ -2293,46 +2308,396 @@ def _build_overview_cards(store: Store):
     ]
 
 
+def _yrange_pad(time_ms, trace, x0: float, x1: float,
+                  fill_frac: float = 0.8) -> tuple[float, float] | None:
+    """Y-axis range such that data within [x0, x1] spans *fill_frac*
+    of the plot's vertical extent (default 80%, i.e. 10% padding each
+    side). Returns None when there are fewer than 3 finite samples in
+    the window so the caller can fall back to Plotly's autorange.
+    """
+    if not time_ms or not trace or len(time_ms) != len(trace):
+        return None
+    vals = [v for t, v in zip(time_ms, trace)
+            if t is not None and v is not None
+            and x0 <= t <= x1 and isinstance(v, (int, float)) and v == v]
+    if len(vals) < 3:
+        return None
+    lo = min(vals)
+    hi = max(vals)
+    span = hi - lo
+    if span <= 0:
+        # Flat trace; give the axis a tiny window so the line draws.
+        eps = abs(hi) * 0.05 if hi != 0 else 1.0
+        return lo - eps, hi + eps
+    # We want data span = fill_frac * total span ⇒ total span =
+    # data_span / fill_frac. Pad = (total - data) / 2 on each side.
+    pad = span * (1.0 - fill_frac) / (2.0 * fill_frac)
+    return lo - pad, hi + pad
+
+
+def _build_overview_thumbnail(store: Store, config: dict | None,
+                                session_dir: str, trace_mode: str
+                                ) -> list:
+    """Return the children list for the Overview waveform-thumbnail
+    Div. *trace_mode* ∈ {"mean", "sem", "overlay"}.
+
+    Both left (stim ±1 ms) and right (analysis window) panels show the
+    LFP mean_trace -- the left panel is just a zoomed view around t=0,
+    not the stim copy channel. Y-axis on every panel scales so the
+    data spans 80% of the plot height.
+    """
+    if not session_dir:
+        return [html.Div()]
+    try:
+        waveforms = store.get_evoked_waveforms_for_session(session_dir)
+    except Exception as e:
+        logger.debug("Could not load waveform thumbnail: %s", e)
+        return [html.Div()]
+    if not waveforms:
+        return [html.Div()]
+
+    fa_cfg = (config or {}).get("feature_analysis", {}) or {}
+    evoked_x0 = float(fa_cfg.get("analysis_start_ms", 2.0))
+    evoked_x1 = float(fa_cfg.get("analysis_end_ms", 200.0))
+    stim_x0, stim_x1 = -1.0, 1.0
+
+    # Latest waveform per channel + the full per-channel history so
+    # overlay mode has something to draw under the mean.
+    latest_by_ch: dict[int, dict] = {}
+    history_by_ch: dict[int, list[dict]] = {}
+    latest_datetime = ""
+    for wf in waveforms:
+        ch = int(wf.get("channel", 0))
+        latest_by_ch[ch] = wf
+        history_by_ch.setdefault(ch, []).append(wf)
+        dt = wf.get("chunk_datetime", "") or ""
+        if dt > latest_datetime:
+            latest_datetime = dt
+    sorted_chs = sorted(latest_by_ch.keys())
+    n_ch = len(sorted_chs)
+    if n_ch == 0:
+        return [html.Div()]
+
+    colors_list = ["#636EFA", "#00CC96", "#FFA15A", "#EF553B", "#AB63FA"]
+    chan_label = {
+        ch: latest_by_ch[ch].get("channel_name", f"Ch{ch}")
+        for ch in sorted_chs
+    }
+    subplot_titles = []
+    for ch in sorted_chs:
+        nm = chan_label[ch]
+        subplot_titles.append(
+            f"Stim window {nm} ({stim_x0:g} to {stim_x1:g} ms)")
+        subplot_titles.append(
+            f"Evoked {nm} ({evoked_x0:g}–{evoked_x1:g} ms)")
+    thumb_fig = make_subplots(
+        rows=n_ch, cols=2, column_widths=[0.2, 0.8],
+        shared_xaxes=False, subplot_titles=subplot_titles,
+        vertical_spacing=0.08, horizontal_spacing=0.06,
+    )
+
+    def _hex_to_rgba(hex_str: str, alpha: float) -> str:
+        h = hex_str.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    for ri, ch in enumerate(sorted_chs, 1):
+        wf = latest_by_ch[ch]
+        nm = chan_label[ch]
+        n_ep = wf.get("n_epochs", 0)
+        time_ms = wf["time_axis_ms"]
+        mean_tr = wf["mean_trace"]
+        sem_tr = wf.get("sem_trace")
+        color = colors_list[(ri - 1) % len(colors_list)]
+        band_color = _hex_to_rgba(color, 0.18)
+        overlay_color = _hex_to_rgba(color, 0.12)
+
+        # Overlay mode: draw every file's mean_trace under this
+        # channel's latest mean. Cheap stylized backdrop, no legend.
+        if trace_mode == "overlay":
+            for prev in history_by_ch[ch]:
+                if prev is wf:
+                    continue
+                pt = prev.get("time_axis_ms")
+                pm = prev.get("mean_trace")
+                if not pt or not pm or len(pt) != len(pm):
+                    continue
+                # Left + right panels both get the overlay so the
+                # stim-window context matches the evoked window.
+                for col_idx in (1, 2):
+                    thumb_fig.add_trace(go.Scatter(
+                        x=pt, y=pm, mode="lines",
+                        line=dict(color=overlay_color, width=0.7),
+                        hoverinfo="skip", showlegend=False,
+                    ), row=ri, col=col_idx)
+
+        # SEM band: filled ribbon mean±sem, mean drawn on top.
+        if trace_mode == "sem" and sem_tr and len(sem_tr) == len(mean_tr):
+            upper = [m + s for m, s in zip(mean_tr, sem_tr)]
+            lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+            for col_idx in (1, 2):
+                thumb_fig.add_trace(go.Scatter(
+                    x=time_ms, y=upper, mode="lines",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    hoverinfo="skip", showlegend=False,
+                ), row=ri, col=col_idx)
+                thumb_fig.add_trace(go.Scatter(
+                    x=time_ms, y=lower, mode="lines",
+                    fill="tonexty", fillcolor=band_color,
+                    line=dict(color="rgba(0,0,0,0)"),
+                    hoverinfo="skip", showlegend=False,
+                ), row=ri, col=col_idx)
+
+        # Left panel: LFP mean, zoomed to ±1 ms around stim.
+        thumb_fig.add_trace(go.Scatter(
+            x=time_ms, y=mean_tr, mode="lines",
+            name=f"{nm} stim",
+            line=dict(color=color, width=1.5),
+            showlegend=False,
+        ), row=ri, col=1)
+        thumb_fig.add_vline(
+            x=0, line=dict(color="white", width=0.5, dash="dash"),
+            row=ri, col=1)
+        thumb_fig.update_xaxes(range=[stim_x0, stim_x1], row=ri, col=1)
+        thumb_fig.update_yaxes(title_text=nm, title_font_size=10,
+                                row=ri, col=1)
+        y_left = _yrange_pad(time_ms, mean_tr, stim_x0, stim_x1)
+        if y_left is not None:
+            thumb_fig.update_yaxes(range=list(y_left), row=ri, col=1)
+
+        # Right panel: LFP mean, evoked window.
+        thumb_fig.add_trace(go.Scatter(
+            x=time_ms, y=mean_tr, mode="lines",
+            name=f"{nm} (n={n_ep})",
+            line=dict(color=color, width=1.5),
+        ), row=ri, col=2)
+        thumb_fig.update_xaxes(range=[evoked_x0, evoked_x1],
+                                row=ri, col=2)
+        y_right = _yrange_pad(time_ms, mean_tr, evoked_x0, evoked_x1)
+        if y_right is not None:
+            thumb_fig.update_yaxes(range=list(y_right), row=ri, col=2)
+
+    thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
+    thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=2)
+    mode_label = {"mean": "mean",
+                   "sem": "mean ± SEM",
+                   "overlay": "mean + per-file overlay"}.get(
+        trace_mode, "mean")
+    thumb_fig.update_layout(
+        title=f"Latest Evoked — {latest_datetime[:16]}  ({mode_label})",
+        height=180 * n_ch, margin=dict(l=60, r=20, t=50, b=30),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                     xanchor="right", x=1, font_size=10),
+    )
+    return [dcc.Graph(figure=thumb_fig, style={"marginTop": "8px"})]
+
+
+def _overview_today_stats(store: Store, session_dir: str) -> dict:
+    """One-shot snapshot for the Overview Today block.
+
+    Today is wall-clock local; pending count is total (not today-only).
+    """
+    today = date.today()
+    start = datetime.combine(today, datetime.min.time()).isoformat()
+    end = datetime.combine(today, datetime.max.time()).isoformat()
+    last_24h = (datetime.now() - timedelta(hours=24)).isoformat()
+    last_1h = (datetime.now() - timedelta(hours=1)).isoformat()
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN status='done'  THEN 1 ELSE 0 END) AS done,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors
+               FROM processed_files
+               WHERE processed_at BETWEEN ? AND ?""",
+            (start, end),
+        ).fetchone()
+        done_today = int((row["done"] if row and row["done"] else 0) or 0)
+        errs_today = int((row["errors"] if row and row["errors"] else 0) or 0)
+
+        prow = conn.execute(
+            "SELECT COUNT(*) AS n, MIN(chunk_datetime) AS oldest "
+            "FROM processed_files WHERE status='pending'"
+        ).fetchone()
+        pending = int(prow["n"] or 0) if prow else 0
+        oldest_pending_iso = (prow["oldest"] if prow else None)
+
+        # 24h hourly throughput.
+        hourly_rows = conn.execute(
+            """SELECT strftime('%Y-%m-%d %H', processed_at) AS bucket,
+                      COUNT(*) AS n
+               FROM processed_files
+               WHERE status='done' AND processed_at >= ?
+               GROUP BY bucket
+               ORDER BY bucket""",
+            (last_24h,),
+        ).fetchall()
+
+        # Active-session "this hour" count.
+        sess_hour = 0
+        if session_dir:
+            srow = conn.execute(
+                "SELECT COUNT(*) AS n FROM processed_files "
+                "WHERE session_dir = ? AND status='done' "
+                "AND processed_at >= ?",
+                (session_dir, last_1h),
+            ).fetchone()
+            sess_hour = int(srow["n"] or 0) if srow else 0
+    finally:
+        conn.close()
+
+    # Oldest-pending age in minutes (or None when nothing pending).
+    oldest_age_min: float | None = None
+    if oldest_pending_iso:
+        try:
+            oldest_dt = datetime.fromisoformat(oldest_pending_iso)
+            oldest_age_min = (datetime.now() - oldest_dt).total_seconds() / 60.0
+        except ValueError:
+            oldest_age_min = None
+
+    return {
+        "done_today": done_today,
+        "errors_today": errs_today,
+        "pending": pending,
+        "oldest_pending_age_min": oldest_age_min,
+        "hourly_done_24h": [dict(r) for r in hourly_rows],
+        "session_hour_done": sess_hour,
+    }
+
+
 def _build_overview_queue(store: Store):
-    """Inner content (children list) for the processing-queue block."""
+    """Stacked Today + Active Session block.
+
+    The old "lifetime queue progress" bar always pinned at 100% once
+    the backlog finished, so it was useless for spotting current
+    problems. This replaces it with today-only counters + a 24h
+    hourly throughput sparkline + an active-session progress strip.
+    """
     sessions = store.get_sessions()
-    total_files = sum(s.get("num_files", 0) for s in sessions)
-    total_done = sum(s.get("processed", 0) for s in sessions)
-    total_errors = sum(s.get("errors", 0) for s in sessions)
-    total_pending = total_files - total_done - total_errors
-    pct_done = (100 * total_done / total_files) if total_files > 0 else 0
-    return [
-        html.H4("Processing Queue", style={
-            "color": "#aaa", "marginTop": "16px", "marginBottom": "8px",
-            "fontSize": "14px", "letterSpacing": "0.5px",
-        }),
-        html.Div([
+    active = sessions[0] if sessions else {}
+    session_dir = active.get("session_dir", "")
+    stats = _overview_today_stats(store, session_dir)
+
+    # ----- Today section ----- #
+    pending = stats["pending"]
+    oldest_min = stats["oldest_pending_age_min"]
+    if oldest_min is None:
+        oldest_str = "—"
+    elif oldest_min < 60:
+        oldest_str = f"{oldest_min:.0f} min"
+    else:
+        oldest_str = f"{oldest_min / 60:.1f} h"
+
+    today_counters = html.Div([
+        html.Span(f"{stats['done_today']} done today",
+                  style={"color": "#00CC96", "marginRight": "16px",
+                          "fontWeight": "600"}),
+        html.Span(f"{stats['errors_today']} errors",
+                  style={"color": "#EF553B" if stats["errors_today"]
+                          else "#888", "marginRight": "16px"}),
+        html.Span(f"{pending} pending",
+                  style={"color": "#FFA15A" if pending else "#888",
+                          "marginRight": "16px"}),
+        html.Span(f"oldest pending: {oldest_str}",
+                  style={"color": "#888"}),
+    ], style={"fontSize": "13px", "marginTop": "4px"})
+
+    # 24h hourly sparkline. Buckets without files are zero so the
+    # eye can see the gap as quickly as the bursts.
+    hourly = {r["bucket"]: r["n"]
+              for r in stats["hourly_done_24h"]}
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    buckets = [(now - timedelta(hours=h)) for h in range(23, -1, -1)]
+    bucket_keys = [b.strftime("%Y-%m-%d %H") for b in buckets]
+    spark_y = [int(hourly.get(k, 0)) for k in bucket_keys]
+    spark_x = [b.strftime("%H:00") for b in buckets]
+    spark_fig = go.Figure(go.Bar(
+        x=spark_x, y=spark_y,
+        marker=dict(color="#636EFA"),
+        hovertemplate="%{x} — %{y} files<extra></extra>",
+    ))
+    spark_fig.update_layout(
+        height=80, margin=dict(l=10, r=10, t=4, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=dict(showgrid=False, tickfont=dict(size=9, color="#888"),
+                   tickmode="array",
+                   tickvals=[spark_x[0], spark_x[len(spark_x) // 2],
+                              spark_x[-1]],
+                   ticktext=["24h ago", "12h ago", "now"]),
+        yaxis=dict(showgrid=False, tickfont=dict(size=9, color="#888"),
+                   zeroline=False),
+    )
+    spark = dcc.Graph(figure=spark_fig, config={"displayModeBar": False},
+                       style={"marginTop": "4px"})
+
+    today_section = html.Div([
+        html.H4("Today",
+                style={"color": "#aaa", "marginTop": "0px",
+                        "marginBottom": "4px", "fontSize": "14px",
+                        "letterSpacing": "0.5px"}),
+        today_counters,
+        spark,
+    ])
+
+    # ----- Active Session section ----- #
+    if active:
+        num = int(active.get("num_files", 0) or 0)
+        done = int(active.get("processed", 0) or 0)
+        errs = int(active.get("errors", 0) or 0)
+        pct = (100.0 * done / num) if num > 0 else 0.0
+        bar = html.Div([
             html.Div(
-                f"{pct_done:.0f}%" if pct_done > 5 else "",
+                f"{pct:.0f}%" if pct > 5 else "",
                 style={
-                    "width": f"{max(pct_done, 1):.1f}%",
-                    "background": "linear-gradient(90deg, #00CC96 0%, #00AA80 100%)",
-                    "height": "28px", "borderRadius": "6px",
-                    "transition": "width 0.8s cubic-bezier(0.4, 0, 0.2, 1)",
+                    "width": f"{max(pct, 1):.1f}%",
+                    "background":
+                        "linear-gradient(90deg, #00CC96 0%, #00AA80 100%)",
+                    "height": "22px", "borderRadius": "5px",
+                    "transition":
+                        "width 0.8s cubic-bezier(0.4, 0, 0.2, 1)",
                     "display": "flex", "alignItems": "center",
                     "justifyContent": "center",
-                    "fontSize": "11px", "fontWeight": "bold", "color": "white",
+                    "fontSize": "11px", "fontWeight": "bold",
+                    "color": "white",
                     "textShadow": "0 1px 2px rgba(0,0,0,0.5)",
                 }),
-        ], style={"backgroundColor": "#1a1a2e", "borderRadius": "6px",
-                  "overflow": "hidden", "marginBottom": "8px",
-                  "boxShadow": "inset 0 1px 4px rgba(0,0,0,0.4)"}),
-        html.Div([
-            html.Span(f"{total_done} done",
-                      style={"color": "#00CC96", "marginRight": "16px"}),
-            html.Span(f"{total_pending} queued",
-                      style={"color": "#FFA15A", "marginRight": "16px"}),
-            html.Span(f"{total_errors} errors",
-                      style={"color": "#EF553B", "marginRight": "16px"}),
-            html.Span(f"{total_files} total detected",
-                      style={"color": "#666"}),
-        ], style={"fontSize": "13px"}),
-    ]
+        ], style={"backgroundColor": "#1a1a2e", "borderRadius": "5px",
+                   "overflow": "hidden", "marginTop": "4px",
+                   "marginBottom": "6px",
+                   "boxShadow": "inset 0 1px 4px rgba(0,0,0,0.4)"})
+        active_counters = html.Div([
+            html.Span(active.get("session_name", "(none)"),
+                      style={"color": "white", "fontWeight": "600",
+                              "marginRight": "12px"}),
+            html.Span(f"{done} / {num} files",
+                      style={"color": "#aaa", "marginRight": "12px"}),
+            html.Span(f"{errs} errors",
+                      style={"color": "#EF553B" if errs else "#888",
+                              "marginRight": "12px"}),
+            html.Span(f"+{stats['session_hour_done']} in last hour",
+                      style={"color": "#888"}),
+        ], style={"fontSize": "12px"})
+        active_section = html.Div([
+            html.H4("Active Session",
+                    style={"color": "#aaa", "marginTop": "16px",
+                            "marginBottom": "4px", "fontSize": "14px",
+                            "letterSpacing": "0.5px"}),
+            bar, active_counters,
+        ])
+    else:
+        active_section = html.Div([
+            html.H4("Active Session",
+                    style={"color": "#aaa", "marginTop": "16px",
+                            "fontSize": "14px",
+                            "letterSpacing": "0.5px"}),
+            html.Div("No sessions yet",
+                     style={"color": "#888", "fontSize": "12px"}),
+        ])
+
+    return [today_section, active_section]
 
 
 def _overview_tab(store: Store, config: dict | None = None):
@@ -2354,138 +2719,41 @@ def _overview_tab(store: Store, config: dict | None = None):
         id="overview-queue", style=SECTION_STYLE,
     )
 
-    # Evoked waveform thumbnail — latest file, all channels, split
-    # into stim window (-1 to +1 ms, left) and evoked window
-    # (analysis_start_ms to analysis_end_ms, right).
-    waveform_thumbnail = html.Div()
-    if session_dir:
-        try:
-            waveforms = store.get_evoked_waveforms_for_session(session_dir)
-            if waveforms:
-                fa_cfg = (config or {}).get("feature_analysis", {}) or {}
-                evoked_x0 = float(fa_cfg.get("analysis_start_ms", 2.0))
-                evoked_x1 = float(fa_cfg.get("analysis_end_ms", 200.0))
-                stim_x0, stim_x1 = -1.0, 1.0
+    # Evoked thumbnail: radio-selected trace mode +
+    # callback-rendered figure. The mode and figure persist across
+    # refresh ticks because the radio lives outside the container Div
+    # that gets re-children'd by refresh_overview_thumbnail.
+    trace_mode_radio = html.Div([
+        html.Span("Trace mode: ",
+                  style={"color": "#888", "fontSize": "12px",
+                          "marginRight": "10px"}),
+        dcc.RadioItems(
+            id="overview-trace-mode",
+            options=[
+                {"label": " Mean", "value": "mean"},
+                {"label": " Mean ± SEM", "value": "sem"},
+                {"label": " Overlay all files", "value": "overlay"},
+            ],
+            value="mean",
+            inline=True,
+            labelStyle={"color": "#ddd", "fontSize": "12px",
+                         "marginRight": "16px"},
+            inputStyle={"marginRight": "4px"},
+        ),
+    ], style={"marginTop": "16px", "marginBottom": "4px"})
+    waveform_thumbnail = html.Div([
+        trace_mode_radio,
+        html.Div(
+            _build_overview_thumbnail(store, config, session_dir, "mean"),
+            id="overview-thumbnail",
+        ),
+    ])
 
-                latest_by_ch = {}
-                latest_datetime = ""
-                for wf in waveforms:
-                    ch = wf.get("channel", 0)
-                    latest_by_ch[ch] = wf
-                    dt = wf.get("chunk_datetime", "")
-                    if dt > latest_datetime:
-                        latest_datetime = dt
-
-                sorted_chs = sorted(latest_by_ch.keys())
-                n_ch = len(sorted_chs)
-                if n_ch > 0:
-                    colors_list = ["#636EFA", "#00CC96", "#FFA15A",
-                                    "#EF553B", "#AB63FA"]
-                    chan_label = {
-                        ch: latest_by_ch[ch].get("channel_name",
-                                                  f"Ch{ch}")
-                        for ch in sorted_chs
-                    }
-                    subplot_titles = []
-                    for ch in sorted_chs:
-                        nm = chan_label[ch]
-                        subplot_titles.append(
-                            f"Stim {nm} ({stim_x0:g} to {stim_x1:g} ms)")
-                        subplot_titles.append(
-                            f"Evoked {nm} ({evoked_x0:g}–{evoked_x1:g} ms)")
-                    thumb_fig = make_subplots(
-                        rows=n_ch, cols=2,
-                        column_widths=[0.2, 0.8],
-                        shared_xaxes=False,
-                        subplot_titles=subplot_titles,
-                        vertical_spacing=0.08, horizontal_spacing=0.06,
-                    )
-                    for ri, ch in enumerate(sorted_chs, 1):
-                        wf = latest_by_ch[ch]
-                        nm = chan_label[ch]
-                        n_ep = wf.get("n_epochs", 0)
-                        time_ms = wf["time_axis_ms"]
-                        mean_tr = wf["mean_trace"]
-                        stim_tr = wf.get("stim_mean_trace")
-                        color = colors_list[ri % len(colors_list)]
-
-                        # Left: stim window (-1 to +1 ms). Prefer
-                        # stored stim_mean_trace; fall back to the LFP
-                        # mean clipped by axis range if absent.
-                        stim_y = (stim_tr
-                                  if (stim_tr
-                                      and len(stim_tr) == len(time_ms))
-                                  else mean_tr)
-                        thumb_fig.add_trace(go.Scatter(
-                            x=time_ms, y=stim_y, mode="lines",
-                            name=f"{nm} stim",
-                            line=dict(color="#888", width=1.2),
-                            showlegend=False,
-                        ), row=ri, col=1)
-                        thumb_fig.add_vline(
-                            x=0, line=dict(color="white", width=0.5,
-                                            dash="dash"),
-                            row=ri, col=1)
-                        thumb_fig.update_xaxes(
-                            range=[stim_x0, stim_x1], row=ri, col=1)
-                        thumb_fig.update_yaxes(
-                            title_text=nm, title_font_size=10,
-                            row=ri, col=1)
-
-                        # Right: evoked window (2 to 200 ms by default)
-                        thumb_fig.add_trace(go.Scatter(
-                            x=time_ms, y=mean_tr, mode="lines",
-                            name=f"{nm} (n={n_ep})",
-                            line=dict(color=color, width=1.5),
-                        ), row=ri, col=2)
-                        thumb_fig.update_xaxes(
-                            range=[evoked_x0, evoked_x1],
-                            row=ri, col=2)
-
-                    thumb_fig.update_xaxes(
-                        title_text="Time (ms)", row=n_ch, col=1)
-                    thumb_fig.update_xaxes(
-                        title_text="Time (ms)", row=n_ch, col=2)
-                    thumb_fig.update_layout(
-                        title=f"Latest Evoked — {latest_datetime[:16]}",
-                        height=180 * n_ch,
-                        margin=dict(l=60, r=20, t=50, b=30),
-                        showlegend=True,
-                        legend=dict(orientation="h", yanchor="bottom",
-                                     y=1.02, xanchor="right", x=1,
-                                     font_size=10),
-                    )
-                    waveform_thumbnail = html.Div([
-                        dcc.Graph(figure=thumb_fig,
-                                  style={"marginTop": "16px"}),
-                    ])
-        except Exception as e:
-            logger.debug("Could not load waveform thumbnail: %s", e)
-
-    # Active session info
+    # Active session basics (session name / file counts / errors) now
+    # live in the queue block's Active Session section, so just emit
+    # an empty placeholder here to keep the channel-map branch below.
+    session_info = html.Div()
     if active_session:
-        session_info = html.Div([
-            html.H3("Active Session", style={"color": "white", "marginTop": "24px"}),
-            html.Div([
-                html.Div([
-                    html.Span("Session: ", style={"color": "#888"}),
-                    html.Span(active_session.get("session_name", "N/A"),
-                              style={"color": "white", "fontWeight": "bold"}),
-                ]),
-                html.Div([
-                    html.Span("Files: ", style={"color": "#888"}),
-                    html.Span(f"{active_session.get('processed', 0)} / {active_session.get('num_files', 0)} processed",
-                              style={"color": "white"}),
-                ]),
-                html.Div([
-                    html.Span("Errors: ", style={"color": "#888"}),
-                    html.Span(str(active_session.get("errors", 0)),
-                              style={"color": "#EF553B" if active_session.get("errors", 0) > 0 else "#00CC96"}),
-                ]),
-            ], style={"backgroundColor": "#1e1e2f", "padding": "12px 16px",
-                      "borderRadius": "8px", "border": "1px solid #333", "marginTop": "8px"}),
-        ])
-
         if ch_map:
             ch_rows = []
             for idx in sorted(ch_map.keys()):
