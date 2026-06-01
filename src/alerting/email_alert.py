@@ -44,8 +44,17 @@ class EmailAlerter:
                 path = os.path.normpath(os.path.join(project_root, path))
             try:
                 if os.path.isfile(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        pw = f.read().strip()
+                    # utf-8-sig auto-strips the BOM that PowerShell's
+                    # `Set-Content -Encoding utf8` prepends -- otherwise
+                    # the BOM lands in the password string and SMTP's
+                    # ASCII auth fails with
+                    # "'ascii' codec can't encode character '\\ufeff'".
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        raw = f.read()
+                    # Strip ALL whitespace (incl. internal spaces).
+                    # Gmail App Passwords are typically shown as four
+                    # space-separated groups; both forms authenticate.
+                    pw = "".join(raw.split())
                     if pw:
                         return pw
             except OSError as e:
