@@ -747,6 +747,29 @@ class Store:
         finally:
             conn.close()
 
+    def get_recent_video_qc(self, hours: int = 24) -> list[dict]:
+        """Return video_qc rows analyzed within the last *hours* hours.
+
+        Used by the Overview compact status card and the weekly video
+        QC digest. Newest first.
+        """
+        assert hours > 0, "hours must be positive"
+        conn = self._connect()
+        try:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            rows = conn.execute(
+                """SELECT id, file_id, video_path, analyzed_at, status,
+                          pct_bad, n_dark, n_bright, n_low_var, n_bad,
+                          first_bad_reason
+                   FROM video_qc
+                   WHERE analyzed_at > ?
+                   ORDER BY analyzed_at DESC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------ #
     #  matlab_results
     # ------------------------------------------------------------------ #
@@ -937,7 +960,7 @@ class Store:
                           SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as errors
                    FROM processed_files
                    GROUP BY session_dir
-                   ORDER BY first_chunk DESC"""
+                   ORDER BY last_chunk DESC"""
             ).fetchall()
             return [dict(r) for r in rows]
         finally:

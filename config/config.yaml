@@ -224,6 +224,44 @@ data_log_xref:
   sheet_id: "1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0"
   tab_name: "Sessions"
 
+notifications:
+  # Unified state file for all recurring digests + the queue-stuck
+  # flag. Migrates the legacy data/surgery_digest_state.json on first
+  # boot so an upgrade doesn't double-send the morning digest.
+  state_file: data/notification_state.json
+  eod_digest:
+    # End-of-day QC summary: files processed today, error count, the
+    # worst-3 chunks by artifact_pct and line_noise_ratio, per-session
+    # done/error split. Fires once per day at/after `hour`.
+    enabled: true
+    hour: 18                    # 24h local clock
+    # recipients: []            # defaults to alerting.smtp.recipients
+  video_weekly:
+    # Rolling 7-day video QC roll-up (ok/warning/critical counts +
+    # top-5 worst by pct_bad). Fires once on `weekday` at/after `hour`.
+    enabled: true
+    weekday: 0                  # 0=Monday ... 6=Sunday
+    hour: 8
+    # recipients: []
+  evoked_weekly:
+    # Weekly evoked-response drift per session + channel (median
+    # peak-to-trough this week vs last week). Flags channels whose
+    # magnitude shifted by >= drift_threshold_pct%.
+    enabled: true
+    weekday: 6                  # 6=Sunday
+    hour: 8
+    drift_threshold_pct: 30.0
+    # recipients: []
+  queue_watch:
+    # Edge-triggered alarm: when no files have moved to 'done' for
+    # `stall_minutes` AND pending count >= `min_pending`, send one
+    # warning. Recovery sends one "clear". Quiet overnight (the
+    # min_pending floor avoids false-alarms on an empty queue).
+    enabled: true
+    min_pending: 100
+    stall_minutes: 60
+    # recipients: []
+
 surgery_digest:
   # Once-a-day email + SMS summary of the same view the Surgeries tab
   # renders -- today's pre-op / surgery / post-op tasks plus a 7-day

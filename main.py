@@ -118,7 +118,7 @@ def main():
 
     emailer = EmailAlerter(config)
     alert_engine = AlertRuleEngine(store, emailer, config)
-    digest_scheduler = DigestScheduler(config, emailer)
+    digest_scheduler = DigestScheduler(config, emailer, store=store)
 
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds

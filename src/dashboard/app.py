@@ -2262,6 +2262,23 @@ def _build_overview_cards(store: Store):
     mem = latest.get("memory_pct", 0)
     disk = latest.get("disk_free_gb", 0)
     fph = latest.get("files_processed_last_hour", 0)
+    # Video QC: 24-hour status mix. Color reflects worst severity in
+    # the window (critical > warning > ok). Empty window stays gray.
+    try:
+        videos = store.get_recent_video_qc(hours=24)
+    except Exception:
+        videos = []
+    n_ok = sum(1 for v in videos if v.get("status") == "ok")
+    n_warn = sum(1 for v in videos if v.get("status") == "warning")
+    n_crit = sum(1 for v in videos if v.get("status") == "critical")
+    if videos:
+        vid_label = f"{n_ok}/{n_warn}/{n_crit}"
+    else:
+        vid_label = "—"
+    vid_color = ("#EF553B" if n_crit
+                  else "#FFA15A" if n_warn
+                  else "#00CC96" if n_ok
+                  else "#666")
     return [
         _status_card("Network", "OK" if net_ok else "DOWN",
                      "#00CC96" if net_ok else "#EF553B"),
@@ -2272,6 +2289,7 @@ def _build_overview_cards(store: Store):
         _status_card("Disk Free", f"{disk:.1f} GB",
                      "#00CC96" if disk > 50 else "#EF553B"),
         _status_card("Files/Hour", str(fph), "#636EFA"),
+        _status_card("Videos (24h)", vid_label, vid_color),
     ]
 
 
@@ -2336,13 +2354,19 @@ def _overview_tab(store: Store, config: dict | None = None):
         id="overview-queue", style=SECTION_STYLE,
     )
 
-    # Evoked waveform thumbnail — show latest file, ALL channels
+    # Evoked waveform thumbnail — latest file, all channels, split
+    # into stim window (-1 to +1 ms, left) and evoked window
+    # (analysis_start_ms to analysis_end_ms, right).
     waveform_thumbnail = html.Div()
     if session_dir:
         try:
             waveforms = store.get_evoked_waveforms_for_session(session_dir)
             if waveforms:
-                # Group by channel, take latest per channel
+                fa_cfg = (config or {}).get("feature_analysis", {}) or {}
+                evoked_x0 = float(fa_cfg.get("analysis_start_ms", 2.0))
+                evoked_x1 = float(fa_cfg.get("analysis_end_ms", 200.0))
+                stim_x0, stim_x1 = -1.0, 1.0
+
                 latest_by_ch = {}
                 latest_datetime = ""
                 for wf in waveforms:
@@ -2355,38 +2379,85 @@ def _overview_tab(store: Store, config: dict | None = None):
                 sorted_chs = sorted(latest_by_ch.keys())
                 n_ch = len(sorted_chs)
                 if n_ch > 0:
-                    colors_list = ["#636EFA", "#00CC96", "#FFA15A", "#EF553B", "#AB63FA"]
+                    colors_list = ["#636EFA", "#00CC96", "#FFA15A",
+                                    "#EF553B", "#AB63FA"]
+                    chan_label = {
+                        ch: latest_by_ch[ch].get("channel_name",
+                                                  f"Ch{ch}")
+                        for ch in sorted_chs
+                    }
+                    subplot_titles = []
+                    for ch in sorted_chs:
+                        nm = chan_label[ch]
+                        subplot_titles.append(
+                            f"Stim {nm} ({stim_x0:g} to {stim_x1:g} ms)")
+                        subplot_titles.append(
+                            f"Evoked {nm} ({evoked_x0:g}–{evoked_x1:g} ms)")
                     thumb_fig = make_subplots(
-                        rows=n_ch, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.06,
+                        rows=n_ch, cols=2,
+                        column_widths=[0.2, 0.8],
+                        shared_xaxes=False,
+                        subplot_titles=subplot_titles,
+                        vertical_spacing=0.08, horizontal_spacing=0.06,
                     )
                     for ri, ch in enumerate(sorted_chs, 1):
                         wf = latest_by_ch[ch]
-                        ch_name = wf.get("channel_name", f"Ch{ch}")
+                        nm = chan_label[ch]
                         n_ep = wf.get("n_epochs", 0)
                         time_ms = wf["time_axis_ms"]
                         mean_tr = wf["mean_trace"]
+                        stim_tr = wf.get("stim_mean_trace")
                         color = colors_list[ri % len(colors_list)]
 
+                        # Left: stim window (-1 to +1 ms). Prefer
+                        # stored stim_mean_trace; fall back to the LFP
+                        # mean clipped by axis range if absent.
+                        stim_y = (stim_tr
+                                  if (stim_tr
+                                      and len(stim_tr) == len(time_ms))
+                                  else mean_tr)
+                        thumb_fig.add_trace(go.Scatter(
+                            x=time_ms, y=stim_y, mode="lines",
+                            name=f"{nm} stim",
+                            line=dict(color="#888", width=1.2),
+                            showlegend=False,
+                        ), row=ri, col=1)
+                        thumb_fig.add_vline(
+                            x=0, line=dict(color="white", width=0.5,
+                                            dash="dash"),
+                            row=ri, col=1)
+                        thumb_fig.update_xaxes(
+                            range=[stim_x0, stim_x1], row=ri, col=1)
+                        thumb_fig.update_yaxes(
+                            title_text=nm, title_font_size=10,
+                            row=ri, col=1)
+
+                        # Right: evoked window (2 to 200 ms by default)
                         thumb_fig.add_trace(go.Scatter(
                             x=time_ms, y=mean_tr, mode="lines",
-                            name=f"{ch_name} (n={n_ep})",
+                            name=f"{nm} (n={n_ep})",
                             line=dict(color=color, width=1.5),
-                        ), row=ri, col=1)
-                        thumb_fig.add_vline(x=0, line=dict(color="white", width=0.5, dash="dash"),
-                                            row=ri, col=1)
-                        thumb_fig.update_yaxes(title_text=ch_name, title_font_size=10, row=ri, col=1)
+                        ), row=ri, col=2)
+                        thumb_fig.update_xaxes(
+                            range=[evoked_x0, evoked_x1],
+                            row=ri, col=2)
 
-                    thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
+                    thumb_fig.update_xaxes(
+                        title_text="Time (ms)", row=n_ch, col=1)
+                    thumb_fig.update_xaxes(
+                        title_text="Time (ms)", row=n_ch, col=2)
                     thumb_fig.update_layout(
                         title=f"Latest Evoked — {latest_datetime[:16]}",
-                        height=180 * n_ch, margin=dict(l=60, r=20, t=40, b=30),
+                        height=180 * n_ch,
+                        margin=dict(l=60, r=20, t=50, b=30),
                         showlegend=True,
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                                    xanchor="right", x=1, font_size=10),
+                        legend=dict(orientation="h", yanchor="bottom",
+                                     y=1.02, xanchor="right", x=1,
+                                     font_size=10),
                     )
                     waveform_thumbnail = html.Div([
-                        dcc.Graph(figure=thumb_fig, style={"marginTop": "16px"}),
+                        dcc.Graph(figure=thumb_fig,
+                                  style={"marginTop": "16px"}),
                     ])
         except Exception as e:
             logger.debug("Could not load waveform thumbnail: %s", e)
