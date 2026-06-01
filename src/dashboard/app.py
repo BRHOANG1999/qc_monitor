@@ -3478,15 +3478,14 @@ def _overview_tab(store: Store, config: dict | None = None):
     ch_map = _get_channel_map(store, session_dir) if session_dir else {}
     recent_alerts = store.get_recent_alerts(hours=24)
 
-    # Pills as a vertical stack -- they live in the second column
-    # of the new 3-col top section (Lab | Pills | Evoked). The
-    # column is narrow (~160px) so pills sit one per line which
-    # makes the row of reference numbers scannable top-down.
+    # Pills as a full-width horizontal strip at the very top of
+    # the Overview tab. flexWrap on so the strip wraps to a second
+    # row on narrow viewports rather than overflowing.
     cards = html.Div(
         _build_overview_cards(store),
         id="overview-cards",
-        style={"display": "flex", "flexDirection": "column",
-                "gap": "6px"},
+        style={"display": "flex", "flexWrap": "wrap",
+                "gap": "6px", "marginBottom": "10px"},
     )
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
@@ -3648,34 +3647,22 @@ def _overview_tab(store: Store, config: dict | None = None):
         "Channel Map", channel_table,
         open_default=False,
     )
-    # Top section: 3 columns.
-    #   Col 1: Lab tiles + Status pills stacked (the sidebar).
-    #   Col 2: Latest Evoked.
-    #   Col 3: Today + KM Recorder log stacked.
-    # User asked for evoked to be col 2 and Today/KM to be col 3 --
-    # everything operational + visual ends up on screen in one
-    # horizontal pass, with reference content (channel map, alerts)
-    # the only thing below.
-    sidebar_col = html.Div([
-        home_grid,
-        cards,
-    ], style={
-        "display": "flex", "flexDirection": "column", "gap": "12px",
-    })
+    # Status pills are a full-width row at the very top, above
+    # everything else. The 3-column grid below holds:
+    #   Col 1 (280px): Lab tiles
+    #   Col 2 (1fr):   Latest Evoked
+    #   Col 3 (1fr):   Today + KM stacked
     ops_col = html.Div([
         queue_wrapped, km_wrapped,
     ], style={
         "display": "flex", "flexDirection": "column", "gap": "8px",
     })
     top_section = html.Div([
-        sidebar_col,
+        home_grid,
         thumb_wrapped,
         ops_col,
     ], style={
         "display": "grid",
-        # 280 fixed for the sidebar; remaining width split evenly so
-        # Evoked and Ops are similar size and Evoked never
-        # dominates the page width.
         "gridTemplateColumns": "280px 1fr 1fr",
         "gap": "12px",
         "alignItems": "start",
@@ -3697,8 +3684,9 @@ def _overview_tab(store: Store, config: dict | None = None):
     )
 
     return html.Div([
-        top_section,
-        reference_row,
+        cards,          # pills strip, full width
+        top_section,    # sidebar | Evoked | Ops
+        reference_row,  # channel + alerts
     ])
 
 
