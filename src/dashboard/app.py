@@ -413,6 +413,32 @@ def _status_card(title: str, value: str, color: str = "#636EFA"):
     ], style=CARD_STYLE)
 
 
+def _status_pill(title: str, value: str, color: str = "#636EFA"):
+    """Compact single-line pill. ~28px tall instead of _status_card's
+    ~72px. Reference info doesn't need to read as a headline; the
+    operator only consults these when something looks wrong, so they
+    earn their visual weight from color (not size)."""
+    return html.Div([
+        html.Span(title, style={
+            "color": "#888", "fontSize": "10px",
+            "textTransform": "uppercase",
+            "letterSpacing": "0.5px",
+            "marginRight": "6px",
+        }),
+        html.Span(value, style={
+            "color": color, "fontSize": "13px",
+            "fontWeight": "600",
+        }),
+    ], style={
+        "padding": "4px 10px",
+        "background": COLOR_SURFACE_1,
+        "border": f"1px solid {COLOR_DIVIDER}",
+        "borderRadius": "999px",
+        "fontFamily": "ui-monospace, SF Mono, monospace",
+        "whiteSpace": "nowrap",
+    })
+
+
 def _empty_fig(text: str = "Nothing to show yet",
                hint: str | None = None,
                height: int = 400) -> go.Figure:
@@ -2482,16 +2508,16 @@ def _build_overview_cards(store: Store):
                   else "#00CC96" if n_ok
                   else "#666")
     return [
-        _status_card("Network", "OK" if net_ok else "DOWN",
+        _status_pill("Network", "OK" if net_ok else "DOWN",
                      "#00CC96" if net_ok else "#EF553B"),
-        _status_card("CPU", f"{cpu:.0f}%",
+        _status_pill("CPU", f"{cpu:.0f}%",
                      "#00CC96" if cpu < 80 else "#FFA15A"),
-        _status_card("Memory", f"{mem:.0f}%",
+        _status_pill("Memory", f"{mem:.0f}%",
                      "#00CC96" if mem < 85 else "#FFA15A"),
-        _status_card("Disk Free", f"{disk:.1f} GB",
+        _status_pill("Disk Free", f"{disk:.1f} GB",
                      "#00CC96" if disk > 50 else "#EF553B"),
-        _status_card("Files/Hour", str(fph), "#636EFA"),
-        _status_card("Videos (24h)", vid_label, vid_color),
+        _status_pill("Files/Hour", str(fph), "#636EFA"),
+        _status_pill("Videos (24h)", vid_label, vid_color),
     ]
 
 
@@ -2570,20 +2596,14 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         ch: latest_by_ch[ch].get("channel_name", f"Ch{ch}")
         for ch in sorted_chs
     }
-    subplot_titles = []
-    for ch in sorted_chs:
-        nm = chan_label[ch]
-        subplot_titles.append(
-            f"Stim window {nm} ({stim_x0:g} to {stim_x1:g} ms)")
-        subplot_titles.append(
-            f"Evoked {nm} ({evoked_x0:g}–{evoked_x1:g} ms)")
-    # Tight subplot grid: ~half the breathing room of the default,
-    # narrower stim column. Wide monitors finally see the evoked
-    # panel as the dominant element it should be.
+    # No per-cell titles: the y-axis label on each row already names
+    # the channel, and two figure-level annotations below name the
+    # columns. Per-cell titles were colliding with neighbouring
+    # x-axis ticks at vertical_spacing=0.04.
     thumb_fig = make_subplots(
         rows=n_ch, cols=2, column_widths=[0.16, 0.84],
-        shared_xaxes=False, subplot_titles=subplot_titles,
-        vertical_spacing=0.04, horizontal_spacing=0.035,
+        shared_xaxes=False, subplot_titles=None,
+        vertical_spacing=0.06, horizontal_spacing=0.035,
     )
 
     def _hex_to_rgba(hex_str: str, alpha: float) -> str:
@@ -2683,12 +2703,29 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
             font=dict(size=11), y=0.98),
         autosize=True,
-        margin=dict(l=42, r=8, t=28, b=18),
+        margin=dict(l=42, r=8, t=40, b=18),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      xanchor="right", x=1, font_size=9),
     )
-    thumb_fig.update_annotations(font_size=9)
+    # Column headers as figure-level annotations, sitting just below
+    # the title. x-positions track column_widths=[0.16, 0.84] +
+    # horizontal_spacing=0.035; update both if the subplot grid
+    # geometry changes.
+    thumb_fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.04, y=1.01, xanchor="left", yanchor="bottom",
+        text=f"Stim window  {stim_x0:g} to {stim_x1:g} ms",
+        showarrow=False,
+        font=dict(size=10, color="#888"),
+    )
+    thumb_fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.22, y=1.01, xanchor="left", yanchor="bottom",
+        text=f"Evoked  {evoked_x0:g}–{evoked_x1:g} ms",
+        showarrow=False,
+        font=dict(size=10, color="#888"),
+    )
     return [dcc.Graph(
         figure=thumb_fig, responsive=True,
         style={
@@ -3559,15 +3596,19 @@ def _overview_tab(store: Store, config: dict | None = None):
     # wide auto-fit grid. Each tile keeps its existing internal
     # header. minmax(380px, 1fr) means the layout shows 1 column under
     # ~760px, 2 under ~1140px, 3 above that.
+    # minmax floor 260 px lets all 6 tiles pack into one row at
+    # ~1700px+ viewports (was 320 px floor -> 6th tile orphaned to
+    # row 2 alone with 4 empty columns next to it).
     home_grid = html.Div(
         _build_home_grid_children(store, config, today),
         id="overview-home-grid",
         style={
             "display": "grid",
             "gridTemplateColumns":
-                "repeat(auto-fit, minmax(320px, 1fr))",
+                "repeat(auto-fit, minmax(260px, 1fr))",
             "gap": "8px",
             "marginBottom": "8px",
+            "alignItems": "start",
         },
     )
 
@@ -3601,25 +3642,35 @@ def _overview_tab(store: Store, config: dict | None = None):
         "Channel Map", channel_table,
         open_default=False,
     )
-    # alignItems: start so short tiles don't stretch to match a tall
-    # neighbour -- that was inflating every grid cell to the height
-    # of the worst offender, producing acres of empty space.
-    upper_grid = html.Div([
-        thumb_wrapped,            # row 1 — full width, the visual
-        queue_wrapped, km_wrapped,  # row 2 — operational pair
-        channel_wrapped, alerts_collapsible,  # row 3 — reference
-    ], style={
+    # Explicit 2-col rows for the operational + reference pairs --
+    # auto-fit was leaving collapsed Channel Map / Alerts strips
+    # alongside tall Today/KM, producing imbalanced cells. Pair-
+    # specific 2-col grids guarantee Today/KM line up evenly and
+    # Channel/Alerts share a thin row of their own. Each grid still
+    # collapses to one column under ~840px via auto-fit + 420px floor.
+    two_col_style = {
         "display": "grid",
         "gridTemplateColumns":
-            "repeat(auto-fit, minmax(320px, 1fr))",
+            "repeat(auto-fit, minmax(420px, 1fr))",
         "gap": "8px",
+        "marginBottom": "8px",
         "alignItems": "start",
-    })
+    }
+    operational_row = html.Div(
+        [queue_wrapped, km_wrapped],
+        style=two_col_style,
+    )
+    reference_row = html.Div(
+        [channel_wrapped, alerts_collapsible],
+        style=two_col_style,
+    )
 
     return html.Div([
         home_grid,
         cards,
-        upper_grid,
+        thumb_wrapped,
+        operational_row,
+        reference_row,
     ])
 
 
