@@ -654,6 +654,18 @@ def create_app(config: dict, store: Store) -> Dash:
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
                      disabled=True),  # auto-refresh OFF by default
         html.Div([
+            html.Button("Focus", id="focus-toggle-btn",
+                        title="Hide header + tabs nav and show only "
+                               "the tab content (click again to restore)",
+                        style={"backgroundColor": COLOR_SURFACE_2,
+                               "color": COLOR_TEXT_PRIMARY,
+                               "border": f"1px solid {COLOR_DIVIDER}",
+                               "borderRadius": RADIUS_SM,
+                               "padding": f"{SPACE_1} {SPACE_3}",
+                               "cursor": "pointer",
+                               "marginRight": SPACE_2,
+                               "fontSize": FONT_SIZE_CAPTION,
+                               "fontFamily": FONT_STACK}),
             html.Button("Refresh", id="manual-refresh-btn",
                         style={"backgroundColor": COLOR_SURFACE_2,
                                "color": COLOR_TEXT_PRIMARY,
@@ -682,6 +694,11 @@ def create_app(config: dict, store: Store) -> Dash:
                   "border": f"1px solid {COLOR_DIVIDER}"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
+        # Focus-mode state: True when the user wants chrome (header,
+        # group tabs, sub-tabs) hidden so only the active tab content
+        # remains visible. Toggled by the Focus button in the refresh
+        # bar; the bar itself stays visible (it's the only way out).
+        dcc.Store(id="focus-mode", data=False),
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
@@ -693,7 +710,7 @@ def create_app(config: dict, store: Store) -> Dash:
               "letterSpacing": "0.1px"})
 
     # ------------------------------------------------------------------ #
-    #  Refresh controls
+    #  Refresh + focus-mode controls
     # ------------------------------------------------------------------ #
     @app.callback(
         Output("refresh", "disabled"),
@@ -701,6 +718,51 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def toggle_auto_refresh(val):
         return not bool(val)
+
+    @app.callback(
+        Output("focus-mode", "data"),
+        Output("focus-toggle-btn", "children"),
+        Input("focus-toggle-btn", "n_clicks"),
+        State("focus-mode", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_focus_mode(_clicks, current):
+        new_state = not bool(current)
+        return new_state, ("Exit focus" if new_state else "Focus")
+
+    @app.callback(
+        Output("app-header", "style"),
+        Output("group-tabs", "style"),
+        Output("tabs", "style"),
+        Output("tab-content", "style"),
+        Input("focus-mode", "data"),
+    )
+    def apply_focus_mode(focus):
+        # Default (chrome visible) styles. Mirror what app.layout sets
+        # so toggling back restores the original geometry.
+        header_default = {"padding": f"{SPACE_4} {SPACE_6}",
+                          "background": COLOR_SURFACE_0,
+                          "borderBottom": f"1px solid {COLOR_DIVIDER}"}
+        group_tabs_default = {"borderBottom": f"1px solid {COLOR_DIVIDER}",
+                              "padding": f"0 {SPACE_5}",
+                              "backgroundColor": COLOR_SURFACE_0}
+        tabs_default = {"borderBottom": f"1px solid {COLOR_DIVIDER}",
+                        "padding": f"{SPACE_2} {SPACE_5} 0",
+                        "backgroundColor": COLOR_SURFACE_0,
+                        "minHeight": "36px"}
+        content_default = {"padding": f"{SPACE_6} {SPACE_5}",
+                           "backgroundColor": COLOR_SURFACE_0,
+                           "minHeight": "80vh"}
+        if not focus:
+            return (header_default, group_tabs_default,
+                    tabs_default, content_default)
+        # Focus mode: hide all chrome and pull the content padding
+        # in so the visible viewport is just the tab body.
+        hidden = {"display": "none"}
+        content_focus = {"padding": f"{SPACE_4} {SPACE_5}",
+                         "backgroundColor": COLOR_SURFACE_0,
+                         "minHeight": "100vh"}
+        return hidden, hidden, hidden, content_focus
 
     @app.callback(
         [Output("refresh-trigger", "data"), Output("last-refresh-ts", "data")],
