@@ -2596,14 +2596,15 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         ch: latest_by_ch[ch].get("channel_name", f"Ch{ch}")
         for ch in sorted_chs
     }
-    # No per-cell titles: the y-axis label on each row already names
-    # the channel, and two figure-level annotations below name the
-    # columns. Per-cell titles were colliding with neighbouring
-    # x-axis ticks at vertical_spacing=0.04.
+    # Per-cell titles dropped (channel name lives on y-axis, column
+    # name lives on the figure-level annotations below). Spacing
+    # bumped to 0.08 + non-bottom rows hide their x ticks, so tick
+    # labels from row N can no longer collide with row N+1's plot
+    # top or with the next row's title region.
     thumb_fig = make_subplots(
         rows=n_ch, cols=2, column_widths=[0.16, 0.84],
         shared_xaxes=False, subplot_titles=None,
-        vertical_spacing=0.06, horizontal_spacing=0.035,
+        vertical_spacing=0.08, horizontal_spacing=0.035,
     )
 
     def _hex_to_rgba(hex_str: str, alpha: float) -> str:
@@ -2687,6 +2688,14 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         if y_right is not None:
             thumb_fig.update_yaxes(range=list(y_right), row=ri, col=2)
 
+        # Only the bottom row carries x-axis ticks + title. Non-
+        # bottom rows hide tick labels so the "-1 -0.5 0 0.5 1"
+        # labels of row N can't collide with row N+1's plot top
+        # at tight vertical spacing.
+        if ri < n_ch:
+            thumb_fig.update_xaxes(showticklabels=False, row=ri, col=1)
+            thumb_fig.update_xaxes(showticklabels=False, row=ri, col=2)
+
     thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
     thumb_fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=2)
     mode_label = {"mean": "mean",
@@ -2703,7 +2712,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
             text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
             font=dict(size=11), y=0.98),
         autosize=True,
-        margin=dict(l=42, r=8, t=40, b=18),
+        margin=dict(l=42, r=8, t=40, b=32),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                      xanchor="right", x=1, font_size=9),
@@ -3639,47 +3648,56 @@ def _overview_tab(store: Store, config: dict | None = None):
         "Channel Map", channel_table,
         open_default=False,
     )
-    # Top section: 3 columns side-by-side -- lab tiles vertical
-    # | status pills vertical | Latest Evoked. User asked for the
-    # lab tiles and pills to each be their own column instead of
-    # two stacked horizontal strips, and for the evoked figure to
-    # stop spanning the whole page. The two sidebar columns sit at
-    # fixed widths so they don't claim space the evoked panel can
-    # use; evoked gets 1fr.
-    top_section = html.Div([
+    # Top section: 3 columns.
+    #   Col 1: Lab tiles + Status pills stacked (the sidebar).
+    #   Col 2: Latest Evoked.
+    #   Col 3: Today + KM Recorder log stacked.
+    # User asked for evoked to be col 2 and Today/KM to be col 3 --
+    # everything operational + visual ends up on screen in one
+    # horizontal pass, with reference content (channel map, alerts)
+    # the only thing below.
+    sidebar_col = html.Div([
         home_grid,
         cards,
+    ], style={
+        "display": "flex", "flexDirection": "column", "gap": "12px",
+    })
+    ops_col = html.Div([
+        queue_wrapped, km_wrapped,
+    ], style={
+        "display": "flex", "flexDirection": "column", "gap": "8px",
+    })
+    top_section = html.Div([
+        sidebar_col,
         thumb_wrapped,
+        ops_col,
     ], style={
         "display": "grid",
-        "gridTemplateColumns": "280px 160px 1fr",
+        # 280 fixed for the sidebar; remaining width split evenly so
+        # Evoked and Ops are similar size and Evoked never
+        # dominates the page width.
+        "gridTemplateColumns": "280px 1fr 1fr",
         "gap": "12px",
         "alignItems": "start",
         "marginBottom": "10px",
     })
 
-    # Below the top section: operational pair + reference pair, each
-    # as a 2-col grid that collapses to single column under ~840 px.
-    two_col_style = {
-        "display": "grid",
-        "gridTemplateColumns":
-            "repeat(auto-fit, minmax(420px, 1fr))",
-        "gap": "8px",
-        "marginBottom": "8px",
-        "alignItems": "start",
-    }
-    operational_row = html.Div(
-        [queue_wrapped, km_wrapped],
-        style=two_col_style,
-    )
+    # Reference row below: channel map + alerts, both collapsed by
+    # default. 2-col grid that collapses to single column under ~840 px.
     reference_row = html.Div(
         [channel_wrapped, alerts_collapsible],
-        style=two_col_style,
+        style={
+            "display": "grid",
+            "gridTemplateColumns":
+                "repeat(auto-fit, minmax(420px, 1fr))",
+            "gap": "8px",
+            "marginBottom": "8px",
+            "alignItems": "start",
+        },
     )
 
     return html.Div([
         top_section,
-        operational_row,
         reference_row,
     ])
 
