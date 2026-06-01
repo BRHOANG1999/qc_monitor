@@ -264,6 +264,52 @@ DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMAR
 # ====================================================================== #
 
 
+def _collapsible(title: str, content, *, open_default: bool = True,
+                  badge: str | None = None,
+                  badge_color: str | None = None):
+    """Section wrapped in a native <details> element so the user can
+    collapse anything they don't want to see. *content* is anything
+    Dash will render (a Div, a list of children, etc.).
+
+    Native <details> handles state in the browser without callbacks --
+    cheap, accessible, survives refresh ticks. The summary row gets a
+    subtle background so the title reads as a header strip even when
+    the section is closed.
+    """
+    summary_children = [
+        html.Span(title, style={
+            "color": "#ddd", "fontSize": "13px", "fontWeight": "600",
+            "letterSpacing": "0.3px",
+        }),
+    ]
+    if badge:
+        summary_children.append(html.Span(
+            badge,
+            style={
+                "marginLeft": "8px",
+                "padding": "1px 7px",
+                "borderRadius": "9px",
+                "background": (badge_color or "rgba(255,255,255,0.08)"),
+                "color": "#fff", "fontSize": "10px",
+                "fontWeight": "600",
+            }))
+    return html.Details([
+        html.Summary(summary_children, style={
+            "cursor": "pointer", "userSelect": "none",
+            "padding": "8px 12px",
+            "background": "rgba(255,255,255,0.04)",
+            "borderRadius": "6px 6px 0 0",
+            "listStyle": "none",
+        }),
+        html.Div(content, style={"padding": "10px 12px"}),
+    ], open=open_default, style={
+        "background": COLOR_SURFACE_1,
+        "border": f"1px solid {COLOR_DIVIDER}",
+        "borderRadius": "6px",
+        "marginBottom": "10px",
+    })
+
+
 def _qc_monitor_version() -> str:
     """Short, human-readable version string for the dashboard header.
 
@@ -3428,50 +3474,75 @@ def _overview_tab(store: Store, config: dict | None = None):
         ])
 
     today = date.today()
-    # Two-column responsive grid -- collapses to one column under ~880px.
-    # The whole grid is wrapped in a fixed-height scroll container so
-    # the lab tiles don't push the rest of the Overview off-screen --
-    # the user can wheel inside the strip if they want to see more.
+    # Home grid (surgeries / schedule / maintenance / incidents /
+    # data log) sits at the TOP of the Overview now, in a 3-col-when-
+    # wide auto-fit grid. Each tile keeps its existing internal
+    # header. minmax(380px, 1fr) means the layout shows 1 column under
+    # ~760px, 2 under ~1140px, 3 above that.
     home_grid = html.Div(
-        html.Div(
-            _build_home_grid_children(store, config, today),
-            id="overview-home-grid",
-            style={
-                "display": "grid",
-                "gridTemplateColumns":
-                    "repeat(auto-fit, minmax(440px, 1fr))",
-                "gap": "12px",
-            },
-        ),
+        _build_home_grid_children(store, config, today),
+        id="overview-home-grid",
         style={
-            "marginTop": "12px",
-            "maxHeight": "28vh",
-            "overflowY": "auto",
-            "paddingRight": "4px",
+            "display": "grid",
+            "gridTemplateColumns":
+                "repeat(auto-fit, minmax(380px, 1fr))",
+            "gap": "12px",
+            "marginBottom": "12px",
         },
     )
 
-    # Two-column responsive layout for the dense upper portion.
-    # Left column carries the operational tiles (cards, KM log,
-    # queue + recording timelines, alerts); right column carries the
-    # latest-evoked thumbnail + channel map. Collapses to a single
-    # column below ~1280 px so narrower viewports still read cleanly.
+    # Recent alerts becomes a single header row with the count so it
+    # stays as a visible divider even when collapsed.
+    n_alerts = len(recent_alerts) if recent_alerts else 0
+    alerts_collapsible = _collapsible(
+        f"Recent Alerts",
+        alerts_section,
+        open_default=bool(recent_alerts),
+        badge=str(n_alerts) if n_alerts else "0",
+        badge_color=("#EF553B" if any(
+            a.get("severity") == "critical" for a in (recent_alerts or []))
+            else "#FFA15A" if recent_alerts else "rgba(255,255,255,0.08)"),
+    )
+
+    # Operational sections in a 3-col grid (KM log, queue/today,
+    # latest-evoked thumbnail, channel map, alerts). Each is a
+    # collapsible <details>; the user can hide anything they don't
+    # care about. minmax(380px, 1fr) keeps 3 cols on wide monitors.
+    cards_wrapped = _collapsible(
+        "System Status", cards,
+        open_default=True,
+    )
+    km_wrapped = _collapsible(
+        "KM Recorder log", km_section,
+        open_default=True,
+    )
+    queue_wrapped = _collapsible(
+        "Today · Recording uptime", queue_section,
+        open_default=True,
+    )
+    thumb_wrapped = _collapsible(
+        "Latest Evoked", waveform_thumbnail,
+        open_default=True,
+    )
+    channel_wrapped = _collapsible(
+        "Channel Map", channel_table,
+        open_default=False,   # rarely changes; default closed
+    )
     upper_grid = html.Div([
-        html.Div([
-            cards, km_section, queue_section,
-            session_info, alerts_section,
-        ]),
-        html.Div([
-            waveform_thumbnail, channel_table,
-        ]),
+        cards_wrapped, km_wrapped, queue_wrapped,
+        thumb_wrapped, channel_wrapped, alerts_collapsible,
     ], style={
         "display": "grid",
-        "gridTemplateColumns": "repeat(auto-fit, minmax(560px, 1fr))",
-        "gap": "16px",
+        "gridTemplateColumns":
+            "repeat(auto-fit, minmax(380px, 1fr))",
+        "gap": "12px",
     })
 
+    # Order: lab tiles at the very top per user request, operational
+    # tiles below.
     return html.Div([
-        upper_grid, home_grid,
+        home_grid,
+        upper_grid,
     ])
 
 
