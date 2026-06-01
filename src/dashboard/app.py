@@ -3469,17 +3469,15 @@ def _overview_tab(store: Store, config: dict | None = None):
     ch_map = _get_channel_map(store, session_dir) if session_dir else {}
     recent_alerts = store.get_recent_alerts(hours=24)
 
-    # Status pills as a flat horizontal strip -- NOT wrapped in a
-    # grid cell, NOT inside a collapsible. Inside a 320px grid cell
-    # six 130-px-min cards stack vertically and inflate every other
-    # grid cell to match -- that was the wasted-space culprit. As a
-    # standalone flex row they wrap horizontally on narrow viewports
-    # and stay one line on wide ones.
+    # Pills as a vertical stack -- they live in the second column
+    # of the new 3-col top section (Lab | Pills | Evoked). The
+    # column is narrow (~160px) so pills sit one per line which
+    # makes the row of reference numbers scannable top-down.
     cards = html.Div(
         _build_overview_cards(store),
         id="overview-cards",
-        style={"display": "flex", "gap": "8px", "flexWrap": "wrap",
-                "marginBottom": "8px"},
+        style={"display": "flex", "flexDirection": "column",
+                "gap": "6px"},
     )
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
@@ -3596,19 +3594,17 @@ def _overview_tab(store: Store, config: dict | None = None):
     # wide auto-fit grid. Each tile keeps its existing internal
     # header. minmax(380px, 1fr) means the layout shows 1 column under
     # ~760px, 2 under ~1140px, 3 above that.
-    # minmax floor 260 px lets all 6 tiles pack into one row at
-    # ~1700px+ viewports (was 320 px floor -> 6th tile orphaned to
-    # row 2 alone with 4 empty columns next to it).
+    # Lab tiles stacked vertically -- they live in the first
+    # column of the new 3-col top section (Lab | Pills | Evoked).
+    # The container is a flex column so each tile gets the full
+    # column width and stacks predictably regardless of how many
+    # tiles _build_home_grid_children returns.
     home_grid = html.Div(
         _build_home_grid_children(store, config, today),
         id="overview-home-grid",
         style={
-            "display": "grid",
-            "gridTemplateColumns":
-                "repeat(auto-fit, minmax(260px, 1fr))",
+            "display": "flex", "flexDirection": "column",
             "gap": "8px",
-            "marginBottom": "8px",
-            "alignItems": "start",
         },
     )
 
@@ -3631,23 +3627,39 @@ def _overview_tab(store: Store, config: dict | None = None):
     queue_wrapped = _collapsible(
         "Today · Recording uptime", queue_section, open_default=True,
     )
-    # Latest Evoked is the headliner: full-row span + lives at the
-    # TOP of the operational grid. Apple's "feature card at top,
-    # supporting tiles below" pattern.
+    # Latest Evoked lives in column 3 of the top section; not full
+    # width. User explicitly asked for it to be narrower than the
+    # whole page. The 1fr grid cell still leaves it the widest
+    # visible element after the two narrow sidebar columns.
     thumb_wrapped = _collapsible(
         "Latest Evoked", waveform_thumbnail,
-        open_default=True, full_width=True,
+        open_default=True,
     )
     channel_wrapped = _collapsible(
         "Channel Map", channel_table,
         open_default=False,
     )
-    # Explicit 2-col rows for the operational + reference pairs --
-    # auto-fit was leaving collapsed Channel Map / Alerts strips
-    # alongside tall Today/KM, producing imbalanced cells. Pair-
-    # specific 2-col grids guarantee Today/KM line up evenly and
-    # Channel/Alerts share a thin row of their own. Each grid still
-    # collapses to one column under ~840px via auto-fit + 420px floor.
+    # Top section: 3 columns side-by-side -- lab tiles vertical
+    # | status pills vertical | Latest Evoked. User asked for the
+    # lab tiles and pills to each be their own column instead of
+    # two stacked horizontal strips, and for the evoked figure to
+    # stop spanning the whole page. The two sidebar columns sit at
+    # fixed widths so they don't claim space the evoked panel can
+    # use; evoked gets 1fr.
+    top_section = html.Div([
+        home_grid,
+        cards,
+        thumb_wrapped,
+    ], style={
+        "display": "grid",
+        "gridTemplateColumns": "280px 160px 1fr",
+        "gap": "12px",
+        "alignItems": "start",
+        "marginBottom": "10px",
+    })
+
+    # Below the top section: operational pair + reference pair, each
+    # as a 2-col grid that collapses to single column under ~840 px.
     two_col_style = {
         "display": "grid",
         "gridTemplateColumns":
@@ -3666,9 +3678,7 @@ def _overview_tab(store: Store, config: dict | None = None):
     )
 
     return html.Div([
-        home_grid,
-        cards,
-        thumb_wrapped,
+        top_section,
         operational_row,
         reference_row,
     ])
