@@ -588,6 +588,7 @@ def create_app(config: dict, store: Store) -> Dash:
         Output("overview-cards", "children"),
         Output("overview-queue", "children"),
         Output("overview-home-grid", "children"),
+        Output("overview-km-log", "children"),
         Input("refresh-trigger", "data"),
         prevent_initial_call=True,
     )
@@ -597,6 +598,7 @@ def create_app(config: dict, store: Store) -> Dash:
             _build_overview_cards(store),
             _build_overview_queue(store),
             _build_home_grid_children(store, config, _date.today()),
+            _build_km_log_section(config),
         )
 
     # Thumbnail has its own callback because the radio adds an
@@ -2483,14 +2485,259 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
                    "sem": "mean ± SEM",
                    "overlay": "mean + per-file overlay"}.get(
         trace_mode, "mean")
+    # Tight per-channel row so all channels + the rest of the
+    # Overview fit a 1080p screen without scrolling. Title font and
+    # legend pulled inward to claw back vertical space.
     thumb_fig.update_layout(
-        title=f"Latest Evoked — {latest_datetime[:16]}  ({mode_label})",
-        height=180 * n_ch, margin=dict(l=60, r=20, t=50, b=30),
+        title=dict(
+            text=f"Latest Evoked — {latest_datetime[:16]} ({mode_label})",
+            font=dict(size=12)),
+        height=max(140, 110 * n_ch),
+        margin=dict(l=50, r=10, t=36, b=22),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                     xanchor="right", x=1, font_size=10),
+                     xanchor="right", x=1, font_size=9),
     )
-    return [dcc.Graph(figure=thumb_fig, style={"marginTop": "8px"})]
+    thumb_fig.update_annotations(font_size=10)
+    return [dcc.Graph(figure=thumb_fig, style={"marginTop": "4px"})]
+
+
+def _km_log_summary(config: dict | None) -> dict:
+    """Most-recent KMrecorder data-log entries + freshness in minutes.
+
+    Pulls from the same Google Sheet the data_log_xref tab uses, so
+    they share the existing API + TTL cache. KMrecorder writes a row
+    per file, so freshness ~ time since last chunk landed on any PC.
+    """
+    out = {
+        "enabled": False, "rows": [], "latest_iso": None,
+        "age_min": None,
+    }
+    try:
+        from src.dashboard.tabs.data_log_xref import _sheet_records
+    except Exception:
+        return out
+    cfg = (config or {}).get("data_log_xref", {}) or {}
+    if not cfg.get("enabled", False):
+        return out
+    ttl_sec = float(cfg.get("refresh_minutes", 15)) * 60.0
+    try:
+        records, _total, _drop = _sheet_records(config or {}, ttl_sec)
+    except Exception as e:
+        logger.debug("KM log fetch failed: %s", e)
+        return out
+    if not records:
+        out["enabled"] = True
+        return out
+
+    # Keys sort lexicographically the same as chronologically because
+    # they're YYYY_MM_DD__HH_MM_SS. Take the last 5.
+    sorted_keys = sorted(records.keys(), reverse=True)
+    rows = [records[k] for k in sorted_keys[:5]]
+    latest_key = sorted_keys[0]
+    try:
+        latest_dt = datetime.strptime(latest_key, "%Y_%m_%d__%H_%M_%S")
+        age_min = (datetime.now() - latest_dt).total_seconds() / 60.0
+    except ValueError:
+        latest_dt = None
+        age_min = None
+    out.update({
+        "enabled": True, "rows": rows,
+        "latest_iso": latest_dt.isoformat() if latest_dt else None,
+        "age_min": age_min,
+    })
+    return out
+
+
+def _build_km_log_section(config: dict | None) -> html.Div:
+    """KM Recorder freshness pill + last-5-entries strip. Inserted
+    between the status-card row and the queue block. Refreshes on
+    every refresh-trigger tick (sheet API is TTL-cached so cost is
+    negligible)."""
+    summary = _km_log_summary(config)
+    if not summary["enabled"]:
+        return html.Div()
+
+    age = summary["age_min"]
+    if age is None:
+        age_text = "unknown"
+        color = "#888"
+    elif age < 90:
+        age_text = f"{age:.0f} min ago"
+        color = "#00CC96"
+    elif age < 24 * 60:
+        age_text = f"{age / 60:.1f} h ago"
+        color = "#FFA15A"
+    else:
+        age_text = f"{age / (24 * 60):.1f} d ago"
+        color = "#EF553B"
+
+    rows = summary["rows"]
+    if rows:
+        tail = []
+        for r in rows:
+            ts_str = r.get("key", "")[:16].replace("_", "/")
+            label = (f"{ts_str} · {r.get('animal') or '?'} "
+                     f"· {r.get('pc') or '?'}")
+            tail.append(html.Div(label, style={
+                "color": "#aaa", "fontSize": "11px",
+                "padding": "2px 0",
+                "overflow": "hidden", "textOverflow": "ellipsis",
+                "whiteSpace": "nowrap",
+            }))
+    else:
+        tail = [html.Div("No rows from KMrecorder log yet.",
+                          style={"color": "#888", "fontSize": "11px"})]
+
+    return html.Div([
+        html.Div([
+            html.Span("KM Recorder log",
+                       style={"color": "#aaa", "fontSize": "12px",
+                               "letterSpacing": "0.5px",
+                               "marginRight": "12px"}),
+            html.Span(f"last entry {age_text}",
+                       style={"color": color, "fontSize": "13px",
+                               "fontWeight": "600"}),
+        ], style={"marginBottom": "6px"}),
+        html.Div(tail),
+    ], style={**SECTION_STYLE, "padding": "10px 14px"})
+
+
+_CHUNK_DT_FMT = "%Y_%m_%d__%H_%M_%S"
+
+
+def _parse_chunk_dt(ts: str | None) -> datetime | None:
+    """Parse a chunk_datetime string into a datetime.
+
+    chunk_datetime is stored in filename format (YYYY_MM_DD__HH_MM_SS)
+    not ISO -- the recorder writes the timestamp into the filename and
+    the watcher persists it as-is. Falls back to fromisoformat() so a
+    future schema change doesn't silently break this.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, _CHUNK_DT_FMT)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+
+
+def _recording_arrivals(store: Store, hours: int) -> list[str]:
+    """chunk_datetime strings for every chunk recorded in the last
+    *hours*. Used to drive the Overview recording-uptime timelines.
+
+    chunk_datetime (filename-derived) is the recording timestamp, not
+    processed_at -- so gaps in this series mean recording was off
+    (or the system was down), not that the QC dispatcher was busy.
+    The format is fixed-width zero-padded, so the SQL lexicographic
+    comparison sorts and filters chronologically once both sides are
+    in the same format.
+    """
+    assert hours > 0, "hours must be positive"
+    cutoff_dt = datetime.now() - timedelta(hours=hours)
+    cutoff_str = cutoff_dt.strftime(_CHUNK_DT_FMT)
+    conn = store._connect()
+    try:
+        rows = conn.execute(
+            "SELECT chunk_datetime FROM processed_files "
+            "WHERE chunk_datetime >= ? ORDER BY chunk_datetime",
+            (cutoff_str,),
+        ).fetchall()
+        return [r["chunk_datetime"] for r in rows
+                if r["chunk_datetime"]]
+    finally:
+        conn.close()
+
+
+def _build_recording_24h_fig(arrivals: list[str]) -> go.Figure:
+    """24-hour recording-uptime band. 15-minute bins; bars green where
+    chunks arrived, gray where they didn't. Compact (~50px tall)."""
+    now = datetime.now()
+    bin_min = 15
+    n_bins = 24 * 60 // bin_min   # 96
+    counts = [0] * n_bins
+    for ts in arrivals:
+        dt = _parse_chunk_dt(ts)
+        if dt is None:
+            continue
+        mins_ago = (now - dt).total_seconds() / 60.0
+        if mins_ago < 0 or mins_ago >= 24 * 60:
+            continue
+        idx = n_bins - 1 - int(mins_ago // bin_min)
+        counts[idx] += 1
+    bin_starts = [now - timedelta(minutes=(n_bins - i) * bin_min)
+                   for i in range(n_bins)]
+    x_labels = [b.strftime("%H:%M") for b in bin_starts]
+    colors = ["#00CC96" if c > 0 else "#2a2a40" for c in counts]
+    fig = go.Figure(go.Bar(
+        x=x_labels, y=[1] * n_bins,
+        marker=dict(color=colors, line=dict(width=0)),
+        hovertext=[
+            f"{b.strftime('%a %H:%M')}: "
+            f"{c} chunk{'s' if c != 1 else ''}"
+            for b, c in zip(bin_starts, counts)
+        ],
+        hoverinfo="text",
+    ))
+    fig.update_layout(
+        height=44, margin=dict(l=10, r=10, t=4, b=18),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False, bargap=0,
+        xaxis=dict(showgrid=False,
+                    tickfont=dict(size=9, color="#888"),
+                    tickmode="array",
+                    tickvals=[x_labels[0],
+                              x_labels[n_bins // 2],
+                              x_labels[-1]],
+                    ticktext=["24h ago", "12h ago", "now"]),
+        yaxis=dict(showgrid=False, showticklabels=False,
+                    zeroline=False, range=[0, 1]),
+    )
+    return fig
+
+
+def _build_recording_7d_fig(arrivals: list[str]) -> go.Figure:
+    """7-day recording uptime as a day × hour heatmap. Each cell = one
+    hour on one day; color intensity = chunks recorded that hour."""
+    today = date.today()
+    z = [[0] * 24 for _ in range(7)]
+    for ts in arrivals:
+        dt = _parse_chunk_dt(ts)
+        if dt is None:
+            continue
+        offset = (today - dt.date()).days
+        if 0 <= offset < 7:
+            z[6 - offset][dt.hour] += 1
+    y_labels = [(today - timedelta(days=d)).strftime("%a %m/%d")
+                for d in range(6, -1, -1)]
+    x_labels = [f"{h:02d}" for h in range(24)]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x_labels, y=y_labels,
+        colorscale=[[0, "#2a2a40"], [0.01, "#1f5a44"],
+                     [0.5, "#00CC96"], [1.0, "#7be3c0"]],
+        showscale=False, xgap=1, ygap=1,
+        hovertemplate="%{y} %{x}:00 — %{z} chunks<extra></extra>",
+    ))
+    fig.update_layout(
+        height=148, margin=dict(l=60, r=10, t=4, b=22),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False,
+                    tickfont=dict(size=9, color="#888"),
+                    tickmode="array",
+                    tickvals=["00", "06", "12", "18", "23"],
+                    ticktext=["00", "06", "12", "18", "23"],
+                    title=dict(text="hour of day",
+                                font=dict(size=10, color="#666"))),
+        yaxis=dict(showgrid=False,
+                    tickfont=dict(size=9, color="#aaa"),
+                    autorange="reversed"),
+    )
+    return fig
 
 
 def _overview_today_stats(store: Store, session_dir: str) -> dict:
@@ -2550,11 +2797,10 @@ def _overview_today_stats(store: Store, session_dir: str) -> dict:
     # Oldest-pending age in minutes (or None when nothing pending).
     oldest_age_min: float | None = None
     if oldest_pending_iso:
-        try:
-            oldest_dt = datetime.fromisoformat(oldest_pending_iso)
-            oldest_age_min = (datetime.now() - oldest_dt).total_seconds() / 60.0
-        except ValueError:
-            oldest_age_min = None
+        oldest_dt = _parse_chunk_dt(oldest_pending_iso)
+        if oldest_dt is not None:
+            oldest_age_min = (
+                datetime.now() - oldest_dt).total_seconds() / 60.0
 
     return {
         "done_today": done_today,
@@ -2603,35 +2849,23 @@ def _build_overview_queue(store: Store):
                   style={"color": "#888"}),
     ], style={"fontSize": "13px", "marginTop": "4px"})
 
-    # 24h hourly sparkline. Buckets without files are zero so the
-    # eye can see the gap as quickly as the bursts.
-    hourly = {r["bucket"]: r["n"]
-              for r in stats["hourly_done_24h"]}
-    now = datetime.now().replace(minute=0, second=0, microsecond=0)
-    buckets = [(now - timedelta(hours=h)) for h in range(23, -1, -1)]
-    bucket_keys = [b.strftime("%Y-%m-%d %H") for b in buckets]
-    spark_y = [int(hourly.get(k, 0)) for k in bucket_keys]
-    spark_x = [b.strftime("%H:00") for b in buckets]
-    spark_fig = go.Figure(go.Bar(
-        x=spark_x, y=spark_y,
-        marker=dict(color="#636EFA"),
-        hovertemplate="%{x} — %{y} files<extra></extra>",
-    ))
-    spark_fig.update_layout(
-        height=80, margin=dict(l=10, r=10, t=4, b=20),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        showlegend=False,
-        xaxis=dict(showgrid=False, tickfont=dict(size=9, color="#888"),
-                   tickmode="array",
-                   tickvals=[spark_x[0], spark_x[len(spark_x) // 2],
-                              spark_x[-1]],
-                   ticktext=["24h ago", "12h ago", "now"]),
-        yaxis=dict(showgrid=False, tickfont=dict(size=9, color="#888"),
-                   zeroline=False),
+    # 24-hour recording-uptime band. chunk_datetime, not processed_at
+    # — gaps here mean recording was actually off, not that the QC
+    # dispatcher was caught up. Replaces the old processed-per-hour
+    # sparkline which always pinned to a single bin since processing
+    # finishes in minutes.
+    arrivals_24h = _recording_arrivals(store, hours=24)
+    rec_24h = dcc.Graph(
+        figure=_build_recording_24h_fig(arrivals_24h),
+        config={"displayModeBar": False},
+        style={"marginTop": "4px"},
     )
-    spark = dcc.Graph(figure=spark_fig, config={"displayModeBar": False},
-                       style={"marginTop": "4px"})
+    arrivals_7d = _recording_arrivals(store, hours=24 * 7)
+    rec_7d = dcc.Graph(
+        figure=_build_recording_7d_fig(arrivals_7d),
+        config={"displayModeBar": False},
+        style={"marginTop": "4px"},
+    )
 
     today_section = html.Div([
         html.H4("Today",
@@ -2639,7 +2873,19 @@ def _build_overview_queue(store: Store):
                         "marginBottom": "4px", "fontSize": "14px",
                         "letterSpacing": "0.5px"}),
         today_counters,
-        spark,
+        html.Div("Recording uptime (last 24h)",
+                  style={"color": "#888", "fontSize": "11px",
+                          "marginTop": "8px",
+                          "letterSpacing": "0.5px"}),
+        rec_24h,
+    ])
+
+    recording_7d_section = html.Div([
+        html.H4("Recording uptime (last 7 days)",
+                style={"color": "#aaa", "marginTop": "16px",
+                        "marginBottom": "4px", "fontSize": "14px",
+                        "letterSpacing": "0.5px"}),
+        rec_7d,
     ])
 
     # ----- Active Session section ----- #
@@ -2697,7 +2943,7 @@ def _build_overview_queue(store: Store):
                      style={"color": "#888", "fontSize": "12px"}),
         ])
 
-    return [today_section, active_section]
+    return [today_section, active_section, recording_7d_section]
 
 
 def _overview_tab(store: Store, config: dict | None = None):
@@ -2712,6 +2958,11 @@ def _overview_tab(store: Store, config: dict | None = None):
         _build_overview_cards(store),
         id="overview-cards",
         style={"display": "flex", "gap": "12px", "flexWrap": "wrap"},
+    )
+
+    km_section = html.Div(
+        _build_km_log_section(config),
+        id="overview-km-log",
     )
 
     queue_section = html.Div(
@@ -2831,9 +3082,27 @@ def _overview_tab(store: Store, config: dict | None = None):
         },
     )
 
+    # Two-column responsive layout for the dense upper portion.
+    # Left column carries the operational tiles (cards, KM log,
+    # queue + recording timelines, alerts); right column carries the
+    # latest-evoked thumbnail + channel map. Collapses to a single
+    # column below ~1280 px so narrower viewports still read cleanly.
+    upper_grid = html.Div([
+        html.Div([
+            cards, km_section, queue_section,
+            session_info, alerts_section,
+        ]),
+        html.Div([
+            waveform_thumbnail, channel_table,
+        ]),
+    ], style={
+        "display": "grid",
+        "gridTemplateColumns": "repeat(auto-fit, minmax(560px, 1fr))",
+        "gap": "16px",
+    })
+
     return html.Div([
-        cards, queue_section, home_grid,
-        waveform_thumbnail, session_info, channel_table, alerts_section,
+        upper_grid, home_grid,
     ])
 
 
