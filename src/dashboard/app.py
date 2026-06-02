@@ -4045,46 +4045,41 @@ def _overview_tab(store: Store, config: dict | None = None):
     #   Col 1 (280px): Lab tiles
     #   Col 2 (1fr):   Latest Evoked
     #   Col 3 (1fr):   Today + KM stacked
+    # Channel Map drops underneath Evoked in column 2; Recent
+    # Alerts drops underneath the snapshot in column 3. Both stay
+    # collapsed by default so they just add a thin header strip,
+    # but they prevent the ragged uneven dead zone the user saw
+    # below the three columns. No separate bottom row anymore --
+    # the page now reads as a single 3-column slab.
+    evoked_col = html.Div([
+        thumb_wrapped, channel_wrapped,
+    ], style={
+        "display": "flex", "flexDirection": "column", "gap": "8px",
+    })
     ops_col = html.Div([
         queue_wrapped, km_wrapped, snapshot_wrapped,
+        alerts_collapsible,
     ], style={
         "display": "flex", "flexDirection": "column", "gap": "8px",
     })
     top_section = html.Div([
         home_grid,
-        thumb_wrapped,
+        evoked_col,
         ops_col,
     ], style={
         "display": "grid",
-        # Sidebar (lab tiles) at 320 px gives the Recent Incidents
-        # blurb + Data Log Diff counters a little breathing room
-        # without robbing the operational columns. minmax(0, 1fr)
-        # on cols 2 and 3 stops nowrap content (KM log filenames,
-        # active-session names) from forcing those columns wider.
+        # Sidebar (lab tiles) at 320 px. minmax(0, 1fr) on cols 2
+        # and 3 stops nowrap content (KM log filenames, active-
+        # session names) from forcing those columns wider.
         "gridTemplateColumns": "320px minmax(0, 1fr) minmax(0, 1fr)",
         "gap": "12px",
         "alignItems": "start",
         "marginBottom": "10px",
     })
 
-    # Reference row below: channel map + alerts, both collapsed by
-    # default. 2-col grid that collapses to single column under ~840 px.
-    reference_row = html.Div(
-        [channel_wrapped, alerts_collapsible],
-        style={
-            "display": "grid",
-            "gridTemplateColumns":
-                "repeat(auto-fit, minmax(420px, 1fr))",
-            "gap": "8px",
-            "marginBottom": "8px",
-            "alignItems": "start",
-        },
-    )
-
     return html.Div([
-        cards,          # pills strip, full width
-        top_section,    # sidebar | Evoked | Ops
-        reference_row,  # channel + alerts
+        cards,         # pills strip, full width
+        top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
 
 
