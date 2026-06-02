@@ -858,6 +858,39 @@ def create_app(config: dict, store: Store) -> Dash:
             store, config, session_dir, trace_mode or "mean")
 
     @app.callback(
+        Output("overview-snapshot-img", "src"),
+        Output("overview-snapshot-caption", "children"),
+        Input("refresh-trigger", "data"),
+    )
+    def refresh_overview_snapshot(_n):
+        # ?t= cache-buster forces the browser to re-fetch each tick;
+        # the Flask side caches the JPEG for ~8s so we don't actually
+        # pummel the SMB share.
+        import time as _t
+        src = f"/media/latest-snapshot.jpg?t={int(_t.time())}"
+        # Caption: recording window of the underlying chunk so the
+        # operator knows how fresh the frame is.
+        conn = store._connect()
+        try:
+            row = conn.execute(
+                "SELECT chunk_datetime, duration_sec "
+                "FROM processed_files "
+                "WHERE has_video = 1 "
+                "ORDER BY chunk_datetime DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["chunk_datetime"]:
+            return src, "No videos available"
+        start_dt = _parse_chunk_dt(row["chunk_datetime"])
+        if start_dt is None:
+            return src, "Latest recording"
+        dur = float(row["duration_sec"] or 3600.0)
+        end_dt = start_dt + timedelta(seconds=dur)
+        return src, (f"Chunk {start_dt.strftime('%H:%M')} – "
+                      f"{end_dt.strftime('%H:%M')} (last frame)")
+
+    @app.callback(
         Output("header-status-dot", "style"),
         Output("header-status-dot", "title"),
         Output("header-status-dot", "className"),
@@ -3908,6 +3941,32 @@ def _overview_tab(store: Store, config: dict | None = None):
     km_wrapped = _collapsible(
         "KM Recorder log", km_section, open_default=True,
     )
+    # Latest video snapshot: most recent decodable frame from the
+    # newest companion video. The image src is rewritten on every
+    # refresh-trigger tick (cache-buster query string) so we always
+    # see fresh frames without manual reload; the Flask side caches
+    # the JPEG for ~8s so refresh ticks don't pummel the SMB share.
+    snapshot_card = html.Div([
+        html.Img(
+            id="overview-snapshot-img",
+            src="/media/latest-snapshot.jpg",
+            style={
+                "width": "100%", "display": "block",
+                "borderRadius": "4px",
+                "background": "#0a0a14",
+            },
+        ),
+        html.Div(
+            id="overview-snapshot-caption",
+            style={"color": "#888", "fontSize": "10px",
+                    "marginTop": "4px",
+                    "textTransform": "uppercase",
+                    "letterSpacing": "0.4px"},
+        ),
+    ])
+    snapshot_wrapped = _collapsible(
+        "Latest snapshot", snapshot_card, open_default=True,
+    )
     queue_wrapped = _collapsible(
         "Today · Recording uptime", queue_section, open_default=True,
     )
@@ -3929,7 +3988,7 @@ def _overview_tab(store: Store, config: dict | None = None):
     #   Col 2 (1fr):   Latest Evoked
     #   Col 3 (1fr):   Today + KM stacked
     ops_col = html.Div([
-        queue_wrapped, km_wrapped,
+        queue_wrapped, km_wrapped, snapshot_wrapped,
     ], style={
         "display": "flex", "flexDirection": "column", "gap": "8px",
     })
