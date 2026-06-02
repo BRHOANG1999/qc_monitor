@@ -913,12 +913,13 @@ def create_app(config: dict, store: Store) -> Dash:
         # pummel the SMB share.
         import time as _t
         src = f"/media/latest-snapshot.jpg?t={int(_t.time())}"
-        # Caption: recording window of the underlying chunk so the
-        # operator knows how fresh the frame is.
+        # Caption: recording window of the underlying chunk + camera
+        # count so the operator can tell single- vs multi-camera
+        # sessions apart at a glance.
         conn = store._connect()
         try:
             row = conn.execute(
-                "SELECT chunk_datetime, duration_sec "
+                "SELECT file_path, chunk_datetime, duration_sec "
                 "FROM processed_files "
                 "WHERE has_video = 1 "
                 "ORDER BY chunk_datetime DESC LIMIT 1"
@@ -927,13 +928,21 @@ def create_app(config: dict, store: Store) -> Dash:
             conn.close()
         if not row or not row["chunk_datetime"]:
             return src, "No videos available"
+        from src.utils.video import companion_video_paths
+        try:
+            n_cams = len(companion_video_paths(row["file_path"] or ""))
+        except Exception:
+            n_cams = 0
+        cam_tag = (f" · {n_cams} cameras" if n_cams > 1
+                    else "")
         start_dt = _parse_chunk_dt(row["chunk_datetime"])
         if start_dt is None:
-            return src, "Latest recording"
+            return src, f"Latest recording{cam_tag}"
         dur = float(row["duration_sec"] or 3600.0)
         end_dt = start_dt + timedelta(seconds=dur)
         return src, (f"Chunk {start_dt.strftime('%H:%M')} – "
-                      f"{end_dt.strftime('%H:%M')} (last frame)")
+                      f"{end_dt.strftime('%H:%M')} (last frame)"
+                      f"{cam_tag}")
 
     @app.callback(
         Output("header-status-dot", "style"),
@@ -3998,13 +4007,11 @@ def _overview_tab(store: Store, config: dict | None = None):
             title="Click to expand / collapse",
             n_clicks=0,
             style={
-                # Both maxWidth + maxHeight set so the browser
-                # proportionally scales the image to fit within
-                # the box -- maxHeight alone wasn't enough because
-                # the parent flex column was letting width: auto
-                # resolve to the natural pixel width.
+                # 320 px max width fits a 2-camera side-by-side
+                # collage without crushing it; single-camera
+                # sessions still cap at 180 px via maxHeight.
                 "display": "block",
-                "maxWidth": "240px",
+                "maxWidth": "320px",
                 "maxHeight": "180px",
                 "width": "100%",
                 "height": "auto",

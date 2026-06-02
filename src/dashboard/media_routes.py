@@ -14,7 +14,7 @@ import time
 
 from flask import abort, g, send_file
 
-from src.utils.video import video_path_for_mat
+from src.utils.video import video_path_for_mat, companion_video_paths
 
 logger = logging.getLogger("qc_monitor.dashboard.media")
 
@@ -58,12 +58,10 @@ def _latest_mat_with_video(db_path: str) -> str | None:
         conn.close()
 
 
-def _extract_last_frame_jpeg(video_path: str,
-                               max_width: int = 640) -> bytes | None:
+def _read_last_frame(video_path: str):
     """Open *video_path* with OpenCV, seek as close to the end as the
-    container allows, grab a frame, and return a JPEG byte buffer.
-    Returns None on any failure (missing codec, read error, etc.) --
-    the caller decides what to surface to the browser."""
+    container allows, return the decoded frame (BGR ndarray) or None.
+    """
     try:
         import cv2  # noqa: WPS433
     except Exception as e:
@@ -76,25 +74,66 @@ def _extract_last_frame_jpeg(video_path: str,
             return None
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total > 1:
-            # Step back one so we land ON a decodable frame instead
-            # of past the end.
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 2))
         ok, frame = cap.read()
         if not ok or frame is None:
             return None
-        h, w = frame.shape[:2]
-        if w > max_width:
-            scale = max_width / float(w)
-            new_size = (max_width, int(round(h * scale)))
-            frame = cv2.resize(frame, new_size,
-                                interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", frame,
-                                 [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ok:
-            return None
-        return bytes(buf.tobytes())
+        return frame
     finally:
         cap.release()
+
+
+def _frames_to_collage_jpeg(video_paths: list[str],
+                              max_width: int = 720) -> bytes | None:
+    """Stitch each video's last frame side-by-side (cv2.hconcat) and
+    encode the collage as a single JPEG. Frames are first resized to
+    the shortest input height to avoid upscaling. Skips videos that
+    fail to decode; returns None if every video fails.
+
+    Multi-camera sessions (cage A + cage B etc.) drop multiple
+    ``_vN.mp4`` next to one .mat; this lets the dashboard show all
+    of them in a single thumbnail without juggling separate <img>
+    elements + Flask round-trips.
+    """
+    try:
+        import cv2  # noqa: WPS433
+    except Exception as e:
+        logger.warning("OpenCV not available: %s", e)
+        return None
+    frames = []
+    for vp in video_paths:
+        f = _read_last_frame(vp)
+        if f is not None:
+            frames.append(f)
+    if not frames:
+        return None
+    # Normalise heights so hconcat doesn't fail. Use the shortest
+    # input as the target so we never up-scale (preserves detail).
+    target_h = min(f.shape[0] for f in frames)
+    norm = []
+    for f in frames:
+        h, w = f.shape[:2]
+        if h == target_h:
+            norm.append(f)
+            continue
+        scale = target_h / float(h)
+        new_w = max(1, int(round(w * scale)))
+        norm.append(cv2.resize(f, (new_w, target_h),
+                                interpolation=cv2.INTER_AREA))
+    collage = cv2.hconcat(norm)
+    # Downscale collage if it exceeds max_width so we don't ship a
+    # 3 K pixel-wide JPEG to the dashboard.
+    h, w = collage.shape[:2]
+    if w > max_width:
+        scale = max_width / float(w)
+        new_size = (max_width, max(1, int(round(h * scale))))
+        collage = cv2.resize(collage, new_size,
+                              interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", collage,
+                             [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return None
+    return bytes(buf.tobytes())
 
 
 def register_media_routes(server, store, config: dict) -> None:
@@ -143,14 +182,22 @@ def register_media_routes(server, store, config: dict) -> None:
                 if mat_path is None:
                     abort(404,
                             description="No recorded videos available")
-                video_path = video_path_for_mat(mat_path)
-                if video_path is None or not os.path.exists(video_path):
-                    abort(404,
-                            description="Companion video not on disk")
-                jpeg = _extract_last_frame_jpeg(video_path)
+                # Glob every companion _vN.mp4 so multi-camera
+                # sessions render side-by-side instead of dropping
+                # all but the first camera.
+                video_paths = companion_video_paths(mat_path)
+                if not video_paths:
+                    # Fallback to legacy single-video path so old
+                    # sessions still resolve cleanly.
+                    legacy = video_path_for_mat(mat_path)
+                    if legacy is None or not os.path.exists(legacy):
+                        abort(404,
+                                description="Companion video not on disk")
+                    video_paths = [legacy]
+                jpeg = _frames_to_collage_jpeg(video_paths)
                 if jpeg is None:
                     abort(500,
-                            description="Could not decode video frame")
+                            description="Could not decode any video frame")
                 captured_at = now
                 _snapshot_cache["latest"] = (jpeg, captured_at)
         resp = send_file(io.BytesIO(jpeg), mimetype="image/jpeg",
