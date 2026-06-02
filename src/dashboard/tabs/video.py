@@ -518,6 +518,60 @@ def layout(store: Store):
                     "scrollZoom": True,
                 },
             ),
+            # Time-locked analysis plot directly under the LFP.
+            # Same x-axis (seconds since chunk start), each point =
+            # one stim epoch, y = the chosen evoked feature. Cursor
+            # tracks the video the same way the LFP does.
+            html.Div([
+                html.Label("Analysis feature",
+                            style={**LABEL_STYLE,
+                                    "marginRight": "8px"}),
+                dcc.Dropdown(
+                    id="video-analysis-feature",
+                    options=[
+                        {"label": "Line length",      "value": "line_length"},
+                        {"label": "Log(AUC)",         "value": "log_auc"},
+                        {"label": "Peak amplitude",   "value": "peak_amplitude"},
+                        {"label": "Trough amplitude", "value": "trough_amplitude"},
+                        {"label": "Peak-to-trough",   "value": "peak_to_trough"},
+                        {"label": "RMS amplitude",    "value": "rms_amplitude"},
+                        {"label": "Peak latency (ms)", "value": "peak_latency_ms"},
+                        {"label": "Trough latency (ms)", "value": "trough_latency_ms"},
+                        {"label": "Max slope",        "value": "max_slope"},
+                        {"label": "Early area",       "value": "early_area"},
+                        {"label": "Late area",        "value": "late_area"},
+                        {"label": "Early/Late ratio", "value": "early_late_ratio"},
+                        {"label": "Recovery tau",     "value": "recovery_tau"},
+                        {"label": "Template corr.",   "value": "template_correlation"},
+                        {"label": "Variance",         "value": "variance"},
+                        {"label": "Sum power low",    "value": "sum_power_low"},
+                        {"label": "Sum power high",   "value": "sum_power_high"},
+                    ],
+                    value="line_length", clearable=False,
+                    style={"backgroundColor": "#262638",
+                            "color": "#f0f0f5", "width": "240px",
+                            "display": "inline-block"},
+                    className="dark-dropdown",
+                ),
+                html.Span(id="video-analysis-status",
+                           style={"color": "#888", "fontSize": "11px",
+                                   "marginLeft": "12px"}),
+            ], style={"marginTop": "16px", "marginBottom": "4px",
+                       "display": "flex", "alignItems": "center"}),
+            dcc.Graph(
+                id="video-analysis-trace",
+                figure=_empty_lfp_fig(
+                    "Pick a file to load analysis features."),
+                config={
+                    "displayModeBar": True,
+                    "displaylogo": False,
+                    "doubleClick": "reset",
+                    "modeBarButtonsToRemove": [
+                        "select2d", "lasso2d", "autoScale2d",
+                    ],
+                    "scrollZoom": True,
+                },
+            ),
         ], style={"marginTop": "20px"}),
 
         # --- Existing video-review notes for this file ------------------ #
@@ -713,6 +767,159 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "smooth": smooth_ms}
         return (fig, " · ".join(status_bits), new_state,
                 float(duration))
+
+    # ---- Time-locked analysis trace (feature vs time) ----
+    @app.callback(
+        Output("video-analysis-trace", "figure"),
+        Output("video-analysis-status", "children"),
+        Input("video-file-dropdown", "value"),
+        Input("video-analysis-feature", "value"),
+    )
+    def _update_analysis(file_id, feature):
+        if not file_id:
+            return (_empty_lfp_fig(
+                "Pick a file to load analysis features."), "")
+        if not feature:
+            return _empty_lfp_fig("Pick a feature."), ""
+        try:
+            rows = store.query_evoked_features(int(file_id))
+        except Exception as e:
+            logger.warning("Analysis load failed file=%s: %s",
+                            file_id, e)
+            return (_empty_lfp_fig(f"Analysis load error: {e}"),
+                    "")
+        if not rows:
+            return (_empty_lfp_fig(
+                "No evoked features yet for this file."), "")
+        ts: list[float] = []
+        ys: list[float] = []
+        artifact_ts: list[float] = []
+        artifact_ys: list[float] = []
+        for r in rows:
+            v = r.get(feature)
+            t = r.get("epoch_time_sec")
+            if v is None or t is None:
+                continue
+            if r.get("is_artifact"):
+                artifact_ts.append(float(t))
+                artifact_ys.append(float(v))
+            else:
+                ts.append(float(t))
+                ys.append(float(v))
+        if not ts and not artifact_ts:
+            return (_empty_lfp_fig(
+                f"No '{feature}' values on this file."), "")
+        feature_label = feature.replace("_", " ")
+        fig = go.Figure()
+        if ts:
+            fig.add_trace(go.Scattergl(
+                x=ts, y=ys, mode="lines+markers",
+                line=dict(color="#5e7ce2", width=1.2),
+                marker=dict(size=5, color="#5e7ce2"),
+                name="ok",
+                hovertemplate=("t=%{x:.2f}s<br>"
+                                + feature_label
+                                + "=%{y:.3f}<extra></extra>"),
+            ))
+        if artifact_ts:
+            fig.add_trace(go.Scattergl(
+                x=artifact_ts, y=artifact_ys, mode="markers",
+                marker=dict(size=6, color="#EF553B", symbol="x"),
+                name="artifact",
+                hovertemplate=("t=%{x:.2f}s<br>"
+                                + feature_label
+                                + "=%{y:.3f} (artifact)"
+                                + "<extra></extra>"),
+            ))
+        fig.update_layout(
+            plot_bgcolor="#13131f", paper_bgcolor="#13131f",
+            height=180,
+            margin=dict(l=60, r=20, t=10, b=40),
+            xaxis=dict(title="Time (s)", showgrid=True,
+                        gridcolor="rgba(255,255,255,0.05)",
+                        zeroline=False, color="#cfd0d6"),
+            yaxis=dict(title=feature_label, showgrid=True,
+                        gridcolor="rgba(255,255,255,0.05)",
+                        zeroline=False, color="#cfd0d6"),
+            showlegend=bool(artifact_ts),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                         xanchor="right", x=1, font_size=10,
+                         bgcolor="rgba(0,0,0,0)"),
+            shapes=[dict(
+                type="line", xref="x", yref="paper",
+                x0=0, x1=0, y0=0, y1=1,
+                line=dict(color="#ff9f0a", width=2),
+            )],
+        )
+        status = (f"{len(ts) + len(artifact_ts)} epochs · "
+                   f"{len(artifact_ts)} artifact")
+        return fig, status
+
+    # 4. Mirror the orange cursor on the analysis trace too.
+    app.clientside_callback(
+        """
+        function(currentTime, fig, lfp_dur) {
+            if (fig === undefined || fig === null) {
+                return window.dash_clientside.no_update;
+            }
+            if (currentTime === null || currentTime === undefined) {
+                return window.dash_clientside.no_update;
+            }
+            var t = currentTime;
+            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (v && isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                t = currentTime * (lfp_dur / v.duration);
+            }
+            const newFig = {
+                data: fig.data,
+                layout: Object.assign({}, fig.layout, {
+                    shapes: [{
+                        type: 'line', xref: 'x', yref: 'paper',
+                        x0: t, x1: t, y0: 0, y1: 1,
+                        line: {color: '#ff9f0a', width: 2}
+                    }]
+                })
+            };
+            return newFig;
+        }
+        """,
+        Output("video-analysis-trace", "figure",
+                allow_duplicate=True),
+        Input("video-current-time", "data"),
+        State("video-analysis-trace", "figure"),
+        State("video-lfp-duration", "data"),
+        prevent_initial_call=True,
+    )
+
+    # 5. Click an epoch on the analysis trace -> seek the video.
+    app.clientside_callback(
+        """
+        function(clickData, lfp_dur) {
+            if (!clickData || !clickData.points || !clickData.points.length) {
+                return '';
+            }
+            const x = clickData.points[0].x;
+            const v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (!v || !isFinite(x)) { return ''; }
+            var vt = x;
+            if (isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                vt = x * (v.duration / lfp_dur);
+            }
+            if (vt < 0) { vt = 0; }
+            if (isFinite(v.duration) && vt > v.duration) {
+                vt = v.duration;
+            }
+            v.currentTime = vt;
+            return '';
+        }
+        """,
+        Output("video-seek-sink", "children", allow_duplicate=True),
+        Input("video-analysis-trace", "clickData"),
+        State("video-lfp-duration", "data"),
+        prevent_initial_call=True,
+    )
 
     # ---- Zoom-driven dynamic decimation ----
     # When the reviewer zooms in, re-decimate just the visible window so
