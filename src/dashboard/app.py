@@ -880,15 +880,23 @@ def create_app(config: dict, store: Store) -> Dash:
             return {
                 "display": "block",
                 "width": "100%",
+                "height": "auto",
+                "maxWidth": "100%",
                 "maxHeight": "none",
+                "objectFit": "contain",
                 "borderRadius": "4px",
                 "background": "#0a0a14",
                 "cursor": "zoom-out",
             }
+        # Small thumbnail: maxWidth caps total width and the
+        # browser keeps the aspect ratio via objectFit: contain.
         return {
             "display": "block",
-            "maxHeight": "160px",
-            "width": "auto",
+            "maxWidth": "240px",
+            "maxHeight": "180px",
+            "width": "100%",
+            "height": "auto",
+            "objectFit": "contain",
             "borderRadius": "4px",
             "background": "#0a0a14",
             "cursor": "zoom-in",
@@ -3990,14 +3998,17 @@ def _overview_tab(store: Store, config: dict | None = None):
             title="Click to expand / collapse",
             n_clicks=0,
             style={
-                # Default = small thumbnail. The callback below
-                # swaps this style with an expanded variant on
-                # click. width:auto + a maxHeight clamp lets the
-                # browser size the image by its natural 4:3 aspect
-                # ratio so a 640×480 frame collapses to ~213×160.
+                # Both maxWidth + maxHeight set so the browser
+                # proportionally scales the image to fit within
+                # the box -- maxHeight alone wasn't enough because
+                # the parent flex column was letting width: auto
+                # resolve to the natural pixel width.
                 "display": "block",
-                "maxHeight": "160px",
-                "width": "auto",
+                "maxWidth": "240px",
+                "maxHeight": "180px",
+                "width": "100%",
+                "height": "auto",
+                "objectFit": "contain",
                 "borderRadius": "4px",
                 "background": "#0a0a14",
                 "cursor": "zoom-in",
