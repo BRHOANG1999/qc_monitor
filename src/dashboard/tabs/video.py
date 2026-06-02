@@ -504,7 +504,19 @@ def layout(store: Store):
             dcc.Graph(
                 id="video-lfp-trace",
                 figure=_empty_lfp_fig("Pick a file to load the LFP trace."),
-                config={"displayModeBar": False},
+                # Modebar on so the user has Zoom / Pan / Reset axes /
+                # download. doubleClick: "reset" makes a double-click
+                # anywhere in the plot snap back to the default view
+                # in one click (Plotly's hidden gem).
+                config={
+                    "displayModeBar": True,
+                    "displaylogo": False,
+                    "doubleClick": "reset",
+                    "modeBarButtonsToRemove": [
+                        "select2d", "lasso2d", "autoScale2d",
+                    ],
+                    "scrollZoom": True,
+                },
             ),
         ], style={"marginTop": "20px"}),
 
@@ -524,6 +536,14 @@ def layout(store: Store):
         # the callback no-ops. Cheap.
         dcc.Interval(id="video-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="video-current-time", data=0.0),
+        # BHZ_DETECTOR-style time lock. We stash the LFP's true
+        # duration (from chunk: n_samples / fs) here when the trace
+        # loads. The clientside callbacks combine this with the
+        # <video> element's own .duration to compute a per-chunk
+        # scale factor (lfp_dur / video_dur) -- container FPS lies
+        # can no longer accumulate drift over the chunk because
+        # we're anchored to ground truth on both ends.
+        dcc.Store(id="video-lfp-duration", data=0.0),
         # Dummy outputs for clientside callbacks that have side effects on
         # the DOM (setting video.currentTime) rather than returning data.
         html.Div(id="video-seek-sink", style={"display": "none"}),
@@ -608,6 +628,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-lfp-trace", "figure", allow_duplicate=True),
         Output("video-lfp-status", "children"),
         Output("video-filter-state", "data"),
+        Output("video-lfp-duration", "data"),
         Input("video-file-dropdown", "value"),
         Input("video-channel-dropdown", "value"),
         Input("video-apply-filter-btn", "n_clicks"),
@@ -621,12 +642,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      hp, lp, notch, smooth_ms):
         if not file_id:
             return (_empty_lfp_fig("Pick a file to load the LFP trace."),
-                    "", no_update)
+                    "", no_update, 0.0)
         if channel is None:
-            return _empty_lfp_fig("Pick an LFP channel."), "", no_update
+            return (_empty_lfp_fig("Pick an LFP channel."),
+                    "", no_update, 0.0)
         file_path = _file_path_for_id(store, file_id)
         if not file_path:
-            return _empty_lfp_fig("File not found in DB."), "", no_update
+            return (_empty_lfp_fig("File not found in DB."),
+                    "", no_update, 0.0)
 
         # Decide whether to apply stim blanking. Only blank channels
         # that aren't themselves the stim source — and only if there
@@ -648,7 +671,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("LFP load failed file=%s ch=%s: %s",
                            file_id, channel, e)
-            return _empty_lfp_fig(f"LFP load error: {e}"), "", no_update
+            return (_empty_lfp_fig(f"LFP load error: {e}"),
+                    "", no_update, 0.0)
 
         # Apply live filter (HP/LP/notch/smooth) on the *decimated*
         # display series so we don't pay the cost of filtering the
@@ -687,7 +711,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             status_bits.append(" + ".join(filt_bits))
         new_state = {"hp": hp, "lp": lp, "notch": notch,
                      "smooth": smooth_ms}
-        return fig, " · ".join(status_bits), new_state
+        return (fig, " · ".join(status_bits), new_state,
+                float(duration))
 
     # ---- Zoom-driven dynamic decimation ----
     # When the reviewer zooms in, re-decimate just the visible window so
@@ -836,23 +861,34 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
 
     # 2. Move the LFP-trace cursor whenever the stored time changes.
-    #    We mutate only the layout.shapes array — Plotly does an
-    #    incremental re-render, so this stays smooth even on long files.
+    #    Translate video.currentTime -> LFP time using the BHZ
+    #    method: cursor_x = currentTime * (lfp_duration /
+    #    video_duration). Both endpoints are ground truth -- the
+    #    .mat tells us how long the LFP runs, the <video> tag tells
+    #    us how long the video runs -- so container FPS lies cannot
+    #    accumulate drift. When either duration isn't known yet,
+    #    fall back to the identity mapping (same as before).
     app.clientside_callback(
         """
-        function(currentTime, fig) {
+        function(currentTime, fig, lfp_dur) {
             if (fig === undefined || fig === null) {
                 return window.dash_clientside.no_update;
             }
             if (currentTime === null || currentTime === undefined) {
                 return window.dash_clientside.no_update;
             }
+            var t = currentTime;
+            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (v && isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                t = currentTime * (lfp_dur / v.duration);
+            }
             const newFig = {
                 data: fig.data,
                 layout: Object.assign({}, fig.layout, {
                     shapes: [{
                         type: 'line', xref: 'x', yref: 'paper',
-                        x0: currentTime, x1: currentTime,
+                        x0: t, x1: t,
                         y0: 0, y1: 1,
                         line: {color: '#ff9f0a', width: 2}
                     }]
@@ -864,26 +900,39 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-lfp-trace", "figure", allow_duplicate=True),
         Input("video-current-time", "data"),
         State("video-lfp-trace", "figure"),
+        State("video-lfp-duration", "data"),
         prevent_initial_call=True,
     )
 
     # 3. Click on the LFP trace -> seek the video to that x value.
+    #    Inverse mapping: video_t = x * (video_duration / lfp_duration).
     app.clientside_callback(
         """
-        function(clickData) {
+        function(clickData, lfp_dur) {
             if (!clickData || !clickData.points || !clickData.points.length) {
                 return '';
             }
-            const t = clickData.points[0].x;
+            const x = clickData.points[0].x;
             const v = document.getElementById('""" + VIDEO_DOM_ID + """');
-            if (v && isFinite(t)) {
-                v.currentTime = t;
+            if (!v || !isFinite(x)) { return ''; }
+            var vt = x;
+            if (isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                vt = x * (v.duration / lfp_dur);
             }
+            // Clamp so a click near the end doesn't trip
+            // <video>'s past-end guard and silently no-op.
+            if (vt < 0) { vt = 0; }
+            if (isFinite(v.duration) && vt > v.duration) {
+                vt = v.duration;
+            }
+            v.currentTime = vt;
             return '';
         }
         """,
         Output("video-seek-sink", "children"),
         Input("video-lfp-trace", "clickData"),
+        State("video-lfp-duration", "data"),
     )
 
 
