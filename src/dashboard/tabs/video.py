@@ -523,41 +523,94 @@ def layout(store: Store):
             # one stim epoch, y = the chosen evoked feature. Cursor
             # tracks the video the same way the LFP does.
             html.Div([
-                html.Label("Analysis feature",
-                            style={**LABEL_STYLE,
-                                    "marginRight": "8px"}),
-                dcc.Dropdown(
-                    id="video-analysis-feature",
-                    options=[
-                        {"label": "Line length",      "value": "line_length"},
-                        {"label": "Log(AUC)",         "value": "log_auc"},
-                        {"label": "Peak amplitude",   "value": "peak_amplitude"},
-                        {"label": "Trough amplitude", "value": "trough_amplitude"},
-                        {"label": "Peak-to-trough",   "value": "peak_to_trough"},
-                        {"label": "RMS amplitude",    "value": "rms_amplitude"},
-                        {"label": "Peak latency (ms)", "value": "peak_latency_ms"},
-                        {"label": "Trough latency (ms)", "value": "trough_latency_ms"},
-                        {"label": "Max slope",        "value": "max_slope"},
-                        {"label": "Early area",       "value": "early_area"},
-                        {"label": "Late area",        "value": "late_area"},
-                        {"label": "Early/Late ratio", "value": "early_late_ratio"},
-                        {"label": "Recovery tau",     "value": "recovery_tau"},
-                        {"label": "Template corr.",   "value": "template_correlation"},
-                        {"label": "Variance",         "value": "variance"},
-                        {"label": "Sum power low",    "value": "sum_power_low"},
-                        {"label": "Sum power high",   "value": "sum_power_high"},
-                    ],
-                    value="line_length", clearable=False,
-                    style={"backgroundColor": "#262638",
-                            "color": "#f0f0f5", "width": "240px",
-                            "display": "inline-block"},
-                    className="dark-dropdown",
-                ),
+                html.Div([
+                    html.Label("Feature", style=LABEL_STYLE),
+                    dcc.Dropdown(
+                        id="video-analysis-feature",
+                        options=[
+                            {"label": "Line length",      "value": "line_length"},
+                            {"label": "Log(AUC)",         "value": "log_auc"},
+                            {"label": "Peak amplitude",   "value": "peak_amplitude"},
+                            {"label": "Trough amplitude", "value": "trough_amplitude"},
+                            {"label": "Peak-to-trough",   "value": "peak_to_trough"},
+                            {"label": "RMS amplitude",    "value": "rms_amplitude"},
+                            {"label": "Peak latency (ms)", "value": "peak_latency_ms"},
+                            {"label": "Trough latency (ms)", "value": "trough_latency_ms"},
+                            {"label": "Max slope",        "value": "max_slope"},
+                            {"label": "Early area",       "value": "early_area"},
+                            {"label": "Late area",        "value": "late_area"},
+                            {"label": "Early/Late ratio", "value": "early_late_ratio"},
+                            {"label": "Recovery tau",     "value": "recovery_tau"},
+                            {"label": "Template corr.",   "value": "template_correlation"},
+                            {"label": "Variance",         "value": "variance"},
+                            {"label": "Sum power low",    "value": "sum_power_low"},
+                            {"label": "Sum power high",   "value": "sum_power_high"},
+                        ],
+                        value="line_length", clearable=False,
+                        style={"backgroundColor": "#262638",
+                                "color": "#f0f0f5", "minWidth": "220px"},
+                        className="dark-dropdown",
+                    ),
+                ], style={"flex": "0 0 230px"}),
+                html.Div([
+                    html.Label("Smooth (s)", style=LABEL_STYLE),
+                    dcc.Input(id="video-analysis-smooth", type="number",
+                                min=0, step=0.5, value=0,
+                                style={"backgroundColor": "#262638",
+                                        "color": "#f0f0f5",
+                                        "width": "80px"}),
+                ], style={"flex": "0 0 100px"}),
+                html.Div([
+                    html.Label("Window (epochs)", style=LABEL_STYLE),
+                    dcc.Input(id="video-analysis-rollwin",
+                                type="number", min=0, step=1, value=0,
+                                style={"backgroundColor": "#262638",
+                                        "color": "#f0f0f5",
+                                        "width": "80px"}),
+                ], style={"flex": "0 0 140px"}),
+                html.Div([
+                    html.Label("Post-process", style=LABEL_STYLE),
+                    dcc.Checklist(
+                        id="video-analysis-postproc",
+                        options=[
+                            {"label": " Detrend",  "value": "detrend"},
+                            {"label": " Z-score",  "value": "zscore"},
+                            {"label": " Hide artifacts",
+                                "value": "hide_artifact"},
+                            {"label": " Median",   "value": "median"},
+                        ],
+                        value=["hide_artifact"], inline=True,
+                        style={"color": "#cfd0d6", "fontSize": "12px"},
+                        inputStyle={"marginRight": "4px",
+                                     "marginLeft": "8px"},
+                    ),
+                ], style={"flex": "1 1 auto"}),
+                html.Div([
+                    html.Label(" ", style=LABEL_STYLE),
+                    html.Button("Apply",
+                                 id="video-analysis-apply-btn",
+                                 n_clicks=0,
+                                 style={"backgroundColor": "#262638",
+                                         "color": "white",
+                                         "border": "1px solid #444",
+                                         "padding": "6px 14px",
+                                         "borderRadius": "6px",
+                                         "cursor": "pointer",
+                                         "fontSize": "12px"}),
+                ], style={"flex": "0 0 90px",
+                           "display": "flex",
+                           "alignItems": "flex-end"}),
                 html.Span(id="video-analysis-status",
                            style={"color": "#888", "fontSize": "11px",
-                                   "marginLeft": "12px"}),
+                                   "marginLeft": "12px",
+                                   "alignSelf": "center"}),
             ], style={"marginTop": "16px", "marginBottom": "4px",
-                       "display": "flex", "alignItems": "center"}),
+                       "display": "flex", "gap": "10px",
+                       "flexWrap": "wrap", "alignItems": "flex-end",
+                       "padding": "8px 10px",
+                       "backgroundColor": "#13131f",
+                       "borderRadius": "6px",
+                       "border": "1px solid rgba(255,255,255,0.06)"}),
             dcc.Graph(
                 id="video-analysis-trace",
                 figure=_empty_lfp_fig(
@@ -774,8 +827,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-analysis-status", "children"),
         Input("video-file-dropdown", "value"),
         Input("video-analysis-feature", "value"),
+        Input("video-analysis-apply-btn", "n_clicks"),
+        State("video-analysis-smooth", "value"),
+        State("video-analysis-rollwin", "value"),
+        State("video-analysis-postproc", "value"),
     )
-    def _update_analysis(file_id, feature):
+    def _update_analysis(file_id, feature, _n_apply,
+                          smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
                 "Pick a file to load analysis features."), "")
@@ -791,29 +849,87 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not rows:
             return (_empty_lfp_fig(
                 "No evoked features yet for this file."), "")
-        ts: list[float] = []
-        ys: list[float] = []
-        artifact_ts: list[float] = []
-        artifact_ys: list[float] = []
+        rows.sort(key=lambda r: (r.get("epoch_time_sec") or 0.0))
+        ok_t, ok_y = [], []
+        art_t, art_y = [], []
         for r in rows:
             v = r.get(feature)
             t = r.get("epoch_time_sec")
             if v is None or t is None:
                 continue
             if r.get("is_artifact"):
-                artifact_ts.append(float(t))
-                artifact_ys.append(float(v))
+                art_t.append(float(t))
+                art_y.append(float(v))
             else:
-                ts.append(float(t))
-                ys.append(float(v))
-        if not ts and not artifact_ts:
+                ok_t.append(float(t))
+                ok_y.append(float(v))
+        if not ok_t and not art_t:
             return (_empty_lfp_fig(
                 f"No '{feature}' values on this file."), "")
         feature_label = feature.replace("_", " ")
+
+        # ---- Post-processing on the OK series ----
+        proc = set(postproc or [])
+        ok_y_arr = np.asarray(ok_y, dtype=np.float64)
+        ok_t_arr = np.asarray(ok_t, dtype=np.float64)
+        applied_bits: list[str] = []
+
+        # Rolling median window in EPOCHS (centered, odd-size).
+        try:
+            rw = int(rollwin or 0)
+        except (TypeError, ValueError):
+            rw = 0
+        if rw >= 3 and ok_y_arr.size >= rw:
+            from scipy.signal import medfilt as _medfilt
+            k = rw if rw % 2 == 1 else rw + 1
+            ok_y_arr = _medfilt(ok_y_arr, kernel_size=k)
+            applied_bits.append(f"medfilt({k})")
+
+        # Gaussian smoothing in SECONDS (sigma; converted to samples
+        # via the median inter-epoch interval so the smoothing
+        # behaves the same regardless of stim rate).
+        try:
+            sm = float(smooth_sec or 0)
+        except (TypeError, ValueError):
+            sm = 0.0
+        if sm > 0 and ok_t_arr.size >= 3:
+            dt_arr = np.diff(ok_t_arr)
+            dt_arr = dt_arr[dt_arr > 0]
+            median_dt = (float(np.median(dt_arr))
+                         if dt_arr.size else 0.0)
+            if median_dt > 0:
+                from scipy.ndimage import gaussian_filter1d as _gf1
+                sigma_samples = max(0.5, sm / median_dt)
+                sigma_samples = min(sigma_samples,
+                                     ok_y_arr.size / 4.0)
+                ok_y_arr = _gf1(ok_y_arr.astype(np.float32),
+                                 sigma=sigma_samples,
+                                 mode="nearest").astype(np.float64)
+                applied_bits.append(f"smooth {sm:g}s")
+
+        if "detrend" in proc and ok_y_arr.size >= 3:
+            from scipy.signal import detrend as _detrend
+            ok_y_arr = _detrend(ok_y_arr, type="linear")
+            applied_bits.append("detrend")
+
+        if "zscore" in proc and ok_y_arr.size >= 2:
+            std = float(np.std(ok_y_arr))
+            if std > 0:
+                ok_y_arr = (ok_y_arr - float(np.mean(ok_y_arr))) / std
+                applied_bits.append("z-score")
+
+        if "median" in proc and ok_y_arr.size >= 1:
+            ok_y_arr = ok_y_arr - float(np.median(ok_y_arr))
+            applied_bits.append("median-center")
+
+        hide_art = "hide_artifact" in proc
+
+        # ---- Build figure ----
         fig = go.Figure()
-        if ts:
+        ok_y = ok_y_arr.tolist()
+        if ok_t:
             fig.add_trace(go.Scattergl(
-                x=ts, y=ys, mode="lines+markers",
+                x=ok_t, y=ok_y, mode="lines+markers",
                 line=dict(color="#5e7ce2", width=1.2),
                 marker=dict(size=5, color="#5e7ce2"),
                 name="ok",
@@ -821,9 +937,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                 + feature_label
                                 + "=%{y:.3f}<extra></extra>"),
             ))
-        if artifact_ts:
+        if art_t and not hide_art:
             fig.add_trace(go.Scattergl(
-                x=artifact_ts, y=artifact_ys, mode="markers",
+                x=art_t, y=art_y, mode="markers",
                 marker=dict(size=6, color="#EF553B", symbol="x"),
                 name="artifact",
                 hovertemplate=("t=%{x:.2f}s<br>"
@@ -841,7 +957,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             yaxis=dict(title=feature_label, showgrid=True,
                         gridcolor="rgba(255,255,255,0.05)",
                         zeroline=False, color="#cfd0d6"),
-            showlegend=bool(artifact_ts),
+            showlegend=bool(art_t and not hide_art),
             legend=dict(orientation="h", yanchor="bottom", y=1.02,
                          xanchor="right", x=1, font_size=10,
                          bgcolor="rgba(0,0,0,0)"),
@@ -851,9 +967,80 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 line=dict(color="#ff9f0a", width=2),
             )],
         )
-        status = (f"{len(ts) + len(artifact_ts)} epochs · "
-                   f"{len(artifact_ts)} artifact")
-        return fig, status
+        bits = [f"{len(ok_t) + len(art_t)} epochs",
+                 f"{len(art_t)} artifact"]
+        if applied_bits:
+            bits.append(" + ".join(applied_bits))
+        return fig, " · ".join(bits)
+
+    # ---- X-axis sync: LFP zoom drives analysis zoom (and back) ----
+    # Bidirectional clientside listeners on relayoutData so either
+    # plot's pan/zoom/reset propagates to the other. We patch only
+    # layout.xaxis.range / autorange -- the existing zoom-decimate
+    # callback on the LFP still fires on its own relayoutData input
+    # without seeing this clientside echo (Dash skips clientside
+    # outputs when the input value is the same as last time).
+    app.clientside_callback(
+        """
+        function(rel, fig) {
+            if (!rel || !fig) {
+                return window.dash_clientside.no_update;
+            }
+            var xa = Object.assign({}, fig.layout.xaxis || {});
+            var has = false;
+            if ('xaxis.range[0]' in rel && 'xaxis.range[1]' in rel) {
+                xa.range = [rel['xaxis.range[0]'],
+                            rel['xaxis.range[1]']];
+                xa.autorange = false;
+                has = true;
+            } else if (rel['xaxis.autorange']) {
+                xa.autorange = true;
+                delete xa.range;
+                has = true;
+            }
+            if (!has) { return window.dash_clientside.no_update; }
+            return {
+                data: fig.data,
+                layout: Object.assign({}, fig.layout, {xaxis: xa}),
+            };
+        }
+        """,
+        Output("video-analysis-trace", "figure",
+                allow_duplicate=True),
+        Input("video-lfp-trace", "relayoutData"),
+        State("video-analysis-trace", "figure"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(rel, fig) {
+            if (!rel || !fig) {
+                return window.dash_clientside.no_update;
+            }
+            var xa = Object.assign({}, fig.layout.xaxis || {});
+            var has = false;
+            if ('xaxis.range[0]' in rel && 'xaxis.range[1]' in rel) {
+                xa.range = [rel['xaxis.range[0]'],
+                            rel['xaxis.range[1]']];
+                xa.autorange = false;
+                has = true;
+            } else if (rel['xaxis.autorange']) {
+                xa.autorange = true;
+                delete xa.range;
+                has = true;
+            }
+            if (!has) { return window.dash_clientside.no_update; }
+            return {
+                data: fig.data,
+                layout: Object.assign({}, fig.layout, {xaxis: xa}),
+            };
+        }
+        """,
+        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        Input("video-analysis-trace", "relayoutData"),
+        State("video-lfp-trace", "figure"),
+        prevent_initial_call=True,
+    )
 
     # 4. Mirror the orange cursor on the analysis trace too.
     app.clientside_callback(
