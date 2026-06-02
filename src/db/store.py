@@ -294,10 +294,20 @@ class Store:
             conn.close()
 
     def get_pending_files(self, limit: int = 50) -> list[dict]:
+        """Pending files, newest chunk_datetime first.
+
+        LIFO on chunk_datetime so the dispatcher always crunches the
+        most recent recordings first -- the Overview "Latest Evoked"
+        thumbnail tracks the live experiment instead of waiting for
+        a multi-day backfill to drain. Backfill still runs, just
+        from the present moving back rather than from the past
+        moving forward.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM processed_files WHERE status = 'pending' ORDER BY chunk_datetime ASC LIMIT ?",
+                "SELECT * FROM processed_files WHERE status = 'pending' "
+                "ORDER BY chunk_datetime DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
