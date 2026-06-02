@@ -735,6 +735,10 @@ def create_app(config: dict, store: Store) -> Dash:
         # remains visible. Toggled by the Focus button in the refresh
         # bar; the bar itself stays visible (it's the only way out).
         dcc.Store(id="focus-mode", data=False),
+        # Snapshot expanded state: False = small thumbnail in the
+        # third column, True = full-width image. Toggled by clicking
+        # the snapshot itself.
+        dcc.Store(id="snapshot-expanded", data=False),
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
@@ -856,6 +860,39 @@ def create_app(config: dict, store: Store) -> Dash:
         session_dir = sessions[0]["session_dir"] if sessions else ""
         return _build_overview_thumbnail(
             store, config, session_dir, trace_mode or "mean")
+
+    @app.callback(
+        Output("snapshot-expanded", "data"),
+        Input("overview-snapshot-img", "n_clicks"),
+        State("snapshot-expanded", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_snapshot_size(n_clicks, current):
+        # Each click flips between thumb and expanded states.
+        return not bool(current)
+
+    @app.callback(
+        Output("overview-snapshot-img", "style"),
+        Input("snapshot-expanded", "data"),
+    )
+    def apply_snapshot_size(expanded):
+        if expanded:
+            return {
+                "display": "block",
+                "width": "100%",
+                "maxHeight": "none",
+                "borderRadius": "4px",
+                "background": "#0a0a14",
+                "cursor": "zoom-out",
+            }
+        return {
+            "display": "block",
+            "maxHeight": "160px",
+            "width": "auto",
+            "borderRadius": "4px",
+            "background": "#0a0a14",
+            "cursor": "zoom-in",
+        }
 
     @app.callback(
         Output("overview-snapshot-img", "src"),
@@ -3942,18 +3979,28 @@ def _overview_tab(store: Store, config: dict | None = None):
         "KM Recorder log", km_section, open_default=True,
     )
     # Latest video snapshot: most recent decodable frame from the
-    # newest companion video. The image src is rewritten on every
-    # refresh-trigger tick (cache-buster query string) so we always
-    # see fresh frames without manual reload; the Flask side caches
-    # the JPEG for ~8s so refresh ticks don't pummel the SMB share.
+    # newest companion video. Renders as a small thumbnail by
+    # default so it doesn't push the column tall; click the image
+    # to expand it inline. The src is cache-busted on every refresh-
+    # trigger tick so we always see fresh frames without reload.
     snapshot_card = html.Div([
         html.Img(
             id="overview-snapshot-img",
             src="/media/latest-snapshot.jpg",
+            title="Click to expand / collapse",
+            n_clicks=0,
             style={
-                "width": "100%", "display": "block",
+                # Default = small thumbnail. The callback below
+                # swaps this style with an expanded variant on
+                # click. width:auto + a maxHeight clamp lets the
+                # browser size the image by its natural 4:3 aspect
+                # ratio so a 640×480 frame collapses to ~213×160.
+                "display": "block",
+                "maxHeight": "160px",
+                "width": "auto",
                 "borderRadius": "4px",
                 "background": "#0a0a14",
+                "cursor": "zoom-in",
             },
         ),
         html.Div(
