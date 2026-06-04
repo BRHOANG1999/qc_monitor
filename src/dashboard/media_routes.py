@@ -165,6 +165,30 @@ def register_media_routes(server, store, config: dict) -> None:
             as_attachment=False,
         )
 
+    @server.route("/media/video/<int:file_id>/<int:cam>")
+    def serve_video_cam(file_id: int, cam: int):  # pragma: no cover
+        """Serve the Nth companion video (_v1, _v2, ...) for a given
+        chunk. cam is 1-indexed because that's how the filenames go.
+        Falls through to 404 when the camera index is out of range."""
+        if not getattr(g, "user", None):
+            abort(403)
+        if cam < 1:
+            abort(400, description="cam must be >= 1")
+        mat_path = _lookup_mat_path(db_path, file_id)
+        if mat_path is None:
+            abort(404, description=f"Unknown file_id {file_id}")
+        paths = companion_video_paths(mat_path)
+        if not paths or cam > len(paths):
+            abort(404,
+                    description=f"Camera v{cam} not available "
+                                 f"({len(paths)} companion(s) on disk)")
+        return send_file(
+            paths[cam - 1],
+            mimetype="video/mp4",
+            conditional=True,
+            as_attachment=False,
+        )
+
     @server.route("/media/latest-snapshot.jpg")
     def serve_latest_snapshot():  # pragma: no cover -- exercised by browser
         """Return a JPEG of the most-recently-recorded video's last

@@ -643,6 +643,10 @@ def layout(store: Store):
         # the callback no-ops. Cheap.
         dcc.Interval(id="video-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="video-current-time", data=0.0),
+        # Sink for the multi-camera slave-sync clientside callback;
+        # the callback returns the empty string and only side-effects
+        # the slave <video> elements' currentTime / play / pause.
+        html.Div(id="video-cam-sync-sink", style={"display": "none"}),
         # BHZ_DETECTOR-style time lock. We stash the LFP's true
         # duration (from chunk: n_samples / fs) here when the trace
         # loads. The clientside callbacks combine this with the
@@ -719,14 +723,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             except Exception as e:
                 logger.warning("Channel probe failed for file %d: %s", file_id, e)
 
-        player = html.Video(
-            id=VIDEO_DOM_ID,
-            src=f"/media/video/{file_id}",
-            controls=True,
-            preload="metadata",
-            style={"width": "100%", "maxHeight": "520px",
-                   "borderRadius": "10px", "backgroundColor": "#000"},
-        )
+        # Multi-camera support: enumerate every companion _vN.mp4
+        # and render one <video> per camera side-by-side. The first
+        # camera is the "master" (carries the controls, drives the
+        # clientside cursor + currentTime store). Slaves are muted
+        # and follow the master via a per-tick clientside sync.
+        n_cams = 0
+        if file_path:
+            try:
+                from src.utils.video import companion_video_paths
+                n_cams = len(companion_video_paths(file_path))
+            except Exception as e:
+                logger.debug("companion enumeration failed: %s", e)
+                n_cams = 0
+        # Fall back to 1 so the legacy single-camera route still
+        # renders something even if globbing fails on the SMB share.
+        n_cams = max(1, n_cams)
+        cam_videos = []
+        for i in range(1, n_cams + 1):
+            is_master = (i == 1)
+            cam_videos.append(html.Video(
+                id=(VIDEO_DOM_ID if is_master
+                     else f"{VIDEO_DOM_ID}-cam{i}"),
+                src=f"/media/video/{file_id}/{i}",
+                controls=is_master,
+                muted=(not is_master),
+                preload="metadata",
+                style={"width": "100%", "maxHeight": "520px",
+                        "borderRadius": "10px",
+                        "backgroundColor": "#000",
+                        "minWidth": "0"},
+            ))
+        if n_cams == 1:
+            player = cam_videos[0]
+        else:
+            player = html.Div(cam_videos, style={
+                "display": "grid",
+                "gridTemplateColumns": f"repeat({n_cams}, 1fr)",
+                "gap": "8px",
+            })
         history = _render_history(store, file_id)
         return player, history, ch_options, ch_value
 
@@ -1251,6 +1286,38 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         }
         """,
         Output("video-current-time", "data"),
+        Input("video-time-tick", "n_intervals"),
+    )
+
+    # 1b. Multi-camera sync. Every tick, walk the DOM for slave
+    #     <video> elements (ids "lfp-video-camN") and keep their
+    #     currentTime + play/pause state aligned with the master
+    #     ("lfp-video"). querySelectorAll handles the variable
+    #     slave count without a callback re-register on file change.
+    app.clientside_callback(
+        """
+        function(_n) {
+            const master = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (!master) { return ''; }
+            const slaves = document.querySelectorAll(
+                'video[id^=\"""" + VIDEO_DOM_ID + """-cam\"]');
+            slaves.forEach(function(s) {
+                if (!isFinite(s.duration) || s.readyState < 1) return;
+                if (Math.abs(s.currentTime - master.currentTime) > 0.12) {
+                    s.currentTime = master.currentTime;
+                }
+                if (master.paused && !s.paused) { s.pause(); }
+                else if (!master.paused && s.paused) {
+                    s.play().catch(function(){});
+                }
+                if (Math.abs(s.playbackRate - master.playbackRate) > 0.01) {
+                    s.playbackRate = master.playbackRate;
+                }
+            });
+            return '';
+        }
+        """,
+        Output("video-cam-sync-sink", "children"),
         Input("video-time-tick", "n_intervals"),
     )
 
