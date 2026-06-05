@@ -739,6 +739,17 @@ def create_app(config: dict, store: Store) -> Dash:
         # third column, True = full-width image. Toggled by clicking
         # the snapshot itself.
         dcc.Store(id="snapshot-expanded", data=False),
+        # LFP Browser -> Video Review bridge. Populated by a "View
+        # video" button click in the LFP Browser tab; consumed by
+        # Video Review to prefill session/file/channel/filters.
+        # Includes a seq counter so re-clicking the same channel
+        # re-fires the consumer even if the payload didn't change.
+        dcc.Store(id="lfp-to-video-bridge", data=None),
+        # Pending video seek (in LFP seconds + LFP duration so the
+        # BHZ scale factor can be applied). A clientside callback
+        # on video-time-tick consumes this once the master <video>
+        # has loaded metadata; it's set to None after seeking.
+        dcc.Store(id="pending-seek", data=None),
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
@@ -1508,6 +1519,7 @@ def create_app(config: dict, store: Store) -> Dash:
         Output("lfp-psd-plot", "figure"),
         Output("lfp-psd-row", "style"),
         Output("lfp-filter-state", "data"),
+        Output("lfp-view-video-row", "children"),
         Input("lfp-load-btn", "n_clicks"),
         Input("lfp-apply-filter-btn", "n_clicks"),
         State("lfp-session-dropdown", "value"),
@@ -1524,13 +1536,13 @@ def create_app(config: dict, store: Store) -> Dash:
         psd_hidden_style = {"display": "none", "marginTop": "12px"}
         if not file_path:
             return (_empty_fig("Select a file and click Load", 600),
-                    no_update, psd_hidden_style, no_update)
+                    no_update, psd_hidden_style, no_update, [])
 
         try:
             chunk = get_chunk(file_path)
         except Exception as e:
             return (_empty_fig(f"Error loading file: {e}", 600),
-                    no_update, psd_hidden_style, no_update)
+                    no_update, psd_hidden_style, no_update, [])
 
         fs = chunk.fs
         # Apply the cached filter to the full signal. get_filtered
@@ -1599,9 +1611,31 @@ def create_app(config: dict, store: Store) -> Dash:
                  "smooth": smooth_ms,
                  "show_psd": bool(show_psd_val)}
 
+        # Per-channel "View video" buttons. Pattern-matched ID so a
+        # single click callback handles any channel via
+        # ctx.triggered_id.channel.
+        view_video_buttons = []
+        for ch_idx in range(n_ch):
+            info = _info_for(ch_idx)
+            view_video_buttons.append(html.Button(
+                f"View video · {info['name']}",
+                id={"type": "lfp-view-video", "channel": ch_idx},
+                n_clicks=0,
+                title=("Open Video Review with this channel + "
+                        "current filter, seek to current LFP zoom"),
+                style={"backgroundColor": "#262638",
+                        "color": "white",
+                        "border": "1px solid #444",
+                        "padding": "4px 10px",
+                        "borderRadius": "5px",
+                        "cursor": "pointer",
+                        "fontSize": "11px"},
+            ))
+
         show_psd = bool(show_psd_val)
         if not show_psd:
-            return fig, no_update, psd_hidden_style, state
+            return (fig, no_update, psd_hidden_style, state,
+                    view_video_buttons)
 
         # --- PSD figure ------------------------------------------- #
         psd_fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
@@ -1640,8 +1674,95 @@ def create_app(config: dict, store: Store) -> Dash:
             height=max(220, n_ch * 140),
             showlegend=False,
         )
-        return fig, psd_fig, {"display": "block",
-                              "marginTop": "12px"}, state
+        return (fig, psd_fig,
+                {"display": "block", "marginTop": "12px"},
+                state, view_video_buttons)
+
+    # ---- "View video" buttons: jump to Video Review pre-filled ----
+    @app.callback(
+        Output("lfp-to-video-bridge", "data"),
+        Output("pending-seek", "data"),
+        Output("group-tabs", "value", allow_duplicate=True),
+        Output("tabs", "value", allow_duplicate=True),
+        Input({"type": "lfp-view-video", "channel": ALL}, "n_clicks"),
+        State("lfp-plot", "relayoutData"),
+        State("lfp-session-dropdown", "value"),
+        State("lfp-file-dropdown", "value"),
+        State("lfp-filter-hp", "value"),
+        State("lfp-filter-lp", "value"),
+        State("lfp-filter-notch", "value"),
+        State("lfp-filter-smooth", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_view_video(n_clicks_list, relayout, session_dir,
+                        file_path, hp, lp, notch, smooth_ms):
+        # Pattern-matched callbacks fire with n_clicks_list = list of
+        # all matching components' n_clicks. The build step also
+        # triggers this with zero clicks; only act when something
+        # was actually clicked.
+        if not n_clicks_list or not any(n_clicks_list):
+            return no_update, no_update, no_update, no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update, no_update, no_update, no_update
+        channel = int(trig.get("channel", 0))
+        if not file_path:
+            return no_update, no_update, no_update, no_update
+        # Pull the LFP duration so the BHZ-style scaling works on
+        # the Video Review side. get_chunk is cached so this is
+        # cheap on a warm path.
+        try:
+            chunk = get_chunk(file_path)
+            lfp_dur = float(chunk.signal.shape[0] / chunk.fs)
+        except Exception as e:
+            logger.warning("View video: chunk load failed: %s", e)
+            lfp_dur = 0.0
+        # Visible window start. relayoutData uses dotted keys when
+        # the user zooms; falls back to 0 (= full file) otherwise.
+        x_start = 0.0
+        if isinstance(relayout, dict):
+            if "xaxis.range[0]" in relayout:
+                try:
+                    x_start = float(relayout["xaxis.range[0]"])
+                except (TypeError, ValueError):
+                    x_start = 0.0
+            else:
+                rng = relayout.get("xaxis.range")
+                if isinstance(rng, list) and rng:
+                    try:
+                        x_start = float(rng[0])
+                    except (TypeError, ValueError):
+                        x_start = 0.0
+        # file_path -> file_id (Video Review's dropdown uses file_id)
+        file_id = None
+        conn = store._connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM processed_files WHERE file_path = ?",
+                (file_path,),
+            ).fetchone()
+            if row:
+                file_id = int(row["id"])
+        finally:
+            conn.close()
+        import time as _t
+        bridge = {
+            "session_dir": session_dir,
+            "file_id": file_id,
+            "channel": channel,
+            "hp": hp or 0, "lp": lp or 0,
+            "notch": notch or 0,
+            "smooth": smooth_ms or 0,
+            "start_sec": max(0.0, x_start),
+            "lfp_dur": lfp_dur,
+            "seq": int(_t.time() * 1000),
+        }
+        pending_seek = {
+            "start_sec": bridge["start_sec"],
+            "lfp_dur": lfp_dur,
+            "seq": bridge["seq"],
+        }
+        return bridge, pending_seek, "analysis", "video"
 
     @app.callback(
         Output("lfp-plot", "figure", allow_duplicate=True),
@@ -4432,6 +4553,19 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
                         "show_psd": False}),
 
         dcc.Graph(id="lfp-plot", figure=_empty_fig("Select a session and file, then click Load", 600)),
+
+        # Per-channel "View video" buttons. Populated dynamically
+        # by load_lfp -- one button per LFP channel. Clicking jumps
+        # to Video Review with the same file, channel, filter
+        # settings, AND seeks the video to the current LFP zoom's
+        # left edge so the operator picks up where they were
+        # looking.
+        html.Div(
+            id="lfp-view-video-row",
+            style={"display": "flex", "flexWrap": "wrap",
+                    "gap": "6px", "marginTop": "8px",
+                    "marginBottom": "8px"},
+        ),
 
         html.Div(
             dcc.Graph(id="lfp-psd-plot",

@@ -669,20 +669,68 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     fa = (config or {}).get("feature_analysis", {}) or {}
     blank_pre_ms = float(fa.get("stim_artifact_start_ms", -5.0))
     blank_post_ms = float(fa.get("stim_artifact_end_ms", 15.0))
+    # ---- Bridge from LFP Browser "View video" buttons ----
+    # Sets the session dropdown + filter inputs whenever the bridge
+    # Store is freshly written. The cascade (session -> file ->
+    # player -> channel) is handled by the existing callbacks
+    # below, which both consult the bridge for their defaults.
+    @app.callback(
+        Output("video-session-dropdown", "value"),
+        Output("video-filter-hp", "value"),
+        Output("video-filter-lp", "value"),
+        Output("video-filter-notch", "value"),
+        Output("video-filter-smooth", "value"),
+        Output("video-apply-filter-btn", "n_clicks",
+                allow_duplicate=True),
+        Input("lfp-to-video-bridge", "data"),
+        State("video-apply-filter-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _consume_bridge(bridge, apply_clicks):
+        if not bridge or not isinstance(bridge, dict):
+            return (no_update, no_update, no_update, no_update,
+                    no_update, no_update)
+        session_dir = bridge.get("session_dir") or no_update
+        # Bump the Apply button n_clicks so the existing
+        # _update_lfp callback (Input on the button) re-fires once
+        # the filter inputs are updated, applying the new settings
+        # without the operator having to click anything.
+        next_clicks = int(apply_clicks or 0) + 1
+        return (
+            session_dir,
+            bridge.get("hp") or 0,
+            bridge.get("lp") or 0,
+            bridge.get("notch") or 0,
+            bridge.get("smooth") or 0,
+            next_clicks,
+        )
+
     # ---- file/channel options ---- #
     @app.callback(
         Output("video-file-dropdown", "options"),
         Output("video-file-dropdown", "value"),
         Input("video-session-dropdown", "value"),
+        State("lfp-to-video-bridge", "data"),
     )
-    def _update_files(session_dir):
+    def _update_files(session_dir, bridge):
         files = _files_with_video(store, session_dir)
         options = [
             {"label": f"{(f['chunk_datetime'] or '')[:16]} - {os.path.basename(f['file_path'])}",
              "value": f["id"]}
             for f in files
         ]
-        default = options[0]["value"] if options else None
+        # Bridge override: when the LFP Browser sent us a file_id
+        # that lives in this session, default to it instead of the
+        # newest file -- otherwise the cascade fights the operator's
+        # intent.
+        default = None
+        if (bridge and isinstance(bridge, dict)
+                and bridge.get("session_dir") == session_dir):
+            wanted = bridge.get("file_id")
+            if any(o["value"] == wanted for o in options):
+                default = wanted
+        if default is None:
+            default = options[0]["value"] if options else None
         return options, default
 
     # ---- video player + history + channel options ---- #
@@ -693,8 +741,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-channel-dropdown", "value"),
         Input("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
+        State("lfp-to-video-bridge", "data"),
     )
-    def _update_player(file_id, current_channel):
+    def _update_player(file_id, current_channel, bridge):
         if not file_id:
             return (
                 html.P("Pick a file to load the video.",
@@ -708,6 +757,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         file_path = _file_path_for_id(store, file_id)
         ch_options: list[dict] = []
         ch_value = 0
+        # Bridge override: when the LFP Browser sent a channel
+        # AND it matches this file, use it as the default.
+        if (bridge and isinstance(bridge, dict)
+                and bridge.get("file_id") == file_id):
+            current_channel = bridge.get("channel", current_channel)
         if file_path:
             try:
                 # Route the channel-count probe through the chunk cache
@@ -1287,6 +1341,42 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         """,
         Output("video-current-time", "data"),
         Input("video-time-tick", "n_intervals"),
+    )
+
+    # 1a. Pending-seek consumer. When the LFP Browser's "View video"
+    #     button fires, it writes pending-seek with the desired LFP
+    #     time + the LFP's true duration. Every 100 ms we check
+    #     whether the master <video> has loaded its metadata; once
+    #     it has, we map LFP time -> video time using the same BHZ
+    #     ratio (currentTime = lfp_t * video_dur / lfp_dur), seek,
+    #     and clear the pending Store so we don't keep re-seeking.
+    app.clientside_callback(
+        """
+        function(_n, pending) {
+            if (!pending || pending.start_sec === null
+                    || pending.start_sec === undefined) {
+                return window.dash_clientside.no_update;
+            }
+            const v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (!v || !isFinite(v.duration) || v.duration <= 0
+                    || v.readyState < 1) {
+                return window.dash_clientside.no_update;
+            }
+            var target = pending.start_sec;
+            if (pending.lfp_dur && pending.lfp_dur > 0) {
+                target = pending.start_sec
+                        * (v.duration / pending.lfp_dur);
+            }
+            if (target < 0) target = 0;
+            if (target > v.duration) target = v.duration;
+            v.currentTime = target;
+            return null;
+        }
+        """,
+        Output("pending-seek", "data", allow_duplicate=True),
+        Input("video-time-tick", "n_intervals"),
+        State("pending-seek", "data"),
+        prevent_initial_call=True,
     )
 
     # 1b. Multi-camera sync. Every tick, walk the DOM for slave
