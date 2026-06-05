@@ -1100,6 +1100,49 @@ def create_app(config: dict, store: Store) -> Dash:
     # ------------------------------------------------------------------ #
     #  Main tab router — re-renders on tab change AND manual refresh
     # ------------------------------------------------------------------ #
+    # Walk a Dash component tree and turn on session-scoped
+    # persistence for every form control that has an id. Solves the
+    # "I switched tabs and lost my session/file/filter selection"
+    # problem in one place instead of touching every Dropdown/Input
+    # call site. Skip components in _PERSIST_SKIP -- those are
+    # ephemeral (load buttons share the same Input class, free-text
+    # search fields shouldn't pin a stale query, etc).
+    _PERSIST_KINDS = (dcc.Dropdown, dcc.Input, dcc.Checklist,
+                       dcc.RadioItems, dcc.Slider, dcc.RangeSlider,
+                       dcc.Tabs)
+    _PERSIST_SKIP = {
+        # Load / Apply / Refresh buttons aren't inputs but they
+        # share a class hierarchy with the wrapped ones below;
+        # listing here for documentation.
+        "manual-refresh-btn", "focus-toggle-btn",
+    }
+
+    def _enable_persistence(node):
+        # depth-first walk; bound at 5000 nodes (NASA rule 2) so
+        # a malformed tree can't spin forever.
+        stack = [node]
+        guard = 0
+        while stack and guard < 5000:
+            guard += 1
+            cur = stack.pop()
+            if isinstance(cur, _PERSIST_KINDS):
+                cid = getattr(cur, "id", None)
+                if (isinstance(cid, str)
+                        and cid and cid not in _PERSIST_SKIP):
+                    # Only set if author didn't already opt in/out.
+                    if getattr(cur, "persistence", None) is None:
+                        cur.persistence = True
+                        cur.persistence_type = "session"
+            kids = getattr(cur, "children", None)
+            if kids is None:
+                continue
+            if not isinstance(kids, list):
+                kids = [kids]
+            for k in kids:
+                if k is not None:
+                    stack.append(k)
+        return node
+
     @app.callback(
         Output("tab-content", "children"),
         Input("tabs", "value"),
@@ -1108,41 +1151,44 @@ def create_app(config: dict, store: Store) -> Dash:
     def render_tab(tab, session_hint):
         try:
             if tab == "overview":
-                return _overview_tab(store, config)
+                return _enable_persistence(_overview_tab(store, config))
             elif tab == "waveforms":
-                return _waveforms_tab_layout(store, default_session=session_hint)
+                return _enable_persistence(
+                    _waveforms_tab_layout(store, default_session=session_hint))
             elif tab == "signal":
-                return _signal_quality_tab(store)
+                return _enable_persistence(_signal_quality_tab(store))
             elif tab == "evoked":
-                return _evoked_tab_layout(store)
+                return _enable_persistence(_evoked_tab_layout(store))
             elif tab == "criticality":
-                return _criticality_tab_layout(store)
+                return _enable_persistence(_criticality_tab_layout(store))
             elif tab == "lfp":
-                return _lfp_browser_tab_layout(store, default_session=session_hint)
+                return _enable_persistence(
+                    _lfp_browser_tab_layout(store, default_session=session_hint))
             elif tab == "video":
-                return tabs_video.layout(store)
+                return _enable_persistence(tabs_video.layout(store))
             elif tab == "electrode_health":
-                return _electrode_health_tab_layout(store, default_session=session_hint)
+                return _enable_persistence(
+                    _electrode_health_tab_layout(store, default_session=session_hint))
             elif tab == "session_compare":
-                return _session_compare_tab_layout(store)
+                return _enable_persistence(_session_compare_tab_layout(store))
             elif tab == "stim":
-                return _stim_tab(store)
+                return _enable_persistence(_stim_tab(store))
             elif tab == "settings":
-                return _settings_tab_layout(store)
+                return _enable_persistence(_settings_tab_layout(store))
             elif tab == "activity_log":
-                return _activity_log_tab_layout(store)
+                return _enable_persistence(_activity_log_tab_layout(store))
             elif tab == "annotations":
-                return _annotations_tab_layout(store)
+                return _enable_persistence(_annotations_tab_layout(store))
             elif tab == "alerts":
-                return _alerts_tab(store)
+                return _enable_persistence(_alerts_tab(store))
             elif tab == "sessions":
-                return _sessions_tab(store)
+                return _enable_persistence(_sessions_tab(store))
             elif tab == "surgeries":
-                return tabs_surgeries.layout(store, config)
+                return _enable_persistence(tabs_surgeries.layout(store, config))
             elif tab == "maintenance":
-                return tabs_maintenance.layout(store, config)
+                return _enable_persistence(tabs_maintenance.layout(store, config))
             elif tab == "data_log_xref":
-                return tabs_data_log_xref.layout(store, config)
+                return _enable_persistence(tabs_data_log_xref.layout(store, config))
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
