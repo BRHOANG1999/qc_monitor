@@ -1,11 +1,5 @@
 watch:
   paths:
-  # As close to the SMB server root as Windows allows -- the literal share
-  # root cannot be enumerated. We list every share with session data; the
-  # watcher recurses from each and OSError-skips $RECYCLE.BIN and
-  # System Volume Information automatically. The two shares overlap on
-  # recent sessions; main.py dedups overlapping content by
-  # (basename, size, mtime) so nothing gets processed twice.
   - //100.106.104.22/database/
   - //100.106.104.22/bhz/
   poll_interval_sec: 30
@@ -13,16 +7,13 @@ watch:
 channel_mapping:
   auto_discover: true
 epoch_extraction:
-  pre_stimulus_ms: -100.0
+  pre_stimulus_ms: -500.0
   post_stimulus_ms: 500.0
   stimulus_threshold_std: 3.0
   min_stimulus_distance_sec: 0.1
-  # Lower bound on stim-copy peak-to-peak / robust-noise ratio. Below this,
-  # the stim channel is assumed to be pure noise and detection is skipped.
-  # Lower for low-charge protocols (e.g. 5 nC) where the stim copy is small.
   stim_peak_ratio_min: 4.0
   baseline_correction: true
-  baseline_start_ms: -60.0
+  baseline_start_ms: -100.0
   baseline_end_ms: -10.0
   highpass_enabled: false
   highpass_cutoff_hz: 1.0
@@ -31,7 +22,7 @@ epoch_extraction:
   lowpass_cutoff_hz: 1000.0
   lowpass_order: 4
   notch_50hz: false
-  notch_60hz: true
+  notch_60hz: false
 feature_analysis:
   window_start_ms: 1.0
   window_end_ms: 200.0
@@ -86,20 +77,16 @@ artifact:
   mad_k: 4.0
   merge_gap_sec: 2.0
 video_qc:
-  # Tier 3: open the companion mp4/avi and walk every Nth frame,
-  # computing the grayscale mean + variance on a downsampled thumbnail.
-  # Flags frames as dark / bright / uniform; emails a 'critical' alert
-  # when the bad-frame % exceeds alert_pct_bad. ~5s on a 60s 30 fps
-  # clip with 1 fps sampling.
   enabled: true
   alert_on_critical: true
-  sample_every_n: null         # null = 1 frame per second (uses fps)
-  downsample_to: [160, 120]    # smaller = faster, slightly noisier
-  # Pixel mean is 0..255 (8-bit grayscale)
-  min_mean: 25.0               # below = too dark (camera covered, IR off)
-  max_mean: 230.0              # above = over-exposed
-  min_variance: 50.0           # below = uniform field (lens fogged, etc.)
-  alert_pct_bad: 25.0          # email when >=25% of sampled frames bad
+  sample_every_n: null
+  downsample_to:
+  - 160
+  - 120
+  min_mean: 25.0
+  max_mean: 230.0
+  min_variance: 50.0
+  alert_pct_bad: 25.0
 qc_thresholds:
   artifact_pct_warning: 50.0
   flatline_std: 1.0e-06
@@ -143,14 +130,6 @@ alerting:
     server: smtp.gmail.com
     port: 587
     from_email: kmrecorder.alert@gmail.com
-    # EmailAlerter looks up the password in this order on every send:
-    #   1. env var $QC_MONITOR_EMAIL_PASSWORD (good for interactive
-    #      testing). Windows services started by NSSM don't inherit
-    #      from your shell, so this often misses.
-    #   2. file `password_file` (project-root relative or absolute).
-    #      Put the 16-char Gmail App Password (no spaces) in this
-    #      file. secrets/ is already gitignored. To rotate: edit the
-    #      file, no service restart needed -- next tick re-reads.
     password_env_var: QC_MONITOR_EMAIL_PASSWORD
     password_file: secrets/smtp_password.txt
     recipients:
@@ -167,175 +146,120 @@ dashboard:
   port: 8050
   refresh_interval_sec: 10
 auth:
-  # Identity gate for the dashboard. Cloudflare Access sits in front of
-  # the Cloudflare Tunnel and performs SSO; this app verifies the JWT
-  # Cloudflare injects so that only authenticated users can read or
-  # write data. See docs/REMOTE_ACCESS.md for the operator runbook.
   enabled: true
-  cf_team_domain: ''                 # e.g. yourteam.cloudflareaccess.com (required in prod)
-  cf_audience: ''                    # AUD tag from the Access app (required in prod)
-  dev_bypass: true                   # local-dev only; flip to false once cloudflared is in front
+  cf_team_domain: ''
+  cf_audience: ''
+  dev_bypass: true
   dev_bypass_email: hoang392@umn.edu
 maintenance:
-  # Mirrors the lab's Apps Script semantics: today's status is read from
-  # the '📅 Schedule' tab (which weekdays each task runs on, who's
-  # assigned) + the 'Active Shelves' tab (which rig+shelf slots count)
-  # + the per-rig event tabs. The QC Monitor does NOT send maintenance
-  # reminders -- the Apps Script owns operational alerts, escalation,
-  # and incident notifications.
   enabled: true
   refresh_minutes: 10
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
-  sheet_id: "1EyECDE7Uk-a2o9YDtTL3zvIZ6xH-OCfN_ZT7vvB-m4U"
-  # Tab names (override if you rename them in the Sheet)
-  schedule_tab_name: "📅 Schedule"
-  active_shelves_tab_name: "Active Shelves"
-  incident_tab_name: "⚠️ Incident Report form"
-  # Task labels in the Schedule tab's Task column -- must match exactly
-  task_label_battery: "Battery Change"
-  task_label_cage: "Cage Cleaning"
-  # When a scheduled task crosses these hours without being done, status
-  # flips from PENDING (yellow) to OVERDUE (red). Same defaults as the
-  # Apps Script CONFIG (BATTERY_ESCALATION_START_HOUR / CAGE_...).
+  sheet_id: 1EyECDE7Uk-a2o9YDtTL3zvIZ6xH-OCfN_ZT7vvB-m4U
+  schedule_tab_name: 📅 Schedule
+  active_shelves_tab_name: Active Shelves
+  incident_tab_name: ⚠️ Incident Report form
+  task_label_battery: Battery Change
+  task_label_cage: Cage Cleaning
   escalation_hours:
-    battery: 15.5    # 3:30 PM
-    cage: 17.0       # 5:00 PM
-  # Per-rig event tabs -- emoji prefix spacing is inconsistent across
-  # the sheet so list each name literally.
+    battery: 15.5
+    cage: 17.0
   rigs:
-    - name: A
-      battery_tab: "🐜 Rig A Battery Replacement"
-      cage_tab: "🐜Rig A Cage Cleaning"
-    - name: B
-      battery_tab: "🐻 Rig B Battery Replacement"
-      cage_tab: "🐻 Rig B Cage Cleaning"
-    - name: C
-      battery_tab: "🐱 Rig C Battery Replacement"
-      cage_tab: "🐱 Rig C Cage Cleaning"
-
+  - name: A
+    battery_tab: 🐜 Rig A Battery Replacement
+    cage_tab: 🐜Rig A Cage Cleaning
+  - name: B
+    battery_tab: 🐻 Rig B Battery Replacement
+    cage_tab: 🐻 Rig B Cage Cleaning
+  - name: C
+    battery_tab: 🐱 Rig C Battery Replacement
+    cage_tab: 🐱 Rig C Cage Cleaning
 data_log_xref:
-  # Reconciles the KMrecorder Data Log Sheet against monitor.db -- shows
-  # sessions logged-but-not-QC'd (missed file?) and QC'd-but-not-logged
-  # (forgot to log?). Matches on the trailing ___YYYY_MM_DD__HH_MM_SS
-  # substring in each side.
   enabled: true
   refresh_minutes: 15
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
-  sheet_id: "1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0"
-  tab_name: "Sessions"
-
+  sheet_id: 1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0
+  tab_name: Sessions
 notifications:
-  # Unified state file for all recurring digests + the queue-stuck
-  # flag. Migrates the legacy data/surgery_digest_state.json on first
-  # boot so an upgrade doesn't double-send the morning digest.
   state_file: data/notification_state.json
   eod_digest:
-    # End-of-day QC summary: files processed today, error count, the
-    # worst-3 chunks by artifact_pct and line_noise_ratio, per-session
-    # done/error split. Fires once per day at/after `hour`.
     enabled: true
-    hour: 18                    # 24h local clock
-    # recipients: []            # defaults to alerting.smtp.recipients
+    hour: 18
   video_weekly:
-    # Rolling 7-day video QC roll-up (ok/warning/critical counts +
-    # top-5 worst by pct_bad). Fires once on `weekday` at/after `hour`.
     enabled: true
-    weekday: 0                  # 0=Monday ... 6=Sunday
+    weekday: 0
     hour: 8
-    # recipients: []
   evoked_weekly:
-    # Weekly evoked-response drift per session + channel (median
-    # peak-to-trough this week vs last week). Flags channels whose
-    # magnitude shifted by >= drift_threshold_pct%.
     enabled: true
-    weekday: 6                  # 6=Sunday
+    weekday: 6
     hour: 8
     drift_threshold_pct: 30.0
-    # recipients: []
   queue_watch:
-    # Edge-triggered alarm: when no files have moved to 'done' for
-    # `stall_minutes` AND pending count >= `min_pending`, send one
-    # warning. Recovery sends one "clear". Quiet overnight (the
-    # min_pending floor avoids false-alarms on an empty queue).
     enabled: true
     min_pending: 100
     stall_minutes: 60
-    # recipients: []
+review_queue:
+  # Per-undergrad behavioral review queue. Pulls a list of
+  # unreviewed recordings for the user's assigned animals from
+  # session_config, surfaces them in the Video Review tab, and
+  # records what was marked done by whom.
+  enabled: true
+  pi_emails:
+    - hoang392@umn.edu
+  assignments:
+    # Reuses the KMrecorder Data Log sheet (data_log_xref.sheet_id)
+    # in a new tab. PI edits Animal_ID + User_Email + Active rows;
+    # dashboard re-reads every refresh_minutes minutes via the
+    # shared Google Sheets API client.
+    sheet_id: "1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0"
+    tab_name: "Reviewer Assignments"
+    service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+    refresh_minutes: 5
+  queue:
+    # Hard cap on queue length per user/animal so the UI stays
+    # snappy even when there's a multi-thousand-file backlog.
+    max_per_view: 100
+    # Backlog warning thresholds used by the PI tab + digest.
+    warn_age_days: 3
+    crit_age_days: 7
+  weekly_digest:
+    # PI summary fired by the existing DigestScheduler.
+    enabled: true
+    weekday: 4   # 0=Mon ... 4=Fri
+    hour: 17
 
 surgery_digest:
-  # Once-a-day email + SMS summary of the same view the Surgeries tab
-  # renders -- today's pre-op / surgery / post-op tasks plus a 7-day
-  # outlook. Fires the first poll-loop tick after `send_hour:` local
-  # time; idempotent across restarts via state_file.
-  #
-  # SMS goes through the recipient's carrier email-to-SMS gateway --
-  # paste an address like 9092036361@<carrier-gateway>. Common gateways:
-  #   Verizon  ->  9092036361@vtext.com
-  #   AT&T     ->  9092036361@txt.att.net
-  #   T-Mobile ->  9092036361@tmomail.net
-  #   Sprint   ->  9092036361@messaging.sprintpcs.com
-  #   Google Fi->  9092036361@msg.fi.google.com
-  # SMTP credentials come from the alerting.smtp block below.
   enabled: true
-  send_hour: 8                  # 24h local clock; fires once on/after this hour
+  send_hour: 8
   email_recipients:
-    - hoang392@umn.edu
-  # Verizon's vtext.com / vzwpix.com gateways are *per-sender* blocked,
-  # not globally decommissioned. KMrecorder still texts the same number
-  # successfully via vtext.com from a different Gmail account. If sends
-  # from `alerting.smtp.from_email` start 550-bouncing again ("Blocked.
-  # Decommission of Email to Text"), the recovery is to rotate
-  # from_email to a fresh Gmail account + drop a new App Password into
-  # secrets/smtp_password.txt (no code change). The gateway itself
-  # still works.
+  - hoang392@umn.edu
   sms_recipients:
-    - 9092036361@vtext.com
+  - 9092036361@vtext.com
   state_file: data/surgery_digest_state.json
 surgeries:
-  # Renders "today's pre-op / surgery / post-op tasks" pulled from
-  # Google Sheets. Two auth paths supported per-sheet:
-  #
-  # (a) Service account (private sheets, recommended) -- set
-  #     service_account_file below, share each sheet with the SA's
-  #     email as Viewer, then list sheets by sheet_id + tab_name.
-  #     See docs/SHEETS_SERVICE_ACCOUNT.md.
-  #
-  # (b) Published CSV -- File > Share > Publish to web > CSV, paste
-  #     the /pub?output=csv URL. No GCP setup but the URL is readable
-  #     by anyone who has it.
-  enabled: true                 # tab renders empty until sheets are listed
+  enabled: true
   refresh_minutes: 10
-  implant_keywords: ["implant", "headstage", "headcap"]
+  implant_keywords:
+  - implant
+  - headstage
+  - headcap
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   sheets:
-    - label: "Injection/Implant Log"
-      sheet_id: "17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E"
-      tab_name: "BCH Log"
-      header_row: 2              # banded headers: row 1 is group labels
-      date_columns:
-        - name: "Date of Injection"
-          is_implant: false
-          event_label: "Injection"
-        - name: "Date of Implant"
-          is_implant: true
-          event_label: "Implant"
-  # KM Lab Mice -> JAX Cages: per-animal cage lookup for the
-  # Surgeries DataTable "Cage" column. The tab is non-tabular (operator
-  # sections with per-cage rows); cage_index.py walks it and builds
-  # {animal_id: cage_descriptor}. Set enabled: false to leave the Cage
-  # column blank.
+  - label: Injection/Implant Log
+    sheet_id: 17fm0UnfT2xd2C3FKbB5U_rlh1qt3gMaVBktyJgD6P1E
+    tab_name: BCH Log
+    header_row: 2
+    date_columns:
+    - name: Date of Injection
+      is_implant: false
+      event_label: Injection
+    - name: Date of Implant
+      is_implant: true
+      event_label: Implant
   cage_index:
     enabled: true
-    sheet_id: "1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14"
-    tab_name: "JAX Cages"
-  #  # Published-CSV path (works without GCP setup, URL is a low-grade secret)
-  #  - label: "Public log"
-  #    url: "https://docs.google.com/spreadsheets/d/e/<KEY>/pub?output=csv&gid=919387434"
-  # column_aliases:               # optional -- extends the defaults
-  #   animal_id:    ["Animal", "Animal #"]
-  #   surgery_date: ["Date", "Surgery date"]
-  #   surgery_type: ["Type", "Procedure"]
-  #   notes:        ["Comments"]
+    sheet_id: 1Y6oCBTq44XleFaJkwiXubnUzEtM0wn-lPz2x0ydlr14
+    tab_name: JAX Cages
 database:
   path: D:/code/qc_monitor/data/monitor.db
 logging:

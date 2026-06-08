@@ -135,6 +135,7 @@ NAV_GROUPS = [
     ]},
     {"id": "system", "label": "System", "subs": [
         {"id": "annotations", "label": "Notes"},
+        {"id": "review_status", "label": "Review status"},
         {"id": "activity_log", "label": "Activity log"},
         {"id": "alerts", "label": "Alerts"},
         {"id": "settings", "label": "Settings"},
@@ -701,10 +702,10 @@ def create_app(config: dict, store: Store) -> Dash:
             dcc.Checklist(id="auto-refresh-toggle",
                           options=[{"label": " Auto", "value": True}],
                           value=[], inline=True,
-                          style={"color": COLOR_TEXT_SECONDARY,
-                                 "display": "inline-block",
-                                 "fontSize": FONT_SIZE_CAPTION,
-                                 "marginRight": SPACE_2}),
+                          style={"display": "inline-block",
+                                 "marginRight": SPACE_2},
+                          labelStyle={"color": COLOR_TEXT_SECONDARY,
+                                      "fontSize": FONT_SIZE_CAPTION}),
             # Interval picker. Updates the dcc.Interval below via
             # callback; default matches config.dashboard.
             # refresh_interval_sec so the dropdown starts in sync.
@@ -1189,6 +1190,10 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_maintenance.layout(store, config))
             elif tab == "data_log_xref":
                 return _enable_persistence(tabs_data_log_xref.layout(store, config))
+            elif tab == "review_status":
+                from src.dashboard.tabs import review_status as tabs_review_status
+                return _enable_persistence(
+                    tabs_review_status.layout(store, config))
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
@@ -4416,9 +4421,11 @@ def _evoked_tab_layout(store: Store):
                 options=feature_options,
                 value=default_features,
                 inline=True,
-                style={"color": "#ddd", "fontSize": "12px"},
+                style={"fontSize": "12px"},
                 inputStyle={"marginRight": "4px"},
-                labelStyle={"marginRight": "16px", "marginBottom": "4px"},
+                labelStyle={"color": "#ddd",
+                             "marginRight": "16px",
+                             "marginBottom": "4px"},
             ),
         ], style={**SECTION_STYLE, "marginBottom": "16px"}),
 
@@ -4572,7 +4579,8 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
                     id="lfp-show-psd",
                     options=[{"label": " Show", "value": "on"}],
                     value=[],
-                    style={"color": "white", "paddingTop": "6px"},
+                    style={"paddingTop": "6px"},
+                    labelStyle={"color": "white"},
                 ),
             ], style={"flex": "0 0 90px"}),
             html.Div([
@@ -4789,7 +4797,7 @@ def _settings_tab_layout(store: Store):
         return dcc.Checklist(
             id=id_, options=[{"label": " Enabled", "value": True}],
             value=[True] if val else [],
-            style={"color": "#ddd"},
+            labelStyle={"color": "#ddd"},
         )
 
     return html.Div([
@@ -5097,8 +5105,9 @@ def _settings_tab_layout(store: Store):
                 id="features-checklist",
                 options=[{"label": f"  {f}", "value": f} for f in all_features],
                 value=ft.get("enabled", all_features),
-                style={"color": "#ddd", "columns": "3", "columnGap": "20px"},
+                style={"columns": "3", "columnGap": "20px"},
                 inputStyle={"marginRight": "6px"},
+                labelStyle={"color": "#ddd"},
             ),
         ], style=SECTION_STYLE),
 

@@ -333,4 +333,43 @@ CREATE TABLE IF NOT EXISTS video_qc (
 );
 CREATE INDEX IF NOT EXISTS idx_video_qc_file ON video_qc(file_id);
 CREATE INDEX IF NOT EXISTS idx_video_qc_status ON video_qc(status);
+
+-- ----------------------------------------------------------------------
+-- Reviewer queue: per-(file, user) review state + append-only audit log.
+-- The dashboard's Video Review tab pulls a queue of unreviewed files for
+-- the user's assigned animals; finishing a file inserts one row here and
+-- one row in review_event_log so the PI can audit who did what when.
+-- ----------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS review_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    user_email TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('claimed', 'no_events',
+                          'has_events', 'abandoned')),
+    markers_json TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_state_file
+    ON review_state(file_id);
+CREATE INDEX IF NOT EXISTS idx_review_state_user
+    ON review_state(user_email);
+CREATE INDEX IF NOT EXISTS idx_review_state_status
+    ON review_state(status);
+
+CREATE TABLE IF NOT EXISTS review_event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    user_email TEXT NOT NULL,
+    action TEXT NOT NULL,
+    payload_json TEXT,
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_event_log_at
+    ON review_event_log(at);
+CREATE INDEX IF NOT EXISTS idx_review_event_log_user
+    ON review_event_log(user_email);
 """

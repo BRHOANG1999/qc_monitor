@@ -36,6 +36,7 @@ from src.notifications.surgery_digest import send_today_digest
 from src.notifications.eod_digest import send_eod_digest
 from src.notifications.video_weekly import send_video_weekly
 from src.notifications.evoked_weekly import send_evoked_weekly
+from src.notifications.review_weekly import send_review_weekly
 from src.notifications import queue_watch
 
 logger = logging.getLogger("qc_monitor.notifications.scheduler")
@@ -53,6 +54,7 @@ class NotificationState:
     eod: str = ""
     video_weekly: str = ""
     evoked_weekly: str = ""
+    review_weekly: str = ""
     queue_stuck: bool = False
 
 
@@ -166,6 +168,7 @@ class DigestScheduler:
             self._tick_eod(now, fired)
             self._tick_video_weekly(now, fired)
             self._tick_evoked_weekly(now, fired)
+            self._tick_review_weekly(now, fired)
             self._tick_queue_watch(now, fired)
             if fired:
                 self._save_state()
@@ -256,6 +259,29 @@ class DigestScheduler:
         self._state.evoked_weekly = now.date().isoformat()
         fired["evoked_weekly"] = bool(result.get("sent"))
         logger.info("Evoked weekly result: %s", result)
+
+    def _tick_review_weekly(self, now: datetime, fired: dict) -> None:
+        cfg = ((self._config.get("review_queue", {}) or {})
+                .get("weekly_digest", {}) or {})
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        weekday = int(cfg.get("weekday", 4))   # 4=Friday
+        hour = int(cfg.get("hour", 17))
+        if not self._due_weekly(now, weekday, hour,
+                                  self._state.review_weekly):
+            return
+        logger.info("Review weekly fire: %s %02d:%02d",
+                     now.date().isoformat(), now.hour, now.minute)
+        try:
+            result = send_review_weekly(now.date(), self._config,
+                                          self._store, self._emailer)
+        except Exception as e:
+            logger.error("Review weekly send raised: %s", e,
+                          exc_info=True)
+            return
+        self._state.review_weekly = now.date().isoformat()
+        fired["review_weekly"] = bool(result.get("sent"))
+        logger.info("Review weekly result: %s", result)
 
     def _tick_queue_watch(self, now: datetime, fired: dict) -> None:
         cfg = (self._config.get("notifications", {}) or {}) \

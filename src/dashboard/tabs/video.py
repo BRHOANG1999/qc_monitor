@@ -29,8 +29,12 @@ import numpy as np
 import plotly.graph_objects as go
 from collections import OrderedDict
 from threading import RLock
-from dash import Input, Output, State, dcc, html, no_update, Patch
+from dash import (Input, Output, State, dcc, html, no_update,
+                   Patch, ALL, callback_context)
 from dash.dependencies import ClientsideFunction
+
+from src.dashboard.auth import current_user_email
+from src.utils import assignments as _assignments
 
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
@@ -495,9 +499,61 @@ def layout(store: Store):
 
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
-                      "Choose a session, then a file, then which "
-                      "electrode channel you want to look at."),
+                      "Pick which animal you're reviewing. The newest "
+                      "unfinished recording loads automatically."),
+
+        # --- My queue picker ----------------------------------------- #
+        # Card-style row: animal picker on left, queue list on the
+        # right. The queue items are buttons keyed by file_id; one
+        # callback handles all of them via pattern-matching IDs and
+        # writes the chosen file's session_dir + file_id back into
+        # the existing dropdowns so every downstream callback keeps
+        # working unchanged.
         html.Div([
+            html.Div([
+                html.Label("Animal you're reviewing",
+                            style=LABEL_STYLE,
+                            title="Pick one of your assigned animals, "
+                                   "or pick from the unassigned pool. "
+                                   "Ask the PI to add you to the "
+                                   "Reviewer Assignments sheet."),
+                dcc.Dropdown(
+                    id="video-queue-animal",
+                    options=[],
+                    placeholder="Loading your animals…",
+                    style=DROPDOWN_STYLE,
+                    className="dark-dropdown",
+                ),
+                html.Div(id="video-queue-status",
+                          style={"color": "#a0a0b0",
+                                  "fontSize": "11px",
+                                  "marginTop": "4px"}),
+            ], style={"flex": "0 0 280px"}),
+            html.Div([
+                html.Label("Queue (newest first)",
+                            style=LABEL_STYLE,
+                            title="Recordings for the chosen animal "
+                                   "that nobody has finished yet. "
+                                   "Click one to load it."),
+                html.Div(id="video-queue-list",
+                          style={"maxHeight": "220px",
+                                  "overflowY": "auto",
+                                  "background": "#13131f",
+                                  "border":
+                                      "1px solid rgba(255,255,255,0.06)",
+                                  "borderRadius": "6px",
+                                  "padding": "4px"}),
+            ], style={"flex": "1", "minWidth": "320px"}),
+        ], style={"display": "flex", "gap": "16px",
+                   "marginBottom": "10px", "flexWrap": "wrap"}),
+
+        # --- Advanced: free-form pickers (preserves legacy IDs) ----- #
+        _details_card(
+            "Pick any recording manually",
+            summary_sub="bypass the queue and choose any session/file/"
+                         "channel directly",
+            open_default=False,
+            content=html.Div([
             html.Div([
                 html.Label("Session", style=LABEL_STYLE,
                             title="A session is a continuous run of "
@@ -534,8 +590,9 @@ def layout(store: Store):
                     className="dark-dropdown",
                 ),
             ], style={"flex": "1", "minWidth": "180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px",
+        ], style={"display": "flex", "gap": "16px", "marginBottom": "8px",
                   "flexWrap": "wrap"}),
+        ),
 
         # --- Step 2: watch ---------------------------------------------- #
         _step_header("2", "Watch",
@@ -699,6 +756,125 @@ def layout(store: Store):
                     "scrollZoom": True,
                 },
             ),
+            # --- Step 4: mark this recording done -------------------- #
+            # Sits between the LFP and the analysis trace by design --
+            # the reviewer makes the call after looking at the trace
+            # + video. Two-radio pattern adopted from BHZ_DETECTOR:
+            # "No events" is one-click + save; "Events" lights up the
+            # onset-marker editor (full marker taxonomy comes later).
+            _step_header(
+                "4", "Mark this recording done",
+                "Tell the system whether you saw any seizure-like "
+                "events. This finishes the recording in your queue."),
+            html.Div([
+                dcc.RadioItems(
+                    id="video-review-decision",
+                    options=[
+                        {"label": " No events seen",
+                            "value": "no_events"},
+                        {"label": " Events seen "
+                                  "(add onset markers below)",
+                            "value": "has_events"},
+                    ],
+                    value=None, inline=False,
+                    labelStyle={"color": "#cfd0d6",
+                                 "fontSize": "13px",
+                                 "marginBottom": "6px",
+                                 "display": "block"},
+                    inputStyle={"marginRight": "8px"},
+                ),
+                html.Div([
+                    html.Label("Onset markers", style=LABEL_STYLE,
+                                title="Click the LFP trace above to "
+                                       "drop an onset marker at that "
+                                       "time. Reorders chronologically."),
+                    html.Div(id="video-review-markers",
+                              style={"color": "#a0a0b0",
+                                      "fontSize": "12px",
+                                      "fontFamily": "ui-monospace, "
+                                                     "SF Mono, monospace",
+                                      "padding": "6px 10px",
+                                      "minHeight": "32px",
+                                      "background": "#13131f",
+                                      "border": "1px solid "
+                                                 "rgba(255,255,255,0.06)",
+                                      "borderRadius": "6px"}),
+                    html.Button(
+                        "Clear markers",
+                        id="video-review-clear-markers-btn",
+                        n_clicks=0,
+                        style={"backgroundColor": "transparent",
+                                "color": "#a0a0b0",
+                                "border": "1px solid "
+                                           "rgba(255,255,255,0.15)",
+                                "padding": "4px 10px",
+                                "borderRadius": "5px",
+                                "cursor": "pointer",
+                                "fontSize": "11px",
+                                "marginTop": "6px"}),
+                ], id="video-review-marker-group",
+                   style={"display": "none",
+                           "marginTop": "10px",
+                           "padding": "8px 10px",
+                           "border": "1px solid "
+                                      "rgba(255,255,255,0.08)",
+                           "borderRadius": "6px",
+                           "backgroundColor":
+                               "rgba(255,255,255,0.02)"}),
+                html.Div([
+                    html.Label("Optional note (max 280 chars)",
+                                style=LABEL_STYLE),
+                    dcc.Textarea(
+                        id="video-review-note",
+                        maxLength=280,
+                        placeholder="e.g. 'partial movement at "
+                                     "0:32 — looks like grooming'",
+                        style={"backgroundColor": "#262638",
+                                "color": "#f0f0f5",
+                                "border":
+                                    "1px solid rgba(255,255,255,0.1)",
+                                "borderRadius": "6px",
+                                "padding": "8px 10px",
+                                "width": "100%",
+                                "height": "60px",
+                                "fontFamily": "inherit",
+                                "fontSize": "12px"}),
+                ], style={"marginTop": "10px"}),
+                html.Div([
+                    html.Button(
+                        "Mark recording done",
+                        id="video-review-save-btn",
+                        n_clicks=0,
+                        title="Saves your decision + any onset "
+                               "markers. Removes the recording from "
+                               "your queue.",
+                        style={"backgroundColor": "#00CC96",
+                                "color": "white",
+                                "border": "none",
+                                "padding": "8px 22px",
+                                "borderRadius": "6px",
+                                "cursor": "pointer",
+                                "fontSize": "13px",
+                                "fontWeight": "700",
+                                "marginRight": "10px"}),
+                    html.Span(id="video-review-status",
+                               style={"color": "#a0a0b0",
+                                       "fontSize": "12px",
+                                       "alignSelf": "center"}),
+                ], style={"marginTop": "10px",
+                           "display": "flex",
+                           "alignItems": "center"}),
+                # Persists the running marker list across reviewer
+                # actions; the click handler appends, the save
+                # handler reads from this Store.
+                dcc.Store(id="video-review-marker-store",
+                           data=[]),
+            ], style={"marginTop": "12px",
+                       "padding": "12px 14px",
+                       "background": "rgba(0, 204, 150, 0.05)",
+                       "border": "1px solid rgba(0, 204, 150, 0.2)",
+                       "borderRadius": "8px"}),
+
             # --- Step 3: analyze --------------------------------------- #
             # Time-locked analysis plot directly under the LFP. Same
             # x-axis (seconds since chunk start), each point = one stim
@@ -828,8 +1004,13 @@ def layout(store: Store):
                                     "value": "median"},
                             ],
                             value=["hide_artifact"], inline=True,
-                            style={"color": "#cfd0d6",
-                                    "fontSize": "12px"},
+                            # labelStyle is what colors each
+                            # individual option's text; without it
+                            # the labels fall back to the browser's
+                            # default (black on the dark theme).
+                            labelStyle={"color": "#cfd0d6",
+                                         "fontSize": "12px",
+                                         "marginRight": "8px"},
                             inputStyle={"marginRight": "4px",
                                          "marginLeft": "8px"},
                         ),
@@ -955,6 +1136,358 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             bridge.get("smooth") or 0,
             next_clicks,
         )
+
+    # ---- Step 1 queue: animal picker + auto-loaded queue ---- #
+    review_cfg = (config or {}).get("review_queue", {}) or {}
+    queue_cfg = review_cfg.get("queue", {}) or {}
+    queue_limit = int(queue_cfg.get("max_per_view", 100))
+    warn_age_days = int(queue_cfg.get("warn_age_days", 3))
+
+    @app.callback(
+        Output("video-queue-animal", "options"),
+        Output("video-queue-animal", "value"),
+        Output("video-queue-status", "children"),
+        Input("video-time-tick", "n_intervals"),
+        State("video-queue-animal", "value"),
+    )
+    def _populate_animal_picker(_n, current_value):
+        """Refresh the animal dropdown from the assignment sheet.
+
+        Fires once on tab open (the time tick is registered there)
+        and once per minute thereafter so PI edits land quickly.
+        Resists overwriting the user's existing selection unless
+        their assignments changed.
+        """
+        if not review_cfg.get("enabled", False):
+            return [], None, "Queue feature is disabled in config."
+        email = current_user_email() or ""
+        my_animals = _assignments.animals_for_user(config, email)
+        try:
+            unassigned = _assignments.unassigned_animals(config,
+                                                            store)
+        except Exception as e:
+            logger.debug("unassigned pool failed: %s", e)
+            unassigned = []
+        options: list[dict] = []
+        if my_animals:
+            for a in my_animals:
+                options.append({
+                    "label": f"⭐  {a}  (assigned to you)",
+                    "value": a,
+                })
+        # Always offer the unassigned pool as a sentinel value so a
+        # user with no assignment can still review.
+        if unassigned:
+            options.append({"label": "── Unassigned pool ──",
+                            "value": "__UNASSIGNED__",
+                            "disabled": True})
+            for a in unassigned:
+                options.append({
+                    "label": f"   {a}",
+                    "value": f"_pool_{a}",
+                })
+        # Pick a sensible default if nothing chosen yet.
+        new_value = current_value
+        if new_value is None or all(o["value"] != new_value
+                                       for o in options):
+            new_value = (my_animals[0] if my_animals
+                          else (f"_pool_{unassigned[0]}"
+                                if unassigned else None))
+        status = ""
+        if not my_animals:
+            status = ("You have no animals assigned. Pick from the "
+                       "unassigned pool below, or ask the PI to add "
+                       "you to the Reviewer Assignments sheet.")
+        else:
+            status = (f"Assigned to you: "
+                       f"{', '.join(my_animals)}.")
+        return options, new_value, status
+
+    @app.callback(
+        Output("video-queue-list", "children"),
+        Input("video-queue-animal", "value"),
+        Input("refresh-trigger", "data"),
+    )
+    def _render_queue(animal_value, _refresh):
+        """Render the per-animal queue list. Each item is a Button
+        with a pattern-matching id so one downstream callback
+        handles all clicks."""
+        if not animal_value:
+            return html.Div(
+                "Pick an animal above to see your queue.",
+                style={"color": "#888", "fontSize": "12px",
+                        "padding": "10px"})
+        # Resolve animal_value to a list of animal ids (single
+        # selection or the unassigned pool sentinel).
+        if animal_value.startswith("_pool_"):
+            animal_ids = [animal_value[len("_pool_"):]]
+        else:
+            animal_ids = [animal_value]
+        email = current_user_email() or ""
+        floor = store.review_backlog_floor()
+        rows = store.get_review_queue(animal_ids, email,
+                                        limit=queue_limit,
+                                        since_iso=floor)
+        if not rows:
+            return html.Div([
+                html.Div("🎉  You're all caught up!",
+                          style={"color": "#00CC96",
+                                  "fontWeight": "600",
+                                  "fontSize": "13px",
+                                  "marginBottom": "4px"}),
+                html.Div(
+                    "No unreviewed recordings for this animal.",
+                    style={"color": "#888", "fontSize": "11px"}),
+            ], style={"padding": "14px", "textAlign": "center"})
+        from datetime import datetime as _dt
+        now = _dt.now()
+        items = []
+        for r in rows[:queue_limit]:
+            ts_raw = r.get("chunk_datetime") or ""
+            try:
+                ts = _dt.strptime(ts_raw,
+                                    "%Y_%m_%d__%H_%M_%S")
+                age_days = (now - ts).total_seconds() / 86400
+                ts_label = ts.strftime("%Y-%m-%d  %H:%M")
+            except ValueError:
+                age_days = 0
+                ts_label = ts_raw
+            warn = age_days >= warn_age_days
+            dur = r.get("duration_sec") or 0
+            dur_h = dur / 3600.0 if dur else 0
+            items.append(html.Button([
+                html.Span(ts_label, style={
+                    "color": "#f0f0f5", "fontWeight": "600",
+                    "fontSize": "12px"}),
+                html.Span(f"  ({dur_h:.1f} h)", style={
+                    "color": "#888", "fontSize": "11px",
+                    "marginLeft": "4px"}),
+                html.Span(
+                    f"  · {age_days:.1f} d old"
+                    if age_days >= 1 else
+                    f"  · {age_days * 24:.0f} h old",
+                    style={
+                        "color": ("#EF553B" if warn
+                                   else "#888"),
+                        "fontSize": "10px",
+                        "marginLeft": "auto"}),
+            ], id={"type": "video-queue-item",
+                    "file_id": int(r["id"])},
+                n_clicks=0,
+                style={
+                    "display": "flex", "alignItems": "center",
+                    "width": "100%", "border": "none",
+                    "background": "transparent",
+                    "color": "#cfd0d6",
+                    "padding": "6px 10px",
+                    "cursor": "pointer",
+                    "borderBottom":
+                        "1px solid rgba(255,255,255,0.04)",
+                    "textAlign": "left",
+                }))
+        return items
+
+    @app.callback(
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Input({"type": "video-queue-item", "file_id": ALL},
+                "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _load_from_queue(n_clicks_list):
+        """Translate a queue button click into setting the existing
+        session + file dropdowns, which cascades through every
+        downstream callback unchanged."""
+        if not n_clicks_list or not any(n_clicks_list):
+            return no_update, no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update, no_update
+        file_id = trig.get("file_id")
+        if file_id is None:
+            return no_update, no_update
+        # Get the session_dir + file_path of the chosen file.
+        conn = store._connect()
+        try:
+            row = conn.execute(
+                "SELECT session_dir, file_path "
+                "FROM processed_files WHERE id = ?",
+                (int(file_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return no_update, no_update
+        # The Video Review file-dropdown's value is the file_id
+        # (see _update_files); session dropdown is session_dir.
+        store.insert_review_event(int(file_id),
+                                    current_user_email() or "anon",
+                                    "claim",
+                                    {"source": "queue_click"})
+        return row["session_dir"], int(file_id)
+
+    # ---- Step 4: reveal marker editor only when "Events" picked ---- #
+    @app.callback(
+        Output("video-review-marker-group", "style"),
+        Input("video-review-decision", "value"),
+        State("video-review-marker-group", "style"),
+    )
+    def _toggle_marker_editor(decision, current):
+        base = dict(current or {})
+        if decision == "has_events":
+            base["display"] = "block"
+        else:
+            base["display"] = "none"
+        return base
+
+    # ---- Step 4: reset marker store + decision when file changes ---- #
+    @app.callback(
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Output("video-review-decision", "value",
+                allow_duplicate=True),
+        Output("video-review-note", "value"),
+        Output("video-review-status", "children"),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _reset_review_panel(file_id):
+        if not file_id:
+            return [], None, "", ""
+        email = current_user_email() or ""
+        existing = store.get_review_state_by_user(int(file_id),
+                                                     email)
+        if existing and existing["status"] in (
+                "no_events", "has_events"):
+            badge = f"✓ You marked this " \
+                     f"{existing['status'].replace('_', ' ')} " \
+                     f"on {existing['updated_at'][:16]}."
+            return ([], existing["status"], existing.get("note") or "",
+                    badge)
+        # Any other user already finalised it?
+        other = store.get_review_state(int(file_id))
+        if other and other["status"] in (
+                "no_events", "has_events") and (
+                other["user_email"] != email.lower()):
+            badge = (f"Already reviewed by "
+                      f"{other['user_email']} on "
+                      f"{other['updated_at'][:16]}.")
+            return [], None, "", badge
+        return [], None, "", "Not reviewed yet."
+
+    # ---- Step 4: click LFP -> append onset marker (when in events mode) ---- #
+    @app.callback(
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Input("video-lfp-trace", "clickData"),
+        State("video-review-decision", "value"),
+        State("video-review-marker-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _maybe_append_marker(click_data, decision, markers):
+        # We don't want every click-to-seek to also drop a marker;
+        # gate on the radio being in events mode.
+        if decision != "has_events":
+            return no_update
+        if not click_data or not click_data.get("points"):
+            return no_update
+        try:
+            t_sec = float(click_data["points"][0]["x"])
+        except (KeyError, ValueError, TypeError):
+            return no_update
+        if t_sec < 0:
+            return no_update
+        new = list(markers or [])
+        # De-dupe within 0.5 s so a double-click doesn't spam.
+        for m in new:
+            if abs(float(m.get("peak_time_sec", -1)) - t_sec) < 0.5:
+                return no_update
+        new.append({
+            "type": "onset",
+            "peak_time_sec": round(t_sec, 3),
+        })
+        new.sort(key=lambda m: m.get("peak_time_sec", 0))
+        return new
+
+    @app.callback(
+        Output("video-review-markers", "children"),
+        Input("video-review-marker-store", "data"),
+    )
+    def _render_markers(markers):
+        if not markers:
+            return (
+                "Click on the brain trace above to add an onset "
+                "marker here.")
+        return ", ".join(
+            f"{m['peak_time_sec']:.2f}s" for m in markers)
+
+    @app.callback(
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Input("video-review-clear-markers-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _clear_markers(n):
+        if not n:
+            return no_update
+        return []
+
+    # ---- Step 4: save the review ---- #
+    @app.callback(
+        Output("video-review-status", "children",
+                allow_duplicate=True),
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Output("video-review-decision", "value",
+                allow_duplicate=True),
+        Output("video-review-note", "value",
+                allow_duplicate=True),
+        Input("video-review-save-btn", "n_clicks"),
+        State("video-file-dropdown", "value"),
+        State("video-review-decision", "value"),
+        State("video-review-marker-store", "data"),
+        State("video-review-note", "value"),
+        prevent_initial_call=True,
+    )
+    def _save_review(n_clicks, file_id, decision, markers, note):
+        if not n_clicks:
+            return no_update, no_update, no_update, no_update
+        if not file_id:
+            return ("Pick a recording first.",
+                    no_update, no_update, no_update)
+        if decision not in ("no_events", "has_events"):
+            return ("Pick \"No events seen\" or \"Events seen\" "
+                     "before saving.",
+                    no_update, no_update, no_update)
+        if decision == "has_events" and not markers:
+            return ("Click the brain trace at least once to drop "
+                     "an onset marker before saving.",
+                    no_update, no_update, no_update)
+        email = current_user_email()
+        if not email:
+            return ("Not signed in — can't record who reviewed "
+                     "this.",
+                    no_update, no_update, no_update)
+        try:
+            store.mark_review(
+                int(file_id),
+                email,
+                decision,
+                markers=markers if decision == "has_events" else None,
+                note=(note or None),
+            )
+        except Exception as e:
+            logger.warning("mark_review failed: %s", e)
+            return (f"Save failed: {e}",
+                    no_update, no_update, no_update)
+        from datetime import datetime as _dt
+        badge = (f"✓ Saved at "
+                  f"{_dt.now().strftime('%H:%M')}. "
+                  f"This recording is now out of your queue.")
+        # Reset the form to defaults so the next file starts clean.
+        return badge, [], None, ""
 
     # ---- file/channel options ---- #
     @app.callback(

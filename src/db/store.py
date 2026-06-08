@@ -1309,3 +1309,350 @@ class Store:
             conn.commit()
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  Review queue / state (Video Review tab)
+    # ------------------------------------------------------------------ #
+
+    # "Reviewed" means at least one final-state row exists for this
+    # file. Claimed-only rows still count the file as unreviewed.
+    _REVIEW_FINAL_STATUSES = ("no_events", "has_events")
+
+    def get_review_state(self, file_id: int) -> dict | None:
+        """Latest review_state row for *file_id*, any user."""
+        assert isinstance(file_id, int), "file_id must be int"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT * FROM review_state
+                   WHERE file_id = ?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (file_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_review_state_by_user(self, file_id: int,
+                                   user_email: str) -> dict | None:
+        """Latest row for this (file, user) pair. Used by the UI to
+        show whether the current viewer already reviewed this file."""
+        assert isinstance(file_id, int), "file_id must be int"
+        if not user_email:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT * FROM review_state
+                   WHERE file_id = ? AND user_email = ?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (file_id, user_email.lower()),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def insert_review_event(self, file_id: int, user_email: str,
+                              action: str,
+                              payload: dict | None = None) -> int:
+        """Write to the append-only review_event_log; returns row id.
+
+        action ∈ {'claim', 'finish', 'abandon', 'reopen',
+                   'backlog_zero'}; payload is JSON-serialised.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert user_email, "user_email required"
+        assert action, "action required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """INSERT INTO review_event_log
+                   (file_id, user_email, action, payload_json, at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (file_id, user_email.lower(), action,
+                 json.dumps(payload or {}), now),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    def mark_review(self, file_id: int, user_email: str,
+                     status: str,
+                     markers: list[dict] | None = None,
+                     note: str | None = None) -> int:
+        """Atomic: write review_state row + matching event-log entry.
+
+        status ∈ {'claimed', 'no_events', 'has_events',
+                   'abandoned'}. Returns the review_state row id.
+        Finalising (no_events / has_events / abandoned) emits a
+        'finish' (or 'abandon') log event; claiming emits 'claim'.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert user_email, "user_email required"
+        assert status in ("claimed", "no_events", "has_events",
+                           "abandoned"), f"bad status {status!r}"
+        now = datetime.now().isoformat()
+        markers_json = json.dumps(markers or [])
+        log_action = ("claim" if status == "claimed"
+                       else "abandon" if status == "abandoned"
+                       else "finish")
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """INSERT INTO review_state
+                   (file_id, user_email, status, markers_json,
+                    note, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (file_id, user_email.lower(), status, markers_json,
+                 note, now, now),
+            )
+            conn.execute(
+                """INSERT INTO review_event_log
+                   (file_id, user_email, action, payload_json, at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (file_id, user_email.lower(), log_action,
+                 json.dumps({"status": status,
+                              "n_markers": len(markers or [])}),
+                 now),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _animal_ids_for_config(channel_names_json: str | None,
+                                 eeg_channels_json: str | None
+                                 ) -> list[str]:
+        """Resolve a session_config row to the list of actual animal
+        identifiers.
+
+        ``eeg_channels`` is a JSON list of channel INDICES into
+        ``channel_names`` (the non-stim_copy electrodes). The
+        animal id is the channel name at each index, e.g. given
+        ``channel_names = ["stimCopy", "BCH040SR", "stimCopy",
+        "saline"]`` and ``eeg_channels = [1, 3]`` this returns
+        ``["BCH040SR", "saline"]``.
+        """
+        if not channel_names_json or not eeg_channels_json:
+            return []
+        try:
+            names = json.loads(channel_names_json)
+            idxs = json.loads(eeg_channels_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(names, list) or not isinstance(idxs, list):
+            return []
+        out: list[str] = []
+        for i in idxs:
+            try:
+                ii = int(i)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= ii < len(names) and names[ii]:
+                out.append(str(names[ii]))
+        return out
+
+    def get_review_queue(self, animal_ids: list[str],
+                          user_email: str,
+                          limit: int = 100,
+                          since_iso: str | None = None
+                          ) -> list[dict]:
+        """Unreviewed files belonging to *any* of *animal_ids*, newest
+        first.
+
+        Rules:
+        * File's session_config animal list (channel_names indexed
+          by eeg_channels) must intersect *animal_ids*.
+        * File must have a companion video (has_video = 1).
+        * No row in review_state with status IN ('no_events',
+          'has_events') for this file (regardless of user).
+        * The current *user_email* hasn't already finalised it.
+        * Optional *since_iso* filters chunk_datetime >= that ISO
+          string (used to honour a backlog-zero floor).
+        """
+        if not animal_ids:
+            return []
+        assert isinstance(limit, int) and limit > 0, "limit must be positive int"
+        # First, prune session_configs to those that actually carry
+        # one of the requested animals. We use a JSON-substring
+        # LIKE (matching the channel name wrapped in quotes) so a
+        # partial token like "BCH06" can't accidentally match the
+        # animal "BCH060SR". With <100 distinct animals this stays
+        # well under 10 ms.
+        like_clauses = " OR ".join(
+            ["sc.channel_names LIKE ?"] * len(animal_ids)
+        )
+        like_args = [f'%"{a}"%' for a in animal_ids]
+        params: list = list(like_args)
+        extra_where = ""
+        if since_iso:
+            extra_where += " AND pf.chunk_datetime >= ?"
+            params.append(since_iso)
+        sql = f"""
+            SELECT pf.id, pf.file_path, pf.session_dir,
+                    pf.session_name, pf.chunk_datetime,
+                    pf.duration_sec, pf.has_video,
+                    sc.eeg_channels, sc.channel_names
+            FROM processed_files pf
+            JOIN session_config sc
+              ON sc.session_dir = pf.session_dir
+            WHERE pf.has_video = 1
+              AND ({like_clauses})
+              AND NOT EXISTS (
+                SELECT 1 FROM review_state rs
+                WHERE rs.file_id = pf.id
+                  AND rs.status IN ('no_events', 'has_events')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM review_state rs2
+                WHERE rs2.file_id = pf.id
+                  AND rs2.user_email = ?
+              )
+              {extra_where}
+            ORDER BY pf.chunk_datetime DESC
+            LIMIT ?
+        """
+        params.append((user_email or "").lower())
+        # Over-fetch a little so the post-filter (rejecting rows
+        # whose decoded animal list doesn't actually intersect)
+        # still has enough hits.
+        params.append(limit * 3)
+        wanted = {a for a in animal_ids}
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for r in rows:
+            r_animals = self._animal_ids_for_config(
+                r["channel_names"], r["eeg_channels"])
+            if wanted & set(r_animals):
+                d = dict(r)
+                d["animals"] = r_animals
+                out.append(d)
+            if len(out) >= limit:
+                break
+        return out
+
+    def review_backlog_summary(self, since_iso: str | None = None
+                                ) -> list[dict]:
+        """Per-animal backlog snapshot for the PI tab + weekly digest.
+
+        Returns rows of {animal_id, n_unreviewed,
+        oldest_chunk_datetime}. animal_id is derived from
+        session_config.eeg_channels split on comma — one row per
+        distinct token.
+        """
+        # Pull every (file, channel_names, eeg_channels) tuple not
+        # finalised. The animal-id resolution happens in Python:
+        # eeg_channels indexes into channel_names to get the actual
+        # electrode/animal labels.
+        conn = self._connect()
+        try:
+            extra_where = ""
+            params: list = []
+            if since_iso:
+                extra_where = " AND pf.chunk_datetime >= ?"
+                params.append(since_iso)
+            rows = conn.execute(
+                f"""SELECT pf.id, pf.chunk_datetime,
+                            sc.channel_names, sc.eeg_channels
+                    FROM processed_files pf
+                    JOIN session_config sc
+                      ON sc.session_dir = pf.session_dir
+                    WHERE pf.has_video = 1
+                      AND sc.channel_names IS NOT NULL
+                      AND sc.eeg_channels IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM review_state rs
+                        WHERE rs.file_id = pf.id
+                          AND rs.status IN ('no_events',
+                                             'has_events')
+                      ){extra_where}""",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        by_animal: dict[str, dict] = {}
+        for r in rows:
+            animals = self._animal_ids_for_config(
+                r["channel_names"], r["eeg_channels"])
+            for a in animals:
+                slot = by_animal.setdefault(a, {
+                    "animal_id": a,
+                    "n_unreviewed": 0,
+                    "oldest_chunk_datetime": r["chunk_datetime"],
+                })
+                slot["n_unreviewed"] += 1
+                if (r["chunk_datetime"] or "") < (
+                        slot["oldest_chunk_datetime"] or ""):
+                    slot["oldest_chunk_datetime"] = r["chunk_datetime"]
+        return sorted(by_animal.values(),
+                       key=lambda d: -d["n_unreviewed"])
+
+    def list_all_animals(self) -> list[str]:
+        """Distinct animal ids across every session_config row.
+
+        Used to compute the unassigned pool (animals - assigned).
+        Names are returned in a stable sorted order.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT channel_names, eeg_channels
+                   FROM session_config
+                   WHERE channel_names IS NOT NULL
+                     AND eeg_channels IS NOT NULL"""
+            ).fetchall()
+        finally:
+            conn.close()
+        seen: set[str] = set()
+        for r in rows:
+            for a in self._animal_ids_for_config(
+                    r["channel_names"], r["eeg_channels"]):
+                seen.add(a)
+        return sorted(seen)
+
+    def review_user_throughput(self, days: int = 7
+                                 ) -> list[dict]:
+        """Per-user finished-count over the last *days*."""
+        assert isinstance(days, int) and days > 0
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT user_email,
+                          SUM(CASE WHEN status='no_events'
+                                   THEN 1 ELSE 0 END) AS n_no_events,
+                          SUM(CASE WHEN status='has_events'
+                                   THEN 1 ELSE 0 END) AS n_has_events,
+                          COUNT(*) AS n_total,
+                          MAX(updated_at) AS last_finalised_at
+                   FROM review_state
+                   WHERE status IN ('no_events', 'has_events')
+                     AND updated_at >= ?
+                   GROUP BY user_email
+                   ORDER BY n_total DESC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def review_backlog_floor(self) -> str | None:
+        """Return the most recent 'backlog_zero' sentinel timestamp,
+        or None if the PI hasn't set a floor yet. The queue + backlog
+        summary use this to ignore prehistoric files."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT MAX(at) AS at FROM review_event_log
+                   WHERE action = 'backlog_zero'"""
+            ).fetchone()
+            return (row["at"] if row and row["at"] else None)
+        finally:
+            conn.close()
