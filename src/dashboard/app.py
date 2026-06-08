@@ -693,6 +693,26 @@ def create_app(config: dict, store: Store) -> Dash:
                                "marginRight": SPACE_2,
                                "fontSize": FONT_SIZE_CAPTION,
                                "fontFamily": FONT_STACK}),
+            # Manual PiP toggle (replaces the IntersectionObserver
+            # auto-pin). Click flips the video-pip-state Store
+            # which a clientside callback in video.py mirrors to
+            # the .qc-pip-grid class. Active-state styling
+            # (filled accent vs outline) is managed by a
+            # clientside callback subscribed to the same Store.
+            html.Button("PiP", id="pip-toggle-btn",
+                        title="Pop the video + LFP into a floating "
+                               "PiP at bottom-right (P hotkey). "
+                               "Click again to dock.",
+                        n_clicks=0,
+                        style={"backgroundColor": COLOR_SURFACE_2,
+                               "color": COLOR_TEXT_PRIMARY,
+                               "border": f"1px solid {COLOR_DIVIDER}",
+                               "borderRadius": RADIUS_SM,
+                               "padding": f"{SPACE_1} {SPACE_3}",
+                               "cursor": "pointer",
+                               "marginRight": SPACE_2,
+                               "fontSize": FONT_SIZE_CAPTION,
+                               "fontFamily": FONT_STACK}),
             html.Button("Refresh", id="manual-refresh-btn",
                         style={"backgroundColor": COLOR_SURFACE_2,
                                "color": COLOR_TEXT_PRIMARY,
@@ -739,6 +759,12 @@ def create_app(config: dict, store: Store) -> Dash:
                   "border": f"1px solid {COLOR_DIVIDER}"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
+        # Video PiP toggle. False = grid sits in normal Step 2
+        # layout; True = grid floats at bottom-right via the
+        # .qc-pip-grid CSS class. Flipped by (a) the PiP button
+        # in this refresh bar, (b) the in-PiP Dock button, or
+        # (c) the P hotkey via kbd-event.
+        dcc.Store(id="video-pip-state", data=False),
         # Cache-version Store for the Reviewer Assignments sheet.
         # Bumped by a background warmer thread; subscribed to by
         # the Video Review animal picker so it auto-updates when
@@ -925,6 +951,85 @@ def create_app(config: dict, store: Store) -> Dash:
         Output("video-events-add-btn", "className"),
         Input("video-review-decision", "value"),
         Input("video-events-store", "data"),
+    )
+
+    # ---- Track C: manual PiP toggle ---- #
+    # The PiP button in the refresh bar, the Dock button inside
+    # the floating PiP, and the P hotkey all flip the same
+    # video-pip-state Store. A separate clientside callback
+    # mirrors the Store into the DOM via assets/pip_video.js.
+    app.clientside_callback(
+        """
+        function (btn_n, dock_n, kbd_ev, state) {
+            const ctx = window.dash_clientside.callback_context;
+            if (!ctx || !ctx.triggered || !ctx.triggered.length) {
+                return window.dash_clientside.no_update;
+            }
+            const trig = ctx.triggered[0].prop_id || '';
+            if (trig.startsWith('kbd-event')) {
+                if (!kbd_ev || kbd_ev.action !== 'toggle_pip') {
+                    return window.dash_clientside.no_update;
+                }
+            } else if (trig.startsWith('pip-toggle-btn')
+                        && !btn_n) {
+                return window.dash_clientside.no_update;
+            } else if (trig.startsWith('pip-dock-btn')
+                        && !dock_n) {
+                return window.dash_clientside.no_update;
+            }
+            return !state;
+        }
+        """,
+        Output("video-pip-state", "data"),
+        Input("pip-toggle-btn", "n_clicks"),
+        Input("pip-dock-btn", "n_clicks"),
+        Input("kbd-event", "data"),
+        State("video-pip-state", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Mirror the Store into the DOM. Calls into
+    # window.qcPipVideo.applyPipClass which lives in
+    # assets/pip_video.js.
+    app.clientside_callback(
+        """
+        function (on) {
+            if (window.qcPipVideo
+                    && window.qcPipVideo.applyPipClass) {
+                window.qcPipVideo.applyPipClass(!!on);
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-pip-state", "id"),  # write-only sink
+        Input("video-pip-state", "data"),
+    )
+
+    # Active-state styling on the refresh-bar PiP button
+    # (filled accent vs outlined) so the reviewer can read the
+    # PiP state at a glance from the top of the screen.
+    app.clientside_callback(
+        """
+        function (on) {
+            const btn = document.getElementById(
+                'pip-toggle-btn');
+            if (!btn) {
+                return window.dash_clientside.no_update;
+            }
+            if (on) {
+                btn.style.backgroundColor = '#5e7ce2';
+                btn.style.color = '#ffffff';
+                btn.style.borderColor = '#5e7ce2';
+            } else {
+                btn.style.backgroundColor = '';
+                btn.style.color = '';
+                btn.style.borderColor = '';
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("pip-toggle-btn", "title"),  # write-only sink
+        Input("video-pip-state", "data"),
     )
 
     # PI-only frame sampler: on click, draw the <video>'s current

@@ -1391,6 +1391,19 @@ def layout(store: Store):
             ),
         ], style={"marginTop": "0", "gridArea": "lfp",
                    "minWidth": "0"}),
+            # In-PiP "Dock" button. Hidden in normal grid view
+            # via the CSS rule on .qc-pip-dock-btn; only appears
+            # when the parent grid has the .qc-pip-grid class.
+            # Click flips video-pip-state back to False (handled
+            # by the same clientside callback that the refresh-
+            # bar PiP button uses).
+            html.Button(
+                "✕ Dock",
+                id="pip-dock-btn",
+                n_clicks=0,
+                title="Dock the PiP back into the page (P).",
+                className="qc-pip-dock-btn",
+            ),
         ], id="video-step2-grid",
            style={"display": "grid",
                    "gridTemplateColumns": "minmax(420px, 1.2fr) "
@@ -1674,10 +1687,23 @@ def layout(store: Store):
                                 "fontSize": "13px",
                                 "fontWeight": "700",
                                 "marginRight": "10px"}),
-                    html.Span(id="video-review-status",
-                               style={"color": "#a0a0b0",
-                                       "fontSize": "12px",
-                                       "alignSelf": "center"}),
+                    dcc.Loading(
+                        id="video-review-status-loading",
+                        type="dot",
+                        color="#5e7ce2",
+                        # 250 ms delay so a cache-hit save
+                        # doesn't flash; the SQLite write +
+                        # CSV append (the slow leg) tip the
+                        # spinner clearly into view.
+                        delay_show=250,
+                        parent_style={"display": "inline-flex",
+                                       "alignItems": "center"},
+                        children=html.Span(
+                            id="video-review-status",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "alignSelf": "center"}),
+                    ),
                 ], style={"marginTop": "10px",
                            "display": "flex",
                            "alignItems": "center"}),

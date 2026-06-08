@@ -104,6 +104,8 @@ SHORTCUTS: tuple[Shortcut, ...] = (
               "Video", display="→"),
     Shortcut("ArrowLeft", "seek_back", "Seek video -1 s",
               "Video", display="←"),
+    Shortcut("p", "toggle_pip",
+              "Pip / dock the video player", "Video"),
     # Notes + help
     Shortcut("/", "focus_note",
               "Focus the reviewer note textarea", "Notes"),
