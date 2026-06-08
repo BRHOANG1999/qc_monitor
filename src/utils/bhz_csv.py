@@ -36,6 +36,8 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import threading
+from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
 
@@ -292,3 +294,130 @@ def resolve_csv_path(base_dir: str | Path,
         date=chunk_date.strftime("%Y%m%d"), animal=animal,
     )
     return Path(base_dir) / name
+
+
+# --------------------------------------------------------------- #
+# Overwrite mode (Track D of the PI verification plan)
+# --------------------------------------------------------------- #
+
+@dataclass
+class CsvDiff:
+    """What an overwrite would change. ``removed_filenames``
+    being non-empty is the trigger for the PI's confirmation
+    modal."""
+    added_filenames: list[str]
+    removed_filenames: list[str]
+    modified_filenames: list[str]
+
+
+_OVERWRITE_LOCK = threading.Lock()
+
+
+def existing_filenames_in_csv(csv_path: str | Path
+                                ) -> dict[str, list[dict]]:
+    """Return ``{filename: [row, ...]}`` for every row in
+    *csv_path*, grouped by the ``filename`` column. Empty dict
+    when the file doesn't exist."""
+    path = Path(csv_path)
+    if not path.exists():
+        return {}
+    out: dict[str, list[dict]] = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            max_iter = 100_000  # NASA Rule 2
+            for i, row in enumerate(reader):
+                assert i < max_iter, "csv scan runaway"
+                fn = (row.get("filename") or "").strip()
+                if not fn:
+                    continue
+                out.setdefault(fn, []).append(dict(row))
+    except Exception as e:
+        logger.warning("existing_filenames_in_csv failed: %s", e)
+        return {}
+    return out
+
+
+def _row_canonical(row: dict) -> tuple:
+    """Return a hashable tuple of the comparable columns.
+
+    Floating-point quirks aside, the canonical row is just
+    the formatted cells in COLUMNS order -- this is what the
+    on-disk CSV stores."""
+    return tuple(_fmt_cell(c, row.get(c)) for c in COLUMNS)
+
+
+def overwrite_day_csv(csv_path: str | Path,
+                       events_by_filename: dict[str, list[dict]],
+                       file_meta_by_filename: dict[str, dict],
+                       fs: float) -> CsvDiff:
+    """Rewrite *csv_path* with the canonical set of approved
+    rows.
+
+    *events_by_filename* maps each .mat filename to the list of
+    structured events the PI has approved; an empty list ->
+    one "No events" row. *file_meta_by_filename* maps the same
+    filenames to the file_meta dicts (folder, Channel, etc.).
+
+    Returns a CsvDiff describing which filenames the overwrite
+    adds, removes, and modifies relative to the file on disk.
+    The PI tab uses this diff to gate the actual write behind
+    a confirmation modal when ``removed_filenames`` is
+    non-empty.
+
+    Thread-safe via a module-level lock so two simultaneous PI
+    overwrites can't trample each other.
+    """
+    assert isinstance(events_by_filename, dict)
+    assert isinstance(file_meta_by_filename, dict)
+    assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
+    path = Path(csv_path)
+    with _OVERWRITE_LOCK:
+        # Snapshot what's on disk.
+        existing = existing_filenames_in_csv(path)
+        existing_fns = set(existing.keys())
+        new_fns = set(events_by_filename.keys())
+        # Build the canonical new rows in deterministic order.
+        new_rows: list[dict] = []
+        max_iter = 4096
+        for i, fn in enumerate(sorted(new_fns)):
+            assert i < max_iter, "filename loop runaway"
+            meta = file_meta_by_filename.get(fn, {})
+            evs = events_by_filename.get(fn, [])
+            if not evs:
+                new_rows.append(_no_events_row(meta))
+                continue
+            for ev in evs:
+                new_rows.append(_event_to_row(ev, meta, fs))
+        # Compute the diff before writing.
+        added = sorted(new_fns - existing_fns)
+        removed = sorted(existing_fns - new_fns)
+        modified: list[str] = []
+        for fn in sorted(new_fns & existing_fns):
+            old_canonical = [_row_canonical(r)
+                              for r in existing.get(fn, [])]
+            new_canonical = [_row_canonical(r)
+                              for r in new_rows
+                              if (r.get("filename") or "")
+                                  .strip() == fn]
+            if old_canonical != new_canonical:
+                modified.append(fn)
+        diff = CsvDiff(
+            added_filenames=added,
+            removed_filenames=removed,
+            modified_filenames=modified,
+        )
+        # Write atomically: tmp file, fsync, rename.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL,
+                                  lineterminator="\n")
+            writer.writerow(COLUMNS)
+            for row in new_rows:
+                writer.writerow(
+                    [_fmt_cell(c, row.get(c)) for c in COLUMNS])
+        # Atomic-ish replace; Windows lacks O_TMPFILE so this
+        # is the simplest portable approach.
+        os.replace(tmp, path)
+        return diff
