@@ -866,57 +866,38 @@ def layout(store: Store):
 
         # --- Step 2: watch ---------------------------------------------- #
         _step_header("2", "Watch",
-                      "The video plays in sync with the LFP trace below."),
+                      "Video plays in sync with the LFP and Hilbert "
+                      "envelope on the right. Scroll down to score "
+                      "events; the video pips to the corner."),
 
-        # --- Player + side panel ---------------------------------------- #
+        # --- Two-column Step 2: video LEFT | LFP+Hilbert RIGHT ----- #
+        # CSS Grid: video spans both rows in column 1; the LFP block
+        # lives in column 2 row 1, the Hilbert block in column 2 row
+        # 2. On narrow viewports (<=900 px) the grid collapses to a
+        # single column via the media query in theme.css.
         html.Div([
-            html.Div([
-                html.Div(
-                    id="video-player-container",
-                    children=html.Div([
-                        html.Div("📹", style={"fontSize": "32px",
-                                              "marginBottom": "6px"}),
-                        html.Div("Pick a recording above to load the "
-                                  "video here.",
-                                  style={"color": "#a0a0b0",
-                                          "fontSize": "13px"}),
-                    ], style={"textAlign": "center"}),
-                    style={"backgroundColor": "#000",
-                           "borderRadius": "10px",
-                           "minHeight": "360px", "display": "flex",
-                           "alignItems": "center", "justifyContent": "center",
-                           "overflow": "hidden"},
-                ),
-            ], style={"flex": "2", "minWidth": "480px"}),
-
-            html.Div([
-                html.Label("Reviewer note", style=LABEL_STYLE),
-                dcc.Textarea(
-                    id="video-note-input",
-                    placeholder="Notes about this video / LFP chunk...",
-                    style={"backgroundColor": "#262638", "color": "#f0f0f5",
-                           "border": "1px solid rgba(255,255,255,0.07)",
-                           "borderRadius": "6px",
-                           "padding": "10px 12px", "width": "100%",
-                           "height": "180px", "fontFamily": "inherit",
-                           "fontSize": "13px"},
-                ),
-                html.Button(
-                    "Save note", id="video-note-save-btn", n_clicks=0,
-                    style={"backgroundColor": "#5e7ce2", "color": "white",
-                           "border": "none", "padding": "8px 20px",
-                           "borderRadius": "6px", "cursor": "pointer",
-                           "fontSize": "13px", "fontWeight": "600",
-                           "marginTop": "8px"},
-                ),
-                html.Div(id="video-note-status",
-                         style={"marginTop": "8px", "fontSize": "12px"}),
-            ], style={"flex": "1", "minWidth": "260px", **SECTION_STYLE}),
-        ], style={"display": "flex", "gap": "16px", "alignItems": "flex-start",
-                  "flexWrap": "wrap"}),
+            html.Div(
+                id="video-player-container",
+                children=html.Div([
+                    html.Div("📹", style={"fontSize": "32px",
+                                          "marginBottom": "6px"}),
+                    html.Div("Pick a recording above to load the "
+                              "video here.",
+                              style={"color": "#a0a0b0",
+                                      "fontSize": "13px"}),
+                ], style={"textAlign": "center"}),
+                style={"backgroundColor": "#000",
+                       "borderRadius": "10px",
+                       "minHeight": "360px",
+                       "display": "flex",
+                       "alignItems": "center",
+                       "justifyContent": "center",
+                       "overflow": "hidden",
+                       "gridArea": "video"},
+            ),
 
         # --- Time-locked LFP trace -------------------------------------- #
-        html.Div([
+            html.Div([
             html.Div([
                 html.Span("Brain signal (LFP)",
                           style={"color": "#cfd0d6", "fontSize": "13px",
@@ -1230,7 +1211,59 @@ def layout(store: Store):
                     "scrollZoom": True,
                 },
             ),
-        ], style={"marginTop": "20px"}),
+        ], style={"marginTop": "0", "gridArea": "lfp",
+                   "minWidth": "0"}),
+        ], id="video-step2-grid",
+           style={"display": "grid",
+                   "gridTemplateColumns": "minmax(420px, 1.2fr) "
+                                            "minmax(420px, 1fr)",
+                   "gridTemplateAreas": "'video lfp'",
+                   "gap": "16px",
+                   "alignItems": "start",
+                   "marginBottom": "12px"}),
+
+        # --- Step 2 reviewer note (optional, collapsed by default) ----- #
+        # Replaces the always-visible 180-px-tall textarea that used to
+        # sit beside the video. Most reviewers don't write a note per
+        # file; the ones that do can expand this and write/save. The
+        # ids stay (video-note-input, video-note-save-btn) so the
+        # existing save callbacks keep working without changes.
+        _details_card(
+            "Add an optional note about this video",
+            summary_sub="free-text reminder for yourself or the next "
+                         "reviewer. Most files don't need one.",
+            open_default=False,
+            content=html.Div([
+                dcc.Textarea(
+                    id="video-note-input",
+                    placeholder="Notes about this video / LFP chunk...",
+                    style={"backgroundColor": "#262638",
+                            "color": "#f0f0f5",
+                            "border": "1px solid rgba(255,255,255,0.07)",
+                            "borderRadius": "6px",
+                            "padding": "10px 12px", "width": "100%",
+                            "height": "80px", "fontFamily": "inherit",
+                            "fontSize": "13px"}),
+                html.Div([
+                    html.Button(
+                        "Save note",
+                        id="video-note-save-btn", n_clicks=0,
+                        style={"backgroundColor": "#5e7ce2",
+                                "color": "white", "border": "none",
+                                "padding": "6px 16px",
+                                "borderRadius": "6px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "fontWeight": "600",
+                                "marginRight": "10px"}),
+                    html.Span(id="video-note-status",
+                               style={"fontSize": "12px",
+                                       "color": "#a0a0b0"}),
+                ], style={"display": "flex",
+                           "alignItems": "center",
+                           "marginTop": "6px"}),
+            ]),
+        ),
 
             # --- Step 4: score events + mark done --------------------- #
             # Lives below the LFP + Hilbert envelope so the reviewer can
