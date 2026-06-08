@@ -504,7 +504,9 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
 
 
 def _render_hilbert_trace(store, file_id: int,
-                            channel: int | None
+                            channel: int | None,
+                            blank_pre_ms: float = -5.0,
+                            blank_post_ms: float = 15.0,
                             ) -> tuple:
     """Return (figure, status_text) for the BHZ Hilbert default.
 
@@ -513,6 +515,12 @@ def _render_hilbert_trace(store, file_id: int,
     ``_get_blanked_series`` so the stim artifact mask matches
     the raw LFP above it, and ``envelope`` so the visual
     decimation is consistent.
+
+    ``blank_pre_ms`` / ``blank_post_ms`` default to the same
+    window the LFP path uses (-5 / 15 ms around each stim
+    pulse). The caller can pass the live config values via
+    ``feature_analysis.stim_artifact_*`` for parity with the
+    raw trace above.
     """
     assert isinstance(file_id, int), "file_id must be int"
     file_path = _file_path_for_id(store, file_id)
@@ -531,6 +539,7 @@ def _render_hilbert_trace(store, file_id: int,
     try:
         series, fs, _ = _get_blanked_series(
             file_path, int(channel), stim_times,
+            blank_pre_ms, blank_post_ms,
         )
     except Exception as e:
         logger.warning("Hilbert load failed file=%s ch=%s: %s",
@@ -2576,7 +2585,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":
             return _render_hilbert_trace(
-                store, int(file_id), channel)
+                store, int(file_id), channel,
+                blank_pre_ms=blank_pre_ms,
+                blank_post_ms=blank_post_ms,
+            )
         try:
             rows = store.query_evoked_features(int(file_id))
         except Exception as e:
