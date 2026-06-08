@@ -212,6 +212,23 @@ def _animal_ids_from_picker(animal_value: str | None
     return [animal_value]
 
 
+def _prefetch_chunk_safe(file_path: str, file_id: int) -> None:
+    """Background-thread chunk warm. Swallows + logs errors so a
+    bad file doesn't crash the prefetch loop.
+
+    NOT for use outside the prefetch daemon -- the dashboard's
+    foreground render paths want exceptions to surface.
+    """
+    assert isinstance(file_path, str) and file_path, "path required"
+    assert isinstance(file_id, int), "file_id must be int"
+    try:
+        get_chunk(file_path)
+        logger.debug("prefetched chunk for file_id=%s", file_id)
+    except Exception as e:
+        logger.debug("prefetch skipped for file_id=%s: %s",
+                      file_id, e)
+
+
 def _resolve_next_in_queue(store: Store,
                              animal_value: str | None,
                              current_file_id: int,
@@ -825,9 +842,14 @@ def layout(store: Store):
                     ),
                 ], style={"flex": "0 0 140px"}),
                 html.Div([
-                    html.Label("Smooth (ms)", style=LABEL_STYLE,
+                    html.Label("Smooth the LFP (ms)", style=LABEL_STYLE,
                                 title="Gaussian smoothing window in "
-                                       "milliseconds. 0 = off. Helpful for "
+                                       "milliseconds, applied to the LFP "
+                                       "trace ONLY (Step 2). 0 = off. "
+                                       "Distinct from Step 3's "
+                                       "smooth-by-seconds, which smooths "
+                                       "the per-event feature line. "
+                                       "Helpful for "
                                        "spotting slow rhythms; bad for "
                                        "spotting fast spikes."),
                     dcc.Input(id="video-filter-smooth", type="number",
@@ -968,6 +990,23 @@ def layout(store: Store):
                                 "fontFamily": "inherit",
                                 "fontSize": "12px"}),
                 ], style={"marginTop": "10px"}),
+                # P1-3 decision preview. NN/g 'Visibility of system
+                # status' + Gmail's compose-summary-before-send.
+                # Read-only: shows the reviewer what's about to be
+                # saved, so the Mark-done click is never a black box.
+                html.Div(id="video-review-preview",
+                          style={"display": "flex",
+                                  "gap": "10px",
+                                  "flexWrap": "wrap",
+                                  "alignItems": "center",
+                                  "padding": "6px 10px",
+                                  "marginTop": "10px",
+                                  "color": "#a0a0b0",
+                                  "fontSize": "11px",
+                                  "background": "#13131f",
+                                  "border":
+                                      "1px solid rgba(255,255,255,0.04)",
+                                  "borderRadius": "6px"}),
                 html.Div([
                     html.Button(
                         "Mark recording done",
@@ -1088,10 +1127,15 @@ def layout(store: Store):
                 open_default=False,
                 content=html.Div([
                     html.Div([
-                        html.Label("Smooth by N seconds",
+                        html.Label("Smooth the feature line (s)",
                                     style=LABEL_STYLE,
                                     title="Gaussian smoothing window in "
-                                           "seconds. 0 = off."),
+                                           "seconds, applied to the "
+                                           "per-event feature line ONLY "
+                                           "(Step 3). 0 = off. Distinct "
+                                           "from Step 2's smooth-the-LFP "
+                                           "(ms), which smooths the raw "
+                                           "trace."),
                         dcc.Input(id="video-analysis-smooth",
                                    type="number", min=0, step=0.5,
                                    value=0,
@@ -1203,6 +1247,14 @@ def layout(store: Store):
         # the callback no-ops. Cheap.
         dcc.Interval(id="video-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="video-current-time", data=0.0),
+        # P1-4 predictive prefetch: a slow tick (2 s) drives a
+        # background warm of the next-in-queue file's chunk so
+        # pressing J / mark-done feels instant. State stores the
+        # last file_id we prefetched against, to avoid redundant
+        # work when nothing changed.
+        dcc.Interval(id="video-prefetch-tick", interval=2000,
+                       n_intervals=0),
+        dcc.Store(id="video-prefetch-state", data=None),
         # Sink for the multi-camera slave-sync clientside callback;
         # the callback returns the empty string and only side-effects
         # the slave <video> elements' currentTime / play / pause.
@@ -1546,6 +1598,47 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     {"source": "queue_click"})
         return row["session_dir"], int(file_id)
 
+    # ---- P1-4 predictive prefetch ---- #
+    # 2 s after the current file loads (and every 2 s thereafter,
+    # though debounced by the last-prefetched marker), warm
+    # chunk_cache for the next-in-queue file in a daemon thread.
+    # Pattern source: Superhuman "next email pre-rendered". Cost
+    # is bounded -- chunk_cache LRU evicts beyond _MAX_ENTRIES.
+    @app.callback(
+        Output("video-prefetch-state", "data"),
+        Input("video-prefetch-tick", "n_intervals"),
+        State("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
+        State("video-prefetch-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _prefetch_next_file(_n, current_file_id, animal_value,
+                              state):
+        if not current_file_id:
+            return no_update
+        last = (state or {}).get("last")
+        if last == int(current_file_id):
+            return no_update
+        email = current_user_email() or ""
+        _sd, next_id = _resolve_next_in_queue(
+            store, animal_value, int(current_file_id), email,
+            queue_limit=queue_limit,
+        )
+        if not next_id:
+            return {"last": int(current_file_id)}
+        next_path = _file_path_for_id(store, int(next_id))
+        if not next_path:
+            return {"last": int(current_file_id)}
+        # Warm in a daemon thread so the request returns now.
+        import threading as _th
+        _th.Thread(
+            target=_prefetch_chunk_safe,
+            args=(next_path, int(next_id)),
+            daemon=True,
+            name=f"video-prefetch-{int(next_id)}",
+        ).start()
+        return {"last": int(current_file_id)}
+
     # ---- Hotkey: J / K (or arrow up / down) cycles the queue ---- #
     # Subscribes to the kbd-event bus from src/dashboard/keyboard.py
     # and translates next/prev actions into a session+file dropdown
@@ -1724,6 +1817,72 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "marker here.")
         return ", ".join(
             f"{m['peak_time_sec']:.2f}s" for m in markers)
+
+    # ---- Decision preview row (P1-3) ---- #
+    # Live mirror of what the Mark-done button is about to save.
+    # Pure read of three existing Stores plus the file dropdown
+    # label; zero new state. Fires on any input change so the row
+    # stays in sync as the reviewer edits.
+    @app.callback(
+        Output("video-review-preview", "children"),
+        Input("video-review-decision", "value"),
+        Input("video-review-marker-store", "data"),
+        Input("video-review-note", "value"),
+        Input("video-file-dropdown", "value"),
+    )
+    def _render_preview(decision, markers, note, file_id):
+        if not file_id:
+            return ""
+        if decision == "no_events":
+            pill_label = "No events"
+            pill_color = "#30d158"
+        elif decision == "has_events":
+            pill_label = "Events"
+            pill_color = "#ff9f0a"
+        else:
+            pill_label = "Not picked yet"
+            pill_color = "#a0a0b0"
+        n_markers = len(markers or [])
+        note_label = (f"note: {len(note)} chars"
+                       if note else "no note")
+        # Lightweight file label (chunk id + datetime if we can
+        # pull it cheaply).
+        file_label = f"#{int(file_id)}"
+        try:
+            conn = store._connect()
+            try:
+                row = conn.execute(
+                    "SELECT chunk_datetime FROM processed_files "
+                    "WHERE id = ?", (int(file_id),),
+                ).fetchone()
+                if row and row["chunk_datetime"]:
+                    file_label = (f"#{int(file_id)} · "
+                                   f"{row['chunk_datetime'][:16]}")
+            finally:
+                conn.close()
+        except Exception:
+            pass  # cheap preview; don't crash on a transient DB read
+        return [
+            html.Span("Preview:",
+                       style={"color": "#6c6c80",
+                               "marginRight": "4px"}),
+            html.Span([
+                html.Span("●  ",
+                           style={"color": pill_color,
+                                   "fontSize": "12px"}),
+                html.Span(pill_label,
+                           style={"color": "#f0f0f5",
+                                   "fontWeight": "600"}),
+            ]),
+            html.Span("·"),
+            html.Span(f"{n_markers} marker"
+                       f"{'' if n_markers == 1 else 's'}"),
+            html.Span("·"),
+            html.Span(note_label),
+            html.Span("·"),
+            html.Span(file_label,
+                       style={"color": "#888"}),
+        ]
 
     MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
 
