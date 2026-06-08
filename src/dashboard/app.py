@@ -922,6 +922,48 @@ def create_app(config: dict, store: Store) -> Dash:
         prevent_initial_call=True,
     )
 
+    # E hotkey -> arm "Events seen" mode (reveals the marker
+    # editor + lets click-on-LFP append onset markers).
+    app.clientside_callback(
+        _kbd.EVENTS_MODE_JS,
+        Output("video-review-decision", "value",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Space / arrows / slash -- pure DOM side effects on the
+    # <video> element + the note textarea. Writes nothing into
+    # Dash state, hence the sink Output.
+    app.clientside_callback(
+        _kbd.SHORTCUT_DOM_JS,
+        Output("kbd-dom-sink", "data", allow_duplicate=True),
+        Input("kbd-event", "data"),
+        prevent_initial_call=True,
+    )
+
+    # M hotkey -> append onset marker at the video's current
+    # time (BHZ-rescaled into LFP seconds).
+    app.clientside_callback(
+        _kbd.DROP_MARKER_JS,
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        State("video-review-marker-store", "data"),
+        State("video-lfp-duration", "data"),
+        prevent_initial_call=True,
+    )
+
+    # X hotkey -> drop the most-recent marker.
+    app.clientside_callback(
+        _kbd.DELETE_MARKER_JS,
+        Output("video-review-marker-store", "data",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        State("video-review-marker-store", "data"),
+        prevent_initial_call=True,
+    )
+
     # Fine-grained refresh: replace just the volatile Overview cards +
     # queue children instead of re-rendering the whole tab. Eliminates
     # the white flash that used to happen on every refresh tick. The

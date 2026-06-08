@@ -290,6 +290,11 @@ def kbd_stores() -> list:
         dcc.Store(id="kbd-keydown", data=None),
         dcc.Store(id="kbd-event", data=None),
         dcc.Store(id="kbd-undo", data=None),
+        # Write-only sink for clientside callbacks whose only
+        # job is DOM side-effects (play/pause video, focus a
+        # textarea). Keeps the bus's "always no_update" pattern
+        # well-formed for Dash.
+        dcc.Store(id="kbd-dom-sink", data=0),
     ]
 
 
@@ -422,5 +427,96 @@ function (ev, curClicks) {
                 window.dash_clientside.no_update];
     }
     return ['no_events', (curClicks || 0) + 1];
+}
+"""
+
+
+# E hotkey -> flip the decision radio into 'has_events' mode so
+# the marker editor reveals and the click-on-LFP path is armed.
+EVENTS_MODE_JS = """
+function (ev) {
+    if (!ev || ev.action !== 'events_mode') {
+        return window.dash_clientside.no_update;
+    }
+    return 'has_events';
+}
+"""
+
+
+# DOM-only shortcuts: Space (play/pause), arrows (seek), / (focus
+# the reviewer note). All side effects, no Store writes.
+SHORTCUT_DOM_JS = """
+function (ev) {
+    if (!ev) { return window.dash_clientside.no_update; }
+    var v = document.getElementById('lfp-video');
+    var t;
+    if (ev.action === 'play_pause' && v) {
+        if (v.paused) { v.play().catch(function () {}); }
+        else { v.pause(); }
+    } else if (ev.action === 'seek_fwd' && v) {
+        t = (v.currentTime || 0) + 1;
+        v.currentTime = Math.min((v.duration || 1e9), t);
+    } else if (ev.action === 'seek_back' && v) {
+        t = (v.currentTime || 0) - 1;
+        v.currentTime = Math.max(0, t);
+    } else if (ev.action === 'focus_note') {
+        var n = document.getElementById('video-review-note');
+        if (n) { n.focus(); n.select && n.select(); }
+    }
+    return window.dash_clientside.no_update;
+}
+"""
+
+
+# M hotkey -> append an onset marker at the video's current
+# time, BHZ-rescaled into LFP seconds. Dedupes + sorts, capped
+# at 64 markers per NASA Rule 3. Mirrors the server-side
+# click-on-LFP append logic.
+DROP_MARKER_JS = """
+function (ev, markers, lfpDur) {
+    if (!ev || ev.action !== 'drop_marker') {
+        return window.dash_clientside.no_update;
+    }
+    var v = document.getElementById('lfp-video');
+    if (!v || isNaN(v.currentTime) || !v.duration) {
+        return window.dash_clientside.no_update;
+    }
+    var lfp_t = v.currentTime;
+    if (lfpDur && v.duration > 0) {
+        lfp_t = v.currentTime * (lfpDur / v.duration);
+    }
+    var m = (markers || []).slice();
+    if (m.length >= 64) {
+        return window.dash_clientside.no_update;
+    }
+    // Dedupe within 0.25 s of an existing marker.
+    var rounded = Math.round(lfp_t * 1000) / 1000;
+    for (var i = 0; i < m.length; i++) {
+        if (Math.abs((m[i].peak_time_sec || 0) - rounded) < 0.25) {
+            return window.dash_clientside.no_update;
+        }
+    }
+    m.push({type: 'onset', peak_time_sec: rounded});
+    m.sort(function (a, b) {
+        return (a.peak_time_sec || 0) - (b.peak_time_sec || 0);
+    });
+    return m;
+}
+"""
+
+
+# X hotkey -> drop the last (most recent in time) marker. The
+# plan calls for "delete focused marker" but there's no focused-
+# marker concept in the UI today; nuking the rightmost one is
+# the most useful default and matches the Vim 'x' verb.
+DELETE_MARKER_JS = """
+function (ev, markers) {
+    if (!ev || ev.action !== 'delete_marker') {
+        return window.dash_clientside.no_update;
+    }
+    if (!markers || markers.length === 0) {
+        return window.dash_clientside.no_update;
+    }
+    return markers.slice(0, -1);
 }
 """
