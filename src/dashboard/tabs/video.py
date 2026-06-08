@@ -40,6 +40,8 @@ from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
 from src.utils.hilbert_envelope import hilbert_envelope_20_200
+from src.utils import bhz_csv as _bhz_csv
+from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.dashboard.tabs import video_events as _events
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
@@ -229,6 +231,69 @@ def _prefetch_chunk_safe(file_path: str, file_id: int) -> None:
     except Exception as e:
         logger.debug("prefetch skipped for file_id=%s: %s",
                       file_id, e)
+
+
+def _build_csv_file_meta(store, file_id: int, channel: int
+                           ) -> tuple[dict, float, str, "date"]:
+    """Assemble the file-level meta dict + (fs, animal_id,
+    chunk_date) for a BHZ CSV row.
+
+    Returns ``(file_meta, fs, animal_id, chunk_date)``. Raises
+    on missing data so the caller can surface a clean error.
+    """
+    from datetime import datetime, date
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        raise ValueError(f"file_id {file_id} has no file_path")
+    session_dir = _session_dir_for_file(store, file_id)
+    chunk = get_chunk(file_path)
+    fs = float(chunk.fs)
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT chunk_datetime FROM processed_files "
+            "WHERE id = ?", (file_id,),
+        ).fetchone()
+        chunk_dt_str = (row["chunk_datetime"] if row else "")
+        cfg_row = conn.execute(
+            "SELECT channel_names FROM session_config "
+            "WHERE session_dir = ?", (session_dir,),
+        ).fetchone()
+    finally:
+        conn.close()
+    # Animal id = the prefix of the chosen channel's name (e.g.
+    # "BCH062SLM" -> "BCH062"). Falls back to "unknown" if the
+    # channel doesn't look like an animal channel.
+    animal = "unknown"
+    if cfg_row and cfg_row["channel_names"]:
+        try:
+            names = json.loads(cfg_row["channel_names"])
+            if 0 <= channel < len(names):
+                cname = names[channel]
+                if is_animal_channel(cname):
+                    animal, _ = split_animal_electrode(cname)
+        except (json.JSONDecodeError, IndexError):
+            pass
+    # Derive Peak_Date / Peak_Time from chunk_datetime when we
+    # can. Without an envelope detector running we leave
+    # Peak_Index / Peak_Stamp empty (NaN).
+    chunk_dt = None
+    try:
+        chunk_dt = datetime.strptime(chunk_dt_str,
+                                      "%Y_%m_%d__%H_%M_%S")
+    except (ValueError, TypeError):
+        pass
+    folder = os.path.dirname(file_path) + os.sep
+    filename = os.path.basename(file_path)
+    meta = _bhz_csv.build_file_meta(
+        folder=folder, filename=filename,
+        fs=fs, cutoff=0.05, channel=int(channel),
+        peak_index=None, peak_stamp=None, peak_dt=chunk_dt,
+    )
+    chunk_date = (chunk_dt.date() if chunk_dt
+                   else date.today())
+    return meta, fs, animal, chunk_date
 
 
 def _resolve_next_in_queue(store: Store,
@@ -1999,14 +2064,32 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
 
+    # Per-field landmark colors. Distinct + semantic so the
+    # reviewer can read EO / LAS / BO / PID / BB by hue alone.
+    LANDMARK_COLORS: dict = {
+        "EO":  "#ff453a",  # red    -- electrographic onset
+        "LAS": "#ff9f0a",  # orange -- large-amp spiking
+        "BO":  "#bf5af2",  # violet -- behavioral onset
+        "PID": "#5e7ce2",  # blue   -- post-ictal depression
+        "BB":  "#30d158",  # green  -- back to baseline
+    }
+
     @app.callback(
         Output("video-lfp-trace", "figure", allow_duplicate=True),
         Input("video-review-marker-store", "data"),
+        Input("video-events-store", "data"),
         State("video-lfp-trace", "figure"),
         prevent_initial_call=True,
     )
-    def _render_marker_shapes(markers, fig):
-        """Paint red verticals on the LFP for each onset marker.
+    def _render_marker_shapes(markers, events, fig):
+        """Paint colored landmark verticals on the LFP.
+
+        Two sources:
+        * ``video-review-marker-store`` -- legacy flat onset
+          markers (red dotted) from the pre-BHZ code path.
+        * ``video-events-store`` -- the BHZ structured events;
+          each filled EO/LAS/BO/PID/BB landmark renders as a
+          line in its semantic color. Up to 5 per event.
 
         Preserves ``shapes[0]`` (the orange video cursor) by
         reading it out of the current figure State and re-using
@@ -2020,6 +2103,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         new_shapes: list[dict] = []
         if cursor is not None:
             new_shapes.append(cursor)
+        # Legacy flat markers (unchanged behavior).
         capped = (markers or [])[:MAX_MARKER_SHAPES]
         for m in capped:
             t = float(m.get("peak_time_sec", 0))
@@ -2031,6 +2115,25 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                           "dash": "dot"},
                 "opacity": 0.85,
             })
+        # Structured BHZ landmarks. Per-field colors.
+        for i, e in enumerate(events or []):
+            if i >= 16:  # NASA Rule 3: bound events per file
+                break
+            for field, color in LANDMARK_COLORS.items():
+                t_sec = e.get(f"{field}_sec")
+                if t_sec is None:
+                    continue
+                try:
+                    t = float(t_sec)
+                except (TypeError, ValueError):
+                    continue
+                new_shapes.append({
+                    "type": "line",
+                    "xref": "x", "yref": "paper",
+                    "x0": t, "x1": t, "y0": 0, "y1": 1,
+                    "line": {"color": color, "width": 2},
+                    "opacity": 0.85,
+                })
         patch = Patch()
         patch["layout"]["shapes"] = new_shapes
         return patch
@@ -2073,10 +2176,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-review-marker-store", "data"),
         State("video-review-note", "value"),
         State("video-queue-animal", "value"),
+        State("video-events-store", "data"),
+        State("video-channel-dropdown", "value"),
         prevent_initial_call=True,
     )
     def _save_review(n_clicks, file_id, decision, markers, note,
-                      animal_value):
+                      animal_value, events, channel):
         nop7 = (no_update,) * 7
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
@@ -2087,27 +2192,66 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ("Pick \"No events seen\" or \"Events seen\" "
                      "before saving.",
                     *nop7[1:])
-        if decision == "has_events" and not markers:
-            return ("Click the brain trace at least once to drop "
-                     "an onset marker before saving.",
-                    *nop7[1:])
+        events = list(events or [])
+        if decision == "has_events":
+            if not events:
+                return ("Add at least one event with + Add event "
+                         "before saving.",
+                        *nop7[1:])
+            # Gating: every event must be complete (type +
+            # required landmarks + Racine 1-8).
+            incomplete = [i + 1 for i, e in enumerate(events)
+                           if not _events.is_event_complete(e)]
+            if incomplete:
+                idxs = ", ".join(str(i) for i in incomplete)
+                return (f"Event{'s' if len(incomplete) > 1 else ''} "
+                         f"{idxs} still need landmarks + Racine "
+                         "before saving.",
+                        *nop7[1:])
         email = current_user_email()
         if not email:
             return ("Not signed in — can't record who reviewed "
                      "this.",
                     *nop7[1:])
+        # Structured events become the canonical markers payload.
+        markers_payload = events if decision == "has_events" else None
         try:
             store.mark_review(
                 int(file_id), email, decision,
-                markers=markers if decision == "has_events" else None,
+                markers=markers_payload,
                 note=(note or None),
             )
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
             return (f"Save failed: {e}", *nop7[1:])
+        # CSV export -- secondary store, doesn't roll back the
+        # SQLite write on failure.
+        csv_msg = ""
+        bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
+        if bhz_cfg.get("enabled") and channel is not None:
+            try:
+                meta, fs, animal_id, chunk_date = (
+                    _build_csv_file_meta(store, int(file_id),
+                                          int(channel)))
+                csv_path = _bhz_csv.resolve_csv_path(
+                    bhz_cfg.get("base_dir", ""),
+                    bhz_cfg.get("filename_template",
+                                 "{date}_{animal}.csv"),
+                    chunk_date, animal_id,
+                )
+                n_rows = _bhz_csv.write_event_rows(
+                    csv_path, meta, events, fs,
+                )
+                csv_msg = (f" · {n_rows} CSV row"
+                            f"{'' if n_rows == 1 else 's'} appended"
+                            if n_rows
+                            else " · CSV already current")
+            except Exception as e:
+                logger.warning("BHZ CSV append failed: %s", e)
+                csv_msg = f" · CSV append failed: {e}"
         from datetime import datetime as _dt
         badge = (f"✓ Saved at "
-                  f"{_dt.now().strftime('%H:%M')}. "
+                  f"{_dt.now().strftime('%H:%M')}{csv_msg}. "
                   f"This recording is now out of your queue.")
         # Resolve the next file in the queue so we can auto-advance.
         next_session, next_file = _resolve_next_in_queue(
