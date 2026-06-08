@@ -1726,13 +1726,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "label": f"   {a}",
                     "value": f"_pool_{a}",
                 })
-        # Pick a sensible default if nothing chosen yet.
+        # Blank on first load. The reviewer explicitly picks an
+        # animal each session -- no auto-default ever (caveat #6
+        # of the queue-card plan). We only preserve the current
+        # value if it's still a valid option (e.g. after the
+        # warmer republishes the same animal list).
         new_value = current_value
-        if new_value is None or all(o["value"] != new_value
-                                       for o in options):
-            new_value = (my_animals[0] if my_animals
-                          else (f"_pool_{unassigned[0]}"
-                                if unassigned else None))
+        if new_value is not None and all(
+                o["value"] != new_value for o in options):
+            new_value = None
         status = ""
         if not my_animals:
             status = ("You have no animals assigned. Pick from the "
@@ -1740,7 +1742,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                        "you to the Reviewer Assignments sheet.")
         else:
             status = (f"Assigned to you: "
-                       f"{', '.join(my_animals)}.")
+                       f"{', '.join(my_animals)}. "
+                       "Pick one above to start reviewing.")
         return options, new_value, status
 
     # Progress + streak strip. Pattern source: Linear sprint

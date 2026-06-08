@@ -282,12 +282,17 @@ button:focus-visible {
     bottom: 18px;
     right: 18px;
     width: 380px !important;
-    max-height: 78vh;
+    /* Lowered from 78vh because the PiP is now a duo
+       (video + LFP); the Hilbert envelope is hidden in PiP
+       mode so the reviewer can focus on the candidate-
+       marker review against the raw LFP without the screen
+       being half-covered. */
+    max-height: 60vh;
     overflow-y: auto;
     overflow-x: hidden;
     z-index: 9998;
-    /* Reflow grid-template to a single column so the LFP and
-       Hilbert stack underneath the video. Bypass the inline
+    /* Reflow grid-template to a single column so the LFP
+       stacks underneath the video. Bypass the inline
        gridTemplateColumns="minmax(420px, 1.2fr) minmax(420px, 1fr)"
        set by the Python layout. */
     grid-template-columns: 1fr !important;
@@ -304,6 +309,17 @@ button:focus-visible {
 .qc-pip-grid:hover {
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
 }
+/* Inserted by assets/pip_video.js immediately before the
+   grid when the PiP class is added. Same height as the grid
+   had at transition time; invisible. Preserves the document
+   flow so the page doesn't shrink (and the browser doesn't
+   snap the scroll position) when the grid pops to fixed
+   positioning. */
+.qc-pip-placeholder {
+    width: 100%;
+    visibility: hidden;
+    pointer-events: none;
+}
 .qc-pip-grid #video-player-container {
     min-height: 160px !important;
     height: 170px;
@@ -313,23 +329,22 @@ button:focus-visible {
     height: 100%;
     object-fit: contain;
 }
-/* Compress the LFP + Hilbert plots so the trio fits in <80vh.
-   Plotly receives a synthetic resize from pip_video.js after
-   the class flips, so the SVG re-renders at the new width. */
-.qc-pip-grid #video-lfp-trace,
-.qc-pip-grid #video-analysis-trace {
-    height: 140px !important;
+/* The LFP plot gets the floor space the Hilbert used to
+   share. Plotly receives a synthetic resize from
+   pip_video.js after the class flips, so the SVG
+   re-renders at the new width. */
+.qc-pip-grid #video-lfp-trace {
+    height: 200px !important;
 }
 .qc-pip-grid #video-lfp-trace .js-plotly-plot,
-.qc-pip-grid #video-analysis-trace .js-plotly-plot,
-.qc-pip-grid #video-lfp-trace .plot-container,
-.qc-pip-grid #video-analysis-trace .plot-container {
-    height: 140px !important;
+.qc-pip-grid #video-lfp-trace .plot-container {
+    height: 200px !important;
 }
-/* Hide non-essential chrome inside the PiP so it doesn't
-   crowd the plots: filter card, brain-feature picker, status
-   text, brain-signal header. The user can scroll up to see
-   them in the grid view. */
+/* Hide everything not-LFP-and-not-video in the PiP. The
+   Hilbert envelope + the Step 3 brain-feature picker +
+   filter cards + dropdowns all go away; the reviewer can
+   scroll back up to access them in the grid view. */
+.qc-pip-grid #video-analysis-trace,
 .qc-pip-grid details,
 .qc-pip-grid label,
 .qc-pip-grid .dash-dropdown {

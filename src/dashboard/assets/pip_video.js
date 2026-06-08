@@ -36,21 +36,55 @@
     var maxRetries = 600;
     var retries = 0;
 
+    function ensurePlaceholder(grid) {
+        // Look for an existing placeholder sibling so we don't
+        // insert duplicates on rapid toggle.
+        var parent = grid.parentElement;
+        if (!parent) { return null; }
+        var existing = parent.querySelector(
+            '.qc-pip-placeholder');
+        if (existing) { return existing; }
+        var ph = document.createElement('div');
+        ph.className = 'qc-pip-placeholder';
+        parent.insertBefore(ph, grid);
+        return ph;
+    }
+
+    function removePlaceholder(grid) {
+        var parent = grid.parentElement;
+        if (!parent) { return; }
+        var existing = parent.querySelector(
+            '.qc-pip-placeholder');
+        if (existing) { existing.remove(); }
+    }
+
     function applyPipClass(grid, on) {
         if (!grid) { return; }
         var has = grid.classList.contains(PIP_CLASS);
         if (on && !has) {
+            // Page-jump fix: before popping the grid out of
+            // document flow (position: fixed), insert a sibling
+            // placeholder of the SAME height so the document
+            // doesn't shrink and the browser doesn't snap the
+            // scroll position to compensate.
+            var h = Math.round(
+                grid.getBoundingClientRect().height);
+            var ph = ensurePlaceholder(grid);
+            if (ph && h > 0) {
+                ph.style.height = h + 'px';
+            }
             grid.classList.add(PIP_CLASS);
         } else if (!on && has) {
             grid.classList.remove(PIP_CLASS);
+            removePlaceholder(grid);
         } else {
             return;
         }
         // Plotly only reflows on window resize. Fire a synthetic
-        // one so the LFP + Hilbert traces re-scale to the new
-        // container width (narrower in PiP, normal in grid).
-        // Two ticks: one immediate, one ~200 ms later to catch
-        // late-loaded plots.
+        // one so the LFP trace re-scales to the new container
+        // width (narrower in PiP, normal in grid). Two ticks:
+        // one immediate, one ~200 ms later to catch late-loaded
+        // plots.
         try {
             window.dispatchEvent(new Event('resize'));
             setTimeout(function () {
