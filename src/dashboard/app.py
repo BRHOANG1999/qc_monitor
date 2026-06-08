@@ -778,6 +778,7 @@ def create_app(config: dict, store: Store) -> Dash:
         # filter by action.
         *_kbd.kbd_stores(),
         _kbd.cheatsheet_overlay(),
+        _kbd.undo_toast(),
     ], style={"backgroundColor": COLOR_SURFACE_0,
               "fontFamily": FONT_STACK,
               "color": COLOR_TEXT_PRIMARY,
@@ -895,6 +896,29 @@ def create_app(config: dict, store: Store) -> Dash:
         _kbd.HELP_TOGGLE_JS,
         Output("kbd-help-overlay", "id"),  # write-only sink
         Input("kbd-event", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Undo toast show/hide. Reads the kbd-undo Store, mirrors its
+    # presence into the toast's visibility, and auto-clears the
+    # Store after the deadline passes.
+    app.clientside_callback(
+        _kbd.UNDO_TOAST_JS,
+        Output("kbd-undo-toast", "title"),  # write-only sink
+        Input("kbd-undo", "data"),
+        prevent_initial_call=True,
+    )
+
+    # N hotkey -> set decision radio + fire the Save button via
+    # the existing _save_review server callback.
+    app.clientside_callback(
+        _kbd.MARK_NO_EVENTS_JS,
+        Output("video-review-decision", "value",
+                allow_duplicate=True),
+        Output("video-review-save-btn", "n_clicks",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        State("video-review-save-btn", "n_clicks"),
         prevent_initial_call=True,
     )
 

@@ -326,3 +326,101 @@ function (ev) {
     return window.dash_clientside.no_update;
 }
 """
+
+
+# --------------------------------------------------------------- #
+# Undo toast (P0-2)
+# --------------------------------------------------------------- #
+
+def undo_toast() -> html.Div:
+    """The bottom-right Undo toast.
+
+    Shown when ``kbd-undo`` Store has a payload, hidden otherwise.
+    UNDO_TOAST_JS handles the show/hide + the auto-clear after
+    the deadline; the actual reopen runs server-side via the
+    Undo button click or the ``U`` hotkey.
+    """
+    return html.Div(
+        id="kbd-undo-toast",
+        children=[
+            html.Span(id="kbd-undo-text",
+                       style={"color": COLOR_TEXT_PRIMARY,
+                               "marginRight": SPACE_4,
+                               "fontSize": FONT_SIZE_BODY}),
+            html.Button(
+                ["Undo  ", _kbd_chip("U")],
+                id="kbd-undo-button",
+                n_clicks=0,
+                style={
+                    "background": "transparent",
+                    "border": f"1px solid {COLOR_ACCENT}",
+                    "color": COLOR_ACCENT,
+                    "padding": f"{SPACE_2} {SPACE_3}",
+                    "borderRadius": RADIUS_SM,
+                    "cursor": "pointer",
+                    "fontSize": FONT_SIZE_BODY,
+                    "fontWeight": 600,
+                    "display": "inline-flex",
+                    "alignItems": "center",
+                    "gap": SPACE_2,
+                },
+            ),
+        ],
+        style={
+            "position": "fixed",
+            "bottom": SPACE_5,
+            "right": SPACE_5,
+            "display": "none",
+            "alignItems": "center",
+            "padding": f"{SPACE_3} {SPACE_4}",
+            "backgroundColor": COLOR_SURFACE_2,
+            "border": f"1px solid {COLOR_DIVIDER}",
+            "borderRadius": RADIUS_MD,
+            "boxShadow": "0 12px 24px rgba(0,0,0,0.45)",
+            "zIndex": "10001",
+        },
+    )
+
+
+UNDO_TOAST_JS = """
+function (undo) {
+    const toast = document.getElementById('kbd-undo-toast');
+    const text  = document.getElementById('kbd-undo-text');
+    if (!toast || !text) { return window.dash_clientside.no_update; }
+    if (!undo || !undo.file_id) {
+        toast.style.display = 'none';
+        return window.dash_clientside.no_update;
+    }
+    text.innerText = undo.label || 'Marked file';
+    toast.style.display = 'flex';
+    const remaining = (undo.deadline_ms || 0) - Date.now();
+    if (remaining > 0) {
+        setTimeout(function () {
+            // Only clear if still the same payload (user could
+            // have already pressed U or another mark fired).
+            const cur = window.dash_clientside &&
+                window.dash_clientside.callback_context;
+            window.dash_clientside.set_props('kbd-undo',
+                                              {data: null});
+        }, remaining);
+    } else {
+        window.dash_clientside.set_props('kbd-undo', {data: null});
+    }
+    return window.dash_clientside.no_update;
+}
+"""
+
+
+# When the user hits `N`, drive the existing Mark-done button:
+# set the decision radio to 'no_events' (so _save_review's
+# validation passes), then bump the Save button's n_clicks. The
+# server callback then handles the auto-advance + Undo wiring.
+MARK_NO_EVENTS_JS = """
+function (ev, curClicks) {
+    if (!ev || ev.action !== 'mark_no_events') {
+        return [window.dash_clientside.no_update,
+                window.dash_clientside.no_update];
+    }
+    return ['no_events', (curClicks || 0) + 1];
+}
+"""

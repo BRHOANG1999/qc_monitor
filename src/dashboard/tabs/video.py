@@ -195,6 +195,58 @@ def _session_dir_for_file(store: Store, file_id: int) -> str | None:
         conn.close()
 
 
+def _animal_ids_from_picker(animal_value: str | None
+                              ) -> list[str]:
+    """Resolve the Step-1 animal picker value into the
+    ``animal_ids`` list ``store.get_review_queue`` expects.
+
+    The picker holds either a plain animal id, the
+    ``__UNASSIGNED__`` sentinel (no real selection), or a
+    ``_pool_<id>`` value pointing at an animal from the
+    unassigned pool. Returns ``[]`` for None / sentinel.
+    """
+    if not animal_value or animal_value == "__UNASSIGNED__":
+        return []
+    if animal_value.startswith("_pool_"):
+        return [animal_value[len("_pool_"):]]
+    return [animal_value]
+
+
+def _resolve_next_in_queue(store: Store,
+                             animal_value: str | None,
+                             current_file_id: int,
+                             user_email: str,
+                             *,
+                             queue_limit: int = 100,
+                             direction: int = 1,
+                             ) -> tuple[str | None, int | None]:
+    """Return ``(session_dir, file_id)`` of the next/prev queue
+    entry, or ``(None, None)`` if there's nothing to advance to.
+
+    Wraps ``store.neighbor_queue_file`` with the dropdown-value
+    parsing and the session_dir lookup so the auto-advance,
+    Undo, and the J/K cycle paths can all share one source of
+    truth.
+    """
+    assert direction in (-1, 1), "direction must be -1 or 1"
+    animal_ids = _animal_ids_from_picker(animal_value)
+    if not animal_ids:
+        return (None, None)
+    floor = store.review_backlog_floor()
+    next_file_id = store.neighbor_queue_file(
+        current_file_id=current_file_id,
+        animal_ids=animal_ids,
+        user_email=(user_email or "").lower(),
+        direction=direction,
+        since_iso=floor,
+        limit=queue_limit,
+    )
+    if next_file_id is None:
+        return (None, None)
+    sd = _session_dir_for_file(store, int(next_file_id))
+    return (sd, int(next_file_id))
+
+
 def _channel_options(store: Store, session_dir: str | None,
                      n_channels: int) -> list[dict]:
     """Build channel-name options for the LFP-review dropdown.
@@ -1422,40 +1474,65 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _hotkey_queue_cycle(ev, current_file_id, animal_value):
         if not ev or ev.get("action") not in ("next", "prev"):
             return no_update, no_update
-        if not animal_value:
-            return no_update, no_update
-        if animal_value.startswith("_pool_"):
-            animal_ids = [animal_value[len("_pool_"):]]
-        else:
-            animal_ids = [animal_value]
         direction = 1 if ev["action"] == "next" else -1
-        floor = store.review_backlog_floor()
         email = current_user_email() or ""
-        new_file_id = store.neighbor_queue_file(
-            current_file_id=(int(current_file_id)
-                              if current_file_id else None),
-            animal_ids=animal_ids, user_email=email,
-            direction=direction,
-            since_iso=floor, limit=queue_limit,
+        sd, new_file_id = _resolve_next_in_queue(
+            store, animal_value,
+            int(current_file_id) if current_file_id else 0,
+            email, queue_limit=queue_limit, direction=direction,
         )
         if new_file_id is None:
-            return no_update, no_update
-        conn = store._connect()
-        try:
-            row = conn.execute(
-                "SELECT session_dir FROM processed_files "
-                "WHERE id = ?", (int(new_file_id),),
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
             return no_update, no_update
         # Log a claim event so the PI audit log knows the
         # reviewer touched this file even if they hop past it.
         store.insert_review_event(int(new_file_id), email or "anon",
                                     "claim",
                                     {"source": f"hotkey_{ev['action']}"})
-        return row["session_dir"], int(new_file_id)
+        return sd, new_file_id
+
+    # ---- Hotkey: U / Undo button reopens the last decision ---- #
+    # Reads kbd-undo State to find what to reopen, validates the
+    # deadline, calls store.reopen_review, clears kbd-undo, and
+    # jumps the file dropdown back to the reopened file. The R
+    # hotkey lands here too -- it re-uses the same Undo payload
+    # if one's pending, otherwise revert is a no-op (a separate
+    # action targeting the *current* file is added in P0-4).
+    @app.callback(
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Output("kbd-undo", "data", allow_duplicate=True),
+        Output("video-review-status", "children",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        Input("kbd-undo-button", "n_clicks"),
+        State("kbd-undo", "data"),
+        prevent_initial_call=True,
+    )
+    def _hotkey_undo(ev, _click, undo):
+        trig = callback_context.triggered_id
+        if trig == "kbd-event":
+            if not ev or ev.get("action") not in ("undo", "revert"):
+                return no_update, no_update, no_update, no_update
+        if not undo or not undo.get("file_id"):
+            return no_update, no_update, no_update, no_update
+        # Honour the deadline: a stale U keystroke after the
+        # toast already vanished should not reach this far, but
+        # belt and braces against clock skew between server and
+        # client.
+        import time as _time
+        if (undo.get("deadline_ms") or 0) < _time.time() * 1000:
+            return no_update, no_update, None, no_update
+        file_id = int(undo["file_id"])
+        email = current_user_email() or "anon"
+        ok = store.reopen_review(file_id, email)
+        if not ok:
+            return no_update, no_update, None, no_update
+        sd = _session_dir_for_file(store, file_id)
+        if sd is None:
+            return no_update, no_update, None, no_update
+        return sd, file_id, None, "↩ Reopened — review again."
 
     # ---- Step 4: reveal marker editor only when "Events" picked ---- #
     @app.callback(
@@ -1563,7 +1640,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update
         return []
 
-    # ---- Step 4: save the review ---- #
+    # ---- Step 4: save the review (Mark done OR N hotkey) ---- #
+    # On a successful save we ALSO push the next-in-queue file id
+    # into the session+file dropdowns (auto-advance, Linear /
+    # Gmail pattern) and emit an Undo toast payload that the
+    # `U` hotkey + Undo button consume. The Undo window is 8 s.
+    UNDO_WINDOW_MS = 8000
+
     @app.callback(
         Output("video-review-status", "children",
                 allow_duplicate=True),
@@ -1573,50 +1656,77 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-review-note", "value",
                 allow_duplicate=True),
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Output("kbd-undo", "data", allow_duplicate=True),
         Input("video-review-save-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-review-decision", "value"),
         State("video-review-marker-store", "data"),
         State("video-review-note", "value"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _save_review(n_clicks, file_id, decision, markers, note):
-        if not n_clicks:
-            return no_update, no_update, no_update, no_update
-        if not file_id:
-            return ("Pick a recording first.",
+    def _save_review(n_clicks, file_id, decision, markers, note,
+                      animal_value):
+        nop7 = (no_update,) * 7
+        if not n_clicks or not file_id:
+            return ("Pick a recording first." if n_clicks
+                    else no_update,
+                    no_update, no_update, no_update,
                     no_update, no_update, no_update)
         if decision not in ("no_events", "has_events"):
             return ("Pick \"No events seen\" or \"Events seen\" "
                      "before saving.",
-                    no_update, no_update, no_update)
+                    *nop7[1:])
         if decision == "has_events" and not markers:
             return ("Click the brain trace at least once to drop "
                      "an onset marker before saving.",
-                    no_update, no_update, no_update)
+                    *nop7[1:])
         email = current_user_email()
         if not email:
             return ("Not signed in — can't record who reviewed "
                      "this.",
-                    no_update, no_update, no_update)
+                    *nop7[1:])
         try:
             store.mark_review(
-                int(file_id),
-                email,
-                decision,
+                int(file_id), email, decision,
                 markers=markers if decision == "has_events" else None,
                 note=(note or None),
             )
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
-            return (f"Save failed: {e}",
-                    no_update, no_update, no_update)
+            return (f"Save failed: {e}", *nop7[1:])
         from datetime import datetime as _dt
         badge = (f"✓ Saved at "
                   f"{_dt.now().strftime('%H:%M')}. "
                   f"This recording is now out of your queue.")
-        # Reset the form to defaults so the next file starts clean.
-        return badge, [], None, ""
+        # Resolve the next file in the queue so we can auto-advance.
+        next_session, next_file = _resolve_next_in_queue(
+            store, animal_value, int(file_id), email,
+            queue_limit=queue_limit,
+        )
+        # Undo toast payload: the JS reads label + deadline_ms and
+        # the U-hotkey / Undo-button callback reads file_id.
+        import time as _time
+        undo_payload = {
+            "file_id": int(file_id),
+            "label": (f"Marked file #{int(file_id)} as "
+                       f"{decision.replace('_', ' ')}"),
+            "deadline_ms": int(_time.time() * 1000)
+                             + UNDO_WINDOW_MS,
+            "status": decision,
+        }
+        # If we found a next file, push it; otherwise leave the
+        # dropdowns alone so the reviewer sees the queue empty
+        # state via _render_queue.
+        if next_file is None:
+            return (badge, [], None, "",
+                    no_update, no_update, undo_payload)
+        return (badge, [], None, "",
+                next_session, next_file, undo_payload)
 
     # ---- file/channel options ---- #
     @app.callback(

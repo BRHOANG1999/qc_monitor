@@ -1582,6 +1582,7 @@ class Store:
                 SELECT 1 FROM review_state rs2
                 WHERE rs2.file_id = pf.id
                   AND rs2.user_email = ?
+                  AND rs2.status IN ('no_events', 'has_events')
               )
               {extra_where}
             ORDER BY pf.chunk_datetime ASC
@@ -1609,6 +1610,49 @@ class Store:
             if len(out) >= limit:
                 break
         return out
+
+    def reopen_review(self, file_id: int, user_email: str) -> bool:
+        """Flip the most recent ``no_events`` / ``has_events`` row
+        for this (file, user) pair to ``abandoned`` and append a
+        ``reopen`` audit entry.
+
+        Powers the Undo toast in Video Review. The queue filter
+        treats ``abandoned`` rows as un-finalised, so the file
+        re-appears in the user's queue right after this call.
+
+        Returns ``True`` if a row was flipped, ``False`` if there
+        was nothing to reopen (idempotent UI noise).
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert user_email, "user_email required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id, status FROM review_state
+                   WHERE file_id = ? AND user_email = ?
+                     AND status IN ('no_events', 'has_events')
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (file_id, user_email.lower()),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE review_state SET status='abandoned', "
+                "updated_at=? WHERE id=?",
+                (now, row["id"]),
+            )
+            conn.execute(
+                """INSERT INTO review_event_log
+                   (file_id, user_email, action, payload_json, at)
+                   VALUES (?, ?, 'reopen', ?, ?)""",
+                (file_id, user_email.lower(),
+                 json.dumps({"from_status": row["status"]}), now),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
     def neighbor_queue_file(self, *, current_file_id: int | None,
                               animal_ids: list[str],
