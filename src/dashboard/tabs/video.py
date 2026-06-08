@@ -2284,24 +2284,40 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-file-dropdown", "value"),
         Input("video-session-dropdown", "value"),
         State("lfp-to-video-bridge", "data"),
+        State("video-file-dropdown", "value"),
     )
-    def _update_files(session_dir, bridge):
+    def _update_files(session_dir, bridge, current_value):
+        """Repopulate the file dropdown when the session changes.
+
+        Priority for the default value:
+          1. LFP-Browser bridge -- explicit hand-off.
+          2. ``current_value`` if it's already in the new options.
+             This is the path the queue button + J/K hotkey rely
+             on: ``_load_from_queue`` writes (session, file_id) in
+             one shot, and this callback fires from the session
+             change a millisecond later. Without the preservation
+             check, ``_update_files`` would overwrite the just-set
+             file_id with ``options[0]`` (the newest file in the
+             session) -- which is why the queue highlight tracked
+             the wrong file AND the LFP loaded a different chunk
+             than the one the reviewer clicked.
+          3. ``options[0]`` (newest file) as the legacy default.
+        """
         files = _files_with_video(store, session_dir)
         options = [
             {"label": f"{(f['chunk_datetime'] or '')[:16]} - {os.path.basename(f['file_path'])}",
              "value": f["id"]}
             for f in files
         ]
-        # Bridge override: when the LFP Browser sent us a file_id
-        # that lives in this session, default to it instead of the
-        # newest file -- otherwise the cascade fights the operator's
-        # intent.
         default = None
         if (bridge and isinstance(bridge, dict)
                 and bridge.get("session_dir") == session_dir):
             wanted = bridge.get("file_id")
             if any(o["value"] == wanted for o in options):
                 default = wanted
+        if default is None and current_value is not None:
+            if any(o["value"] == current_value for o in options):
+                default = current_value
         if default is None:
             default = options[0]["value"] if options else None
         return options, default
