@@ -269,6 +269,39 @@ button:focus-visible {
     animation: qc-pulse 1.4s ease-out infinite;
 }
 
+/* --- Floating PiP video --- */
+/* assets/pip_video.js toggles .qc-video-pip on the
+   #video-player-container Div whenever an IntersectionObserver
+   says the container has scrolled out of viewport. The Div
+   pops out of the Step 2 grid and floats fixed at the bottom
+   right; the <video> inside keeps playing without
+   interruption, still time-locked to the LFP cursor. Scrolling
+   back into view removes the class and the player snaps back. */
+.qc-video-pip {
+    position: fixed !important;
+    bottom: 18px;
+    right: 18px;
+    width: 360px !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    height: 208px;
+    z-index: 9998;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    border: 2px solid var(--accent, #5e7ce2);
+    border-radius: 10px;
+    overflow: hidden;
+    transition: width 0.2s ease-out, height 0.2s ease-out,
+                box-shadow 0.2s ease-out;
+}
+.qc-video-pip:hover {
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+}
+.qc-video-pip video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
 /* --- Accessibility: honor reduced-motion --- */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
