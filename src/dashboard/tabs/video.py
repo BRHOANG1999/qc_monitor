@@ -1678,6 +1678,12 @@ def layout(store: Store):
         dcc.Interval(id="video-prefetch-tick", interval=2000,
                        n_intervals=0),
         dcc.Store(id="video-prefetch-state", data=None),
+        # Focused camera (1-based). Defaults to the master
+        # (cam 1); each new file load resets to 1. The PiP
+        # CSS hides every wrapper with data-focused="false"
+        # so the floating column shows only the focused
+        # camera + LFP.
+        dcc.Store(id="video-focus-cam", data=1),
         # Sink for the multi-camera slave-sync clientside callback;
         # the callback returns the empty string and only side-effects
         # the slave <video> elements' currentTime / play / pause.
@@ -2342,6 +2348,65 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _reset_events_on_file_change(_file_id):
         return []
 
+    # ---- Track D: multi-camera focus selector ---- #
+    # The focused-cam index (1-based) lives in video-focus-cam.
+    # Defaults to 1 (master) and resets on file change. A
+    # clientside callback walks the DOM and flips data-focused
+    # on each camera card -- CSS targets [data-focused="true"]
+    # for the accent border and [data-focused="false"] for the
+    # in-PiP hide rule.
+    @app.callback(
+        Output("video-focus-cam", "data",
+                allow_duplicate=True),
+        Input({"type": "video-cam-focus-btn", "idx": ALL},
+                "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _on_focus_cam_click(_clicks):
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx = trig.get("idx")
+        if idx is None:
+            return no_update
+        return int(idx)
+
+    @app.callback(
+        Output("video-focus-cam", "data",
+                allow_duplicate=True),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _reset_focus_on_file_change(_file_id):
+        return 1
+
+    # Clientside: paint data-focused="true"/"false" on each
+    # .video-cam-wrapper based on the Store. Patch isn't useful
+    # here because we're flipping DOM attributes, not Dash
+    # component props.
+    app.clientside_callback(
+        """
+        function (focus_idx) {
+            const wrappers = document.querySelectorAll(
+                '.video-cam-wrapper');
+            const focused = Number(focus_idx || 1);
+            wrappers.forEach(function (w) {
+                const i = Number(w.dataset.camIdx || 0);
+                if (i === focused) {
+                    w.dataset.focused = 'true';
+                    w.style.borderColor = '#5e7ce2';
+                } else {
+                    w.dataset.focused = 'false';
+                    w.style.borderColor = 'transparent';
+                }
+            });
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-focus-cam", "id"),  # write-only sink
+        Input("video-focus-cam", "data"),
+    )
+
     # ---- PI-only: video quality threshold panel + sampler ---- #
     pi_emails = (((config or {}).get("review_queue", {}) or {})
                   .get("pi_emails", []) or [])
@@ -2959,7 +3024,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         cam_videos = []
         for i in range(1, n_cams + 1):
             is_master = (i == 1)
-            cam_videos.append(html.Video(
+            video_el = html.Video(
                 id=(VIDEO_DOM_ID if is_master
                      else f"{VIDEO_DOM_ID}-cam{i}"),
                 src=f"/media/video/{file_id}/{i}",
@@ -2970,7 +3035,56 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         "borderRadius": "10px",
                         "backgroundColor": "#000",
                         "minWidth": "0"},
-            ))
+            )
+            # Wrap each camera in a card with a FOCUS badge.
+            # Single-camera files skip the wrapper -- there's
+            # nothing to focus against. Multi-cam wraps so the
+            # reviewer can mark which camera shows the target
+            # animal; PiP narrows to JUST the focused camera.
+            if n_cams == 1:
+                cam_videos.append(video_el)
+            else:
+                cam_videos.append(html.Div([
+                    video_el,
+                    html.Button(
+                        "FOCUS",
+                        id={"type": "video-cam-focus-btn",
+                             "idx": i},
+                        n_clicks=0,
+                        title="Mark this camera as the one "
+                               "showing the target animal. "
+                               "Pip mode shows only the "
+                               "focused camera.",
+                        style={
+                            "position": "absolute",
+                            "top": "6px", "right": "6px",
+                            "padding": "3px 8px",
+                            "background":
+                                "rgba(10, 10, 20, 0.7)",
+                            "color": "#cfd0d6",
+                            "border":
+                                "1px solid rgba(255,255,255,0.2)",
+                            "borderRadius": "4px",
+                            "fontSize": "10px",
+                            "fontWeight": "600",
+                            "letterSpacing": "0.5px",
+                            "cursor": "pointer",
+                            "backdropFilter": "blur(6px)",
+                        },
+                    ),
+                ], id={"type": "video-cam", "idx": i},
+                   className="video-cam-wrapper",
+                   style={"position": "relative",
+                           "borderRadius": "10px",
+                           # data-focused attribute is set by
+                           # a clientside callback when the
+                           # video-focus-cam Store changes.
+                           "border": "2px solid transparent",
+                           "transition": "border-color 0.15s "
+                                          "ease-out"},
+                   **{"data-cam-idx": i,
+                       "data-focused":
+                           "true" if is_master else "false"}))
         if n_cams == 1:
             player = cam_videos[0]
         elif n_cams == 2:
@@ -3275,65 +3389,50 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # callback on the LFP still fires on its own relayoutData input
     # without seeing this clientside echo (Dash skips clientside
     # outputs when the input value is the same as last time).
-    app.clientside_callback(
-        """
-        function(rel, fig) {
-            if (!rel || !fig) {
-                return window.dash_clientside.no_update;
-            }
-            var xa = Object.assign({}, fig.layout.xaxis || {});
-            var has = false;
-            if ('xaxis.range[0]' in rel && 'xaxis.range[1]' in rel) {
-                xa.range = [rel['xaxis.range[0]'],
-                            rel['xaxis.range[1]']];
-                xa.autorange = false;
-                has = true;
-            } else if (rel['xaxis.autorange']) {
-                xa.autorange = true;
-                delete xa.range;
-                has = true;
-            }
-            if (!has) { return window.dash_clientside.no_update; }
-            return {
-                data: fig.data,
-                layout: Object.assign({}, fig.layout, {xaxis: xa}),
-            };
+    # Use Patch (not a full-figure return) so only layout.xaxis
+    # is touched. Returning `{data: fig.data, ...}` from the
+    # full-figure variant created a race on file/channel switch:
+    # the State("...figure") snapshot was captured at chain
+    # start, potentially BEFORE _update_analysis or _update_lfp
+    # had written the new figure for the new file. Writing
+    # back fig.data then clobbered the new envelope with the
+    # previous file's data, producing the "Hilbert looks like
+    # raw instantaneous amplitude" symptom the user reported.
+    # Patch is merged atomically against whatever the figure
+    # currently is, so the data array stays whatever the
+    # latest _update_* callback wrote.
+    _XAXIS_SYNC_JS = """
+    function(rel) {
+        if (!rel) { return window.dash_clientside.no_update; }
+        var has_range = ('xaxis.range[0]' in rel
+                          && 'xaxis.range[1]' in rel);
+        var has_auto = !!rel['xaxis.autorange'];
+        if (!has_range && !has_auto) {
+            return window.dash_clientside.no_update;
         }
-        """,
+        var p = new window.dash_clientside.Patch();
+        if (has_range) {
+            p.layout.xaxis.range = [rel['xaxis.range[0]'],
+                                     rel['xaxis.range[1]']];
+            p.layout.xaxis.autorange = false;
+        } else {
+            p.layout.xaxis.autorange = true;
+            delete p.layout.xaxis.range;
+        }
+        return p;
+    }
+    """
+    app.clientside_callback(
+        _XAXIS_SYNC_JS,
         Output("video-analysis-trace", "figure",
                 allow_duplicate=True),
         Input("video-lfp-trace", "relayoutData"),
-        State("video-analysis-trace", "figure"),
         prevent_initial_call=True,
     )
     app.clientside_callback(
-        """
-        function(rel, fig) {
-            if (!rel || !fig) {
-                return window.dash_clientside.no_update;
-            }
-            var xa = Object.assign({}, fig.layout.xaxis || {});
-            var has = false;
-            if ('xaxis.range[0]' in rel && 'xaxis.range[1]' in rel) {
-                xa.range = [rel['xaxis.range[0]'],
-                            rel['xaxis.range[1]']];
-                xa.autorange = false;
-                has = true;
-            } else if (rel['xaxis.autorange']) {
-                xa.autorange = true;
-                delete xa.range;
-                has = true;
-            }
-            if (!has) { return window.dash_clientside.no_update; }
-            return {
-                data: fig.data,
-                layout: Object.assign({}, fig.layout, {xaxis: xa}),
-            };
-        }
-        """,
+        _XAXIS_SYNC_JS,
         Output("video-lfp-trace", "figure", allow_duplicate=True),
         Input("video-analysis-trace", "relayoutData"),
-        State("video-lfp-trace", "figure"),
         prevent_initial_call=True,
     )
 

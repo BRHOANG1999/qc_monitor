@@ -329,6 +329,34 @@ button:focus-visible {
     height: 100%;
     object-fit: contain;
 }
+/* In PiP, non-focused cameras hide entirely so the floating
+   column shows only the camera the reviewer marked as
+   showing the target animal. The dataset/attribute is
+   maintained by the clientside callback in video.py keyed
+   off the video-focus-cam Store. */
+.qc-pip-grid .video-cam-wrapper[data-focused="false"] {
+    display: none !important;
+}
+.qc-pip-grid .video-cam-wrapper[data-focused="true"] {
+    border: none !important;
+}
+/* In normal grid view, the focused camera gets a subtle
+   accent border so the reviewer always knows which one is
+   the target. The transition is set inline (Python layout)
+   so the toggle is smooth. */
+.video-cam-wrapper[data-focused="true"] {
+    border-color: var(--accent, #5e7ce2) !important;
+}
+.video-cam-wrapper[data-focused="false"] {
+    border-color: transparent !important;
+}
+/* Hide the FOCUS badge on the currently-focused camera --
+   the colored border is signal enough; the badge is a
+   verb that only makes sense on the non-focused ones. */
+.video-cam-wrapper[data-focused="true"]
+        button[id*='video-cam-focus-btn'] {
+    display: none;
+}
 /* The LFP plot gets the floor space the Hilbert used to
    share. Plotly receives a synthetic resize from
    pip_video.js after the class flips, so the SVG
