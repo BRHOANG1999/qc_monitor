@@ -139,6 +139,8 @@ NAV_GROUPS = [
     {"id": "system", "label": "System", "subs": [
         {"id": "annotations", "label": "Notes"},
         {"id": "review_status", "label": "Review status"},
+        {"id": "event_verification",
+          "label": "Event Verification"},
         {"id": "activity_log", "label": "Activity log"},
         {"id": "alerts", "label": "Alerts"},
         {"id": "settings", "label": "Settings"},
@@ -1513,6 +1515,10 @@ def create_app(config: dict, store: Store) -> Dash:
                 from src.dashboard.tabs import review_status as tabs_review_status
                 return _enable_persistence(
                     tabs_review_status.layout(store, config))
+            elif tab == "event_verification":
+                from src.dashboard.tabs import event_verification as tabs_evtv
+                return _enable_persistence(
+                    tabs_evtv.layout(store, config))
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
@@ -2813,6 +2819,10 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_surgeries.register_callbacks(app, store, config)
     tabs_maintenance.register_callbacks(app, store, config)
     tabs_data_log_xref.register_callbacks(app, store, config)
+    # PI verification tab (gated on pi_emails). Import inline
+    # so the legacy bootstrap path stays minimal.
+    from src.dashboard.tabs import event_verification as _tabs_evtv
+    _tabs_evtv.register_callbacks(app, store, config)
 
     return app
 
