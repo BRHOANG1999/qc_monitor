@@ -255,6 +255,28 @@ button:focus-visible {
     filter: brightness(1.1);
 }
 
+/* --- Loading pill (Track B of the loading-feedback plan) --- */
+/* The chip animation pulses softly so the reviewer can tell
+   the spinner is still alive even on a long SMB read. The
+   spinner glyph itself rotates via .qc-spinner. The pill's
+   container styles + visibility flip live in the Python
+   render callback. */
+@keyframes pulse-load-chip {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+}
+.pulse-load-chip {
+    animation: pulse-load-chip 1.4s ease-in-out infinite;
+}
+@keyframes qc-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+.qc-spinner {
+    display: inline-block;
+    animation: qc-spin 1.4s linear infinite;
+}
+
 /* --- "+ Add event" pulse when the events list is empty --- */
 /* Toggled by a clientside callback in app.py that adds the
    .qc-pulse class when the events store is empty AND the

@@ -814,6 +814,17 @@ def layout(store: Store):
             "marginBottom": "16px",
         }),
 
+        # --- Loading pill (sticky at top of tab) ----------------------- #
+        # Track B of the loading-feedback plan. Reads from
+        # video-load-state; shown when any of {video, lfp,
+        # hilbert} is "loading"; hidden when all done. Per-leg
+        # chips colored by state so the reviewer can tell which
+        # piece is still working.
+        html.Div(id="video-load-pill",
+                  className="video-load-pill",
+                  style={"display": "none"}),
+        dcc.Store(id="video-load-state", data={}),
+
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
                       "Pick which animal you're reviewing. Recordings "
@@ -1016,24 +1027,35 @@ def layout(store: Store):
         # 2. On narrow viewports (<=900 px) the grid collapses to a
         # single column via the media query in theme.css.
         html.Div([
-            html.Div(
-                id="video-player-container",
-                children=html.Div([
-                    html.Div("📹", style={"fontSize": "32px",
-                                          "marginBottom": "6px"}),
-                    html.Div("Pick a recording above to load the "
-                              "video here.",
-                              style={"color": "#a0a0b0",
-                                      "fontSize": "13px"}),
-                ], style={"textAlign": "center"}),
-                style={"backgroundColor": "#000",
-                       "borderRadius": "10px",
-                       "minHeight": "360px",
-                       "display": "flex",
-                       "alignItems": "center",
-                       "justifyContent": "center",
-                       "overflow": "hidden",
-                       "gridArea": "video"},
+            dcc.Loading(
+                id="video-player-loading",
+                type="circle",
+                color="#5e7ce2",
+                # 180 ms before showing the spinner means warm-
+                # cache renders don't flash; cold-cache reads
+                # (where the reviewer needs the feedback) tip
+                # over the threshold and show clearly.
+                delay_show=180,
+                parent_style={"gridArea": "video",
+                               "minHeight": "360px"},
+                children=html.Div(
+                    id="video-player-container",
+                    children=html.Div([
+                        html.Div("📹", style={"fontSize": "32px",
+                                              "marginBottom": "6px"}),
+                        html.Div("Pick a recording above to load "
+                                  "the video here.",
+                                  style={"color": "#a0a0b0",
+                                          "fontSize": "13px"}),
+                    ], style={"textAlign": "center"}),
+                    style={"backgroundColor": "#000",
+                            "borderRadius": "10px",
+                            "minHeight": "360px",
+                            "display": "flex",
+                            "alignItems": "center",
+                            "justifyContent": "center",
+                            "overflow": "hidden"},
+                ),
             ),
 
         # --- Time-locked LFP trace -------------------------------------- #
@@ -1134,23 +1156,31 @@ def layout(store: Store):
             ),  # close _details_card("Filter the brain signal", ...)
             dcc.Store(id="video-filter-state",
                       data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
-            dcc.Graph(
-                id="video-lfp-trace",
-                figure=_empty_lfp_fig(
-                    "Pick a recording above to see the brain signal here."),
-                # Modebar on so the user has Zoom / Pan / Reset axes /
-                # download. doubleClick: "reset" makes a double-click
-                # anywhere in the plot snap back to the default view
-                # in one click (Plotly's hidden gem).
-                config={
-                    "displayModeBar": True,
-                    "displaylogo": False,
-                    "doubleClick": "reset",
-                    "modeBarButtonsToRemove": [
-                        "select2d", "lasso2d", "autoScale2d",
-                    ],
-                    "scrollZoom": True,
-                },
+            dcc.Loading(
+                id="video-lfp-loading",
+                type="circle",
+                color="#5e7ce2",
+                delay_show=180,
+                parent_style={"minHeight": "220px"},
+                children=dcc.Graph(
+                    id="video-lfp-trace",
+                    figure=_empty_lfp_fig(
+                        "Pick a recording above to see the brain "
+                        "signal here."),
+                    # Modebar on so the user has Zoom / Pan /
+                    # Reset axes / download. doubleClick: "reset"
+                    # snaps back to the default view (Plotly's
+                    # hidden gem).
+                    config={
+                        "displayModeBar": True,
+                        "displaylogo": False,
+                        "doubleClick": "reset",
+                        "modeBarButtonsToRemove": [
+                            "select2d", "lasso2d", "autoScale2d",
+                        ],
+                        "scrollZoom": True,
+                    },
+                ),
             ),
             # Step 4 used to live here -- it's been moved below
             # Step 3 so the reviewer sees the LFP + Hilbert
@@ -1337,19 +1367,27 @@ def layout(store: Store):
                           "border":
                               "1px solid rgba(255,255,255,0.06)"}),
             ),
-            dcc.Graph(
-                id="video-analysis-trace",
-                figure=_empty_lfp_fig(
-                    "Pick a recording above to see the feature trace."),
-                config={
-                    "displayModeBar": True,
-                    "displaylogo": False,
-                    "doubleClick": "reset",
-                    "modeBarButtonsToRemove": [
-                        "select2d", "lasso2d", "autoScale2d",
-                    ],
-                    "scrollZoom": True,
-                },
+            dcc.Loading(
+                id="video-analysis-loading",
+                type="circle",
+                color="#5e7ce2",
+                delay_show=180,
+                parent_style={"minHeight": "220px"},
+                children=dcc.Graph(
+                    id="video-analysis-trace",
+                    figure=_empty_lfp_fig(
+                        "Pick a recording above to see the feature "
+                        "trace."),
+                    config={
+                        "displayModeBar": True,
+                        "displaylogo": False,
+                        "doubleClick": "reset",
+                        "modeBarButtonsToRemove": [
+                            "select2d", "lasso2d", "autoScale2d",
+                        ],
+                        "scrollZoom": True,
+                    },
+                ),
             ),
         ], style={"marginTop": "0", "gridArea": "lfp",
                    "minWidth": "0"}),
@@ -2379,6 +2417,156 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _reset_focus_on_file_change(_file_id):
         return 1
+
+    # ---- Track B: top-of-tab loading pill ---- #
+    # On file-dropdown change, mark all three legs as
+    # "loading"; each render callback flips its own leg to
+    # "done" via a Patch when it returns. The pill renderer
+    # watches the store, shows the pill while any leg is
+    # loading, fades it ~700 ms after all three resolve.
+    @app.callback(
+        Output("video-load-state", "data",
+                allow_duplicate=True),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _start_load(file_id):
+        if not file_id:
+            # File cleared -> no load happening; the pill
+            # disappears on the next renderer fire.
+            return {}
+        return {
+            "video": "loading", "lfp": "loading",
+            "hilbert": "loading",
+            "for_file_id": int(file_id),
+        }
+
+    @app.callback(
+        Output("video-load-state", "data",
+                allow_duplicate=True),
+        Input("video-channel-dropdown", "value"),
+        State("video-load-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _start_channel_load(_ch, state):
+        # Channel change re-fires LFP + Hilbert but not video.
+        # Only mark those two; leave video chip whatever it was.
+        if not state:
+            return no_update
+        next_state = dict(state)
+        next_state["lfp"] = "loading"
+        next_state["hilbert"] = "loading"
+        return next_state
+
+    @app.callback(
+        Output("video-load-pill", "children"),
+        Output("video-load-pill", "style"),
+        Input("video-load-state", "data"),
+        State("video-load-pill", "style"),
+    )
+    def _render_load_pill(state, current_style):
+        legs = (("video", "Video"), ("lfp", "LFP"),
+                 ("hilbert", "Hilbert"))
+        s = state or {}
+        any_loading = any(s.get(k) == "loading" for k, _ in legs)
+        base_style = dict(current_style or {})
+        if not s or not any_loading:
+            base_style["display"] = "none"
+            return [], base_style
+        base_style.update({
+            "display": "flex",
+            "alignItems": "center",
+            "gap": "8px",
+            "padding": "6px 12px",
+            "marginBottom": "10px",
+            "borderRadius": "999px",
+            "background": "rgba(94, 124, 226, 0.10)",
+            "border": "1px solid rgba(94, 124, 226, 0.30)",
+            "fontSize": "12px",
+            "color": "#cfd0d6",
+            "width": "fit-content",
+        })
+        chips = []
+        for key, label in legs:
+            status = s.get(key, "idle")
+            if status == "done":
+                chips.append(html.Span(
+                    f"✓ {label}",
+                    style={"color": "#30d158",
+                            "fontSize": "11px",
+                            "padding": "2px 8px",
+                            "background":
+                                "rgba(48, 209, 88, 0.12)",
+                            "borderRadius": "4px"}))
+            elif status == "loading":
+                chips.append(html.Span(
+                    label,
+                    className="pulse-load-chip",
+                    style={"color": "#a0a0b0",
+                            "fontSize": "11px",
+                            "padding": "2px 8px",
+                            "background":
+                                "rgba(255,255,255,0.06)",
+                            "borderRadius": "4px"}))
+            else:
+                continue
+        children = [
+            html.Span("⟳", className="qc-spinner",
+                       style={"fontSize": "14px",
+                               "color": "#5e7ce2"}),
+            html.Span("Loading new recording…",
+                       style={"fontWeight": "600"}),
+            *chips,
+        ]
+        return children, base_style
+
+    # Three lightweight "leg done" watchers. Each one fires
+    # when the relevant render callback writes its primary
+    # Output; the guard makes them cheap (cursor ticks fire
+    # video-lfp-trace.figure 10x/sec but only the FIRST
+    # post-load fire trips the transition, every subsequent
+    # call returns no_update).
+    @app.callback(
+        Output("video-load-state", "data",
+                allow_duplicate=True),
+        Input("video-player-container", "children"),
+        State("video-load-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _mark_video_done(_children, state):
+        if not state or state.get("video") != "loading":
+            return no_update
+        next_state = dict(state)
+        next_state["video"] = "done"
+        return next_state
+
+    @app.callback(
+        Output("video-load-state", "data",
+                allow_duplicate=True),
+        Input("video-lfp-trace", "figure"),
+        State("video-load-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _mark_lfp_done(_fig, state):
+        if not state or state.get("lfp") != "loading":
+            return no_update
+        next_state = dict(state)
+        next_state["lfp"] = "done"
+        return next_state
+
+    @app.callback(
+        Output("video-load-state", "data",
+                allow_duplicate=True),
+        Input("video-analysis-trace", "figure"),
+        State("video-load-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _mark_hilbert_done(_fig, state):
+        if not state or state.get("hilbert") != "loading":
+            return no_update
+        next_state = dict(state)
+        next_state["hilbert"] = "done"
+        return next_state
 
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful
