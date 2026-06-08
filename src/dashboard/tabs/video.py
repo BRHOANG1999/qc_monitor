@@ -894,34 +894,42 @@ def layout(store: Store):
                     inputStyle={"marginRight": "8px"},
                 ),
                 html.Div([
-                    html.Label("Onset markers", style=LABEL_STYLE,
-                                title="Click the LFP trace above to "
-                                       "drop an onset marker at that "
-                                       "time. Reorders chronologically."),
-                    html.Div(id="video-review-markers",
-                              style={"color": "#a0a0b0",
-                                      "fontSize": "12px",
-                                      "fontFamily": "ui-monospace, "
-                                                     "SF Mono, monospace",
-                                      "padding": "6px 10px",
-                                      "minHeight": "32px",
-                                      "background": "#13131f",
-                                      "border": "1px solid "
-                                                 "rgba(255,255,255,0.06)",
-                                      "borderRadius": "6px"}),
-                    html.Button(
-                        "Clear markers",
-                        id="video-review-clear-markers-btn",
-                        n_clicks=0,
-                        style={"backgroundColor": "transparent",
-                                "color": "#a0a0b0",
-                                "border": "1px solid "
-                                           "rgba(255,255,255,0.15)",
-                                "padding": "4px 10px",
-                                "borderRadius": "5px",
-                                "cursor": "pointer",
-                                "fontSize": "11px",
-                                "marginTop": "6px"}),
+                    html.Div(
+                        "Click the brain trace above to drop onset "
+                        "markers. Each click becomes a red dotted "
+                        "vertical on the LFP at that time.",
+                        style={"color": "#a0a0b0",
+                                "fontSize": "12px",
+                                "marginBottom": "6px"}),
+                    html.Div([
+                        html.Button(
+                            "Clear markers",
+                            id="video-review-clear-markers-btn",
+                            n_clicks=0,
+                            style={"backgroundColor": "transparent",
+                                    "color": "#a0a0b0",
+                                    "border": "1px solid "
+                                               "rgba(255,255,255,0.15)",
+                                    "padding": "4px 10px",
+                                    "borderRadius": "5px",
+                                    "cursor": "pointer",
+                                    "fontSize": "11px",
+                                    "marginRight": "8px"}),
+                    ], style={"marginTop": "4px"}),
+                    _details_card(
+                        "Show timestamps as list",
+                        html.Div(id="video-review-markers",
+                                  style={"color": "#a0a0b0",
+                                          "fontSize": "12px",
+                                          "fontFamily": "ui-monospace, "
+                                                         "SF Mono, monospace",
+                                          "padding": "6px 10px",
+                                          "minHeight": "32px",
+                                          "background": "#13131f",
+                                          "border": "1px solid "
+                                                     "rgba(255,255,255,0.06)",
+                                          "borderRadius": "6px"}),
+                    ),
                 ], id="video-review-marker-group",
                    style={"display": "none",
                            "marginTop": "10px",
@@ -1617,6 +1625,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         new.sort(key=lambda m: m.get("peak_time_sec", 0))
         return new
 
+    # The reviewer sees onset markers two ways: as red verticals
+    # on the LFP trace (P0-3: recognition > recall) and -- when
+    # they expand the details card -- as a comma-separated text
+    # list. Two callbacks keep both views in sync from the same
+    # video-review-marker-store Store.
     @app.callback(
         Output("video-review-markers", "children"),
         Input("video-review-marker-store", "data"),
@@ -1628,6 +1641,44 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "marker here.")
         return ", ".join(
             f"{m['peak_time_sec']:.2f}s" for m in markers)
+
+    MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
+
+    @app.callback(
+        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        Input("video-review-marker-store", "data"),
+        State("video-lfp-trace", "figure"),
+        prevent_initial_call=True,
+    )
+    def _render_marker_shapes(markers, fig):
+        """Paint red verticals on the LFP for each onset marker.
+
+        Preserves ``shapes[0]`` (the orange video cursor) by
+        reading it out of the current figure State and re-using
+        it untouched. Anything past index 0 is marker territory.
+        Capped at ``MAX_MARKER_SHAPES`` per NASA Rule 3.
+        """
+        if not fig:
+            return no_update
+        existing = (fig.get("layout") or {}).get("shapes") or []
+        cursor = existing[0] if existing else None
+        new_shapes: list[dict] = []
+        if cursor is not None:
+            new_shapes.append(cursor)
+        capped = (markers or [])[:MAX_MARKER_SHAPES]
+        for m in capped:
+            t = float(m.get("peak_time_sec", 0))
+            new_shapes.append({
+                "type": "line",
+                "xref": "x", "yref": "paper",
+                "x0": t, "x1": t, "y0": 0, "y1": 1,
+                "line": {"color": "#ff453a", "width": 1.5,
+                          "dash": "dot"},
+                "opacity": 0.85,
+            })
+        patch = Patch()
+        patch["layout"]["shapes"] = new_shapes
+        return patch
 
     @app.callback(
         Output("video-review-marker-store", "data",
