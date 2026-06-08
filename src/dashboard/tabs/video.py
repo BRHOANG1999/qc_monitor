@@ -326,6 +326,79 @@ def _empty_lfp_fig(text: str) -> go.Figure:
 #  Layout
 # ===================================================================== #
 
+def _step_header(number: str, title: str, sub: str | None = None):
+    """Numbered step header used to break the tab into a 1-2-3 flow.
+
+    Apple-style numbered badge + friendly subhead. Keeps an undergrad
+    oriented without a wall of NASA-grade jargon.
+    """
+    children = [
+        html.Div(number, style={
+            "display": "inline-flex",
+            "alignItems": "center", "justifyContent": "center",
+            "width": "22px", "height": "22px",
+            "borderRadius": "50%",
+            "background": "linear-gradient(135deg, #5e7ce2, #4a64c4)",
+            "color": "white", "fontSize": "12px",
+            "fontWeight": "700", "marginRight": "10px",
+            "flexShrink": "0",
+        }),
+        html.Span(title, style={
+            "color": "#f0f0f5", "fontSize": "15px",
+            "fontWeight": "600",
+        }),
+    ]
+    head = html.Div(children, style={
+        "display": "flex", "alignItems": "center",
+        "marginTop": "8px",
+    })
+    if sub:
+        return html.Div([
+            head,
+            html.Div(sub, style={
+                "color": "#888", "fontSize": "12px",
+                "marginLeft": "32px", "marginBottom": "8px",
+                "marginTop": "2px",
+            }),
+        ], style={"marginBottom": "6px"})
+    return html.Div([head], style={"marginBottom": "8px"})
+
+
+def _details_card(summary_text: str, content,
+                   summary_sub: str | None = None,
+                   open_default: bool = False):
+    """Lightweight ``html.Details`` wrapper used to hide advanced
+    controls behind a click. Keeps the default view friendly.
+    """
+    summary_children: list = [
+        html.Span("⚙  ", style={"color": "#888",
+                                 "fontSize": "11px"}),
+        html.Span(summary_text, style={
+            "color": "#cfd0d6", "fontSize": "12px",
+            "fontWeight": "600",
+        }),
+    ]
+    if summary_sub:
+        summary_children.append(html.Span(
+            f"  · {summary_sub}",
+            style={"color": "#888", "fontSize": "11px",
+                    "marginLeft": "4px"},
+        ))
+    return html.Details([
+        html.Summary(summary_children, style={
+            "cursor": "pointer", "userSelect": "none",
+            "padding": "8px 12px", "listStyle": "none",
+            "borderRadius": "6px",
+        }),
+        html.Div(content, style={"padding": "0 6px 6px 6px"}),
+    ], open=open_default, style={
+        "background": "rgba(255,255,255,0.02)",
+        "border": "1px solid rgba(255,255,255,0.06)",
+        "borderRadius": "6px",
+        "marginTop": "10px", "marginBottom": "10px",
+    })
+
+
 def layout(store: Store):
     sessions = _sessions_with_video(store)
     session_options = [
@@ -352,10 +425,83 @@ def layout(store: Store):
                   "marginTop": "32px"})
 
     return html.Div([
-        # --- Pickers ----------------------------------------------------- #
+        # --- Quick Start ------------------------------------------------- #
+        # First-visit help card. Native <details> so the user's collapsed
+        # state survives navigation without us wiring a callback. Default
+        # open so undergrads see the orientation on first visit.
+        html.Details([
+            html.Summary([
+                html.Span("👋  Quick start", style={
+                    "color": "#f0f0f5", "fontSize": "13px",
+                    "fontWeight": "600",
+                }),
+                html.Span("  (click to hide)", style={
+                    "color": "#888", "fontSize": "11px",
+                    "marginLeft": "6px",
+                }),
+            ], style={
+                "cursor": "pointer", "userSelect": "none",
+                "padding": "10px 14px", "listStyle": "none",
+            }),
+            html.Div([
+                html.Div(
+                    "This tab pairs the cage video with the brain signal "
+                    "(LFP) recorded at the same time. Use it to check "
+                    "whether what's happening in the video matches what "
+                    "the electrodes saw.",
+                    style={"color": "#cfd0d6", "fontSize": "13px",
+                            "marginBottom": "10px",
+                            "lineHeight": "1.5"},
+                ),
+                html.Div([
+                    html.Span("Three things to know:", style={
+                        "color": "#a0a0b0", "fontSize": "11px",
+                        "fontWeight": "600",
+                        "textTransform": "uppercase",
+                        "letterSpacing": "0.5px",
+                    }),
+                ], style={"marginBottom": "6px"}),
+                html.Ul([
+                    html.Li([
+                        html.B("Pick a recording"),
+                        " above. The video and brain signal load together.",
+                    ]),
+                    html.Li([
+                        html.B("Click on the brain trace"),
+                        " to jump the video to that moment.",
+                    ]),
+                    html.Li([
+                        html.B("Click a channel name in the legend"),
+                        " to focus on just that channel "
+                        "(double-click to isolate).",
+                    ]),
+                ], style={"color": "#cfd0d6", "fontSize": "13px",
+                            "marginTop": "0", "paddingLeft": "20px",
+                            "lineHeight": "1.7"}),
+                html.Div(
+                    "Everything else is optional — open the "
+                    "\"Advanced\" sections if you need to filter the "
+                    "signal or change what feature is plotted.",
+                    style={"color": "#888", "fontSize": "12px",
+                            "marginTop": "8px", "fontStyle": "italic"},
+                ),
+            ], style={"padding": "0 14px 14px 14px"}),
+        ], open=True, style={
+            "background": "rgba(94, 124, 226, 0.08)",
+            "border": "1px solid rgba(94, 124, 226, 0.25)",
+            "borderRadius": "8px",
+            "marginBottom": "16px",
+        }),
+
+        # --- Step 1: pick a recording ---------------------------------- #
+        _step_header("1", "Pick a recording",
+                      "Choose a session, then a file, then which "
+                      "electrode channel you want to look at."),
         html.Div([
             html.Div([
-                html.Label("Session", style=LABEL_STYLE),
+                html.Label("Session", style=LABEL_STYLE,
+                            title="A session is a continuous run of "
+                                   "recording with one animal."),
                 dcc.Dropdown(
                     id="video-session-dropdown",
                     options=session_options,
@@ -365,7 +511,10 @@ def layout(store: Store):
                 ),
             ], style={"flex": "2", "minWidth": "260px"}),
             html.Div([
-                html.Label("File (chunk)", style=LABEL_STYLE),
+                html.Label("File (chunk)", style=LABEL_STYLE,
+                            title="Each chunk is roughly one hour of "
+                                   "recording, named with its start "
+                                   "timestamp."),
                 dcc.Dropdown(
                     id="video-file-dropdown",
                     options=[],
@@ -374,7 +523,9 @@ def layout(store: Store):
                 ),
             ], style={"flex": "3", "minWidth": "320px"}),
             html.Div([
-                html.Label("LFP channel", style=LABEL_STYLE),
+                html.Label("Brain channel", style=LABEL_STYLE,
+                            title="Which electrode contact to display "
+                                   "the LFP trace for."),
                 dcc.Dropdown(
                     id="video-channel-dropdown",
                     options=[],
@@ -386,15 +537,23 @@ def layout(store: Store):
         ], style={"display": "flex", "gap": "16px", "marginBottom": "16px",
                   "flexWrap": "wrap"}),
 
+        # --- Step 2: watch ---------------------------------------------- #
+        _step_header("2", "Watch",
+                      "The video plays in sync with the LFP trace below."),
+
         # --- Player + side panel ---------------------------------------- #
         html.Div([
             html.Div([
                 html.Div(
                     id="video-player-container",
-                    children=html.P(
-                        "Pick a session and file to load the video.",
-                        style={"color": "#a0a0b0"},
-                    ),
+                    children=html.Div([
+                        html.Div("📹", style={"fontSize": "32px",
+                                              "marginBottom": "6px"}),
+                        html.Div("Pick a recording above to load the "
+                                  "video here.",
+                                  style={"color": "#a0a0b0",
+                                          "fontSize": "13px"}),
+                    ], style={"textAlign": "center"}),
                     style={"backgroundColor": "#000",
                            "borderRadius": "10px",
                            "minHeight": "360px", "display": "flex",
@@ -432,78 +591,100 @@ def layout(store: Store):
         # --- Time-locked LFP trace -------------------------------------- #
         html.Div([
             html.Div([
-                html.Span("LFP — time-locked to video",
-                          style={"color": "#a0a0b0", "fontSize": "11px",
-                                 "letterSpacing": "0.4px",
-                                 "textTransform": "uppercase",
+                html.Span("Brain signal (LFP)",
+                          style={"color": "#cfd0d6", "fontSize": "13px",
                                  "fontWeight": "600"}),
                 html.Span(id="video-lfp-status",
-                          style={"color": "#6c6c80", "fontSize": "11px",
+                          style={"color": "#888", "fontSize": "11px",
                                  "marginLeft": "12px"}),
-                html.Span("Click the trace to seek the video.",
-                          style={"color": "#6c6c80", "fontSize": "11px",
-                                 "marginLeft": "auto"}),
+                html.Span("💡  Click on the trace to jump the video here.",
+                          style={"color": "#5e7ce2", "fontSize": "11px",
+                                 "marginLeft": "auto",
+                                 "fontStyle": "italic"}),
             ], style={"display": "flex", "alignItems": "baseline",
                       "marginBottom": "8px"}),
-            # --- Live filter strip ---
-            html.Div([
+            # --- Filter strip (hidden by default, click to expand) ---
+            _details_card(
+                "Filter the brain signal",
+                summary_sub="advanced — leave alone unless the trace "
+                             "looks noisy",
+                open_default=False,
+                content=html.Div([
                 html.Div([
-                    html.Label("HP (Hz)", style=LABEL_STYLE),
+                    html.Label("Remove slow drift (Hz)", style=LABEL_STYLE,
+                                title="High-pass filter cutoff. Drops "
+                                       "frequencies below this. 0 = off. "
+                                       "Try 1 Hz if the trace drifts up "
+                                       "and down."),
                     dcc.Input(id="video-filter-hp", type="number", min=0,
                               step=0.5, value=0,
                               style={"backgroundColor": "#262638",
-                                     "color": "#f0f0f5", "width": "80px"}),
-                ], style={"flex": "0 0 90px"}),
+                                     "color": "#f0f0f5", "width": "90px"}),
+                ], style={"flex": "0 0 150px"}),
                 html.Div([
-                    html.Label("LP (Hz)", style=LABEL_STYLE),
+                    html.Label("Remove fast noise (Hz)", style=LABEL_STYLE,
+                                title="Low-pass filter cutoff. Drops "
+                                       "frequencies above this. 0 = off. "
+                                       "Try 300 Hz to keep only the LFP "
+                                       "band."),
                     dcc.Input(id="video-filter-lp", type="number", min=0,
                               step=1, value=0,
                               style={"backgroundColor": "#262638",
-                                     "color": "#f0f0f5", "width": "80px"}),
-                ], style={"flex": "0 0 90px"}),
+                                     "color": "#f0f0f5", "width": "90px"}),
+                ], style={"flex": "0 0 150px"}),
                 html.Div([
-                    html.Label("Notch", style=LABEL_STYLE),
+                    html.Label("Power-line filter", style=LABEL_STYLE,
+                                title="Removes 50 Hz or 60 Hz hum from "
+                                       "nearby AC power. US lab = 60 Hz."),
                     dcc.Dropdown(
                         id="video-filter-notch",
                         options=[{"label": "Off", "value": 0},
-                                  {"label": "50 Hz", "value": 50},
-                                  {"label": "60 Hz", "value": 60}],
+                                  {"label": "50 Hz (EU)", "value": 50},
+                                  {"label": "60 Hz (US)", "value": 60}],
                         value=0, clearable=False,
                         style={"backgroundColor": "#262638",
                                "color": "#f0f0f5"},
                         className="dark-dropdown",
                     ),
-                ], style={"flex": "0 0 110px"}),
+                ], style={"flex": "0 0 140px"}),
                 html.Div([
-                    html.Label("Smooth (ms)", style=LABEL_STYLE),
+                    html.Label("Smooth (ms)", style=LABEL_STYLE,
+                                title="Gaussian smoothing window in "
+                                       "milliseconds. 0 = off. Helpful for "
+                                       "spotting slow rhythms; bad for "
+                                       "spotting fast spikes."),
                     dcc.Input(id="video-filter-smooth", type="number",
                               min=0, step=1, value=0,
                               style={"backgroundColor": "#262638",
-                                     "color": "#f0f0f5", "width": "80px"}),
-                ], style={"flex": "0 0 110px"}),
+                                     "color": "#f0f0f5", "width": "90px"}),
+                ], style={"flex": "0 0 130px"}),
                 html.Div([
                     html.Label(" ", style=LABEL_STYLE),
-                    html.Button("Apply filter",
+                    html.Button("Apply",
                                  id="video-apply-filter-btn", n_clicks=0,
-                                 style={"backgroundColor": "#262638",
+                                 title="Apply the filter settings above.",
+                                 style={"backgroundColor": "#5e7ce2",
                                         "color": "white",
-                                        "border": "1px solid #444",
-                                        "padding": "6px 14px",
+                                        "border": "none",
+                                        "padding": "7px 18px",
                                         "borderRadius": "6px",
                                         "cursor": "pointer",
-                                        "fontSize": "12px"}),
-                ], style={"flex": "0 0 110px",
+                                        "fontSize": "12px",
+                                        "fontWeight": "600"}),
+                ], style={"flex": "0 0 100px",
                           "display": "flex", "alignItems": "flex-end"}),
-            ], style={"display": "flex", "gap": "10px",
-                      "marginBottom": "10px", "flexWrap": "wrap",
+            ], style={"display": "flex", "gap": "12px",
+                      "marginBottom": "4px", "flexWrap": "wrap",
                       "padding": "8px 10px", "backgroundColor": "#13131f",
                       "borderRadius": "6px",
                       "border": "1px solid rgba(255,255,255,0.06)"}),
+            ),  # close _details_card("Filter the brain signal", ...)
             dcc.Store(id="video-filter-state",
                       data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
             dcc.Graph(
                 id="video-lfp-trace",
-                figure=_empty_lfp_fig("Pick a file to load the LFP trace."),
+                figure=_empty_lfp_fig(
+                    "Pick a recording above to see the brain signal here."),
                 # Modebar on so the user has Zoom / Pan / Reset axes /
                 # download. doubleClick: "reset" makes a double-click
                 # anywhere in the plot snap back to the default view
@@ -518,103 +699,173 @@ def layout(store: Store):
                     "scrollZoom": True,
                 },
             ),
-            # Time-locked analysis plot directly under the LFP.
-            # Same x-axis (seconds since chunk start), each point =
-            # one stim epoch, y = the chosen evoked feature. Cursor
-            # tracks the video the same way the LFP does.
+            # --- Step 3: analyze --------------------------------------- #
+            # Time-locked analysis plot directly under the LFP. Same
+            # x-axis (seconds since chunk start), each point = one stim
+            # epoch, y = the chosen evoked feature. Cursor tracks the
+            # video the same way the LFP does.
+            _step_header(
+                "3", "Look at a brain feature over time",
+                "Pick a number that gets computed from the brain signal "
+                "for every stim event in the recording. Click a point "
+                "to jump the video to that moment.",
+            ),
+            # Top-level row: just the friendly Feature picker + a
+            # live status pill. Everything else (smoothing, detrend,
+            # etc.) is in the advanced collapsible below.
             html.Div([
                 html.Div([
-                    html.Label("Feature", style=LABEL_STYLE),
+                    html.Label("Brain feature to plot",
+                                style=LABEL_STYLE,
+                                title="What number to compute and plot "
+                                       "for each stim event. Line length "
+                                       "is a good default — it's how "
+                                       "wiggly the trace is around the "
+                                       "event."),
                     dcc.Dropdown(
                         id="video-analysis-feature",
                         options=[
-                            {"label": "Line length",      "value": "line_length"},
-                            {"label": "Log(AUC)",         "value": "log_auc"},
-                            {"label": "Peak amplitude",   "value": "peak_amplitude"},
-                            {"label": "Trough amplitude", "value": "trough_amplitude"},
-                            {"label": "Peak-to-trough",   "value": "peak_to_trough"},
-                            {"label": "RMS amplitude",    "value": "rms_amplitude"},
-                            {"label": "Peak latency (ms)", "value": "peak_latency_ms"},
-                            {"label": "Trough latency (ms)", "value": "trough_latency_ms"},
-                            {"label": "Max slope",        "value": "max_slope"},
-                            {"label": "Early area",       "value": "early_area"},
-                            {"label": "Late area",        "value": "late_area"},
-                            {"label": "Early/Late ratio", "value": "early_late_ratio"},
-                            {"label": "Recovery tau",     "value": "recovery_tau"},
-                            {"label": "Template corr.",   "value": "template_correlation"},
-                            {"label": "Variance",         "value": "variance"},
-                            {"label": "Sum power low",    "value": "sum_power_low"},
-                            {"label": "Sum power high",   "value": "sum_power_high"},
+                            {"label": "Line length (default)",
+                                "value": "line_length"},
+                            {"label": "Log(AUC) — area under the curve",
+                                "value": "log_auc"},
+                            {"label": "Peak amplitude",
+                                "value": "peak_amplitude"},
+                            {"label": "Trough amplitude",
+                                "value": "trough_amplitude"},
+                            {"label": "Peak-to-trough (size of swing)",
+                                "value": "peak_to_trough"},
+                            {"label": "RMS amplitude",
+                                "value": "rms_amplitude"},
+                            {"label": "Peak latency (ms)",
+                                "value": "peak_latency_ms"},
+                            {"label": "Trough latency (ms)",
+                                "value": "trough_latency_ms"},
+                            {"label": "Max slope",
+                                "value": "max_slope"},
+                            {"label": "Early area (0–50 ms)",
+                                "value": "early_area"},
+                            {"label": "Late area (50–200 ms)",
+                                "value": "late_area"},
+                            {"label": "Early/Late ratio",
+                                "value": "early_late_ratio"},
+                            {"label": "Recovery tau",
+                                "value": "recovery_tau"},
+                            {"label": "Template correlation",
+                                "value": "template_correlation"},
+                            {"label": "Variance",
+                                "value": "variance"},
+                            {"label": "Sum power (low freq.)",
+                                "value": "sum_power_low"},
+                            {"label": "Sum power (high freq.)",
+                                "value": "sum_power_high"},
                         ],
                         value="line_length", clearable=False,
                         style={"backgroundColor": "#262638",
-                                "color": "#f0f0f5", "minWidth": "220px"},
+                                "color": "#f0f0f5",
+                                "minWidth": "260px"},
                         className="dark-dropdown",
                     ),
-                ], style={"flex": "0 0 230px"}),
-                html.Div([
-                    html.Label("Smooth (s)", style=LABEL_STYLE),
-                    dcc.Input(id="video-analysis-smooth", type="number",
-                                min=0, step=0.5, value=0,
-                                style={"backgroundColor": "#262638",
-                                        "color": "#f0f0f5",
-                                        "width": "80px"}),
-                ], style={"flex": "0 0 100px"}),
-                html.Div([
-                    html.Label("Window (epochs)", style=LABEL_STYLE),
-                    dcc.Input(id="video-analysis-rollwin",
-                                type="number", min=0, step=1, value=0,
-                                style={"backgroundColor": "#262638",
-                                        "color": "#f0f0f5",
-                                        "width": "80px"}),
-                ], style={"flex": "0 0 140px"}),
-                html.Div([
-                    html.Label("Post-process", style=LABEL_STYLE),
-                    dcc.Checklist(
-                        id="video-analysis-postproc",
-                        options=[
-                            {"label": " Detrend",  "value": "detrend"},
-                            {"label": " Z-score",  "value": "zscore"},
-                            {"label": " Hide artifacts",
-                                "value": "hide_artifact"},
-                            {"label": " Median",   "value": "median"},
-                        ],
-                        value=["hide_artifact"], inline=True,
-                        style={"color": "#cfd0d6", "fontSize": "12px"},
-                        inputStyle={"marginRight": "4px",
-                                     "marginLeft": "8px"},
-                    ),
-                ], style={"flex": "1 1 auto"}),
-                html.Div([
-                    html.Label(" ", style=LABEL_STYLE),
-                    html.Button("Apply",
-                                 id="video-analysis-apply-btn",
-                                 n_clicks=0,
-                                 style={"backgroundColor": "#262638",
-                                         "color": "white",
-                                         "border": "1px solid #444",
-                                         "padding": "6px 14px",
-                                         "borderRadius": "6px",
-                                         "cursor": "pointer",
-                                         "fontSize": "12px"}),
-                ], style={"flex": "0 0 90px",
-                           "display": "flex",
-                           "alignItems": "flex-end"}),
+                ], style={"flex": "0 0 280px"}),
                 html.Span(id="video-analysis-status",
                            style={"color": "#888", "fontSize": "11px",
-                                   "marginLeft": "12px",
+                                   "marginLeft": "16px",
                                    "alignSelf": "center"}),
-            ], style={"marginTop": "16px", "marginBottom": "4px",
+            ], style={"marginTop": "12px", "marginBottom": "4px",
                        "display": "flex", "gap": "10px",
-                       "flexWrap": "wrap", "alignItems": "flex-end",
-                       "padding": "8px 10px",
-                       "backgroundColor": "#13131f",
-                       "borderRadius": "6px",
-                       "border": "1px solid rgba(255,255,255,0.06)"}),
+                       "flexWrap": "wrap",
+                       "alignItems": "flex-end"}),
+            # Advanced post-processing: smooth, detrend, z-score, etc.
+            # Default closed so undergrads aren't intimidated.
+            _details_card(
+                "Smooth, detrend, normalize",
+                summary_sub="advanced — change how the feature trace is "
+                             "cleaned up",
+                open_default=False,
+                content=html.Div([
+                    html.Div([
+                        html.Label("Smooth by N seconds",
+                                    style=LABEL_STYLE,
+                                    title="Gaussian smoothing window in "
+                                           "seconds. 0 = off."),
+                        dcc.Input(id="video-analysis-smooth",
+                                   type="number", min=0, step=0.5,
+                                   value=0,
+                                   style={"backgroundColor": "#262638",
+                                           "color": "#f0f0f5",
+                                           "width": "90px"}),
+                    ], style={"flex": "0 0 150px"}),
+                    html.Div([
+                        html.Label("Median window (events)",
+                                    style=LABEL_STYLE,
+                                    title="Centered rolling median of N "
+                                           "consecutive events. Good for "
+                                           "rejecting single-event "
+                                           "outliers. 0 = off."),
+                        dcc.Input(id="video-analysis-rollwin",
+                                   type="number", min=0, step=1,
+                                   value=0,
+                                   style={"backgroundColor": "#262638",
+                                           "color": "#f0f0f5",
+                                           "width": "90px"}),
+                    ], style={"flex": "0 0 170px"}),
+                    html.Div([
+                        html.Label("Clean-up options",
+                                    style=LABEL_STYLE,
+                                    title="Optional transforms applied "
+                                           "after the rolling median + "
+                                           "smoothing."),
+                        dcc.Checklist(
+                            id="video-analysis-postproc",
+                            options=[
+                                {"label": " Remove linear drift",
+                                    "value": "detrend"},
+                                {"label": " Normalize (z-score)",
+                                    "value": "zscore"},
+                                {"label": " Hide bad epochs",
+                                    "value": "hide_artifact"},
+                                {"label": " Center on median",
+                                    "value": "median"},
+                            ],
+                            value=["hide_artifact"], inline=True,
+                            style={"color": "#cfd0d6",
+                                    "fontSize": "12px"},
+                            inputStyle={"marginRight": "4px",
+                                         "marginLeft": "8px"},
+                        ),
+                    ], style={"flex": "1 1 auto"}),
+                    html.Div([
+                        html.Label(" ", style=LABEL_STYLE),
+                        html.Button(
+                            "Apply",
+                            id="video-analysis-apply-btn",
+                            n_clicks=0,
+                            title="Apply smoothing / detrend / "
+                                   "normalize / clean-up choices.",
+                            style={"backgroundColor": "#5e7ce2",
+                                    "color": "white",
+                                    "border": "none",
+                                    "padding": "7px 18px",
+                                    "borderRadius": "6px",
+                                    "cursor": "pointer",
+                                    "fontSize": "12px",
+                                    "fontWeight": "600"}),
+                    ], style={"flex": "0 0 100px",
+                               "display": "flex",
+                               "alignItems": "flex-end"}),
+                ], style={"display": "flex", "gap": "12px",
+                          "flexWrap": "wrap",
+                          "alignItems": "flex-end",
+                          "padding": "8px 10px",
+                          "backgroundColor": "#13131f",
+                          "borderRadius": "6px",
+                          "border":
+                              "1px solid rgba(255,255,255,0.06)"}),
+            ),
             dcc.Graph(
                 id="video-analysis-trace",
                 figure=_empty_lfp_fig(
-                    "Pick a file to load analysis features."),
+                    "Pick a recording above to see the feature trace."),
                 config={
                     "displayModeBar": True,
                     "displaylogo": False,
@@ -837,10 +1088,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _update_lfp(file_id, channel, _n_apply,
                      hp, lp, notch, smooth_ms):
         if not file_id:
-            return (_empty_lfp_fig("Pick a file to load the LFP trace."),
+            return (_empty_lfp_fig(
+                "Pick a recording above to see the brain signal here."),
                     "", no_update, 0.0)
         if channel is None:
-            return (_empty_lfp_fig("Pick an LFP channel."),
+            return (_empty_lfp_fig(
+                "Pick a brain channel to display."),
                     "", no_update, 0.0)
         file_path = _file_path_for_id(store, file_id)
         if not file_path:
@@ -925,19 +1178,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                           smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
-                "Pick a file to load analysis features."), "")
+                "Pick a recording above to see the feature trace."), "")
         if not feature:
-            return _empty_lfp_fig("Pick a feature."), ""
+            return (_empty_lfp_fig(
+                "Pick a brain feature to plot."), "")
         try:
             rows = store.query_evoked_features(int(file_id))
         except Exception as e:
             logger.warning("Analysis load failed file=%s: %s",
                             file_id, e)
-            return (_empty_lfp_fig(f"Analysis load error: {e}"),
-                    "")
+            return (_empty_lfp_fig(
+                f"Couldn't load features: {e}"), "")
         if not rows:
             return (_empty_lfp_fig(
-                "No evoked features yet for this file."), "")
+                "This recording hasn't been analyzed yet — "
+                "features show up here once the pipeline finishes."), "")
         rows.sort(key=lambda r: (r.get("epoch_time_sec") or 0.0))
         ok_t, ok_y = [], []
         art_t, art_y = [], []
