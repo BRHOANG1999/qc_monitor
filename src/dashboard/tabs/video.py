@@ -2546,12 +2546,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         ]
         return children, base_style
 
-    # Three lightweight "leg done" watchers. Each one fires
-    # when the relevant render callback writes its primary
-    # Output; the guard makes them cheap (cursor ticks fire
-    # video-lfp-trace.figure 10x/sec but only the FIRST
-    # post-load fire trips the transition, every subsequent
-    # call returns no_update).
+    # Three lightweight "leg done" watchers. Originally these
+    # had Input("...trace", "figure") which sounded right --
+    # the figure changes when the render callback returns. The
+    # 10 Hz cursor clientside Patch on shapes[0].x0 ALSO
+    # triggers Input on figure, and Dash serializes the entire
+    # figure dict (120 k decimated points, several MB) on
+    # every fire. That's ~10 MB/sec per plot of Dash transport
+    # for the lifetime of the tab and the source of the
+    # reviewer's "video takes forever to load + sometimes OOMs"
+    # report. Fix: subscribe to the cheap STATUS TEXT outputs
+    # that the same render callbacks write -- a tiny string
+    # that only changes once per file/channel load. The
+    # callback chain that should trip "done" still trips;
+    # cursor ticks no longer fire these watchers at all.
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
@@ -2569,11 +2577,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
-        Input("video-lfp-trace", "figure"),
+        Input("video-lfp-status", "children"),
         State("video-load-state", "data"),
         prevent_initial_call=True,
     )
-    def _mark_lfp_done(_fig, state):
+    def _mark_lfp_done(_status, state):
         if not state or state.get("lfp") != "loading":
             return no_update
         next_state = dict(state)
@@ -2583,11 +2591,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
-        Input("video-analysis-trace", "figure"),
+        Input("video-analysis-status", "children"),
         State("video-load-state", "data"),
         prevent_initial_call=True,
     )
-    def _mark_hilbert_done(_fig, state):
+    def _mark_hilbert_done(_status, state):
         if not state or state.get("hilbert") != "loading":
             return no_update
         next_state = dict(state)
