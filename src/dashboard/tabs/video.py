@@ -1282,6 +1282,97 @@ def layout(store: Store):
                    "alignItems": "start",
                    "marginBottom": "12px"}),
 
+        # --- PI-only: frame-variance quality threshold sampler ----- #
+        # Hidden by default; _toggle_pi_quality_panel makes it visible
+        # only for emails in config.review_queue.pi_emails. The
+        # 'Sample current frame' button is a clientside JS handler
+        # that draws the current paused frame to a hidden canvas,
+        # computes grayscale pixel variance, and writes the result
+        # to video-pi-variance-store; the server-side save persists
+        # via store.set_video_quality_threshold.
+        html.Div(
+            id="video-pi-quality-panel",
+            style={"display": "none",
+                    "marginTop": "8px",
+                    "padding": "10px 14px",
+                    "background": "rgba(255,159,10,0.05)",
+                    "border": "1px solid rgba(255,159,10,0.25)",
+                    "borderRadius": "6px"},
+            children=[
+                html.Div(
+                    "🛠️  Advanced: video quality threshold (PI)",
+                    style={"color": "#ff9f0a", "fontSize": "12px",
+                            "fontWeight": "600",
+                            "marginBottom": "8px"}),
+                html.Div([
+                    html.Button(
+                        "Sample current frame",
+                        id="video-pi-sample-btn", n_clicks=0,
+                        title="Pause the video first, then click. "
+                               "Captures the current frame to a canvas "
+                               "and computes grayscale pixel variance.",
+                        style={"background": "#262638",
+                                "color": "#f0f0f5",
+                                "border":
+                                    "1px solid rgba(255,255,255,0.15)",
+                                "borderRadius": "5px",
+                                "padding": "6px 12px",
+                                "fontSize": "12px",
+                                "fontWeight": "600",
+                                "cursor": "pointer",
+                                "marginRight": "10px"}),
+                    html.Span(id="video-pi-variance-display",
+                               style={"color": "#a0a0b0",
+                                       "fontSize": "12px",
+                                       "fontFamily":
+                                           "ui-monospace, monospace"}),
+                ], style={"display": "flex",
+                           "alignItems": "center",
+                           "marginBottom": "8px"}),
+                html.Div([
+                    html.Span("Threshold:",
+                               style={"color": "#a0a0b0",
+                                       "fontSize": "12px",
+                                       "marginRight": "8px"}),
+                    dcc.Input(
+                        id="video-pi-threshold-input",
+                        type="number", min=0, step=0.1,
+                        placeholder="e.g. 200",
+                        style={"backgroundColor": "#262638",
+                                "color": "#f0f0f5",
+                                "border":
+                                    "1px solid rgba(255,255,255,0.1)",
+                                "borderRadius": "4px",
+                                "padding": "4px 8px",
+                                "width": "110px",
+                                "fontSize": "12px",
+                                "marginRight": "8px"}),
+                    html.Button(
+                        "Save as quality threshold",
+                        id="video-pi-set-threshold-btn", n_clicks=0,
+                        style={"background": "#ff9f0a",
+                                "color": "white",
+                                "border": "none",
+                                "borderRadius": "5px",
+                                "padding": "6px 14px",
+                                "fontSize": "12px",
+                                "fontWeight": "600",
+                                "cursor": "pointer"}),
+                    html.Span(id="video-pi-set-status",
+                               style={"color": "#a0a0b0",
+                                       "fontSize": "12px",
+                                       "marginLeft": "10px"}),
+                ], style={"display": "flex",
+                           "alignItems": "center",
+                           "marginBottom": "8px"}),
+                html.Div(id="video-pi-current-threshold",
+                          style={"color": "#a0a0b0",
+                                  "fontSize": "11px",
+                                  "marginTop": "6px"}),
+                dcc.Store(id="video-pi-variance-store", data=None),
+            ],
+        ),
+
         # --- Step 2 reviewer note (optional, collapsed by default) ----- #
         # Replaces the always-visible 180-px-tall textarea that used to
         # sit beside the video. Most reviewers don't write a note per
@@ -2018,6 +2109,107 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _reset_events_on_file_change(_file_id):
         return []
 
+    # ---- PI-only: video quality threshold panel + sampler ---- #
+    pi_emails = (((config or {}).get("review_queue", {}) or {})
+                  .get("pi_emails", []) or [])
+    pi_email_set = {str(e).lower() for e in pi_emails}
+
+    @app.callback(
+        Output("video-pi-quality-panel", "style"),
+        Output("video-pi-current-threshold", "children"),
+        Input("video-file-dropdown", "value"),
+        Input("refresh-trigger", "data"),
+        State("video-pi-quality-panel", "style"),
+    )
+    def _toggle_pi_quality_panel(_file_id, _refresh, current):
+        email = (current_user_email() or "").lower()
+        is_pi = bool(email and email in pi_email_set)
+        base = dict(current or {})
+        base["display"] = "block" if is_pi else "none"
+        if not is_pi:
+            return base, ""
+        rec = store.get_video_quality_threshold()
+        if not rec:
+            cur_label = ("No threshold set yet. Sample a frame "
+                          "and save one to start.")
+        else:
+            cur_label = (
+                f"Current threshold = "
+                f"{rec.get('threshold', 0):.2f}  ·  "
+                f"sampled variance = "
+                f"{rec.get('sampled_variance', 0):.2f}  ·  "
+                f"set by {rec.get('user_email', '?')} at "
+                f"{(rec.get('at') or '')[:16]}"
+                + (f"  ·  note: {rec['note']}"
+                    if rec.get("note") else ""))
+        return base, cur_label
+
+    @app.callback(
+        Output("video-pi-variance-display", "children"),
+        Output("video-pi-threshold-input", "value",
+                allow_duplicate=True),
+        Input("video-pi-variance-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _show_pi_variance(data):
+        if not data or data.get("variance") in (None, "null"):
+            err = (data or {}).get("error")
+            return (f"⚠️  {err}" if err else "(no sample yet)",
+                    no_update)
+        var = float(data["variance"])
+        t_sec = float(data.get("time") or 0.0)
+        paused = data.get("paused")
+        return (f"variance = {var:.2f}  (t={t_sec:.2f}s · "
+                 f"paused={bool(paused)} · {data.get('w')}x"
+                 f"{data.get('h')} px)",
+                round(var, 2))
+
+    @app.callback(
+        Output("video-pi-set-status", "children"),
+        Output("video-pi-current-threshold", "children",
+                allow_duplicate=True),
+        Input("video-pi-set-threshold-btn", "n_clicks"),
+        State("video-pi-threshold-input", "value"),
+        State("video-pi-variance-store", "data"),
+        State("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _save_pi_threshold(n, threshold, variance_data, file_id):
+        if not n:
+            return no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not email or email not in pi_email_set:
+            return "Not authorised.", no_update
+        if threshold is None or threshold == "":
+            return ("Enter a number first.", no_update)
+        try:
+            thr = float(threshold)
+        except (TypeError, ValueError):
+            return (f"Invalid threshold: {threshold!r}",
+                    no_update)
+        sampled = float((variance_data or {})
+                          .get("variance") or 0.0)
+        try:
+            store.set_video_quality_threshold(
+                threshold=thr,
+                sampled_variance=sampled,
+                set_by_email=email,
+                file_id=int(file_id) if file_id else None,
+                note="",
+            )
+        except Exception as e:
+            logger.warning("set_video_quality_threshold failed: %s",
+                            e)
+            return (f"Save failed: {e}", no_update)
+        rec = store.get_video_quality_threshold() or {}
+        from datetime import datetime as _dt
+        return (f"✓ Saved at "
+                 f"{_dt.now().strftime('%H:%M')}.",
+                 f"Current threshold = {rec.get('threshold', 0):.2f}"
+                 f"  ·  sampled variance = "
+                 f"{rec.get('sampled_variance', 0):.2f}  ·  "
+                 f"set by {rec.get('user_email', '?')}")
+
     # ---- Step 4: reset marker store + decision when file changes ---- #
     @app.callback(
         Output("video-review-marker-store", "data",
@@ -2548,7 +2740,23 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             ))
         if n_cams == 1:
             player = cam_videos[0]
+        elif n_cams == 2:
+            # Two cameras: stack vertically. With the Step 2
+            # grid taking a single column for video + LFP +
+            # Hilbert, side-by-side at 2 wide compresses each
+            # video to ~240 px which is too small to see
+            # behavioral detail; vertical stack uses the full
+            # column width.
+            player = html.Div(cam_videos, style={
+                "display": "grid",
+                "gridTemplateColumns": "1fr",
+                "gridTemplateRows": "1fr 1fr",
+                "gap": "8px",
+            })
         else:
+            # 3+ cameras: side-by-side stays most space-
+            # efficient (each video is at least 220 px wide
+            # at 3 cams).
             player = html.Div(cam_videos, style={
                 "display": "grid",
                 "gridTemplateColumns": f"repeat({n_cams}, 1fr)",

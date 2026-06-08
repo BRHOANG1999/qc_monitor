@@ -927,6 +927,59 @@ def create_app(config: dict, store: Store) -> Dash:
         Input("video-events-store", "data"),
     )
 
+    # PI-only frame sampler: on click, draw the <video>'s current
+    # frame to an offscreen canvas, compute grayscale (BT.601)
+    # pixel variance, and report it back. Wide enough to capture
+    # behavioral detail; capped at 640 px so a one-hour 1080p
+    # video doesn't OOM the browser.
+    app.clientside_callback(
+        """
+        function (n_clicks) {
+            if (!n_clicks) {
+                return window.dash_clientside.no_update;
+            }
+            const v = document.getElementById('lfp-video');
+            if (!v || v.readyState < 2 || !v.videoWidth) {
+                return {error: 'Video not ready -- load a '
+                                + 'recording first.', variance: null};
+            }
+            const TARGET_W = 640;
+            const w = Math.min(TARGET_W, v.videoWidth);
+            const h = Math.round(w * (v.videoHeight / v.videoWidth));
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            const ctx = c.getContext('2d');
+            try {
+                ctx.drawImage(v, 0, 0, w, h);
+            } catch (e) {
+                return {error: 'Cross-origin video; can\\'t sample.',
+                         variance: null};
+            }
+            const px = ctx.getImageData(0, 0, w, h).data;
+            const n = w * h;
+            let sum = 0, sumsq = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                const g = 0.299 * px[i]
+                        + 0.587 * px[i+1]
+                        + 0.114 * px[i+2];
+                sum += g;
+                sumsq += g * g;
+            }
+            const mean = sum / n;
+            const variance = (sumsq / n) - mean * mean;
+            return {
+                variance: variance,
+                time: v.currentTime,
+                paused: v.paused,
+                w: w, h: h,
+            };
+        }
+        """,
+        Output("video-pi-variance-store", "data"),
+        Input("video-pi-sample-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
     # Undo toast show/hide. Reads the kbd-undo Store, mirrors its
     # presence into the toast's visibility, and auto-clears the
     # Store after the deadline passes.

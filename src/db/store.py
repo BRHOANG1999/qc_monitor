@@ -1869,3 +1869,76 @@ class Store:
             return (row["at"] if row and row["at"] else None)
         finally:
             conn.close()
+
+    def set_video_quality_threshold(self, *,
+                                       threshold: float,
+                                       sampled_variance: float,
+                                       set_by_email: str,
+                                       file_id: int | None = None,
+                                       note: str = "") -> int:
+        """Persist a new pixel-variance quality threshold.
+
+        Uses ``review_event_log`` as a single-source audit
+        trail; ``get_video_quality_threshold`` reads back the
+        latest payload. ``file_id`` is the recording the sample
+        was taken from when available; without it we attach the
+        sentinel row to the most recent processed_files id so
+        the existing FK constraint stays honored.
+        """
+        assert isinstance(threshold, (int, float)), "threshold num"
+        assert isinstance(sampled_variance, (int, float)), \
+            "sampled_variance num"
+        assert set_by_email, "set_by_email required"
+        payload = {
+            "threshold": float(threshold),
+            "sampled_variance": float(sampled_variance),
+            "note": str(note or ""),
+        }
+        # Resolve a valid file_id for the FK. Prefer the caller's
+        # explicit id; fall back to "any existing file" so the
+        # threshold can be set before/without a specific
+        # recording in view.
+        resolved_id = file_id
+        if not resolved_id:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT id FROM processed_files "
+                    "ORDER BY id LIMIT 1").fetchone()
+                resolved_id = int(row["id"]) if row else None
+            finally:
+                conn.close()
+        if not resolved_id:
+            # Empty DB -- no audit row possible. Caller can retry
+            # after first ingest.
+            raise RuntimeError(
+                "No processed_files row exists to anchor the "
+                "quality-threshold audit row to.")
+        return self.insert_review_event(
+            int(resolved_id), set_by_email,
+            "video_quality_threshold", payload,
+        )
+
+    def get_video_quality_threshold(self) -> dict | None:
+        """Return the latest video quality threshold record
+        (``{threshold, sampled_variance, note, at, user_email}``)
+        or ``None`` if a PI has never set one."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT user_email, payload_json, at
+                   FROM review_event_log
+                   WHERE action = 'video_quality_threshold'
+                   ORDER BY at DESC LIMIT 1"""
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        payload["at"] = row["at"]
+        payload["user_email"] = row["user_email"]
+        return payload
