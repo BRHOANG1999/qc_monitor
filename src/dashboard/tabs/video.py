@@ -1184,16 +1184,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-queue-animal", "options"),
         Output("video-queue-animal", "value"),
         Output("video-queue-status", "children"),
-        Input("video-time-tick", "n_intervals"),
+        Input("refresh-trigger", "data"),
         State("video-queue-animal", "value"),
     )
     def _populate_animal_picker(_n, current_value):
         """Refresh the animal dropdown from the assignment sheet.
 
-        Fires once on tab open (the time tick is registered there)
-        and once per minute thereafter so PI edits land quickly.
-        Resists overwriting the user's existing selection unless
-        their assignments changed.
+        Fires once on tab mount (refresh-trigger has an initial
+        value so the callback runs at component-mount time) and
+        again whenever the user clicks the floating Refresh button.
+        Using the 100 ms video-time-tick interval here was wrong:
+        it hammered the DB + Sheets cache 10x/sec which made the
+        whole tab strip thrash and could flip the user back to
+        Overview. PI edits land at most ``refresh_minutes`` minutes
+        after they're typed; the manual Refresh button picks them
+        up immediately.
         """
         if not review_cfg.get("enabled", False):
             return [], None, "Queue feature is disabled in config."
