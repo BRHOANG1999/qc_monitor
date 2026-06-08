@@ -1205,29 +1205,41 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-queue-animal", "options"),
         Output("video-queue-animal", "value"),
         Output("video-queue-status", "children"),
-        Input("refresh-trigger", "data"),
+        Input("manual-refresh-btn", "n_clicks"),
+        Input("assignments-version", "data"),
         State("video-queue-animal", "value"),
     )
-    def _populate_animal_picker(_n, current_value):
+    def _populate_animal_picker(_clicks, _version, current_value):
         """Refresh the animal dropdown from the assignment sheet.
 
-        Fires once on tab mount (refresh-trigger has an initial
-        value so the callback runs at component-mount time) and
-        again whenever the user clicks the floating Refresh button.
-        Using the 100 ms video-time-tick interval here was wrong:
-        it hammered the DB + Sheets cache 10x/sec which made the
-        whole tab strip thrash and could flip the user back to
-        Overview. PI edits land at most ``refresh_minutes`` minutes
-        after they're typed; the manual Refresh button picks them
-        up immediately.
+        Subscribes to two inputs:
+
+          * ``manual-refresh-btn`` -- fires once on initial render
+            (Dash convention) and on every user-clicked Refresh.
+          * ``assignments-version`` -- bumped by the background
+            warmer thread in ``src/utils/assignments.py`` when
+            fresh data lands. Lets the picker auto-update without
+            blocking on the Sheets API in this render path.
+
+        Reads via ``cache_only=True`` so the callback is always
+        instant: a ``None`` from ``animals_for_user`` means the
+        warmer hasn't populated the cache yet and we render a
+        "Loading..." placeholder; the version-bump will re-fire
+        this callback once the cache is warm.
         """
         if not review_cfg.get("enabled", False):
             return [], None, "Queue feature is disabled in config."
         email = current_user_email() or ""
-        my_animals = _assignments.animals_for_user(config, email)
+        my_animals = _assignments.animals_for_user(
+            config, email, cache_only=True)
+        if my_animals is None:
+            return ([], None,
+                     "Loading assignments from Google Sheets...")
         try:
-            unassigned = _assignments.unassigned_animals(config,
-                                                            store)
+            unassigned = _assignments.unassigned_animals(
+                config, store, cache_only=True)
+            if unassigned is None:
+                unassigned = []
         except Exception as e:
             logger.debug("unassigned pool failed: %s", e)
             unassigned = []

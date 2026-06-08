@@ -214,7 +214,12 @@ review_queue:
     sheet_id: "1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0"
     tab_name: "Reviewer Assignments"
     service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
-    refresh_minutes: 5
+    # The background warmer in src/utils/assignments.py refreshes
+    # this cache on its own clock, and the floating Refresh button
+    # forces an immediate re-read, so a longer TTL is safe -- it
+    # just bounds how stale a brand-new assignment looks to a
+    # reviewer who doesn't click Refresh.
+    refresh_minutes: 30
   queue:
     # Hard cap on queue length per user/animal so the UI stays
     # snappy even when there's a multi-thousand-file backlog.

@@ -24,6 +24,7 @@ from src.utils.filters import (
     SUPPORTED_NOTCH, apply_filter, compute_psd, get_filtered,
 )
 from src.dashboard.auth import register_auth, current_user_email
+from src.utils import assignments as _assignments
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
@@ -560,6 +561,11 @@ def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dic
 def create_app(config: dict, store: Store) -> Dash:
     refresh_sec = config.get("dashboard", {}).get("refresh_interval_sec", 10)
 
+    # Warm the Reviewer Assignments cache in a daemon thread so the
+    # Video Review picker never blocks on the Sheets API in any
+    # render path. Idempotent across reloads.
+    _assignments.start_warmer(config)
+
     assets_dir = os.path.join(os.path.dirname(__file__), "assets")
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
                assets_folder=assets_dir)
@@ -731,6 +737,15 @@ def create_app(config: dict, store: Store) -> Dash:
                   "border": f"1px solid {COLOR_DIVIDER}"}),
         dcc.Store(id="refresh-trigger", data=0),
         dcc.Store(id="last-refresh-ts", data=None),
+        # Cache-version Store for the Reviewer Assignments sheet.
+        # Bumped by a background warmer thread; subscribed to by
+        # the Video Review animal picker so it auto-updates when
+        # new data lands without paying the Sheets API latency on
+        # the render path. The 2 s polling Interval here is
+        # server-side cheap (it just reads an int).
+        dcc.Store(id="assignments-version", data=0),
+        dcc.Interval(id="assignments-poll", interval=2000,
+                       n_intervals=0),
         # Focus-mode state: True when the user wants chrome (header,
         # group tabs, sub-tabs) hidden so only the active tab content
         # remains visible. Toggled by the Focus button in the refresh
@@ -835,6 +850,22 @@ def create_app(config: dict, store: Store) -> Dash:
     def on_refresh(clicks, intervals, current):
         import time as _time
         return (current or 0) + 1, _time.time()
+
+    # Publish the assignments cache version into a Store so picker
+    # callbacks can react to "data ready" without polling the
+    # Sheets API themselves. Returns no_update unless the warmer
+    # actually bumped the counter, so downstream callbacks don't
+    # refire every 2 s for no reason.
+    @app.callback(
+        Output("assignments-version", "data"),
+        Input("assignments-poll", "n_intervals"),
+        State("assignments-version", "data"),
+    )
+    def _publish_assignments_version(_n, prev):
+        cur = _assignments.cache_version()
+        if cur == (prev or 0):
+            return no_update
+        return cur
 
     # Fine-grained refresh: replace just the volatile Overview cards +
     # queue children instead of re-rendering the whole tab. Eliminates

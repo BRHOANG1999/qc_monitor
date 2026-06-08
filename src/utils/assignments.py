@@ -12,6 +12,8 @@ dashboard refresh and a stale read after a PI edit is bounded to
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -23,6 +25,14 @@ from src.dashboard.tabs.surgeries import (
 )
 
 logger = logging.getLogger("qc_monitor.utils.assignments")
+
+# Monotonic version counter bumped by the background warmer each
+# time it successfully refreshes the assignment cache. The Dash UI
+# polls this through a hidden Store so the picker auto-re-renders
+# when fresh data lands -- no need for the user to click Refresh.
+_cache_version: int = 0
+_warmer_started: bool = False
+_warmer_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -48,33 +58,47 @@ def _cfg(config: dict) -> dict:
 
 
 def load_assignments(config: dict,
-                       ttl_sec: float | None = None
-                       ) -> list[Assignment]:
+                       ttl_sec: float | None = None,
+                       *, cache_only: bool = False,
+                       ) -> list[Assignment] | None:
     """Return every ACTIVE assignment row from the configured tab.
 
     Inactive rows (``Active`` cell != truthy) are dropped from the
     returned list but kept in the sheet for audit. Returns ``[]``
     on any error or when the feature is disabled in config.
+
+    ``cache_only=True`` skips the network round trip and only reads
+    the in-process TTL cache. Returns ``None`` if the cache has
+    never been populated (warmer hasn't finished its first
+    iteration yet); UI callers should render a "Loading..."
+    placeholder and let the assignments-version Store push a
+    re-render once the warmer publishes fresh data. Returns ``[]``
+    if cached but truly empty.
     """
     cfg = _cfg(config)
     if not cfg:
         return []
     sheet_id = cfg.get("sheet_id")
     tab_name = cfg.get("tab_name") or "Reviewer Assignments"
-    sa_path_raw = cfg.get("service_account_file", "")
     if not sheet_id:
         return []
-    if not sa_path_raw:
-        # Fall back to the lab's shared service-account file used
-        # everywhere else.
-        sa_path_raw = (config.get("data_log_xref", {}) or {}).get(
-            "service_account_file", "")
-    sa_path = _resolve_sa_path(config or {}, sa_path_raw)
-    if not sa_path:
-        return []
-    if ttl_sec is None:
-        ttl_sec = float(cfg.get("refresh_minutes", 5)) * 60.0
-    df = _load_sheet_via_api(sheet_id, tab_name, sa_path, ttl_sec)
+    if cache_only:
+        df = _peek_sheet_cache(sheet_id, tab_name)
+        if df is None:
+            return None
+    else:
+        sa_path_raw = cfg.get("service_account_file", "")
+        if not sa_path_raw:
+            # Fall back to the lab's shared service-account file
+            # used everywhere else.
+            sa_path_raw = (config.get("data_log_xref", {}) or {}).get(
+                "service_account_file", "")
+        sa_path = _resolve_sa_path(config or {}, sa_path_raw)
+        if not sa_path:
+            return []
+        if ttl_sec is None:
+            ttl_sec = float(cfg.get("refresh_minutes", 30)) * 60.0
+        df = _load_sheet_via_api(sheet_id, tab_name, sa_path, ttl_sec)
     if df is None or df.empty:
         return []
 
@@ -115,24 +139,47 @@ def load_assignments(config: dict,
     return out
 
 
-def assignments_for_user(config: dict, user_email: str
-                           ) -> list[Assignment]:
-    """Active assignments for one reviewer. Case-insensitive."""
+def assignments_for_user(config: dict, user_email: str,
+                           *, cache_only: bool = False,
+                           ) -> list[Assignment] | None:
+    """Active assignments for one reviewer. Case-insensitive.
+
+    ``cache_only=True`` returns ``None`` if the cache is cold
+    (see ``load_assignments``).
+    """
     if not user_email:
         return []
-    every = load_assignments(config)
+    every = load_assignments(config, cache_only=cache_only)
+    if every is None:
+        return None
     return [a for a in every if a.matches_user(user_email)]
 
 
-def animals_for_user(config: dict, user_email: str) -> list[str]:
-    """Sorted distinct animal ids assigned to the user."""
-    return sorted({a.animal_id
-                    for a in assignments_for_user(config, user_email)})
+def animals_for_user(config: dict, user_email: str,
+                       *, cache_only: bool = False,
+                       ) -> list[str] | None:
+    """Sorted distinct animal ids assigned to the user.
+
+    Returns ``None`` (cache cold) only when ``cache_only=True``.
+    """
+    rows = assignments_for_user(config, user_email,
+                                  cache_only=cache_only)
+    if rows is None:
+        return None
+    return sorted({a.animal_id for a in rows})
 
 
-def assigned_animals(config: dict) -> set[str]:
-    """Every animal id with at least one active assignee."""
-    return {a.animal_id for a in load_assignments(config)}
+def assigned_animals(config: dict,
+                       *, cache_only: bool = False,
+                       ) -> set[str] | None:
+    """Every animal id with at least one active assignee.
+
+    Returns ``None`` (cache cold) only when ``cache_only=True``.
+    """
+    every = load_assignments(config, cache_only=cache_only)
+    if every is None:
+        return None
+    return {a.animal_id for a in every}
 
 
 def assignees_for_animal(config: dict, animal_id: str
@@ -140,16 +187,122 @@ def assignees_for_animal(config: dict, animal_id: str
     """Email addresses currently assigned to *animal_id*."""
     if not animal_id:
         return []
-    return sorted({a.user_email
-                    for a in load_assignments(config)
+    every = load_assignments(config)
+    if every is None:
+        return []
+    return sorted({a.user_email for a in every
                     if a.animal_id == animal_id})
 
 
-def unassigned_animals(config: dict, store) -> list[str]:
+def unassigned_animals(config: dict, store,
+                         *, cache_only: bool = False,
+                         ) -> list[str] | None:
     """Animal ids that exist in session_config but have no active
-    assignee. Used for the "Unassigned pool" UX."""
+    assignee. Used for the "Unassigned pool" UX.
+
+    Returns ``None`` (cache cold) only when ``cache_only=True``.
+    """
+    assigned = assigned_animals(config, cache_only=cache_only)
+    if assigned is None:
+        return None
     every_animal = set(store.list_all_animals())
-    return sorted(every_animal - assigned_animals(config))
+    return sorted(every_animal - assigned)
+
+
+# --------------------------------------------------------------------- #
+# Background cache warmer
+# --------------------------------------------------------------------- #
+
+def cache_version() -> int:
+    """Monotonic version of the assignment cache.
+
+    Bumped each time the background warmer successfully refreshes
+    the sheet. The dashboard polls this through a hidden Store so
+    picker callbacks can subscribe to "data changed" without paying
+    network latency themselves.
+    """
+    return _cache_version
+
+
+def _warmer_interval_sec(config: dict) -> float:
+    """Sleep interval between warmer iterations. Floored at 60 s
+    so a misconfigured refresh_minutes=0 doesn't busy-loop."""
+    cfg = _cfg(config)
+    minutes = float(cfg.get("refresh_minutes", 30) or 30)
+    return max(60.0, minutes * 60.0)
+
+
+def start_warmer(config: dict) -> None:
+    """Spawn the background cache-warmer thread. Idempotent.
+
+    Refreshes the assignment cache on its own clock (independent
+    of the dashboard's 10 s refresh tick) and bumps
+    ``_cache_version`` so the UI can react to "data ready" without
+    blocking on the Sheets API in any render path.
+    """
+    assert isinstance(config, dict), "config must be a dict"
+    cfg = _cfg(config)
+    if not cfg or not cfg.get("sheet_id"):
+        logger.debug("assignments warmer not started (no sheet "
+                      "configured)")
+        return
+    global _warmer_started
+    with _warmer_lock:
+        if _warmer_started:
+            return
+        _warmer_started = True
+    t = threading.Thread(
+        target=_warmer_loop, args=(config,),
+        daemon=True, name="qc-assignments-warmer",
+    )
+    t.start()
+    logger.info("Started assignments cache warmer "
+                 "(refresh every %.0f s)",
+                 _warmer_interval_sec(config))
+
+
+def _warmer_loop(config: dict) -> None:
+    """Daemon loop. Refreshes assignments + bumps version counter.
+
+    The ``while True`` here is a service loop by design, but per
+    the lab's NASA JPL Rule 2 we still cap iterations and assert
+    at the top. At a 30-min refresh the cap covers ~60,000 years.
+    """
+    global _cache_version
+    assert isinstance(config, dict), "config must be a dict"
+    interval = _warmer_interval_sec(config)
+    max_iter = 10 ** 9
+    i = 0
+    while True:
+        assert i < max_iter, "warmer loop runaway"
+        i += 1
+        try:
+            load_assignments(config, ttl_sec=0.0)
+            _cache_version += 1
+            logger.debug("assignments cache warmed (v=%d)",
+                          _cache_version)
+        except Exception:
+            logger.exception(
+                "assignments warmer iteration failed; "
+                "will retry in %.0f s", interval)
+        time.sleep(interval)
+
+
+def _peek_sheet_cache(sheet_id: str,
+                       tab_name: str) -> pd.DataFrame | None:
+    """Read the shared sheet TTL cache without triggering a fetch.
+
+    Returns the cached DataFrame regardless of age (it's the
+    warmer's job to keep it fresh) or ``None`` if the cache has
+    never been populated for this (sheet, tab).
+    """
+    assert sheet_id, "sheet_id required"
+    assert tab_name, "tab_name required"
+    from src.dashboard.tabs.surgeries import _cache, _cache_lock
+    cache_key = f"api:{sheet_id}:{tab_name}:h1"
+    with _cache_lock:
+        hit = _cache.get(cache_key)
+    return hit[1] if hit is not None else None
 
 
 # --------------------------------------------------------------------- #
