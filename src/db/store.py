@@ -1423,18 +1423,17 @@ class Store:
             conn.close()
 
     @staticmethod
-    def _animal_ids_for_config(channel_names_json: str | None,
-                                 eeg_channels_json: str | None
-                                 ) -> list[str]:
-        """Resolve a session_config row to the list of actual animal
-        identifiers.
+    def _eeg_channel_names_for_config(channel_names_json: str | None,
+                                          eeg_channels_json: str | None
+                                          ) -> list[tuple[int, str]]:
+        """Return ``(channel_index, channel_name)`` pairs for every
+        EEG channel in this session_config row.
 
-        ``eeg_channels`` is a JSON list of channel INDICES into
-        ``channel_names`` (the non-stim_copy electrodes). The
-        animal id is the channel name at each index, e.g. given
-        ``channel_names = ["stimCopy", "BCH040SR", "stimCopy",
-        "saline"]`` and ``eeg_channels = [1, 3]`` this returns
-        ``["BCH040SR", "saline"]``.
+        ``eeg_channels`` is a JSON list of channel indices into
+        ``channel_names`` (the non-stim_copy electrodes). stim_copy
+        + reference channels are intentionally NOT in eeg_channels
+        and therefore never appear here, so the reviewer can't pick
+        them as an LFP target.
         """
         if not channel_names_json or not eeg_channels_json:
             return []
@@ -1445,14 +1444,81 @@ class Store:
             return []
         if not isinstance(names, list) or not isinstance(idxs, list):
             return []
-        out: list[str] = []
+        out: list[tuple[int, str]] = []
         for i in idxs:
             try:
                 ii = int(i)
             except (TypeError, ValueError):
                 continue
             if 0 <= ii < len(names) and names[ii]:
-                out.append(str(names[ii]))
+                out.append((ii, str(names[ii])))
+        return out
+
+    @staticmethod
+    def _animal_ids_for_config(channel_names_json: str | None,
+                                 eeg_channels_json: str | None,
+                                 pattern: str | None = None,
+                                 ) -> list[str]:
+        """Distinct animal IDs (without electrode suffix) for the
+        EEG channels in this row. Skips non-animal labels like
+        ``saline`` / ``test`` so the queue and backlog summaries
+        only ever surface real animals.
+
+        E.g. given channel_names=``["stimCopy", "BCH062SR",
+        "stimCopy", "BCH062SLM"]`` and eeg_channels=``[1, 3]``,
+        returns ``["BCH062"]`` (one entry — the two electrode
+        locations collapse to a single animal).
+        """
+        # Local import: keeps schema-only consumers from pulling
+        # the parser module.
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        pairs = Store._eeg_channel_names_for_config(
+            channel_names_json, eeg_channels_json,
+        )
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for _idx, name in pairs:
+            if not is_animal_channel(name):
+                continue
+            animal, _ = split_animal_electrode(name, pattern)
+            if animal and animal not in seen_set:
+                seen.append(animal)
+                seen_set.add(animal)
+        return seen
+
+    def electrodes_for_animal_in_session(
+            self, session_dir: str, animal_id: str,
+            pattern: str | None = None,
+            ) -> list[dict]:
+        """Return ``[{channel_index, channel_name, location}, ...]``
+        for every EEG channel in *session_dir* whose parsed animal
+        prefix matches *animal_id*. Used by the Video Review
+        channel picker to default to the assigned animal's first
+        electrode and let the user switch to another.
+        """
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        if not session_dir or not animal_id:
+            return []
+        cfg = self.get_session_config(session_dir) or {}
+        pairs = self._eeg_channel_names_for_config(
+            cfg.get("channel_names"), cfg.get("eeg_channels"),
+        )
+        out: list[dict] = []
+        wanted = animal_id.strip()
+        for idx, name in pairs:
+            if not is_animal_channel(name):
+                continue
+            animal, location = split_animal_electrode(name, pattern)
+            if animal == wanted:
+                out.append({
+                    "channel_index": idx,
+                    "channel_name": name,
+                    "location": location or "",
+                })
         return out
 
     def get_review_queue(self, animal_ids: list[str],
@@ -1483,16 +1549,15 @@ class Store:
         if not animal_ids:
             return []
         assert isinstance(limit, int) and limit > 0, "limit must be positive int"
-        # First, prune session_configs to those that actually carry
-        # one of the requested animals. We use a JSON-substring
-        # LIKE (matching the channel name wrapped in quotes) so a
-        # partial token like "BCH06" can't accidentally match the
-        # animal "BCH060SR". With <100 distinct animals this stays
-        # well under 10 ms.
+        # animal_ids are PREFIXES (no electrode suffix) — match any
+        # quoted channel name that starts with the prefix. The trailing
+        # wildcard catches BCH062SR + BCH062SLM under "BCH062" while
+        # the leading quote keeps "BCH062" from also matching "BCH0620".
+        # A precise Python check below the SQL trims accidental matches.
         like_clauses = " OR ".join(
             ["sc.channel_names LIKE ?"] * len(animal_ids)
         )
-        like_args = [f'%"{a}"%' for a in animal_ids]
+        like_args = [f'%"{a}%' for a in animal_ids]
         params: list = list(like_args)
         extra_where = ""
         if since_iso:

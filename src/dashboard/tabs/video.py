@@ -176,14 +176,17 @@ def _session_dir_for_file(store: Store, file_id: int) -> str | None:
 
 def _channel_options(store: Store, session_dir: str | None,
                      n_channels: int) -> list[dict]:
-    """Build channel-name options for the dropdown.
+    """Build channel-name options for the LFP-review dropdown.
 
-    Prefers session_config.channel_names if present; otherwise falls
-    back to "Ch0", "Ch1", ... so the dropdown always has labels.
+    Only EEG channels appear; stim_copy / saline / reference
+    channels are never selectable as an LFP-review target because
+    they don't carry behaviorally-interpretable signal. Falls back
+    to numeric Ch0, Ch1, ... when no session_config row is on file
+    (legacy chunks before auto-discovery landed).
     """
-    options = [{"label": f"Ch{i}", "value": i} for i in range(n_channels)]
     if not session_dir:
-        return options
+        return [{"label": f"Ch{i}", "value": i}
+                for i in range(n_channels)]
     cfg = store.get_session_config(session_dir) or {}
     raw_names = cfg.get("channel_names")
     if isinstance(raw_names, str):
@@ -191,9 +194,40 @@ def _channel_options(store: Store, session_dir: str | None,
             raw_names = json.loads(raw_names)
         except json.JSONDecodeError:
             raw_names = None
-    if isinstance(raw_names, list):
-        for i in range(min(n_channels, len(raw_names))):
-            options[i] = {"label": f"{raw_names[i]} (Ch{i})", "value": i}
+    raw_eeg = cfg.get("eeg_channels")
+    if isinstance(raw_eeg, str):
+        try:
+            raw_eeg = json.loads(raw_eeg)
+        except json.JSONDecodeError:
+            raw_eeg = None
+    # Without an explicit eeg_channels list, fall back to the whole
+    # legacy "every channel" dropdown so we don't regress old sessions.
+    if not isinstance(raw_eeg, list):
+        options = [{"label": f"Ch{i}", "value": i}
+                    for i in range(n_channels)]
+        if isinstance(raw_names, list):
+            for i in range(min(n_channels, len(raw_names))):
+                options[i] = {
+                    "label": f"{raw_names[i]} (Ch{i})", "value": i,
+                }
+        return options
+    # Build EEG-only options with friendly labels.
+    options: list[dict] = []
+    for raw_idx in raw_eeg:
+        try:
+            i = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= i < n_channels):
+            continue
+        name = (raw_names[i] if isinstance(raw_names, list)
+                 and i < len(raw_names) else f"Ch{i}")
+        options.append({"label": f"{name} (Ch{i})", "value": i})
+    # If session_config exists but eeg_channels was empty for some
+    # reason, give the operator every channel rather than nothing.
+    if not options:
+        return [{"label": f"Ch{i}", "value": i}
+                for i in range(n_channels)]
     return options
 
 
@@ -1529,8 +1563,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
         State("lfp-to-video-bridge", "data"),
+        State("video-queue-animal", "value"),
     )
-    def _update_player(file_id, current_channel, bridge):
+    def _update_player(file_id, current_channel, bridge, queue_animal):
         if not file_id:
             return (
                 html.P("Pick a file to load the video.",
@@ -1549,6 +1584,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if (bridge and isinstance(bridge, dict)
                 and bridge.get("file_id") == file_id):
             current_channel = bridge.get("channel", current_channel)
+        # Resolve the queue-picked animal (strip the "_pool_" prefix
+        # so the unassigned-pool case behaves the same as an
+        # assignment).
+        target_animal = None
+        if queue_animal:
+            if queue_animal.startswith("_pool_"):
+                target_animal = queue_animal[len("_pool_"):]
+            else:
+                target_animal = queue_animal
         if file_path:
             try:
                 # Route the channel-count probe through the chunk cache
@@ -1557,10 +1601,41 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 n_ch = int(chunk.signal.shape[1])
                 session_dir = _session_dir_for_file(store, file_id)
                 ch_options = _channel_options(store, session_dir, n_ch)
-                # Keep current channel if still in range, else 0
-                ch_value = current_channel if (
-                    current_channel is not None and current_channel < n_ch
-                ) else 0
+                # Animal-aware default: when the reviewer picked
+                # animal X from the queue, find that animal's
+                # electrode contacts in this file and default to the
+                # first one. Bridge overrides this. Free-form (no
+                # queue selection) keeps the existing behaviour.
+                animal_choice = None
+                if target_animal and session_dir:
+                    elecs = store.electrodes_for_animal_in_session(
+                        session_dir, target_animal,
+                    )
+                    valid_ch_values = {o["value"] for o in ch_options}
+                    for e in elecs:
+                        if e["channel_index"] in valid_ch_values:
+                            animal_choice = e["channel_index"]
+                            break
+                # Priority: explicit bridge > queue-picked animal
+                # > previous user pick > 0.
+                if (bridge and isinstance(bridge, dict)
+                        and bridge.get("file_id") == file_id
+                        and bridge.get("channel") is not None):
+                    desired = bridge.get("channel")
+                elif animal_choice is not None:
+                    desired = animal_choice
+                elif current_channel is not None:
+                    desired = current_channel
+                else:
+                    desired = (ch_options[0]["value"]
+                                if ch_options else 0)
+                # Ensure desired ends up in the visible options set;
+                # if not, fall back to the first option (which
+                # excludes stim_copy by construction).
+                valid = {o["value"] for o in ch_options}
+                ch_value = (desired if desired in valid else
+                             (ch_options[0]["value"]
+                                if ch_options else 0))
             except Exception as e:
                 logger.warning("Channel probe failed for file %d: %s", file_id, e)
 
