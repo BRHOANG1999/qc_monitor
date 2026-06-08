@@ -40,6 +40,7 @@ from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
 from src.utils.hilbert_envelope import hilbert_envelope_20_200
+from src.dashboard.tabs import video_events as _events
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
 )
@@ -1181,6 +1182,17 @@ def layout(store: Store):
                                  "display": "block"},
                     inputStyle={"marginRight": "8px"},
                 ),
+                # The BHZ-style event editor lives inside the
+                # "Events seen" branch -- hidden until the
+                # reviewer picks that radio. video-events-store
+                # mirrors the structured event list; render_*
+                # callbacks live in src/dashboard/tabs/video_events.py.
+                html.Div(
+                    _events.render_events_panel(),
+                    id="video-events-wrapper",
+                    style={"display": "none",
+                            "marginTop": "12px"},
+                ),
                 html.Div([
                     html.Div(
                         "Click the brain trace above to drop onset "
@@ -1795,19 +1807,43 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update, no_update, None, no_update
         return sd, file_id, None, "↩ Reopened — review again."
 
-    # ---- Step 4: reveal marker editor only when "Events" picked ---- #
+    # ---- Step 4: reveal marker + events editor when "Events" picked ---- #
     @app.callback(
         Output("video-review-marker-group", "style"),
+        Output("video-events-wrapper", "style"),
         Input("video-review-decision", "value"),
         State("video-review-marker-group", "style"),
+        State("video-events-wrapper", "style"),
     )
-    def _toggle_marker_editor(decision, current):
-        base = dict(current or {})
+    def _toggle_marker_editor(decision, marker_style,
+                               events_style):
+        m_base = dict(marker_style or {})
+        e_base = dict(events_style or {})
         if decision == "has_events":
-            base["display"] = "block"
+            m_base["display"] = "block"
+            e_base["display"] = "block"
         else:
-            base["display"] = "none"
-        return base
+            m_base["display"] = "none"
+            e_base["display"] = "none"
+        return m_base, e_base
+
+    # Register the BHZ events editor's own callbacks (Add /
+    # Delete / type radio / Drop / Clear / Racine / comments).
+    # These all read+write video-events-store with pattern-
+    # matching ids so adding a new event field is a one-place
+    # change in video_events.py.
+    _events.register_callbacks(app, store)
+
+    # Clear the events list when the file dropdown changes so
+    # the next recording starts blank.
+    @app.callback(
+        Output("video-events-store", "data",
+                allow_duplicate=True),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _reset_events_on_file_change(_file_id):
+        return []
 
     # ---- Step 4: reset marker store + decision when file changes ---- #
     @app.callback(
