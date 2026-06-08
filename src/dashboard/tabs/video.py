@@ -2606,14 +2606,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-file-dropdown", "value"),
         Input("video-analysis-feature", "value"),
         Input("video-analysis-apply-btn", "n_clicks"),
+        # Channel must be an Input -- the file→channel cascade
+        # sets channel AFTER _update_analysis first fires (with
+        # channel=None). State would leave the Hilbert envelope
+        # stuck on the empty 'Pick a brain channel' message.
+        Input("video-channel-dropdown", "value"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
-        State("video-channel-dropdown", "value"),
     )
     def _update_analysis(file_id, feature, _n_apply,
-                          smooth_sec, rollwin, postproc,
-                          channel):
+                          channel,
+                          smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
                 "Pick a recording above to see the feature trace."), "")

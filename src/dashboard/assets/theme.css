@@ -269,37 +269,71 @@ button:focus-visible {
     animation: qc-pulse 1.4s ease-out infinite;
 }
 
-/* --- Floating PiP video --- */
-/* assets/pip_video.js toggles .qc-video-pip on the
-   #video-player-container Div whenever an IntersectionObserver
-   says the container has scrolled out of viewport. The Div
-   pops out of the Step 2 grid and floats fixed at the bottom
-   right; the <video> inside keeps playing without
-   interruption, still time-locked to the LFP cursor. Scrolling
-   back into view removes the class and the player snaps back. */
-.qc-video-pip {
+/* --- Floating PiP Step 2 grid --- */
+/* assets/pip_video.js toggles .qc-pip-grid on #video-step2-grid
+   whenever an IntersectionObserver (with rootMargin hysteresis
+   + 220 ms debounce) says the grid has scrolled out of
+   viewport. The grid pops out of layout and floats fixed at
+   the bottom right, re-flowing to a single vertical column so
+   the video, LFP, and Hilbert envelope all stay visible while
+   the reviewer scores events down in Step 4. */
+.qc-pip-grid {
     position: fixed !important;
     bottom: 18px;
     right: 18px;
-    width: 360px !important;
-    min-width: 0 !important;
-    min-height: 0 !important;
-    height: 208px;
+    width: 380px !important;
+    max-height: 78vh;
+    overflow-y: auto;
+    overflow-x: hidden;
     z-index: 9998;
+    /* Reflow grid-template to a single column so the LFP and
+       Hilbert stack underneath the video. Bypass the inline
+       gridTemplateColumns="minmax(420px, 1.2fr) minmax(420px, 1fr)"
+       set by the Python layout. */
+    grid-template-columns: 1fr !important;
+    grid-template-areas: 'video' 'lfp' !important;
+    gap: 6px !important;
+    padding: 8px;
+    background: rgba(10, 10, 20, 0.96);
+    backdrop-filter: blur(10px);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
     border: 2px solid var(--accent, #5e7ce2);
     border-radius: 10px;
-    overflow: hidden;
-    transition: width 0.2s ease-out, height 0.2s ease-out,
-                box-shadow 0.2s ease-out;
+    transition: box-shadow 0.2s ease-out;
 }
-.qc-video-pip:hover {
+.qc-pip-grid:hover {
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
 }
-.qc-video-pip video {
+.qc-pip-grid #video-player-container {
+    min-height: 160px !important;
+    height: 170px;
+}
+.qc-pip-grid #video-player-container video {
     width: 100%;
     height: 100%;
     object-fit: contain;
+}
+/* Compress the LFP + Hilbert plots so the trio fits in <80vh.
+   Plotly receives a synthetic resize from pip_video.js after
+   the class flips, so the SVG re-renders at the new width. */
+.qc-pip-grid #video-lfp-trace,
+.qc-pip-grid #video-analysis-trace {
+    height: 140px !important;
+}
+.qc-pip-grid #video-lfp-trace .js-plotly-plot,
+.qc-pip-grid #video-analysis-trace .js-plotly-plot,
+.qc-pip-grid #video-lfp-trace .plot-container,
+.qc-pip-grid #video-analysis-trace .plot-container {
+    height: 140px !important;
+}
+/* Hide non-essential chrome inside the PiP so it doesn't
+   crowd the plots: filter card, brain-feature picker, status
+   text, brain-signal header. The user can scroll up to see
+   them in the grid view. */
+.qc-pip-grid details,
+.qc-pip-grid label,
+.qc-pip-grid .dash-dropdown {
+    display: none !important;
 }
 
 /* --- Accessibility: honor reduced-motion --- */
