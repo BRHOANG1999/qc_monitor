@@ -233,6 +233,16 @@ review_queue:
     weekday: 4   # 0=Mon ... 4=Fri
     hour: 17
 
+# BHZ_DETECTOR-compatible CSV export. Each completed Mark-done
+# in Video Review appends rows here so the lab's downstream
+# MATLAB pipelines see the same 44-column schema they always
+# have. See src/utils/bhz_csv.py for the encoding contract.
+bhz_csv:
+  enabled: true
+  base_dir: "G:\\BHZ\\BHZ_CSV_Exports"
+  filename_template: "{date}_{animal}.csv"
+  append: true
+
 surgery_digest:
   enabled: true
   send_hour: 8
