@@ -217,6 +217,28 @@ def _animal_ids_from_picker(animal_value: str | None
     return [animal_value]
 
 
+def _pi_flag_note_for_file(store, file_id: int) -> str:
+    """Return the most-recent ``pi_flag`` note for *file_id* or
+    an empty string if there isn't one.
+
+    Used by the queue card to show "🚩 PI flagged: ..." on
+    re-queued files so the undergrad sees the PI's instructions
+    without leaving the tab.
+    """
+    assert isinstance(file_id, int), "file_id must be int"
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            """SELECT note FROM review_state
+               WHERE file_id = ? AND status = 'pi_flagged'
+               ORDER BY updated_at DESC LIMIT 1""",
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return (row["note"] or "") if row else ""
+
+
 def _prefetch_chunk_safe(file_path: str, file_id: int) -> None:
     """Background-thread chunk warm. Swallows + logs errors so a
     bad file doesn't crash the prefetch loop.
@@ -2043,7 +2065,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         warn = age_days >= warn_age_days
         title = (f"Queue (FIFO · {total} unreviewed for "
                   f"{animal_label})")
-        body = html.Div([
+        # If this file is back in the queue because the PI flagged
+        # it for re-review, surface the PI's note so the
+        # undergrad knows what to look for. Cheap query: one
+        # SELECT against review_state by file_id.
+        pi_flag_note = _pi_flag_note_for_file(store,
+                                                 int(row["id"]))
+        body_children: list = [
             html.Div(ts_label,
                       style={"color": "#f0f0f5",
                               "fontWeight": "600",
@@ -2054,7 +2082,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                   else "#888"),
                        "fontSize": "11px",
                        "marginTop": "2px"}),
-        ])
+        ]
+        if pi_flag_note:
+            body_children.append(html.Div(
+                f"🚩 PI flagged: {pi_flag_note}",
+                style={"color": "#ff9f0a",
+                        "fontSize": "11px",
+                        "marginTop": "4px",
+                        "padding": "3px 8px",
+                        "background": "rgba(255,159,10,0.12)",
+                        "border":
+                            "1px solid rgba(255,159,10,0.30)",
+                        "borderRadius": "4px"}))
+        body = html.Div(body_children)
         position_str = f"Position {clamped + 1} of {total}"
         # If we clamped, write the clamped position back so
         # the next prev/next click is from a valid base.
@@ -3033,46 +3073,33 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ("Not signed in — can't record who reviewed "
                      "this.",
                     *nop7[1:])
-        # Structured events become the canonical markers payload.
+        # PI verification pipeline (the BHZ event taxonomy plan):
+        # every undergrad save lands in 'pending_pi_review'.
+        # markers_json stores the canonical event list -- empty
+        # for the no-events branch, populated for the events
+        # branch. The CSV is NOT written here; that happens
+        # exclusively when the PI hits Approve in the Event
+        # Verification tab. This is the second-layer safety net
+        # the lab asked for.
         markers_payload = events if decision == "has_events" else None
         try:
             store.mark_review(
-                int(file_id), email, decision,
+                int(file_id), email, "pending_pi_review",
                 markers=markers_payload,
                 note=(note or None),
             )
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
             return (f"Save failed: {e}", *nop7[1:])
-        # CSV export -- secondary store, doesn't roll back the
-        # SQLite write on failure.
-        csv_msg = ""
-        bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
-        if bhz_cfg.get("enabled") and channel is not None:
-            try:
-                meta, fs, animal_id, chunk_date = (
-                    _build_csv_file_meta(store, int(file_id),
-                                          int(channel)))
-                csv_path = _bhz_csv.resolve_csv_path(
-                    bhz_cfg.get("base_dir", ""),
-                    bhz_cfg.get("filename_template",
-                                 "{date}_{animal}.csv"),
-                    chunk_date, animal_id,
-                )
-                n_rows = _bhz_csv.write_event_rows(
-                    csv_path, meta, events, fs,
-                )
-                csv_msg = (f" · {n_rows} CSV row"
-                            f"{'' if n_rows == 1 else 's'} appended"
-                            if n_rows
-                            else " · CSV already current")
-            except Exception as e:
-                logger.warning("BHZ CSV append failed: %s", e)
-                csv_msg = f" · CSV append failed: {e}"
         from datetime import datetime as _dt
-        badge = (f"✓ Saved at "
-                  f"{_dt.now().strftime('%H:%M')}{csv_msg}. "
-                  f"This recording is now out of your queue.")
+        decision_label = ("0 events"
+                           if decision == "no_events"
+                           else f"{len(events)} event"
+                                 f"{'' if len(events) == 1 else 's'}")
+        badge = (f"✓ Saved for PI review at "
+                  f"{_dt.now().strftime('%H:%M')}  ·  "
+                  f"{decision_label}.  "
+                  f"The PI will verify before final CSV export.")
         # Resolve the next file in the queue so we can auto-advance.
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
