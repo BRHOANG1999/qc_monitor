@@ -1611,6 +1611,70 @@ class Store:
                 break
         return out
 
+    def user_streak_sessions(self, user_email: str) -> int:
+        """Consecutive review *sessions* with >=1 finish event.
+
+        A 'session' is a calendar day; we count consecutive
+        distinct review days walking backward from today,
+        allowing up to a 2-day gap between days (the lab's
+        cadence is bi-daily, so an off-day should not break
+        the streak). Returns 0 if the most-recent finish is
+        more than 2 days old.
+        """
+        assert user_email, "user_email required"
+        from datetime import date
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT date(at) AS d
+                   FROM review_event_log
+                   WHERE user_email = ? AND action = 'finish'
+                   ORDER BY d DESC LIMIT 60""",
+                (user_email.lower(),),
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return 0
+        dates: list[date] = []
+        max_iter = 60
+        for i, r in enumerate(rows):
+            assert i < max_iter, "row scan runaway"
+            try:
+                dates.append(date.fromisoformat(r["d"]))
+            except (ValueError, TypeError):
+                continue
+        if not dates:
+            return 0
+        today = date.today()
+        if (today - dates[0]).days > 2:
+            return 0
+        streak = 1
+        for i in range(1, len(dates)):
+            if (dates[i - 1] - dates[i]).days <= 2:
+                streak += 1
+            else:
+                break
+        return streak
+
+    def user_finishes_today(self, user_email: str) -> int:
+        """Count of ``finish`` events emitted today (lab local).
+
+        Used by the queue progress strip ("Today: 12 reviewed").
+        """
+        assert user_email, "user_email required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM review_event_log
+                   WHERE user_email = ? AND action = 'finish'
+                     AND date(at) = date('now', 'localtime')""",
+                (user_email.lower(),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row["n"]) if row else 0
+
     def reopen_review(self, file_id: int, user_email: str) -> bool:
         """Flip the most recent ``no_events`` / ``has_events`` row
         for this (file, user) pair to ``abandoned`` and append a

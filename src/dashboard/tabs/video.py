@@ -645,6 +645,16 @@ def layout(store: Store):
                                    "Oldest at the top so you clear "
                                    "the backlog from the front. "
                                    "Click one to load it."),
+                # Progress + motivation strip (P1-1). Rendered by
+                # _render_queue_progress; mirrors Linear's sprint
+                # progress + Duolingo's streak surface.
+                html.Div(id="video-queue-progress",
+                          style={"display": "flex",
+                                  "alignItems": "center",
+                                  "gap": "12px",
+                                  "padding": "4px 6px 6px",
+                                  "color": "#a0a0b0",
+                                  "fontSize": "11px"}),
                 html.Div(id="video-queue-list",
                           style={"maxHeight": "220px",
                                   "overflowY": "auto",
@@ -1337,6 +1347,79 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             status = (f"Assigned to you: "
                        f"{', '.join(my_animals)}.")
         return options, new_value, status
+
+    # Progress + streak strip. Pattern source: Linear sprint
+    # progress + Duolingo streak. Fires on the same triggers as
+    # _render_queue so the numbers move in lockstep with the
+    # queue list. "Streak" is in *sessions* (2-day buckets) per
+    # the plan's caveat #6 -- a bi-daily cadence means a calendar
+    # off-day should NOT reset the streak.
+    @app.callback(
+        Output("video-queue-progress", "children"),
+        Input("video-queue-animal", "value"),
+        Input("refresh-trigger", "data"),
+    )
+    def _render_queue_progress(animal_value, _refresh):
+        email = current_user_email() or ""
+        if not email:
+            return ""
+        done_today = store.user_finishes_today(email)
+        streak = store.user_streak_sessions(email)
+        animal_ids = _animal_ids_from_picker(animal_value)
+        n_waiting = 0
+        oldest_label = ""
+        if animal_ids:
+            rows = store.get_review_queue(
+                animal_ids, email,
+                limit=queue_limit,
+                since_iso=store.review_backlog_floor(),
+            )
+            n_waiting = len(rows)
+            if rows:
+                from datetime import datetime as _dt
+                try:
+                    dt = _dt.strptime(
+                        rows[0]["chunk_datetime"] or "",
+                        "%Y_%m_%d__%H_%M_%S")
+                    age_days = ((_dt.now() - dt)
+                                  .total_seconds() / 86400.0)
+                    if age_days < 1:
+                        oldest_label = (f"oldest "
+                                         f"{age_days * 24:.0f} h")
+                    else:
+                        oldest_label = (f"oldest "
+                                         f"{age_days:.1f} d")
+                except ValueError:
+                    oldest_label = ""
+        # Color the warn / crit ages so the user sees backlog
+        # heat without reading the number.
+        heat_color = "#a0a0b0"
+        if oldest_label and "d" in oldest_label:
+            days = float(oldest_label.split()[1])
+            if days >= 7:
+                heat_color = "#ff453a"
+            elif days >= warn_age_days:
+                heat_color = "#ff9f0a"
+        chips: list = [
+            html.Span(f"Today: {done_today} reviewed",
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+            html.Span("·"),
+            html.Span(
+                (f"Streak: {streak} sessions"
+                 if streak else "Streak: -- "),
+                style={"color": ("#30d158" if streak >= 2
+                                  else "#a0a0b0")}),
+        ]
+        if n_waiting:
+            chips.append(html.Span("·"))
+            chips.append(html.Span(f"{n_waiting} waiting",
+                                     style={"color": "#a0a0b0"}))
+        if oldest_label:
+            chips.append(html.Span("·"))
+            chips.append(html.Span(oldest_label,
+                                     style={"color": heat_color}))
+        return chips
 
     @app.callback(
         Output("video-queue-list", "children"),
