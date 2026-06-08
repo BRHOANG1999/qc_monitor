@@ -865,14 +865,94 @@ def layout(store: Store):
                                   "padding": "4px 6px 6px",
                                   "color": "#a0a0b0",
                                   "fontSize": "11px"}),
-                html.Div(id="video-queue-list",
-                          style={"maxHeight": "220px",
-                                  "overflowY": "auto",
-                                  "background": "#13131f",
-                                  "border":
-                                      "1px solid rgba(255,255,255,0.06)",
-                                  "borderRadius": "6px",
-                                  "padding": "4px"}),
+                # One-at-a-time browse card (Track F of the
+                # UX polish plan). Replaces the scrollable
+                # button list with prev/next arrows + Load.
+                # The full list still lives below behind a
+                # "Show all timestamps" expander so J/K cycle
+                # + the active-file highlight have something
+                # to attach to.
+                html.Div([
+                    html.Div(id="video-queue-card-title",
+                              style={"color": "#a0a0b0",
+                                      "fontSize": "11px",
+                                      "marginBottom": "6px"}),
+                    html.Div([
+                        html.Button(
+                            "◀",
+                            id="video-queue-prev-btn",
+                            n_clicks=0,
+                            title="Browse to the next-newer "
+                                   "recording (no load yet).",
+                            style={"background": "transparent",
+                                    "color": "#cfd0d6",
+                                    "border": "1px solid "
+                                               "rgba(255,255,255,0.15)",
+                                    "borderRadius": "5px",
+                                    "padding": "4px 10px",
+                                    "cursor": "pointer",
+                                    "fontSize": "12px"}),
+                        html.Div(id="video-queue-card-body",
+                                  style={"flex": "1",
+                                          "padding": "0 10px",
+                                          "textAlign": "center"}),
+                        html.Button(
+                            "▶",
+                            id="video-queue-next-btn",
+                            n_clicks=0,
+                            title="Browse to the next-older "
+                                   "recording (no load yet).",
+                            style={"background": "transparent",
+                                    "color": "#cfd0d6",
+                                    "border": "1px solid "
+                                               "rgba(255,255,255,0.15)",
+                                    "borderRadius": "5px",
+                                    "padding": "4px 10px",
+                                    "cursor": "pointer",
+                                    "fontSize": "12px"}),
+                    ], style={"display": "flex",
+                               "alignItems": "center",
+                               "padding": "8px 6px",
+                               "background": "#13131f",
+                               "border":
+                                   "1px solid rgba(255,255,255,0.06)",
+                               "borderRadius": "6px"}),
+                    html.Div([
+                        html.Button(
+                            "Load this recording",
+                            id="video-queue-load-btn",
+                            n_clicks=0,
+                            style={"background": "#5e7ce2",
+                                    "color": "white",
+                                    "border": "none",
+                                    "padding": "6px 16px",
+                                    "borderRadius": "5px",
+                                    "cursor": "pointer",
+                                    "fontSize": "12px",
+                                    "fontWeight": "600",
+                                    "marginRight": "10px"}),
+                        html.Span(id="video-queue-card-position",
+                                   style={"color": "#a0a0b0",
+                                           "fontSize": "11px"}),
+                    ], style={"display": "flex",
+                               "alignItems": "center",
+                               "marginTop": "6px"}),
+                    _details_card(
+                        "Show all timestamps",
+                        summary_sub="full FIFO list -- click "
+                                     "any item to load it",
+                        open_default=False,
+                        content=html.Div(id="video-queue-list",
+                                  style={"maxHeight": "220px",
+                                          "overflowY": "auto",
+                                          "background": "#13131f",
+                                          "border":
+                                              "1px solid rgba(255,255,255,0.06)",
+                                          "borderRadius": "6px",
+                                          "padding": "4px"}),
+                    ),
+                    dcc.Store(id="video-queue-position", data=0),
+                ], id="video-queue-card"),
             ], style={"flex": "1", "minWidth": "320px"}),
         ], style={"display": "flex", "gap": "16px",
                    "marginBottom": "10px", "flexWrap": "wrap"}),
@@ -1818,6 +1898,156 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             chips.append(html.Span(oldest_label,
                                      style={"color": heat_color}))
         return chips
+
+    # ---- Track F: one-at-a-time queue card ---- #
+    # The card renders the FIFO entry at video-queue-position;
+    # prev/next adjust the position WITHOUT loading; the "Load
+    # this recording" button is what actually opens the file.
+    # Edge cases (empty queue, position out of range, no
+    # animal picked) all surface inline in the card body.
+    @app.callback(
+        Output("video-queue-card-title", "children"),
+        Output("video-queue-card-body", "children"),
+        Output("video-queue-card-position", "children"),
+        Output("video-queue-position", "data",
+                allow_duplicate=True),
+        Input("video-queue-animal", "value"),
+        Input("video-queue-position", "data"),
+        Input("refresh-trigger", "data"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _render_queue_card(animal_value, position, _refresh):
+        if not animal_value:
+            return ("",
+                    html.Div("Pick an animal above to see "
+                              "your queue.",
+                              style={"color": "#888",
+                                      "fontSize": "12px"}),
+                    "", no_update)
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
+            return ("",
+                    html.Div("Pick an animal above to see "
+                              "your queue.",
+                              style={"color": "#888",
+                                      "fontSize": "12px"}),
+                    "", no_update)
+        email = current_user_email() or ""
+        floor = store.review_backlog_floor()
+        rows = store.get_review_queue(animal_ids, email,
+                                        limit=queue_limit,
+                                        since_iso=floor)
+        animal_label = animal_ids[0]
+        if not rows:
+            title = (f"Queue (FIFO · 0 unreviewed for "
+                      f"{animal_label})")
+            return (title,
+                    html.Div([
+                        html.Div("🎉  You're all caught up!",
+                                  style={"color": "#00CC96",
+                                          "fontWeight": "600",
+                                          "fontSize": "13px"}),
+                        html.Div("No unreviewed recordings.",
+                                  style={"color": "#888",
+                                          "fontSize": "11px",
+                                          "marginTop": "2px"}),
+                    ]),
+                    "", 0)
+        total = len(rows)
+        clamped = max(0, min(int(position or 0), total - 1))
+        row = rows[clamped]
+        from datetime import datetime as _dt
+        now = _dt.now()
+        ts_raw = row.get("chunk_datetime") or ""
+        try:
+            ts = _dt.strptime(ts_raw, "%Y_%m_%d__%H_%M_%S")
+            age_days = (now - ts).total_seconds() / 86400
+            ts_label = ts.strftime("%Y-%m-%d  %H:%M")
+        except ValueError:
+            age_days, ts_label = 0, ts_raw
+        dur = row.get("duration_sec") or 0
+        dur_h = dur / 3600.0 if dur else 0
+        age_label = (f"{age_days:.1f} d old"
+                      if age_days >= 1
+                      else f"{age_days * 24:.0f} h old")
+        warn = age_days >= warn_age_days
+        title = (f"Queue (FIFO · {total} unreviewed for "
+                  f"{animal_label})")
+        body = html.Div([
+            html.Div(ts_label,
+                      style={"color": "#f0f0f5",
+                              "fontWeight": "600",
+                              "fontSize": "14px"}),
+            html.Div(
+                f"{dur_h:.1f} h  ·  {age_label}",
+                style={"color": ("#ff453a" if warn
+                                  else "#888"),
+                       "fontSize": "11px",
+                       "marginTop": "2px"}),
+        ])
+        position_str = f"Position {clamped + 1} of {total}"
+        # If we clamped, write the clamped position back so
+        # the next prev/next click is from a valid base.
+        if clamped != (position or 0):
+            return (title, body, position_str, clamped)
+        return (title, body, position_str, no_update)
+
+    @app.callback(
+        Output("video-queue-position", "data",
+                allow_duplicate=True),
+        Input("video-queue-prev-btn", "n_clicks"),
+        Input("video-queue-next-btn", "n_clicks"),
+        Input("video-queue-animal", "value"),
+        State("video-queue-position", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_queue_arrow(_prev, _next, _animal, pos):
+        trig = callback_context.triggered_id
+        if trig == "video-queue-animal":
+            # Reset position to head when the animal changes.
+            return 0
+        cur = int(pos or 0)
+        if trig == "video-queue-prev-btn":
+            return max(0, cur - 1)
+        if trig == "video-queue-next-btn":
+            # Render-side clamp catches overshoots; this lets
+            # the next callback bump position by 1 without
+            # re-querying the queue size from the click path.
+            return cur + 1
+        return no_update
+
+    @app.callback(
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Input("video-queue-load-btn", "n_clicks"),
+        State("video-queue-animal", "value"),
+        State("video-queue-position", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_queue_load(n, animal_value, position):
+        if not n or not animal_value:
+            return no_update, no_update
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
+            return no_update, no_update
+        email = current_user_email() or ""
+        floor = store.review_backlog_floor()
+        rows = store.get_review_queue(animal_ids, email,
+                                        limit=queue_limit,
+                                        since_iso=floor)
+        if not rows:
+            return no_update, no_update
+        clamped = max(0, min(int(position or 0), len(rows) - 1))
+        row = rows[clamped]
+        # Log a claim event so the PI audit log knows the
+        # reviewer touched this file (parity with the queue-
+        # button click path).
+        store.insert_review_event(int(row["id"]),
+                                    email or "anon", "claim",
+                                    {"source": "queue_card_load"})
+        return row["session_dir"], int(row["id"])
 
     @app.callback(
         Output("video-queue-list", "children"),
