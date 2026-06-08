@@ -499,8 +499,9 @@ def layout(store: Store):
 
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
-                      "Pick which animal you're reviewing. The newest "
-                      "unfinished recording loads automatically."),
+                      "Pick which animal you're reviewing. Recordings "
+                      "show up oldest first (FIFO) so the backlog "
+                      "clears from the front — work top to bottom."),
 
         # --- My queue picker ----------------------------------------- #
         # Card-style row: animal picker on left, queue list on the
@@ -530,10 +531,12 @@ def layout(store: Store):
                                   "marginTop": "4px"}),
             ], style={"flex": "0 0 280px"}),
             html.Div([
-                html.Label("Queue (newest first)",
+                html.Label("Queue (oldest first · FIFO)",
                             style=LABEL_STYLE,
                             title="Recordings for the chosen animal "
                                    "that nobody has finished yet. "
+                                   "Oldest at the top so you clear "
+                                   "the backlog from the front. "
                                    "Click one to load it."),
                 html.Div(id="video-queue-list",
                           style={"maxHeight": "220px",

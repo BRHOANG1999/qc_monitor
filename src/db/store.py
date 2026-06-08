@@ -1460,8 +1460,15 @@ class Store:
                           limit: int = 100,
                           since_iso: str | None = None
                           ) -> list[dict]:
-        """Unreviewed files belonging to *any* of *animal_ids*, newest
-        first.
+        """Unreviewed files belonging to *any* of *animal_ids*, FIFO
+        (oldest chunk first).
+
+        The behavioral-review queue is intentionally FIFO so a
+        reviewer always clears the backlog from the front — the
+        oldest unfinished recording surfaces at the top no matter
+        how many newer chunks have landed since. Pairs with the
+        warn_age / crit_age badges in the UI: the operator sees the
+        loudest-aged item every time.
 
         Rules:
         * File's session_config animal list (channel_names indexed
@@ -1512,7 +1519,7 @@ class Store:
                   AND rs2.user_email = ?
               )
               {extra_where}
-            ORDER BY pf.chunk_datetime DESC
+            ORDER BY pf.chunk_datetime ASC
             LIMIT ?
         """
         params.append((user_email or "").lower())
