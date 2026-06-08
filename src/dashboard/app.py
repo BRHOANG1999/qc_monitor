@@ -24,6 +24,7 @@ from src.utils.filters import (
     SUPPORTED_NOTCH, apply_filter, compute_psd, get_filtered,
 )
 from src.dashboard.auth import register_auth, current_user_email
+from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
@@ -679,6 +680,7 @@ def create_app(config: dict, store: Store) -> Dash:
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
                      disabled=True),  # auto-refresh OFF by default
         html.Div([
+            _kbd.kbd_help_hint(),
             html.Button("Focus", id="focus-toggle-btn",
                         title="Hide header + tabs nav and show only "
                                "the tab content (click again to restore)",
@@ -769,6 +771,13 @@ def create_app(config: dict, store: Store) -> Dash:
         dcc.Interval(id="elapsed-ticker", interval=5000, n_intervals=0),
         # Hidden stores
         dcc.Store(id="selected-session-dir"),
+        # Keyboard-shortcut layer (see src/dashboard/keyboard.py).
+        # kbd-keydown is written by assets/keyboard.js on each
+        # raw keypress; a clientside callback maps it through
+        # kbd-bindings into kbd-event which downstream subscribers
+        # filter by action.
+        *_kbd.kbd_stores(),
+        _kbd.cheatsheet_overlay(),
     ], style={"backgroundColor": COLOR_SURFACE_0,
               "fontFamily": FONT_STACK,
               "color": COLOR_TEXT_PRIMARY,
@@ -866,6 +875,28 @@ def create_app(config: dict, store: Store) -> Dash:
         if cur == (prev or 0):
             return no_update
         return cur
+
+    # Keyboard shortcut bus. assets/keyboard.js pushes raw keydowns
+    # into kbd-keydown; this clientside map looks the key up in
+    # kbd-bindings (Python-owned) and bumps kbd-event with the
+    # action name. Downstream callbacks subscribe to kbd-event and
+    # filter on ``data["action"]``.
+    app.clientside_callback(
+        _kbd.KEY_TO_ACTION_JS,
+        Output("kbd-event", "data"),
+        Input("kbd-keydown", "data"),
+        State("kbd-bindings", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Help overlay open/close. Done in JS because it only flips a
+    # style.display flag -- no need for a server round trip.
+    app.clientside_callback(
+        _kbd.HELP_TOGGLE_JS,
+        Output("kbd-help-overlay", "id"),  # write-only sink
+        Input("kbd-event", "data"),
+        prevent_initial_call=True,
+    )
 
     # Fine-grained refresh: replace just the volatile Overview cards +
     # queue children instead of re-rendering the whole tab. Eliminates
