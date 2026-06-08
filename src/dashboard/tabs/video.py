@@ -484,10 +484,16 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
         name=label,
     ))
     # Cursor placeholder — clientside callback updates the x position.
+    # dragmode='pan' makes click-on-the-trace forgiving: a stray
+    # 1-2px drag while attempting to click no longer activates the
+    # zoom-box (which would swallow the click event before our
+    # marker-add callback sees it). Zoom moves to scrollwheel +
+    # modebar; double-click still resets the view.
     fig.update_layout(
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         height=220,
         margin=dict(l=60, r=20, t=10, b=40),
+        dragmode="pan",
         xaxis=dict(title="Time (s)", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
         yaxis=dict(title="μV", showgrid=True,

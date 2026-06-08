@@ -255,6 +255,20 @@ button:focus-visible {
     filter: brightness(1.1);
 }
 
+/* --- "+ Add event" pulse when the events list is empty --- */
+/* Toggled by a clientside callback in app.py that adds the
+   .qc-pulse class when the events store is empty AND the
+   reviewer just picked "Events seen" -- a visual nudge so the
+   first event isn't missed. */
+@keyframes qc-pulse {
+    0%   { box-shadow: 0 0 0 0   rgba(94, 124, 226, 0.55); }
+    70%  { box-shadow: 0 0 0 12px rgba(94, 124, 226, 0.0); }
+    100% { box-shadow: 0 0 0 0   rgba(94, 124, 226, 0.0); }
+}
+.qc-pulse {
+    animation: qc-pulse 1.4s ease-out infinite;
+}
+
 /* --- Accessibility: honor reduced-motion --- */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {

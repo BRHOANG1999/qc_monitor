@@ -910,6 +910,23 @@ def create_app(config: dict, store: Store) -> Dash:
         prevent_initial_call=True,
     )
 
+    # Pulsate "+ Add event" when the reviewer picked "Events
+    # seen" but hasn't added any events yet -- a one-time visual
+    # nudge so the first event isn't missed.
+    app.clientside_callback(
+        """
+        function (decision, events) {
+            const empty = !events || events.length === 0;
+            const should_pulse = (decision === 'has_events'
+                                    && empty);
+            return should_pulse ? 'qc-pulse' : '';
+        }
+        """,
+        Output("video-events-add-btn", "className"),
+        Input("video-review-decision", "value"),
+        Input("video-events-store", "data"),
+    )
+
     # Undo toast show/hide. Reads the kbd-undo Store, mirrors its
     # presence into the toast's visibility, and auto-clears the
     # Store after the deadline passes.
