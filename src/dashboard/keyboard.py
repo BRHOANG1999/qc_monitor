@@ -259,15 +259,27 @@ def cheatsheet_overlay() -> html.Div:
 
 
 def kbd_help_hint() -> html.Span:
-    """Tiny 'Press ? for shortcuts' chip for the refresh bar."""
+    """Tiny 'Press ? for shortcuts' chip for the refresh bar.
+
+    Click-affordance: a clientside callback registered in app.py
+    listens for ``n_clicks`` on this chip and bumps ``kbd-event``
+    with ``action='toggle_help'`` -- same effect as pressing
+    ``?``. Reviewers who reach for the mouse before the keyboard
+    don't have to know the keyboard exists.
+    """
     return html.Span(
         ["Press ", _kbd_chip("?"), " for shortcuts"],
         id="kbd-help-hint",
+        n_clicks=0,
+        title="Click here (or press ?) to see all keyboard "
+               "shortcuts.",
         style={
             "display": "inline-flex", "alignItems": "center", "gap": SPACE_2,
             "color": COLOR_TEXT_TERTIARY,
             "fontSize": FONT_SIZE_CAPTION,
             "marginRight": SPACE_3,
+            "cursor": "pointer",
+            "userSelect": "none",
         },
     )
 
@@ -329,6 +341,19 @@ function (ev) {
         el.style.display = 'none';
     }
     return window.dash_clientside.no_update;
+}
+"""
+
+
+# Click on the "Press ? for shortcuts" chip emits the same
+# toggle_help action the ? key does. Lets mouse-first reviewers
+# reach the cheat sheet without knowing it has a hotkey.
+HELP_HINT_CLICK_JS = """
+function (n_clicks) {
+    if (!n_clicks) {
+        return window.dash_clientside.no_update;
+    }
+    return {action: 'toggle_help', seq: Date.now()};
 }
 """
 

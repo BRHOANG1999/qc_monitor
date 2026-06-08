@@ -899,6 +899,17 @@ def create_app(config: dict, store: Store) -> Dash:
         prevent_initial_call=True,
     )
 
+    # Click on the "Press ? for shortcuts" chip emits the same
+    # toggle_help action the ? key does. Goes through kbd-event
+    # so the existing HELP_TOGGLE_JS subscriber handles the open/
+    # close; no duplicated DOM logic.
+    app.clientside_callback(
+        _kbd.HELP_HINT_CLICK_JS,
+        Output("kbd-event", "data", allow_duplicate=True),
+        Input("kbd-help-hint", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
     # Undo toast show/hide. Reads the kbd-undo Store, mirrors its
     # presence into the toast's visibility, and auto-clears the
     # Store after the deadline passes.
