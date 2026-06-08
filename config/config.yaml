@@ -233,6 +233,18 @@ review_queue:
     weekday: 4   # 0=Mon ... 4=Fri
     hour: 17
 
+# Event-clip extractor (ffmpeg) for the PI verification flow.
+# Builds a stitched 10+ min clip (5 min before EO to 5 min
+# after BB) for every event the PI opens for detail review.
+# Stream-copy by default for speed; falls back to libx264
+# re-encode when keyframe alignment breaks the copy.
+event_clip:
+  enabled: true
+  cache_dir: secrets/event_clip_cache
+  cache_max_gb: 5
+  ffmpeg_bin: ffmpeg
+  fallback_to_reencode: true
+
 # BHZ_DETECTOR-compatible CSV export. Each completed Mark-done
 # in Video Review appends rows here so the lab's downstream
 # MATLAB pipelines see the same 44-column schema they always

@@ -12,8 +12,9 @@ import sqlite3
 import threading
 import time
 
-from flask import abort, g, send_file
+from flask import abort, g, jsonify, send_file
 
+from src.utils import event_clip as _event_clip
 from src.utils.video import video_path_for_mat, companion_video_paths
 
 logger = logging.getLogger("qc_monitor.dashboard.media")
@@ -188,6 +189,50 @@ def register_media_routes(server, store, config: dict) -> None:
             conditional=True,
             as_attachment=False,
         )
+
+    @server.route("/media/clip/<spec_hash>")
+    def serve_event_clip(spec_hash: str):  # pragma: no cover
+        """Serve a PI event-verification clip by its spec_hash.
+
+        Three response shapes:
+        * 200 + video/mp4 -- the cached clip is ready.
+        * 202 + JSON status -- still extracting or queued; the
+          PI tab polls until status flips to ``done``.
+        * 404 -- the spec_hash was never queued.
+        """
+        if not getattr(g, "user", None):
+            abort(403)
+        if not spec_hash or len(spec_hash) > 64:
+            abort(400, description="bad spec_hash")
+        info = _event_clip.poll_video_clip_status(spec_hash, store)
+        status = info.get("status")
+        if status == "missing":
+            abort(404,
+                    description=f"No clip job for {spec_hash}")
+        if status == "done" and info.get("cache_path"):
+            cache_path = info["cache_path"]
+            if not os.path.exists(cache_path):
+                # Cache file was evicted; respond 410 so the
+                # PI tab can re-submit the job.
+                abort(410,
+                        description="Cached clip evicted; "
+                                     "resubmit the job")
+            return send_file(
+                cache_path,
+                mimetype="video/mp4",
+                conditional=True,
+                as_attachment=False,
+            )
+        if status in ("pending", "running"):
+            return jsonify({"status": status,
+                             "spec_hash": spec_hash,
+                             "error": info.get("error")}), 202
+        if status == "failed":
+            return jsonify({"status": "failed",
+                             "spec_hash": spec_hash,
+                             "error": info.get("error")}), 500
+        abort(500,
+                description=f"unexpected clip status {status}")
 
     @server.route("/media/latest-snapshot.jpg")
     def serve_latest_snapshot():  # pragma: no cover -- exercised by browser
