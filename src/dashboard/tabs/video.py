@@ -40,6 +40,7 @@ from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
 from src.utils.hilbert_envelope import hilbert_envelope_20_200
+from src.utils.peakseek import peakseek
 from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.dashboard.tabs import video_events as _events
@@ -509,24 +510,37 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
     return fig
 
 
+# BHZ_DETECTOR peak-detector defaults (behavioral_seizure_
+# detection.m:237). minpeakdist = fs * 30 * 5 samples (= 150
+# s); cutoff defaults to 0.05 to match the lab's CSV examples.
+_BHZ_CUTOFF: float = 0.05
+_BHZ_MIN_PEAK_DIST_SEC: float = 150.0
+
+
 def _render_hilbert_trace(store, file_id: int,
                             channel: int | None,
                             blank_pre_ms: float = -5.0,
                             blank_post_ms: float = 15.0,
+                            cutoff: float = _BHZ_CUTOFF,
+                            min_peak_dist_sec: float = _BHZ_MIN_PEAK_DIST_SEC,
                             ) -> tuple:
-    """Return (figure, status_text) for the BHZ Hilbert default.
+    """Return (figure, status_text) for the BHZ Hilbert detector.
 
-    Continuous-time 20-200 Hz envelope, plotted as a single
-    Scattergl line over the file's full duration. Re-uses
-    ``_get_blanked_series`` so the stim artifact mask matches
-    the raw LFP above it, and ``envelope`` so the visual
-    decimation is consistent.
+    Full pipeline matches behavioral_seizure_detection.m: load
+    LFP -> tay_preprocess (smoothed Hilbert envelope, 20-200 Hz)
+    -> peakseek (local-maxima + height + min-distance prune) ->
+    overlay the candidate-event markers on the envelope.
+
+    The envelope is drawn as a continuous green line. A dashed
+    horizontal at ``cutoff`` marks the threshold. Each detected
+    peak gets a magenta downward triangle + an annotation line
+    so the reviewer can read off the candidate count at a
+    glance.
 
     ``blank_pre_ms`` / ``blank_post_ms`` default to the same
     window the LFP path uses (-5 / 15 ms around each stim
-    pulse). The caller can pass the live config values via
-    ``feature_analysis.stim_artifact_*`` for parity with the
-    raw trace above.
+    pulse); ``cutoff`` and ``min_peak_dist_sec`` default to the
+    lab's BHZ_DETECTOR defaults (0.05 and 150 s).
     """
     assert isinstance(file_id, int), "file_id must be int"
     file_path = _file_path_for_id(store, file_id)
@@ -553,19 +567,65 @@ def _render_hilbert_trace(store, file_id: int,
         return (_empty_lfp_fig(
             f"Couldn't load LFP for Hilbert: {e}"), "")
     env = hilbert_envelope_20_200(series, fs)
+    # BHZ peak detection runs on the FULL-resolution envelope
+    # before decimation; sample indices then translate to seconds
+    # the same way the LFP cursor does.
+    min_peak_dist = max(1, int(round(fs * min_peak_dist_sec)))
+    peak_locs, peak_heights = peakseek(
+        env, minpeakdist=min_peak_dist, minpeakh=float(cutoff),
+    )
+    peak_times = peak_locs.astype(np.float64) / float(fs)
+
     target_bins = choose_target_bins(len(env)) or 4000
     t, display, _decim = envelope(env, fs, target_bins, t_start=0.0)
     fig = _build_lfp_figure(
         t, display,
         "Hilbert envelope (20-200 Hz)",
     )
-    # Recolor to distinguish from the raw LFP above.
     fig.data[0].line.color = "#30d158"
     fig.data[0].hovertemplate = (
         "t=%{x:.2f}s<br>env=%{y:.2f}<extra></extra>"
     )
-    status = (f"20-200 Hz Hilbert envelope · fs={int(fs)} Hz · "
-               f"{len(env)/fs:.1f} s")
+    # Threshold line: horizontal dashed at y = cutoff. The
+    # cursor lives in shapes[0]; the threshold takes shapes[1].
+    fig.layout.shapes = list(fig.layout.shapes or []) + [dict(
+        type="line", xref="paper", yref="y",
+        x0=0, x1=1, y0=cutoff, y1=cutoff,
+        line=dict(color="#ff9f0a", width=1, dash="dash"),
+        opacity=0.8,
+    )]
+    # Threshold annotation in the right margin.
+    fig.add_annotation(
+        x=1.0, y=cutoff, xref="paper", yref="y",
+        text=f"cutoff = {cutoff:.3g}",
+        showarrow=False, xanchor="right", yanchor="bottom",
+        font=dict(size=10, color="#ff9f0a"),
+    )
+    # Candidate-event markers: magenta downward triangles
+    # plotted ABOVE the trace's local height so the reviewer
+    # can scan for them. NASA Rule 3: cap at 256 candidates
+    # per render (any more and the plot is unreadable anyway).
+    n_candidates = int(min(len(peak_times), 256))
+    if n_candidates:
+        marker_y = float(np.max(display) * 1.05
+                          if len(display) else cutoff)
+        fig.add_trace(go.Scattergl(
+            x=peak_times[:n_candidates],
+            y=np.full(n_candidates, marker_y),
+            mode="markers",
+            marker=dict(symbol="triangle-down", size=10,
+                         color="#ff2d92", line=dict(width=0)),
+            hovertemplate="candidate @ t=%{x:.2f}s<extra></extra>",
+            name="BHZ candidate",
+            showlegend=False,
+        ))
+    status = (
+        f"BHZ detection · cutoff={cutoff:.3g} · "
+        f"min_dist={int(min_peak_dist_sec)}s · "
+        f"{len(peak_times)} candidate"
+        f"{'' if len(peak_times) == 1 else 's'} · "
+        f"{len(env)/fs:.1f} s @ {int(fs)} Hz"
+    )
     return (fig, status)
 
 
