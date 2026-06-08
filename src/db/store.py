@@ -1610,6 +1610,39 @@ class Store:
                 break
         return out
 
+    def neighbor_queue_file(self, *, current_file_id: int | None,
+                              animal_ids: list[str],
+                              user_email: str,
+                              direction: int,
+                              since_iso: str | None = None,
+                              limit: int = 100,
+                              ) -> int | None:
+        """File id +/- one slot from ``current_file_id`` in the
+        FIFO queue. Returns ``None`` when there's nowhere to go.
+
+        Powers ``J`` / ``K`` queue cycling and the auto-advance
+        after ``N``-mark-done. If ``current_file_id`` isn't in
+        the queue (e.g. it was just finalised), we return the
+        queue head for direction=+1 / the queue tail for -1, so
+        the reviewer never gets stuck.
+        """
+        assert direction in (-1, 1), "direction must be -1 or +1"
+        assert isinstance(animal_ids, list), "animal_ids list"
+        rows = self.get_review_queue(
+            animal_ids, user_email,
+            limit=limit, since_iso=since_iso,
+        )
+        if not rows:
+            return None
+        ids = [int(r["id"]) for r in rows]
+        if current_file_id is None or int(current_file_id) not in ids:
+            return ids[0] if direction == 1 else ids[-1]
+        idx = ids.index(int(current_file_id))
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(ids):
+            return None
+        return ids[new_idx]
+
     def review_backlog_summary(self, since_iso: str | None = None
                                 ) -> list[dict]:
         """Per-animal backlog snapshot for the PI tab + weekly digest.

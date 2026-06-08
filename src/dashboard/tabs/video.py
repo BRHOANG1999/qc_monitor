@@ -1403,6 +1403,60 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     {"source": "queue_click"})
         return row["session_dir"], int(file_id)
 
+    # ---- Hotkey: J / K (or arrow up / down) cycles the queue ---- #
+    # Subscribes to the kbd-event bus from src/dashboard/keyboard.py
+    # and translates next/prev actions into a session+file dropdown
+    # update -- the same effect as clicking a queue button, so the
+    # whole downstream cascade (video, LFP, analysis, review reset)
+    # fires without any extra wiring.
+    @app.callback(
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        State("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _hotkey_queue_cycle(ev, current_file_id, animal_value):
+        if not ev or ev.get("action") not in ("next", "prev"):
+            return no_update, no_update
+        if not animal_value:
+            return no_update, no_update
+        if animal_value.startswith("_pool_"):
+            animal_ids = [animal_value[len("_pool_"):]]
+        else:
+            animal_ids = [animal_value]
+        direction = 1 if ev["action"] == "next" else -1
+        floor = store.review_backlog_floor()
+        email = current_user_email() or ""
+        new_file_id = store.neighbor_queue_file(
+            current_file_id=(int(current_file_id)
+                              if current_file_id else None),
+            animal_ids=animal_ids, user_email=email,
+            direction=direction,
+            since_iso=floor, limit=queue_limit,
+        )
+        if new_file_id is None:
+            return no_update, no_update
+        conn = store._connect()
+        try:
+            row = conn.execute(
+                "SELECT session_dir FROM processed_files "
+                "WHERE id = ?", (int(new_file_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return no_update, no_update
+        # Log a claim event so the PI audit log knows the
+        # reviewer touched this file even if they hop past it.
+        store.insert_review_event(int(new_file_id), email or "anon",
+                                    "claim",
+                                    {"source": f"hotkey_{ev['action']}"})
+        return row["session_dir"], int(new_file_id)
+
     # ---- Step 4: reveal marker editor only when "Events" picked ---- #
     @app.callback(
         Output("video-review-marker-group", "style"),
