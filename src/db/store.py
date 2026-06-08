@@ -31,8 +31,80 @@ class Store:
         }
         if "user_email" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN user_email TEXT")
+        # PI verification rollout migration: widen the review_state
+        # status CHECK + promote pre-existing finalised rows to
+        # 'pi_approved' (their CSV row was already written under the
+        # pre-PI flow). SQLite can't ALTER a CHECK in place, so we
+        # detect-and-rebuild only when the old constraint is on disk.
+        self._migrate_review_state_pi_statuses(conn)
         conn.commit()
         conn.close()
+
+    def _migrate_review_state_pi_statuses(self, conn) -> None:
+        """Promote pre-existing review_state rows to the PI flow.
+
+        Detects the old CHECK constraint via sqlite_master.sql and
+        rebuilds the table only when it's the pre-PI shape. Idempotent
+        across boots; once migrated the rebuild is skipped.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='review_state'"
+        ).fetchone()
+        if not row:
+            return
+        current_sql = (row["sql"] or "").lower()
+        if "pi_approved" in current_sql:
+            return  # already migrated
+        # Rebuild with the wider CHECK + promote in one go.
+        conn.executescript(
+            """
+            CREATE TABLE review_state_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL
+                    REFERENCES processed_files(id),
+                user_email TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('claimed', 'no_events',
+                                      'has_events', 'abandoned',
+                                      'pending_pi_review',
+                                      'pi_approved',
+                                      'pi_flagged')),
+                markers_json TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- Promote: every row whose pre-PI status was a finalised
+            -- one is treated as already-PI-approved (the CSV row was
+            -- written under the old _save_review path). Claimed +
+            -- abandoned stay where they are.
+            INSERT INTO review_state_new
+              (id, file_id, user_email, status, markers_json, note,
+               created_at, updated_at)
+            SELECT id, file_id, user_email,
+                   CASE WHEN status IN ('no_events', 'has_events')
+                        THEN 'pi_approved'
+                        ELSE status END,
+                   markers_json, note, created_at, updated_at
+              FROM review_state;
+            DROP TABLE review_state;
+            ALTER TABLE review_state_new RENAME TO review_state;
+            CREATE INDEX IF NOT EXISTS idx_review_state_file
+                ON review_state(file_id);
+            CREATE INDEX IF NOT EXISTS idx_review_state_user
+                ON review_state(user_email);
+            CREATE INDEX IF NOT EXISTS idx_review_state_status
+                ON review_state(status);
+            INSERT INTO review_event_log
+              (file_id, user_email, action, payload_json, at)
+            SELECT file_id, user_email, 'pi_migration_auto',
+                   '{"reason": "pre-PI promote to pi_approved"}',
+                   datetime('now')
+              FROM review_state
+              WHERE status = 'pi_approved';
+            """
+        )
 
     # ------------------------------------------------------------------ #
     #  settings_versions
@@ -1573,16 +1645,28 @@ class Store:
               ON sc.session_dir = pf.session_dir
             WHERE pf.has_video = 1
               AND ({like_clauses})
+              -- A file is OUT of the queue once it's been
+              -- finalised by anyone (legacy no_events /
+              -- has_events) OR submitted to the PI
+              -- (pending_pi_review, pi_approved). pi_flagged
+              -- INTENTIONALLY does NOT appear here: the PI's
+              -- "send back for re-review" puts the file back
+              -- in the undergrad's queue. The pi_flagged row's
+              -- note is surfaced by the queue-card renderer.
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs
                 WHERE rs.file_id = pf.id
-                  AND rs.status IN ('no_events', 'has_events')
+                  AND rs.status IN ('no_events', 'has_events',
+                                     'pending_pi_review',
+                                     'pi_approved')
               )
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs2
                 WHERE rs2.file_id = pf.id
                   AND rs2.user_email = ?
-                  AND rs2.status IN ('no_events', 'has_events')
+                  AND rs2.status IN ('no_events', 'has_events',
+                                      'pending_pi_review',
+                                      'pi_approved')
               )
               {extra_where}
             ORDER BY pf.chunk_datetime ASC
@@ -1674,6 +1758,293 @@ class Store:
         finally:
             conn.close()
         return int(row["n"]) if row else 0
+
+    # ------------------------------------------------------------------ #
+    #  PI verification layer (Track A2 of the PI verification plan)
+    # ------------------------------------------------------------------ #
+
+    def pi_pending_files(self, *,
+                           animal_id: str | None = None,
+                           limit: int = 200) -> list[dict]:
+        """Return files in ``pending_pi_review``, oldest first.
+
+        Each row includes the deserialised events list so the PI
+        tab can render without a second query. ``animal_id``
+        narrows to a single animal prefix (matched against the
+        session_config channel naming convention).
+        """
+        assert isinstance(limit, int) and limit > 0, "limit > 0"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT rs.id AS state_id, rs.file_id,
+                          rs.user_email, rs.status,
+                          rs.markers_json, rs.note,
+                          rs.created_at AS submitted_at,
+                          pf.file_path, pf.session_dir,
+                          pf.chunk_datetime, pf.duration_sec,
+                          pf.sampling_rate
+                   FROM review_state rs
+                   JOIN processed_files pf
+                     ON pf.id = rs.file_id
+                   WHERE rs.status = 'pending_pi_review'
+                   ORDER BY rs.created_at ASC, rs.id ASC
+                   LIMIT ?""",
+                (limit * 4,),  # over-fetch; animal filter prunes
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                events = json.loads(r["markers_json"] or "[]")
+            except json.JSONDecodeError:
+                events = []
+            if animal_id:
+                names = self._channel_names_for_session(
+                    r["session_dir"])
+                if not self._session_has_animal(names, animal_id):
+                    continue
+            d = dict(r)
+            d["events"] = events
+            out.append(d)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _channel_names_for_session(self, session_dir: str
+                                      ) -> list[str]:
+        """Helper for animal-prefix filtering."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT channel_names FROM session_config "
+                "WHERE session_dir = ?", (session_dir,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["channel_names"]:
+            return []
+        try:
+            return list(json.loads(row["channel_names"]))
+        except json.JSONDecodeError:
+            return []
+
+    @staticmethod
+    def _session_has_animal(channel_names: list[str],
+                              animal_id: str) -> bool:
+        from src.utils.animal import split_animal_electrode
+        max_iter = 64  # NASA Rule 2
+        for i, name in enumerate(channel_names):
+            assert i < max_iter, "channel scan runaway"
+            if not isinstance(name, str):
+                continue
+            a, _ = split_animal_electrode(name)
+            if a == animal_id:
+                return True
+        return False
+
+    def pi_approve(self, file_id: int, pi_email: str,
+                     *,
+                     events_override: list[dict] | None = None,
+                     ) -> int:
+        """Move a file from ``pending_pi_review`` to ``pi_approved``.
+
+        When the PI nudges or removes events inline, pass the new
+        list as ``events_override``; the original undergrad
+        markers are captured in the audit row's payload_json so
+        the pre-PI version stays queryable.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert pi_email, "pi_email required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id, markers_json FROM review_state
+                   WHERE file_id = ?
+                     AND status = 'pending_pi_review'
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            pre_edit = row["markers_json"]
+            if events_override is not None:
+                new_payload = json.dumps(events_override)
+                conn.execute(
+                    """UPDATE review_state
+                       SET status='pi_approved',
+                           markers_json=?, updated_at=?
+                       WHERE id=?""",
+                    (new_payload, now, row["id"]),
+                )
+            else:
+                conn.execute(
+                    """UPDATE review_state
+                       SET status='pi_approved', updated_at=?
+                       WHERE id=?""",
+                    (now, row["id"]),
+                )
+            payload = {
+                "pi_email": pi_email.lower(),
+                "edited": events_override is not None,
+            }
+            if events_override is not None:
+                payload["pre_edit_markers_json"] = pre_edit
+            conn.execute(
+                """INSERT INTO review_event_log
+                   (file_id, user_email, action, payload_json, at)
+                   VALUES (?, ?, 'pi_approve', ?, ?)""",
+                (file_id, pi_email.lower(),
+                 json.dumps(payload), now),
+            )
+            conn.commit()
+            return int(row["id"])
+        finally:
+            conn.close()
+
+    def pi_flag(self, file_id: int, pi_email: str,
+                  *, note: str,
+                  event_indices: list[int] | None = None) -> int:
+        """Send a file back to the undergrad's queue with a note.
+
+        ``note`` shows up on the queue card. ``event_indices``
+        marks WHICH events the PI wants re-checked; an empty list
+        means the whole file needs a second look.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert pi_email, "pi_email required"
+        assert isinstance(note, str), "note must be str"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id FROM review_state
+                   WHERE file_id = ?
+                     AND status IN ('pending_pi_review',
+                                     'pi_approved')
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            conn.execute(
+                """UPDATE review_state
+                   SET status='pi_flagged', note=?, updated_at=?
+                   WHERE id=?""",
+                (note, now, row["id"]),
+            )
+            conn.execute(
+                """INSERT INTO review_event_log
+                   (file_id, user_email, action, payload_json, at)
+                   VALUES (?, ?, 'pi_flag', ?, ?)""",
+                (file_id, pi_email.lower(),
+                 json.dumps({"note": note,
+                              "event_indices":
+                                  list(event_indices or [])}),
+                 now),
+            )
+            conn.commit()
+            return int(row["id"])
+        finally:
+            conn.close()
+
+    def pi_bulk_approve(self, file_ids: list[int],
+                          pi_email: str) -> int:
+        """Approve many files; emits one ``pi_bulk_approve`` row
+        in addition to a per-file ``pi_approve`` entry each.
+        """
+        assert isinstance(file_ids, list), "file_ids must be list"
+        assert pi_email, "pi_email required"
+        max_iter = 1024
+        n_done = 0
+        for i, fid in enumerate(file_ids):
+            assert i < max_iter, "bulk loop runaway"
+            if self.pi_approve(int(fid), pi_email):
+                n_done += 1
+        if n_done:
+            self.insert_review_event(
+                int(file_ids[0]), pi_email,
+                "pi_bulk_approve",
+                {"file_ids": [int(f) for f in file_ids],
+                 "n_approved": n_done},
+            )
+        return n_done
+
+    def pi_bulk_flag(self, file_ids: list[int], pi_email: str,
+                       *, note: str) -> int:
+        """Flag many files with a shared note."""
+        assert isinstance(file_ids, list), "file_ids must be list"
+        assert pi_email, "pi_email required"
+        max_iter = 1024
+        n_done = 0
+        for i, fid in enumerate(file_ids):
+            assert i < max_iter, "bulk loop runaway"
+            if self.pi_flag(int(fid), pi_email, note=note):
+                n_done += 1
+        if n_done:
+            self.insert_review_event(
+                int(file_ids[0]), pi_email,
+                "pi_bulk_flag",
+                {"file_ids": [int(f) for f in file_ids],
+                 "n_flagged": n_done, "note": note},
+            )
+        return n_done
+
+    def get_adjacent_files(self, file_id: int,
+                              direction: str) -> dict | None:
+        """Return the previous or next ``processed_files`` row in
+        the same ``session_dir`` by ``chunk_datetime``.
+
+        Powers the event-clip stitcher when the EO-5min /
+        BB+5min window crosses a recording boundary.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert direction in ("prev", "next"), \
+            "direction in {'prev', 'next'}"
+        conn = self._connect()
+        try:
+            base = conn.execute(
+                """SELECT session_dir, chunk_datetime
+                   FROM processed_files WHERE id = ?""",
+                (file_id,),
+            ).fetchone()
+            if not base:
+                return None
+            cmp = "<" if direction == "prev" else ">"
+            order = "DESC" if direction == "prev" else "ASC"
+            row = conn.execute(
+                f"""SELECT id, file_path, session_dir,
+                           chunk_datetime, duration_sec,
+                           sampling_rate
+                    FROM processed_files
+                    WHERE session_dir = ?
+                      AND chunk_datetime {cmp} ?
+                    ORDER BY chunk_datetime {order}
+                    LIMIT 1""",
+                (base["session_dir"], base["chunk_datetime"]),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def file_row(self, file_id: int) -> dict | None:
+        """Single ``processed_files`` row lookup. Used by the
+        event-clip resolver."""
+        assert isinstance(file_id, int), "file_id must be int"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id, file_path, session_dir,
+                          chunk_datetime, duration_sec,
+                          sampling_rate
+                   FROM processed_files WHERE id = ?""",
+                (file_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def reopen_review(self, file_id: int, user_email: str) -> bool:
         """Flip the most recent ``no_events`` / ``has_events`` row

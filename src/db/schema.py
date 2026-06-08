@@ -347,7 +347,9 @@ CREATE TABLE IF NOT EXISTS review_state (
     user_email TEXT NOT NULL,
     status TEXT NOT NULL
         CHECK(status IN ('claimed', 'no_events',
-                          'has_events', 'abandoned')),
+                          'has_events', 'abandoned',
+                          'pending_pi_review',
+                          'pi_approved', 'pi_flagged')),
     markers_json TEXT,
     note TEXT,
     created_at TEXT NOT NULL,
@@ -372,4 +374,31 @@ CREATE INDEX IF NOT EXISTS idx_review_event_log_at
     ON review_event_log(at);
 CREATE INDEX IF NOT EXISTS idx_review_event_log_user
     ON review_event_log(user_email);
+
+-- ----------------------------------------------------------------------
+-- event_clip_job: ffmpeg job queue + cache index. The PI tab kicks off
+-- a video-clip extraction (5 min before EO to 5 min after BB) and
+-- polls this table for completion. spec_hash is the SHA-256 of the
+-- normalised ClipSpec + segment list so cache hits across PIs are
+-- instant.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS event_clip_job (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spec_hash TEXT UNIQUE NOT NULL,
+    file_id INTEGER REFERENCES processed_files(id),
+    eo_sec REAL,
+    bb_sec REAL,
+    status TEXT NOT NULL
+        CHECK(status IN ('pending', 'running',
+                          'done', 'failed')),
+    cache_path TEXT,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_clip_job_status
+    ON event_clip_job(status);
+CREATE INDEX IF NOT EXISTS idx_event_clip_job_hash
+    ON event_clip_job(spec_hash);
 """
