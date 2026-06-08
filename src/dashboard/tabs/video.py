@@ -163,6 +163,27 @@ def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
     return set()
 
 
+def _should_stim_blank(channel: int,
+                        stim_copy: set[int]) -> bool:
+    """Whether the display trace for *channel* should be stim-blanked.
+
+    The lab's recording rig wires each animal's LFP electrode
+    immediately after its corresponding stim-copy channel. The shared
+    stim artifact bleeds into the immediately-following LFP via
+    capacitive coupling but the next LFP (two slots after stim_copy)
+    is far enough away to read cleanly. So the rule is: blank iff
+    ``channel - 1`` is a stim-copy channel AND ``channel`` itself
+    isn't.
+
+    Example: channel_names ``["stimCopy", "BCH061SLM", "stimCopy",
+    "BCH062SR", "BCH062SLM"]`` -> blank Ch1 and Ch3 only. Ch4 is
+    two slots away from a stim-copy so it stays raw.
+    """
+    if channel in stim_copy:
+        return False
+    return (channel - 1) in stim_copy
+
+
 def _session_dir_for_file(store: Store, file_id: int) -> str | None:
     conn = store._connect()
     try:
@@ -1716,15 +1737,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return (_empty_lfp_fig("File not found in DB."),
                     "", no_update, 0.0)
 
-        # Decide whether to apply stim blanking. Only blank channels
-        # that aren't themselves the stim source — and only if there
-        # are actually detected stim events on this file.
+        # Stim-blank ONLY the LFP channel that sits directly after a
+        # stim_copy channel in the channel list. The stim artifact
+        # cross-talks into the immediately-following electrode via
+        # capacitive coupling; channels further along read cleanly.
+        # Stim-copy channels themselves are never blanked (you'd
+        # erase the signal you want to see).
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
         is_stim_copy = channel in stim_copy
-        stim_times = (np.asarray([], dtype=np.float64)
-                      if is_stim_copy
-                      else _stim_times_for_file(store, file_id))
+        do_blank = _should_stim_blank(channel, stim_copy)
+        stim_times = (_stim_times_for_file(store, file_id)
+                       if do_blank
+                       else np.asarray([], dtype=np.float64))
 
         try:
             t, signal, duration, n_blanked = _decimated_lfp(
@@ -1765,6 +1790,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         status_bits = [f"{duration:.1f}s", f"{len(t):,} display points"]
         if is_stim_copy:
             status_bits.append("stim-copy channel · not blanked")
+        elif not do_blank:
+            # Channel exists but isn't directly after a stim_copy
+            # contact, so it stays raw even when stim events exist.
+            status_bits.append(
+                "two slots from stim-copy · not blanked")
         elif n_blanked:
             status_bits.append(
                 f"stim-blanked: {n_blanked} pulses "
@@ -2095,10 +2125,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
-        is_stim_copy = channel in stim_copy
-        stim_times = (np.asarray([], dtype=np.float64)
-                      if is_stim_copy
-                      else _stim_times_for_file(store, file_id))
+        # Mirror the same "blank only the LFP directly after a
+        # stim_copy contact" rule from _update_lfp so the
+        # re-decimated zoom view shows the same NaN gaps the wider
+        # view does. Anything else (stim-copy itself, or an LFP two
+        # slots away) re-decimates raw.
+        do_blank = _should_stim_blank(channel, stim_copy)
+        stim_times = (_stim_times_for_file(store, file_id)
+                       if do_blank
+                       else np.asarray([], dtype=np.float64))
 
         try:
             series, fs, _ = _get_blanked_series(
