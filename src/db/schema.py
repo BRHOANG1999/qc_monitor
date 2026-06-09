@@ -376,6 +376,51 @@ CREATE INDEX IF NOT EXISTS idx_review_event_log_user
     ON review_event_log(user_email);
 
 -- ----------------------------------------------------------------------
+-- envelope_peak_cache: per-(file, channel, cutoff) peakseek result so
+-- the PI's Mass Analyze panel can re-sweep thresholds without paying
+-- the FFT cost twice. UNIQUE constraint makes the cache-aside lookup a
+-- single indexed read.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS envelope_peak_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    channel INTEGER NOT NULL,
+    cutoff REAL NOT NULL,
+    min_peak_dist_sec REAL NOT NULL DEFAULT 150.0,
+    n_peaks INTEGER NOT NULL,
+    peak_times_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(file_id, channel, cutoff, min_peak_dist_sec)
+);
+CREATE INDEX IF NOT EXISTS idx_envelope_peak_cache_lookup
+    ON envelope_peak_cache(file_id, channel, cutoff);
+
+-- ----------------------------------------------------------------------
+-- mass_analyze_job: background scan queue + progress for the PI's
+-- Mass Analyze panel. One row per (PI, animal, cutoff) run; the panel
+-- polls scanned_files / n_zero_peaks / n_with_peaks for live progress.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mass_analyze_job (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pi_email TEXT NOT NULL,
+    animal_id TEXT NOT NULL,
+    cutoff REAL NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('pending', 'running',
+                          'done', 'failed', 'cancelled')),
+    total_files INTEGER,
+    scanned_files INTEGER DEFAULT 0,
+    n_zero_peaks INTEGER DEFAULT 0,
+    n_with_peaks INTEGER DEFAULT 0,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mass_analyze_job_status
+    ON mass_analyze_job(status);
+
+-- ----------------------------------------------------------------------
 -- event_clip_job: ffmpeg job queue + cache index. The PI tab kicks off
 -- a video-clip extraction (5 min before EO to 5 min after BB) and
 -- polls this table for completion. spec_hash is the SHA-256 of the

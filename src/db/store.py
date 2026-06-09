@@ -37,6 +37,20 @@ class Store:
         # pre-PI flow). SQLite can't ALTER a CHECK in place, so we
         # detect-and-rebuild only when the old constraint is on disk.
         self._migrate_review_state_pi_statuses(conn)
+        # Reap mass_analyze_job rows stuck in 'running' across a
+        # restart -- without this they'd never re-progress because
+        # the worker that started them no longer exists. Safe to
+        # run unconditionally; idempotent on a clean shutdown.
+        try:
+            conn.execute(
+                """UPDATE mass_analyze_job
+                   SET status='failed', error='worker restart',
+                       finished_at=datetime('now')
+                   WHERE status IN ('pending', 'running')"""
+            )
+        except Exception:
+            # Table doesn't exist yet on a brand-new DB; fine.
+            pass
         conn.commit()
         conn.close()
 
