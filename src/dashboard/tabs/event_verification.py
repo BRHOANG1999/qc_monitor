@@ -32,6 +32,7 @@ from src.dashboard.auth import current_user_email
 from src.dashboard.tabs.review_status import _is_pi
 from src.utils import bhz_csv as _bhz_csv
 from src.utils import event_clip as _event_clip
+from src.utils import mass_analyze as _mass_analyze
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.utils.decimate import envelope, choose_target_bins
 
@@ -89,6 +90,12 @@ def layout(store: Store, config: dict | None = None):
                         if not ffmpeg_ok
                         else "1px solid rgba(48,209,88,0.30)",
                     "borderRadius": "6px"}),
+        # Mass Analyze panel (collapsed-by-default details
+        # card). Runs hilbert_envelope_20_200 + peakseek over
+        # every pending file for an animal at the chosen
+        # cutoff; zero-peak files get auto-cleared to
+        # pending_pi_review on Confirm.
+        _mass_analyze_panel(store),
         # Bulk-action bar.
         html.Div([
             html.Button(
@@ -211,6 +218,115 @@ def _btn_style(*, accent: bool = False, warning: bool = False,
         base["background"] = "#262638"
         base["color"] = "#cfd0d6"
     return base
+
+
+# --------------------------------------------------------------- #
+# Mass Analyze panel (PI bulk Hilbert/peakseek pre-screen)
+# --------------------------------------------------------------- #
+
+def _mass_analyze_panel(store) -> html.Details:
+    """Collapsed-by-default details card. The PI picks animal +
+    cutoff, clicks Scan, watches progress, and clicks Confirm
+    to auto-clear zero-peak files."""
+    animals = sorted(store.list_all_animals())
+    return html.Details([
+        html.Summary([
+            html.Span("Mass Analyze pending files ",
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+            html.Span("(PI bulk pre-screen)",
+                       style={"color": "#a0a0b0",
+                               "fontSize": "11px",
+                               "marginLeft": "6px"}),
+        ], style={"cursor": "pointer",
+                   "marginBottom": "8px"}),
+        html.Div([
+            html.Div(
+                "Hilbert peakseek runs on every pending "
+                "file's first animal channel at the "
+                "threshold below. Files with zero peaks "
+                "above the threshold get an automatic "
+                "'no events seen' submission you can "
+                "bulk-approve in the list. Files with any "
+                "peaks above the threshold stay in the "
+                "queue for normal scoring. The threshold "
+                "is the same BHZ cutoff column the CSV "
+                "records.",
+                style={"color": "#a0a0b0",
+                        "fontSize": "11px",
+                        "padding": "8px 12px",
+                        "background": "rgba(94,124,226,0.04)",
+                        "border":
+                            "1px solid rgba(94,124,226,0.18)",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px"}),
+            html.Div([
+                html.Label("Animal:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="evtv-ma-animal-dropdown",
+                    options=[{"label": a, "value": a}
+                             for a in animals],
+                    placeholder="Pick an animal",
+                    style={"flex": "1 1 220px",
+                            "minWidth": "200px"},
+                    className="dark-dropdown",
+                ),
+                html.Label("Cutoff:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginLeft": "14px",
+                                    "marginRight": "6px"}),
+                dcc.Input(
+                    id="evtv-ma-cutoff-input",
+                    type="number", min=0, step=0.005,
+                    value=0.05,
+                    style={"flex": "0 0 110px",
+                            "padding": "6px 10px",
+                            "background": "#262638",
+                            "color": "#f0f0f5",
+                            "border":
+                                "1px solid rgba(255,255,255,0.10)",
+                            "borderRadius": "4px",
+                            "fontSize": "12px"}),
+                html.Button(
+                    "Scan files",
+                    id="evtv-ma-scan-btn", n_clicks=0,
+                    style=_btn_style(accent=True)),
+                html.Button(
+                    "Cancel scan",
+                    id="evtv-ma-cancel-btn", n_clicks=0,
+                    style=_btn_style(secondary=True)),
+            ], style={"display": "flex",
+                       "alignItems": "center",
+                       "gap": "8px",
+                       "flexWrap": "wrap",
+                       "marginBottom": "10px"}),
+            html.Div(id="evtv-ma-progress",
+                      style={"color": "#a0a0b0",
+                              "fontSize": "12px",
+                              "minHeight": "16px",
+                              "marginBottom": "8px"}),
+            html.Div(id="evtv-ma-summary",
+                      style={"marginBottom": "10px"}),
+            html.Div(id="evtv-ma-confirm-row",
+                      style={"display": "flex", "gap": "8px",
+                              "alignItems": "center"}),
+            # State stores + polling.
+            dcc.Store(id="evtv-ma-job-id", data=None),
+            dcc.Interval(id="evtv-ma-poll",
+                           interval=1500, n_intervals=0,
+                           disabled=True),
+        ]),
+    ], open=False,
+       style={"padding": "12px 14px",
+               "background": "#13131f",
+               "border":
+                   "1px solid rgba(255,255,255,0.06)",
+               "borderRadius": "8px",
+               "marginBottom": "14px"})
 
 
 # --------------------------------------------------------------- #
@@ -1046,6 +1162,194 @@ def register_callbacks(app, store, config: dict) -> None:
                          None, new_style)
             return (summary, None, new_style)
         return (no_update, no_update, no_update)
+
+    # ---- Mass Analyze: 4 callbacks ---- #
+    @app.callback(
+        Output("evtv-ma-job-id", "data"),
+        Output("evtv-ma-poll", "disabled"),
+        Output("evtv-ma-progress", "children",
+                allow_duplicate=True),
+        Input("evtv-ma-scan-btn", "n_clicks"),
+        State("evtv-ma-animal-dropdown", "value"),
+        State("evtv-ma-cutoff-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_ma_scan(n_clicks, animal_id, cutoff):
+        if not n_clicks:
+            return no_update, no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return None, True, "Not authorised."
+        if not animal_id:
+            return (None, True,
+                     "Pick an animal first.")
+        try:
+            cutoff = float(cutoff)
+        except (TypeError, ValueError):
+            return (None, True,
+                     f"Invalid cutoff: {cutoff!r}")
+        if cutoff <= 0:
+            return (None, True,
+                     "Cutoff must be > 0.")
+        try:
+            job_id = _mass_analyze.create_job(
+                store, email, animal_id, cutoff)
+        except Exception as e:
+            logger.exception("create_job failed")
+            return (None, True, f"Failed to start: {e}")
+        return job_id, False, "Scan queued…"
+
+    @app.callback(
+        Output("evtv-ma-progress", "children"),
+        Output("evtv-ma-summary", "children"),
+        Output("evtv-ma-confirm-row", "children"),
+        Output("evtv-ma-poll", "disabled",
+                allow_duplicate=True),
+        Input("evtv-ma-poll", "n_intervals"),
+        Input("evtv-ma-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_ma_poll(_n, job_id):
+        if not job_id:
+            return ("", "", [], True)
+        job = _mass_analyze.get_job(store, int(job_id))
+        if not job:
+            return ("Job vanished.", "", [], True)
+        status = job.get("status") or "?"
+        scanned = int(job.get("scanned_files") or 0)
+        total = int(job.get("total_files") or 0)
+        n_zero = int(job.get("n_zero_peaks") or 0)
+        n_with = int(job.get("n_with_peaks") or 0)
+        progress = (
+            f"{status}  ·  scanned {scanned}"
+            + (f" of {total}" if total else "")
+            + f"  ·  zero-peak: {n_zero}  ·  "
+              f"≥1 peak: {n_with}"
+        )
+        summary = []
+        confirm_row = []
+        polling_disabled = status in ("done", "failed",
+                                         "cancelled")
+        if status == "done":
+            summary = html.Div([
+                html.Div([
+                    html.Span("✓",
+                               style={"color": "#30d158",
+                                       "marginRight": "6px"}),
+                    html.Span(
+                        f"{n_zero} files with 0 peaks above "
+                        f"{job['cutoff']:g}  ·  will mark as "
+                        "no-events pending PI review",
+                        style={"color": "#30d158",
+                                "fontWeight": "600"}),
+                ], style={"fontSize": "12px",
+                           "marginBottom": "4px"}),
+                html.Div([
+                    html.Span("•",
+                               style={"color": "#a0a0b0",
+                                       "marginRight": "6px"}),
+                    html.Span(
+                        f"{n_with} files with ≥1 peak  ·  "
+                        "stay in queue for normal review",
+                        style={"color": "#a0a0b0"}),
+                ], style={"fontSize": "12px"}),
+            ])
+            confirm_row = [
+                html.Button(
+                    f"Confirm threshold → mark {n_zero} files "
+                    "as no-events pending PI review",
+                    id="evtv-ma-confirm-btn", n_clicks=0,
+                    style=_btn_style(accent=True)
+                    if n_zero > 0
+                    else _btn_style(secondary=True),
+                    disabled=(n_zero == 0)),
+                html.Button(
+                    "Discard scan",
+                    id="evtv-ma-discard-btn", n_clicks=0,
+                    style=_btn_style(secondary=True)),
+            ]
+        elif status == "failed":
+            err = job.get("error") or "unknown"
+            summary = html.Div(f"Scan failed: {err}",
+                                 style={"color": "#ff453a",
+                                         "fontSize": "12px"})
+        elif status == "cancelled":
+            summary = html.Div(
+                f"Cancelled at scanned {scanned} of {total}.",
+                style={"color": "#ff9f0a",
+                        "fontSize": "12px"})
+        return (progress, summary, confirm_row,
+                polling_disabled)
+
+    @app.callback(
+        Output("evtv-ma-job-id", "data",
+                allow_duplicate=True),
+        Output("evtv-ma-progress", "children",
+                allow_duplicate=True),
+        Output("evtv-ma-poll", "disabled",
+                allow_duplicate=True),
+        Input("evtv-ma-cancel-btn", "n_clicks"),
+        State("evtv-ma-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_ma_cancel(n_clicks, job_id):
+        if not n_clicks or not job_id:
+            return no_update, no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return no_update, "Not authorised.", no_update
+        _mass_analyze.cancel_job(store, int(job_id))
+        return no_update, "Cancel requested.", no_update
+
+    @app.callback(
+        Output("evtv-ma-progress", "children",
+                allow_duplicate=True),
+        Output("evtv-ma-summary", "children",
+                allow_duplicate=True),
+        Output("evtv-ma-confirm-row", "children",
+                allow_duplicate=True),
+        Output("evtv-ma-job-id", "data",
+                allow_duplicate=True),
+        Output("evtv-pending-list", "children",
+                allow_duplicate=True),
+        Input("evtv-ma-confirm-btn", "n_clicks"),
+        Input("evtv-ma-discard-btn", "n_clicks"),
+        State("evtv-ma-animal-dropdown", "value"),
+        State("evtv-ma-cutoff-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_ma_commit(_confirm_n, _discard_n,
+                       animal_id, cutoff):
+        trig = callback_context.triggered_id
+        if trig == "evtv-ma-discard-btn":
+            return ("", "", [], None, no_update)
+        if trig != "evtv-ma-confirm-btn":
+            return (no_update, no_update, no_update,
+                     no_update, no_update)
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return ("Not authorised.", "", [], None,
+                     no_update)
+        try:
+            cutoff = float(cutoff)
+        except (TypeError, ValueError):
+            return (f"Invalid cutoff: {cutoff!r}",
+                     "", [], None, no_update)
+        try:
+            result = _mass_analyze.commit_threshold(
+                store, animal_id, cutoff, email)
+        except Exception as e:
+            logger.exception("commit_threshold failed")
+            return (f"Commit failed: {e}", "", [],
+                     None, no_update)
+        msg = (f"✓ {result['n_cleared']} files moved to "
+                "pending_pi_review. Approve them in the list "
+                "below.")
+        # Force a list re-render so the new pending files
+        # show up immediately.
+        rows = store.pi_pending_files(limit=500)
+        return (msg, "", [], None,
+                 _render_pending_list(rows, []))
 
 
 # --------------------------------------------------------------- #

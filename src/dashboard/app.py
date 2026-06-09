@@ -27,6 +27,7 @@ from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
+from src.utils import mass_analyze as _mass_analyze
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
@@ -573,6 +574,9 @@ def create_app(config: dict, store: Store) -> Dash:
     # Daemon thread that drains event_clip_job 'pending' rows
     # via ffmpeg. Idempotent across reloads.
     _event_clip.start_worker(store, config)
+    # Mass Analyze (PI bulk pre-screen) worker. Drains
+    # mass_analyze_job rows; same idempotent pattern.
+    _mass_analyze.start_worker(store, config)
 
     assets_dir = os.path.join(os.path.dirname(__file__), "assets")
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
