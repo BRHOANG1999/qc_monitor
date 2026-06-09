@@ -35,6 +35,50 @@ TIME_RANGE_OPTIONS: list[dict] = [
 ]
 
 
+# Full list of plottable evoked_features columns. Used by the
+# Evoked, Session Compare, and Settings tabs for dropdown options
+# and label translation. The order is the display order in the
+# Evoked tab's feature picker.
+EVOKED_FEATURE_COLS: list[str] = [
+    "line_length", "log_auc", "peak_amplitude", "trough_amplitude",
+    "peak_to_trough", "rms_amplitude", "peak_latency_ms",
+    "trough_latency_ms", "max_slope", "max_slope_time_ms",
+    "early_area", "late_area", "early_late_ratio", "recovery_tau",
+    "recovery_slope", "template_correlation", "pca_recon_error",
+    "variance", "autocorrelation", "ac_width", "exp_fit_a",
+    "sum_power_low", "freq_moment_low", "sum_power_high",
+    "freq_moment_high", "is_artifact", "is_ictal", "epoch_time_sec",
+]
+
+# Human-readable labels for the columns above. Keys match
+# EVOKED_FEATURE_COLS; ``EVOKED_FEATURE_LABELS.get(col, col)`` is the
+# canonical "make this safe to render" idiom across tabs.
+EVOKED_FEATURE_LABELS: dict[str, str] = {
+    "line_length": "Line Length", "log_auc": "Log(AUC)",
+    "peak_amplitude": "Peak Amplitude",
+    "trough_amplitude": "Trough Amplitude",
+    "peak_to_trough": "Peak-to-Trough",
+    "rms_amplitude": "RMS Amplitude",
+    "peak_latency_ms": "Peak Latency (ms)",
+    "trough_latency_ms": "Trough Latency (ms)",
+    "max_slope": "Max Slope",
+    "max_slope_time_ms": "Max Slope Time (ms)",
+    "early_area": "Early Area", "late_area": "Late Area",
+    "early_late_ratio": "Early/Late Ratio",
+    "recovery_tau": "Recovery Tau",
+    "recovery_slope": "Recovery Slope",
+    "template_correlation": "Template Correlation",
+    "pca_recon_error": "PCA Recon Error", "variance": "Variance",
+    "autocorrelation": "Autocorrelation", "ac_width": "AC Width",
+    "exp_fit_a": "Exp Fit A", "sum_power_low": "Sum Power Low",
+    "freq_moment_low": "Freq Moment Low",
+    "sum_power_high": "Sum Power High",
+    "freq_moment_high": "Freq Moment High",
+    "is_artifact": "Is Artifact", "is_ictal": "Is Ictal",
+    "epoch_time_sec": "Epoch Time (sec)",
+}
+
+
 def empty_fig(text: str = "Nothing to show yet",
               hint: str | None = None,
               height: int = 400) -> go.Figure:
@@ -117,3 +161,14 @@ def color_for_role(role: str) -> str:
     """Look up the design-token color for a channel role; defaults to
     the Plotly indigo so an unknown role still renders."""
     return ROLE_COLORS.get(role, "#636EFA")
+
+
+def session_dropdown_options(store: Store) -> list[dict]:
+    """Standard ``{label, value}`` options for any session-picker
+    dcc.Dropdown. Sessions are listed in the order
+    ``Store.get_sessions`` returns them (newest first)."""
+    sessions = store.get_sessions()
+    return [
+        {"label": s["session_name"], "value": s["session_dir"]}
+        for s in sessions
+    ]

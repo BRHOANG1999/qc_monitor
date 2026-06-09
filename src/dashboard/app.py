@@ -35,6 +35,7 @@ from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
 from src.dashboard.tabs import alerts as tabs_alerts
 from src.dashboard.tabs import criticality as tabs_criticality
+from src.dashboard.tabs import session_compare as tabs_session_compare
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
 from src.dashboard.components import (
@@ -50,35 +51,13 @@ from src.dashboard import plotly_template  # noqa: F401
 
 logger = logging.getLogger("qc_monitor.dashboard")
 
-# Full list of plottable evoked feature columns
-EVOKED_FEATURE_COLS = [
-    "line_length", "log_auc", "peak_amplitude", "trough_amplitude",
-    "peak_to_trough", "rms_amplitude", "peak_latency_ms", "trough_latency_ms",
-    "max_slope", "max_slope_time_ms", "early_area", "late_area",
-    "early_late_ratio", "recovery_tau", "recovery_slope",
-    "template_correlation", "pca_recon_error", "variance",
-    "autocorrelation", "ac_width", "exp_fit_a", "sum_power_low",
-    "freq_moment_low", "sum_power_high", "freq_moment_high",
-    "is_artifact", "is_ictal", "epoch_time_sec",
-]
-
-# Human-readable labels
-EVOKED_FEATURE_LABELS = {
-    "line_length": "Line Length", "log_auc": "Log(AUC)",
-    "peak_amplitude": "Peak Amplitude", "trough_amplitude": "Trough Amplitude",
-    "peak_to_trough": "Peak-to-Trough", "rms_amplitude": "RMS Amplitude",
-    "peak_latency_ms": "Peak Latency (ms)", "trough_latency_ms": "Trough Latency (ms)",
-    "max_slope": "Max Slope", "max_slope_time_ms": "Max Slope Time (ms)",
-    "early_area": "Early Area", "late_area": "Late Area",
-    "early_late_ratio": "Early/Late Ratio", "recovery_tau": "Recovery Tau",
-    "recovery_slope": "Recovery Slope", "template_correlation": "Template Correlation",
-    "pca_recon_error": "PCA Recon Error", "variance": "Variance",
-    "autocorrelation": "Autocorrelation", "ac_width": "AC Width",
-    "exp_fit_a": "Exp Fit A", "sum_power_low": "Sum Power Low",
-    "freq_moment_low": "Freq Moment Low", "sum_power_high": "Sum Power High",
-    "freq_moment_high": "Freq Moment High", "is_artifact": "Is Artifact",
-    "is_ictal": "Is Ictal", "epoch_time_sec": "Epoch Time (sec)",
-}
+# EVOKED_FEATURE_COLS / EVOKED_FEATURE_LABELS moved to
+# src/dashboard/data_helpers.py so tab modules can share one source
+# of truth. Imported below so the 6 existing in-module references
+# keep resolving.
+from src.dashboard.data_helpers import (  # noqa: E402,F401
+    EVOKED_FEATURE_COLS, EVOKED_FEATURE_LABELS,
+)
 
 # --------------------------------------------------------------------- #
 #  Design tokens (Apple HIG-inspired)
@@ -425,9 +404,10 @@ def _empty_state(headline: str, hint: str = "",
               "marginTop": SPACE_6})
 
 
-def _session_dropdown_options(store: Store) -> list[dict]:
-    sessions = store.get_sessions()
-    return [{"label": s["session_name"], "value": s["session_dir"]} for s in sessions]
+# _session_dropdown_options moved to src/dashboard/data_helpers.
+from src.dashboard.data_helpers import (  # noqa: E402,F401
+    session_dropdown_options as _session_dropdown_options,
+)
 
 
 def _default_session(store: Store, hint: str | None = None) -> str | None:
@@ -1397,7 +1377,8 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(
                     _electrode_health_tab_layout(store, default_session=session_hint))
             elif tab == "session_compare":
-                return _enable_persistence(_session_compare_tab_layout(store))
+                return _enable_persistence(
+                    tabs_session_compare.layout(store))
             elif tab == "stim":
                 return _enable_persistence(tabs_stim.layout(store))
             elif tab == "settings":
@@ -2121,143 +2102,8 @@ def create_app(config: dict, store: Store) -> Dash:
         fig.update_annotations(font=dict(color="white"))
         return fig
 
-    # ------------------------------------------------------------------ #
-    #  Session Compare callback
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        [Output("session-compare-waveform-plot", "figure"),
-         Output("session-compare-features-plot", "figure")],
-        [Input("compare-session-a-dropdown", "value"),
-         Input("compare-session-b-dropdown", "value"),
-         Input("compare-smooth", "value")],
-    )
-    def update_session_compare(session_a, session_b, smooth_ms):
-        if not session_a or not session_b:
-            return (_empty_fig("Select two sessions", 450),
-                    _empty_fig("Select two sessions", 450))
-
-        smooth_ms = float(smooth_ms or 0)
-
-        # --- Waveform overlay ---
-        wf_fig = go.Figure()
-        for sess_dir, color, label in [(session_a, "#636EFA", "Session A"),
-                                       (session_b, "#EF553B", "Session B")]:
-            try:
-                waveforms = store.get_evoked_waveforms_for_session(sess_dir)
-            except Exception:
-                waveforms = []
-
-            if waveforms:
-                # Use the latest waveform
-                wf = waveforms[-1]
-                time_ms = wf["time_axis_ms"]
-                mean_tr = wf["mean_trace"]
-                sem_tr = wf["sem_trace"]
-
-                # Optional smoothing -- Gaussian filter in display-ms.
-                if smooth_ms > 0 and mean_tr and len(time_ms) > 1:
-                    try:
-                        dt_ms = float(time_ms[1] - time_ms[0])
-                        if dt_ms > 0:
-                            fs_proxy = 1000.0 / dt_ms
-                            mean_tr = apply_filter(
-                                np.asarray(mean_tr, dtype=np.float32),
-                                fs_proxy, smoothing_ms=smooth_ms,
-                            ).tolist()
-                            if sem_tr and len(sem_tr) == len(mean_tr):
-                                sem_tr = apply_filter(
-                                    np.asarray(sem_tr, dtype=np.float32),
-                                    fs_proxy, smoothing_ms=smooth_ms,
-                                ).tolist()
-                    except Exception as e:
-                        logger.debug("Compare smoothing skipped: %s", e)
-
-                sessions = store.get_sessions()
-                sname = sess_dir
-                for s in sessions:
-                    if s["session_dir"] == sess_dir:
-                        sname = s["session_name"]
-                        break
-
-                if sem_tr and len(sem_tr) == len(mean_tr):
-                    upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-                    lower = [m - s for m, s in zip(mean_tr, sem_tr)]
-                    fill_color = color.replace(")", ",0.15)").replace("rgb", "rgba") if color.startswith("rgb") else color
-                    if color == "#636EFA":
-                        fill_color = "rgba(99,110,250,0.15)"
-                    else:
-                        fill_color = "rgba(239,85,59,0.15)"
-                    fig_band_x = list(time_ms) + list(reversed(time_ms))
-                    fig_band_y = upper + list(reversed(lower))
-                    wf_fig.add_trace(go.Scatter(
-                        x=fig_band_x, y=fig_band_y,
-                        fill="toself", fillcolor=fill_color,
-                        line=dict(width=0), showlegend=False, hoverinfo="skip",
-                    ))
-
-                wf_fig.add_trace(go.Scatter(
-                    x=time_ms, y=mean_tr, mode="lines",
-                    name=f"{label}: {sname}",
-                    line=dict(color=color, width=2),
-                ))
-
-        wf_fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
-        wf_fig.update_layout(
-            title="Mean Evoked Waveform Overlay",
-            xaxis_title="Time (ms)", yaxis_title="Amplitude",
-            height=450,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-
-        # --- Feature distribution comparison (top 5 features) ---
-        top_features = ["peak_amplitude", "trough_amplitude", "rms_amplitude",
-                        "line_length", "peak_to_trough"]
-        feat_fig = go.Figure()
-
-        for sess_dir, color, label in [(session_a, "#636EFA", "Session A"),
-                                       (session_b, "#EF553B", "Session B")]:
-            means = []
-            stds = []
-            f_names = []
-            for feat in top_features:
-                try:
-                    fdata = store.get_evoked_feature_timeseries(
-                        feature_name=feat, session_dir=sess_dir)
-                    vals = [d["value"] for d in fdata if d["value"] is not None
-                            and not d.get("is_artifact", 0)]
-                except Exception:
-                    vals = []
-
-                f_names.append(EVOKED_FEATURE_LABELS.get(feat, feat))
-                if vals:
-                    means.append(statistics.mean(vals))
-                    stds.append(statistics.stdev(vals) if len(vals) > 1 else 0)
-                else:
-                    means.append(0)
-                    stds.append(0)
-
-            sessions = store.get_sessions()
-            sname = sess_dir
-            for s in sessions:
-                if s["session_dir"] == sess_dir:
-                    sname = s["session_name"]
-                    break
-
-            feat_fig.add_trace(go.Bar(
-                x=f_names, y=means,
-                name=f"{label}: {sname}",
-                marker_color=color,
-                error_y=dict(type="data", array=stds, visible=True),
-            ))
-
-        feat_fig.update_layout(
-            title="Feature Distribution Comparison (top 5)",
-            xaxis_title="Feature", yaxis_title="Value",
-            barmode="group", height=450,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-
-        return wf_fig, feat_fig
+    # Session Compare callback moved to
+    # src/dashboard/tabs/session_compare.py.
 
     # ------------------------------------------------------------------ #
     #  Activity Log callback
@@ -2671,6 +2517,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_signal_quality.register_callbacks(app, store, config)
     tabs_stim.register_callbacks(app, store, config)
     tabs_criticality.register_callbacks(app, store, config)
+    tabs_session_compare.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -4932,47 +4779,7 @@ def _electrode_health_tab_layout(store: Store, default_session: str | None = Non
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Session Compare tab (NEW)
-# ------------------------------------------------------------------ #
-
-def _session_compare_tab_layout(store: Store):
-    session_options = _session_dropdown_options(store)
-
-    return html.Div([
-        html.H3("Session Compare", style={"color": "white", "marginBottom": "12px"}),
-        html.Div([
-            html.Div([
-                html.Label("Session A", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="compare-session-a-dropdown",
-                    options=session_options,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "300px"}),
-            html.Div([
-                html.Label("Session B", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="compare-session-b-dropdown",
-                    options=session_options,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "300px"}),
-            html.Div([
-                html.Label("Smooth (ms)", style=LABEL_STYLE),
-                dcc.Input(id="compare-smooth", type="number", min=0,
-                          step=0.5, value=0,
-                          style={"backgroundColor": "#262638",
-                                 "color": "#f0f0f5", "width": "80px"}),
-            ], style={"flex": "0 0 110px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
-
-        dcc.Graph(id="session-compare-waveform-plot", style={"height": "450px"}),
-        dcc.Graph(id="session-compare-features-plot", style={"height": "450px",
-                                                              "marginTop": "16px"}),
-    ])
+# Session Compare tab moved to src/dashboard/tabs/session_compare.py.
 
 
 # Stim QC tab moved to src/dashboard/tabs/stim.py.
