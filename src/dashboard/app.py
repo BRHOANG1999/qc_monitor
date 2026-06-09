@@ -4356,6 +4356,18 @@ def _overview_tab(store: Store, config: dict | None = None):
                 "gap": "6px", "marginBottom": "10px"},
     )
 
+    # Per-animal behavioral seizure analysis status. Sits
+    # between the pill strip and the 3-column grid so it's
+    # always above the fold. Glance-able: top line answers
+    # "are we keeping up?" with the rate delta; the table
+    # below breaks it down per animal so the user can spot
+    # which animal is the bottleneck.
+    bsz_status = html.Div(
+        _build_behavioral_seizure_status_card(store),
+        id="overview-bsz-status",
+        style={"marginBottom": "12px"},
+    )
+
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
     # the dashboard read as "card-on-card-on-card."
@@ -4591,8 +4603,175 @@ def _overview_tab(store: Store, config: dict | None = None):
 
     return html.Div([
         cards,         # pills strip, full width
+        bsz_status,    # per-animal seizure analysis status
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
+
+
+def _build_behavioral_seizure_status_card(store):
+    """Per-animal behavioral seizure analysis status.
+
+    Designed so the user can answer two questions at a glance:
+      1. Are we keeping up?  -- rate delta on top.
+      2. Which animal is the bottleneck?  -- per-row breakdown.
+
+    Sorted so animals with the steepest backlog growth float
+    to the top.
+    """
+    rows = store.behavioral_seizure_status_per_animal(days=7)
+    if not rows:
+        return html.Div(
+            "No animals ingested yet.",
+            style={"padding": "12px",
+                    "color": "#a0a0b0",
+                    "fontSize": "12px",
+                    "background": COLOR_SURFACE_1,
+                    "border": f"1px solid {COLOR_DIVIDER}",
+                    "borderRadius": RADIUS_MD})
+    # Totals + rate verdict.
+    total_created = sum(r["created_window"] for r in rows)
+    total_approved = sum(r["approved_window"] for r in rows)
+    total_queue = sum(r["n_queue"] for r in rows)
+    total_pending = sum(r["n_pending_pi"] for r in rows)
+    rate_delta = total_created - total_approved
+    rate_per_day = rate_delta / 7.0
+    if rate_per_day > 5:
+        verdict_text = (
+            f"Backlog growing by +{rate_per_day:.1f} files/day. "
+            "Consider hiring more reviewers.")
+        verdict_color = "#ff453a"
+    elif rate_per_day > 0.5:
+        verdict_text = (
+            f"Backlog growing slowly (+{rate_per_day:.1f} "
+            "files/day). Team marginal.")
+        verdict_color = "#ff9f0a"
+    elif rate_per_day > -0.5:
+        verdict_text = (
+            "Team keeping up. Throughput matches arrivals.")
+        verdict_color = "#30d158"
+    else:
+        verdict_text = (
+            f"Backlog shrinking ({rate_per_day:.1f} files/day). "
+            "Team ahead of schedule.")
+        verdict_color = "#30d158"
+    header = html.Div([
+        html.Div([
+            html.Span("Behavioral seizure analysis status",
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600",
+                               "fontSize": "13px"}),
+            html.Span("  (last 7 days)",
+                       style={"color": "#888",
+                               "fontSize": "11px"}),
+        ]),
+        html.Div([
+            html.Span(f"{total_created} created  ·  ",
+                       style={"color": "#cfd0d6"}),
+            html.Span(f"{total_approved} approved  ·  ",
+                       style={"color": "#cfd0d6"}),
+            html.Span(f"{total_queue} in queue  ·  ",
+                       style={"color": "#cfd0d6"}),
+            html.Span(f"{total_pending} pending PI",
+                       style={"color": "#cfd0d6"}),
+        ], style={"fontSize": "12px",
+                   "marginTop": "2px"}),
+        html.Div(verdict_text,
+                  style={"color": verdict_color,
+                          "fontWeight": "600",
+                          "fontSize": "12px",
+                          "marginTop": "6px"}),
+    ], style={"padding": "12px 14px",
+               "borderBottom": f"1px solid {COLOR_DIVIDER}"})
+    # Per-animal table.
+    cells = []
+    for r in rows:
+        delta = (r["created_window"]
+                  - r["approved_window"])
+        delta_color = ("#ff453a" if delta > 5
+                        else "#ff9f0a" if delta > 0
+                        else "#30d158")
+        delta_label = (f"+{delta}" if delta > 0
+                        else f"{delta}")
+        last = r["last_activity_at"][:16] or "—"
+        cells.append(html.Div([
+            html.Div(r["animal_id"],
+                      style={"color": "#f0f0f5",
+                              "fontWeight": "600",
+                              "fontSize": "13px",
+                              "marginBottom": "4px"}),
+            html.Div([
+                html.Div([
+                    html.Span("queue",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(f"{r['n_queue']}",
+                              style={"color": "#cfd0d6",
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+                html.Div([
+                    html.Span("pending PI",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(f"{r['n_pending_pi']}",
+                              style={"color": "#5e7ce2",
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+                html.Div([
+                    html.Span("approved",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(f"{r['n_approved']}",
+                              style={"color": "#30d158",
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+                html.Div([
+                    html.Span("7 d net",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(delta_label,
+                              style={"color": delta_color,
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+            ], style={"display": "grid",
+                       "gridTemplateColumns":
+                           "repeat(4, 1fr)",
+                       "gap": "8px",
+                       "marginBottom": "4px"}),
+            html.Div(
+                f"created 7 d: {r['created_window']}  ·  "
+                f"approved 7 d: {r['approved_window']}  ·  "
+                f"last activity: {last}",
+                style={"color": "#888",
+                        "fontSize": "10px"}),
+        ], style={"padding": "10px 12px",
+                   "background": COLOR_SURFACE_1,
+                   "border": f"1px solid {COLOR_DIVIDER}",
+                   "borderRadius": RADIUS_SM,
+                   "borderLeft": f"3px solid {delta_color}"}))
+    grid = html.Div(
+        cells,
+        style={"display": "grid",
+                "gridTemplateColumns":
+                    "repeat(auto-fit, minmax(260px, 1fr))",
+                "gap": "8px",
+                "padding": "12px 14px"})
+    return html.Div([header, grid],
+                      style={"background": COLOR_SURFACE_1,
+                              "border":
+                                  f"1px solid {COLOR_DIVIDER}",
+                              "borderRadius": RADIUS_MD})
 
 
 # ------------------------------------------------------------------ #

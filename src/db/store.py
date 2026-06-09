@@ -2200,6 +2200,112 @@ class Store:
         return sorted(by_animal.values(),
                        key=lambda d: -d["n_unreviewed"])
 
+    def behavioral_seizure_status_per_animal(self,
+                                                  days: int = 7
+                                                  ) -> list[dict]:
+        """Per-animal pipeline state for the Overview status card.
+
+        For every animal that has at least one ingested file,
+        compute:
+          * queue depth (files with no review_state or
+            'pi_flagged');
+          * pending_pi_review count;
+          * pi_approved count (already in CSV);
+          * pi_flagged count;
+          * files CREATED in the last *days* (rate-of-arrival);
+          * files APPROVED in the last *days* (rate-of-
+            throughput);
+          * last_activity_at (max updated_at across all the
+            animal's review_state rows).
+
+        The rate delta = created_window - approved_window lets
+        the Overview card tell the user 'team keeping up' vs
+        'backlog growing' at a glance.
+
+        One round-trip; SQL does the join + aggregation.
+        """
+        assert isinstance(days, int) and days > 0, "days > 0"
+        cutoff_iso = (datetime.now()
+                       - timedelta(days=days)).isoformat()
+        conn = self._connect()
+        try:
+            # Pull every (file, session, status) tuple we'll
+            # need. Animal resolution happens in Python via
+            # _animal_ids_for_config so the LIKE-fuzzy match
+            # of get_review_queue isn't repeated here.
+            rows = conn.execute(
+                """SELECT pf.id AS file_id,
+                          pf.session_dir, pf.chunk_datetime,
+                          sc.channel_names, sc.eeg_channels,
+                          (
+                            SELECT status FROM review_state rs
+                            WHERE rs.file_id = pf.id
+                            ORDER BY rs.updated_at DESC LIMIT 1
+                          ) AS latest_status,
+                          (
+                            SELECT updated_at FROM review_state rs
+                            WHERE rs.file_id = pf.id
+                            ORDER BY rs.updated_at DESC LIMIT 1
+                          ) AS latest_updated_at
+                   FROM processed_files pf
+                   JOIN session_config sc
+                     ON sc.session_dir = pf.session_dir
+                   WHERE pf.has_video = 1
+                     AND sc.channel_names IS NOT NULL
+                     AND sc.eeg_channels IS NOT NULL"""
+            ).fetchall()
+        finally:
+            conn.close()
+        # Aggregate per animal.
+        per_animal: dict[str, dict] = {}
+        max_iter = len(rows) + 1
+        for i, r in enumerate(rows):
+            assert i < max_iter, "row scan runaway"
+            animals = self._animal_ids_for_config(
+                r["channel_names"], r["eeg_channels"])
+            status = r["latest_status"]
+            chunk_dt = r["chunk_datetime"] or ""
+            updated_at = r["latest_updated_at"] or ""
+            for a in animals:
+                slot = per_animal.setdefault(a, {
+                    "animal_id": a,
+                    "n_queue": 0,
+                    "n_pending_pi": 0,
+                    "n_approved": 0,
+                    "n_flagged": 0,
+                    "created_window": 0,
+                    "approved_window": 0,
+                    "last_activity_at": "",
+                })
+                # Status buckets.
+                if status is None or status == "pi_flagged":
+                    slot["n_queue"] += 1
+                if status == "pending_pi_review":
+                    slot["n_pending_pi"] += 1
+                if status == "pi_approved":
+                    slot["n_approved"] += 1
+                if status == "pi_flagged":
+                    slot["n_flagged"] += 1
+                # Rate windows.
+                if (chunk_dt and chunk_dt >= cutoff_iso):
+                    slot["created_window"] += 1
+                if (status == "pi_approved"
+                        and updated_at
+                        and updated_at >= cutoff_iso):
+                    slot["approved_window"] += 1
+                # Last activity.
+                if (updated_at
+                        and updated_at > slot["last_activity_at"]):
+                    slot["last_activity_at"] = updated_at
+        out = list(per_animal.values())
+        # Sort: animals with growing backlog first (positive
+        # net delta), then by queue size descending.
+        out.sort(key=lambda s: (
+            -(s["created_window"] - s["approved_window"]),
+            -s["n_queue"],
+        ))
+        return out
+
     def list_all_animals(self) -> list[str]:
         """Distinct animal ids across every session_config row.
 
