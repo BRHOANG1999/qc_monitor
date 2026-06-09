@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from .schema import SCHEMA_SQL
 
@@ -20,6 +21,24 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    @contextmanager
+    def connection(self):
+        """Public contextmanager handle for the SQLite connection.
+
+        Used by callers (dashboard tabs, notifications, background
+        workers) that need to run ad-hoc reads/writes against tables
+        the Store class doesn't yet expose a method for. Callers must
+        still ``conn.commit()`` explicitly for writes -- this matches
+        the connect-and-commit-by-hand pattern used inside Store and
+        keeps the sweep from this commit mechanical. The connection
+        is closed on exit regardless of whether the block raised.
+        """
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         conn = self._connect()

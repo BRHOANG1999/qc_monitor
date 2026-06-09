@@ -115,14 +115,11 @@ def _sheet_records(config: dict, ttl_sec: float
 def _db_records(store: Store) -> dict[str, dict]:
     """All processed_files rows, keyed by extracted timestamp."""
     records: dict[str, dict] = {}
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             "SELECT id, file_path, session_name, chunk_datetime, status "
             "FROM processed_files",
         ).fetchall()
-    finally:
-        conn.close()
     for r in rows:
         key = _extract_key(r["file_path"])
         if key is None:

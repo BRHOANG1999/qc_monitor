@@ -36,8 +36,7 @@ def _collect_eod_stats(store: Store, today: date) -> dict:
     """
     assert isinstance(store, Store), "store must be a Store"
     start, end = _today_iso_bounds(today)
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             """SELECT
                  COUNT(*) AS total,
@@ -87,8 +86,6 @@ def _collect_eod_stats(store: Store, today: date) -> dict:
                ORDER BY n_files DESC""",
             (start, end),
         ).fetchall()]
-    finally:
-        conn.close()
 
     return {
         "totals": totals,

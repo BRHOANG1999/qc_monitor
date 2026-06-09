@@ -41,8 +41,12 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def health_snapshot(watcher: FileWatcher, store: Store, queue_depth: int) -> dict:
-    disk = shutil.disk_usage("D:\\")
+def health_snapshot(watcher: FileWatcher, store: Store, queue_depth: int,
+                    db_path: str) -> dict:
+    # Report free space on the disk the DB actually lives on so the
+    # snapshot survives a move off D:\ (e.g., a non-Windows host running
+    # tests, or a future deployment on a different drive letter).
+    disk = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path)) or ".")
     return {
         "cpu_pct": psutil.cpu_percent(interval=0.5),
         "memory_pct": psutil.virtual_memory().percent,
@@ -138,13 +142,11 @@ def main():
     known_paths = set()
     known_fingerprints = set()
 
-    import sqlite3
-    conn = sqlite3.connect(db_path)
-    for row in conn.execute("SELECT file_path, file_size, file_mtime FROM processed_files"):
-        fp, fsize, fmt = row[0], row[1], row[2]
-        known_paths.add(fp)
-        known_fingerprints.add((os.path.basename(fp), fsize, fmt))
-    conn.close()
+    with store.connection() as conn:
+        for row in conn.execute("SELECT file_path, file_size, file_mtime FROM processed_files"):
+            fp, fsize, fmt = row[0], row[1], row[2]
+            known_paths.add(fp)
+            known_fingerprints.add((os.path.basename(fp), fsize, fmt))
     logger.info("Known files: %d (unique fingerprints: %d)",
                 len(known_paths), len(known_fingerprints))
 
@@ -176,7 +178,7 @@ def main():
                 else:
                     consecutive_network_failures += 1
 
-                health = health_snapshot(watcher, store, 0)
+                health = health_snapshot(watcher, store, 0, db_path)
                 store.insert_health(health)
                 last_health_time = loop_start
 
@@ -244,14 +246,18 @@ def main():
             logger.error("Main loop error: %s", e, exc_info=True)
             time.sleep(poll_interval)
 
-    # Cleanup: kill any orphaned MATLAB subprocesses
-    logger.info("Cleaning up MATLAB subprocesses...")
-    try:
-        import subprocess
-        subprocess.run(["taskkill", "/F", "/IM", "MATLAB.exe"],
-                       capture_output=True, timeout=10)
-    except Exception:
-        pass
+    # Cleanup: kill any orphaned MATLAB subprocesses (Windows only --
+    # the daemon's production host. On other platforms the dispatcher
+    # is exercised under tests with a stubbed matlab_bridge, so there
+    # is nothing to reap.)
+    if sys.platform == "win32":
+        logger.info("Cleaning up MATLAB subprocesses...")
+        try:
+            import subprocess
+            subprocess.run(["taskkill", "/F", "/IM", "MATLAB.exe"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
     logger.info("QC Monitor stopped")
 
 

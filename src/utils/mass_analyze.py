@@ -112,8 +112,7 @@ def get_or_compute_peak_count(store, file_id: int,
         "channel must be >= 0"
     assert isinstance(cutoff, (int, float)) and cutoff > 0, \
         "cutoff must be > 0"
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             """SELECT n_peaks, peak_times_json
                FROM envelope_peak_cache
@@ -122,8 +121,6 @@ def get_or_compute_peak_count(store, file_id: int,
             (file_id, channel, float(cutoff),
              float(min_peak_dist_sec)),
         ).fetchone()
-    finally:
-        conn.close()
     if row is not None:
         try:
             times = list(json.loads(row["peak_times_json"]
@@ -181,8 +178,7 @@ def _compute_peak_count_uncached(store, file_id: int,
 def _write_cache(store, result: FilePeakResult,
                    min_peak_dist_sec: float) -> None:
     now = datetime.now().isoformat()
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO envelope_peak_cache
                (file_id, channel, cutoff, min_peak_dist_sec,
@@ -194,8 +190,6 @@ def _write_cache(store, result: FilePeakResult,
              json.dumps(result.peak_times), now),
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 # --------------------------------------------------------------- #
@@ -215,8 +209,7 @@ def pending_files_for_animal(store, animal_id: str
     """
     assert isinstance(animal_id, str) and animal_id, \
         "animal_id required"
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT DISTINCT pf.id AS file_id,
                       pf.session_dir, pf.file_path,
@@ -238,8 +231,6 @@ def pending_files_for_animal(store, animal_id: str
                ORDER BY pf.chunk_datetime ASC""",
             (f'%"{animal_id}%',),  # animal prefix match
         ).fetchall()
-    finally:
-        conn.close()
     # Post-filter: the LIKE is loose ("BCH062" would also match
     # "BCH0620"); use the parser to be precise.
     out: list[dict] = []
@@ -276,8 +267,7 @@ def create_job(store, pi_email: str, animal_id: str,
     assert isinstance(cutoff, (int, float)) and cutoff > 0, \
         "cutoff > 0"
     now = datetime.now().isoformat()
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         cur = conn.execute(
             """INSERT INTO mass_analyze_job
                (pi_email, animal_id, cutoff, status,
@@ -287,29 +277,23 @@ def create_job(store, pi_email: str, animal_id: str,
         )
         conn.commit()
         job_id = int(cur.lastrowid)
-    finally:
-        conn.close()
     _wake.set()
     return job_id
 
 
 def get_job(store, job_id: int) -> dict | None:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT * FROM mass_analyze_job WHERE id = ?",
             (int(job_id),),
         ).fetchone()
-    finally:
-        conn.close()
     return dict(row) if row else None
 
 
 def cancel_job(store, job_id: int) -> bool:
     """Flip a pending/running job to 'cancelled'. The worker
     checks this between files and bails cleanly."""
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         cur = conn.execute(
             """UPDATE mass_analyze_job
                SET status='cancelled',
@@ -320,8 +304,6 @@ def cancel_job(store, job_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
-    finally:
-        conn.close()
 
 
 def scan_for_animal(store, job_id: int,
@@ -342,8 +324,7 @@ def scan_for_animal(store, job_id: int,
     cutoff = float(job["cutoff"])
     # Flip to running.
     now = datetime.now().isoformat()
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         conn.execute(
             """UPDATE mass_analyze_job
                SET status='running', started_at=?
@@ -351,20 +332,15 @@ def scan_for_animal(store, job_id: int,
             (now, job_id),
         )
         conn.commit()
-    finally:
-        conn.close()
     files = pending_files_for_animal(store, animal_id)
     total = len(files)
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         conn.execute(
             """UPDATE mass_analyze_job
                SET total_files=? WHERE id=?""",
             (total, job_id),
         )
         conn.commit()
-    finally:
-        conn.close()
     n_zero = 0
     n_with = 0
     max_iter = total + 1
@@ -400,8 +376,7 @@ def scan_for_animal(store, job_id: int,
             else:
                 n_with += 1
         # Live progress update.
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             conn.execute(
                 """UPDATE mass_analyze_job
                    SET scanned_files=?,
@@ -410,11 +385,8 @@ def scan_for_animal(store, job_id: int,
                 (i + 1, n_zero, n_with, job_id),
             )
             conn.commit()
-        finally:
-            conn.close()
     # Done.
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         conn.execute(
             """UPDATE mass_analyze_job
                SET status='done', finished_at=?
@@ -422,8 +394,6 @@ def scan_for_animal(store, job_id: int,
             (datetime.now().isoformat(), job_id),
         )
         conn.commit()
-    finally:
-        conn.close()
     return {"status": "done",
              "scanned_files": total,
              "total_files": total,
@@ -432,14 +402,11 @@ def scan_for_animal(store, job_id: int,
 
 
 def _job_status(store, job_id: int) -> str:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT status FROM mass_analyze_job WHERE id=?",
             (int(job_id),),
         ).fetchone()
-    finally:
-        conn.close()
     return row["status"] if row else ""
 
 
@@ -474,8 +441,7 @@ def commit_threshold(store, animal_id: str, cutoff: float,
         fid = int(f["file_id"])
         ch = first_animal_channel_index(
             store, f["session_dir"])
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             row = conn.execute(
                 """SELECT n_peaks FROM envelope_peak_cache
                    WHERE file_id=? AND channel=? AND cutoff=?
@@ -483,8 +449,6 @@ def commit_threshold(store, animal_id: str, cutoff: float,
                 (fid, ch, float(cutoff),
                  float(min_peak_dist_sec)),
             ).fetchone()
-        finally:
-            conn.close()
         if row is None or int(row["n_peaks"]) > 0:
             skipped.append(fid)
             continue
@@ -555,15 +519,12 @@ def _worker_loop(store) -> None:
         assert i < max_iter, "worker loop runaway"
         i += 1
         try:
-            conn = store._connect()
-            try:
+            with store.connection() as conn:
                 row = conn.execute(
                     """SELECT id FROM mass_analyze_job
                        WHERE status='pending'
                        ORDER BY created_at ASC LIMIT 1"""
                 ).fetchone()
-            finally:
-                conn.close()
             if row is None:
                 _wake.wait(timeout=interval)
                 _wake.clear()

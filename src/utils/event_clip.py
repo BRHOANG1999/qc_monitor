@@ -256,8 +256,7 @@ def submit_video_clip_job(spec: ClipSpec, store,
     h = spec_hash(spec, segs)
     cache_dir = _cache_dir(config)
     cache_path = cache_dir / f"{h}.mp4"
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         existing = conn.execute(
             "SELECT status, cache_path FROM event_clip_job "
             "WHERE spec_hash = ?", (h,),
@@ -282,8 +281,6 @@ def submit_video_clip_job(spec: ClipSpec, store,
              float(spec.bb_sec), str(cache_path), now),
         )
         conn.commit()
-    finally:
-        conn.close()
     _worker_wake.set()
     return h
 
@@ -292,15 +289,12 @@ def poll_video_clip_status(spec_hash_str: str,
                               store) -> dict:
     """Return ``{status, cache_path, error}`` for a job."""
     assert spec_hash_str, "spec_hash required"
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             """SELECT status, cache_path, error
                FROM event_clip_job WHERE spec_hash = ?""",
             (spec_hash_str,),
         ).fetchone()
-    finally:
-        conn.close()
     if not row:
         return {"status": "missing", "cache_path": None,
                 "error": None}
@@ -339,16 +333,13 @@ def _process_one_job(row: dict, store, config: dict) -> None:
     spec_h = row["spec_hash"]
     cache_path = Path(row["cache_path"])
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         conn.execute(
             "UPDATE event_clip_job SET status='running', "
             "started_at=? WHERE spec_hash = ?",
             (datetime.now().isoformat(), spec_h),
         )
         conn.commit()
-    finally:
-        conn.close()
     try:
         # Rebuild the segments from the original spec so we
         # don't trust stale cached state.
@@ -359,31 +350,25 @@ def _process_one_job(row: dict, store, config: dict) -> None:
         )
         segs = resolve_clip_segments(spec, store)
         _ffmpeg_concat(segs, cache_path, config)
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             conn.execute(
                 "UPDATE event_clip_job SET status='done', "
                 "finished_at=? WHERE spec_hash = ?",
                 (datetime.now().isoformat(), spec_h),
             )
             conn.commit()
-        finally:
-            conn.close()
         logger.info("event_clip: produced %s (%d segments)",
                      cache_path, len(segs))
     except Exception as e:
         logger.warning("event_clip job %s failed: %s",
                         spec_h, e)
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             conn.execute(
                 "UPDATE event_clip_job SET status='failed', "
                 "error=?, finished_at=? WHERE spec_hash = ?",
                 (str(e), datetime.now().isoformat(), spec_h),
             )
             conn.commit()
-        finally:
-            conn.close()
 
 
 def _ffmpeg_concat(segs: list[Segment], out_path: Path,
@@ -507,8 +492,7 @@ def _worker_loop(store, config: dict) -> None:
         assert i < max_iter, "worker loop runaway"
         i += 1
         try:
-            conn = store._connect()
-            try:
+            with store.connection() as conn:
                 row = conn.execute(
                     "SELECT spec_hash, file_id, eo_sec, "
                     "bb_sec, cache_path "
@@ -516,8 +500,6 @@ def _worker_loop(store, config: dict) -> None:
                     "WHERE status = 'pending' "
                     "ORDER BY created_at ASC LIMIT 1"
                 ).fetchone()
-            finally:
-                conn.close()
             if row is None:
                 _worker_wake.wait(timeout=interval)
                 _worker_wake.clear()

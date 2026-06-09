@@ -545,8 +545,7 @@ def _default_session(store: Store, hint: str | None = None) -> str | None:
 
 def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dict]:
     """Return processed file rows for a session, ordered by chunk_datetime."""
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT id, file_path, chunk_datetime, session_name
                FROM processed_files
@@ -555,8 +554,6 @@ def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dic
             (session_dir,),
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 # ====================================================================== #
@@ -1253,16 +1250,13 @@ def create_app(config: dict, store: Store) -> Dash:
         # Caption: recording window of the underlying chunk + camera
         # count so the operator can tell single- vs multi-camera
         # sessions apart at a glance.
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             row = conn.execute(
                 "SELECT file_path, chunk_datetime, duration_sec "
                 "FROM processed_files "
                 "WHERE has_video = 1 "
                 "ORDER BY chunk_datetime DESC LIMIT 1"
             ).fetchone()
-        finally:
-            conn.close()
         if not row or not row["chunk_datetime"]:
             return src, "No videos available"
         from src.utils.video import companion_video_paths
@@ -2115,16 +2109,13 @@ def create_app(config: dict, store: Store) -> Dash:
                         x_start = 0.0
         # file_path -> file_id (Video Review's dropdown uses file_id)
         file_id = None
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             row = conn.execute(
                 "SELECT id FROM processed_files WHERE file_path = ?",
                 (file_path,),
             ).fetchone()
             if row:
                 file_id = int(row["id"])
-        finally:
-            conn.close()
         import time as _t
         bridge = {
             "session_dir": session_dir,
@@ -2791,13 +2782,10 @@ def create_app(config: dict, store: Store) -> Dash:
         if not n_clicks:
             return no_update
         try:
-            conn = store._connect()
-            try:
+            with store.connection() as conn:
                 conn.execute("UPDATE processed_files SET status = 'pending' WHERE status = 'done'")
                 cnt = conn.execute("SELECT changes()").fetchone()[0]
                 conn.commit()
-            finally:
-                conn.close()
             return html.Div(f"Queued {cnt} files for reprocessing",
                             style={"color": "#FFA15A", "marginTop": "10px"})
         except Exception as e:
@@ -3839,8 +3827,7 @@ def _recording_arrivals_with_session(
     assert hours > 0, "hours must be positive"
     cutoff_dt = datetime.now() - timedelta(hours=hours + 2)
     cutoff_str = cutoff_dt.strftime(_CHUNK_DT_FMT)
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             "SELECT chunk_datetime, duration_sec, session_dir, "
             "       session_name "
@@ -3860,8 +3847,6 @@ def _recording_arrivals_with_session(
             sn = str(r["session_name"] or sd.rsplit("/", 1)[-1] or "?")
             out.append((ts, dur, sd, sn))
         return out
-    finally:
-        conn.close()
 
 
 # Per-session color palette for the 24h band. Cycles when there are
@@ -4109,8 +4094,7 @@ def _overview_today_stats(store: Store, session_dir: str) -> dict:
     end = datetime.combine(today, datetime.max.time()).isoformat()
     last_24h = (datetime.now() - timedelta(hours=24)).isoformat()
     last_1h = (datetime.now() - timedelta(hours=1)).isoformat()
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             """SELECT
                  SUM(CASE WHEN status='done'  THEN 1 ELSE 0 END) AS done,
@@ -4150,8 +4134,6 @@ def _overview_today_stats(store: Store, session_dir: str) -> dict:
                 (session_dir, last_1h),
             ).fetchone()
             sess_hour = int(srow["n"] or 0) if srow else 0
-    finally:
-        conn.close()
 
     # Oldest-pending age in minutes (or None when nothing pending).
     oldest_age_min: float | None = None
@@ -5227,15 +5209,12 @@ def _session_compare_tab_layout(store: Store):
 # ------------------------------------------------------------------ #
 
 def _stim_tab(store: Store):
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT pf.chunk_datetime, pf.session_name, sq.*
                FROM stim_qc sq JOIN processed_files pf ON sq.file_id = pf.id
                ORDER BY pf.chunk_datetime DESC LIMIT 500"""
         ).fetchall()
-    finally:
-        conn.close()
 
     if not rows:
         return html.Div("No stimulation data yet.", style={"color": "#888"})

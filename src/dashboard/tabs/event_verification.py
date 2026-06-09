@@ -1491,8 +1491,7 @@ def _finalize_approved_to_csv(store, config: dict,
 def _fetch_approved_rows(store) -> list[dict]:
     """Every pi_approved review_state row + its deserialised
     events list."""
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT rs.id AS state_id, rs.file_id,
                       rs.user_email, rs.markers_json,
@@ -1504,8 +1503,6 @@ def _fetch_approved_rows(store) -> list[dict]:
                WHERE rs.status = 'pi_approved'
                ORDER BY rs.updated_at ASC"""
         ).fetchall()
-    finally:
-        conn.close()
     import json as _json
     out: list[dict] = []
     for r in rows:

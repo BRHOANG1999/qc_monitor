@@ -21,20 +21,16 @@ logger = logging.getLogger("qc_monitor.notifications.queue_watch")
 
 
 def _pending_count(store: Store) -> int:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM processed_files "
             "WHERE status = 'pending'"
         ).fetchone()
         return int(row["n"]) if row else 0
-    finally:
-        conn.close()
 
 
 def _last_done_at(store: Store) -> datetime | None:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT MAX(processed_at) AS ts FROM processed_files "
             "WHERE status = 'done'"
@@ -45,8 +41,6 @@ def _last_done_at(store: Store) -> datetime | None:
             return datetime.fromisoformat(row["ts"])
         except ValueError:
             return None
-    finally:
-        conn.close()
 
 
 def evaluate(store: Store, config: dict, now: datetime | None = None

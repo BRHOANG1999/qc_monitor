@@ -8,7 +8,6 @@ the time the handler fires the user is already verified.
 import io
 import logging
 import os
-import sqlite3
 import threading
 import time
 
@@ -28,10 +27,8 @@ _snapshot_cache: dict[str, tuple[bytes, float]] = {}
 _snapshot_lock = threading.Lock()
 
 
-def _lookup_mat_path(db_path: str, file_id: int) -> str | None:
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        conn.row_factory = sqlite3.Row
+def _lookup_mat_path(store, file_id: int) -> str | None:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT file_path, has_video FROM processed_files WHERE id = ?",
             (file_id,),
@@ -39,24 +36,18 @@ def _lookup_mat_path(db_path: str, file_id: int) -> str | None:
         if row is None:
             return None
         return row["file_path"]
-    finally:
-        conn.close()
 
 
-def _latest_mat_with_video(db_path: str) -> str | None:
+def _latest_mat_with_video(store) -> str | None:
     """Return file_path of the most-recently-recorded chunk that has
     a companion video, or None when nothing qualifies."""
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        conn.row_factory = sqlite3.Row
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT file_path FROM processed_files "
             "WHERE has_video = 1 "
             "ORDER BY chunk_datetime DESC LIMIT 1"
         ).fetchone()
         return row["file_path"] if row else None
-    finally:
-        conn.close()
 
 
 def _read_last_frame(video_path: str):
@@ -145,13 +136,11 @@ def register_media_routes(server, store, config: dict) -> None:
     the whole file. Returns 404 if the file_id is unknown or the video
     doesn't exist on disk.
     """
-    db_path = (config or {}).get("database", {}).get("path") or store.db_path
-
     @server.route("/media/video/<int:file_id>")
     def serve_video(file_id: int):  # pragma: no cover — exercised by browser
         if not getattr(g, "user", None):
             abort(403)
-        mat_path = _lookup_mat_path(db_path, file_id)
+        mat_path = _lookup_mat_path(store, file_id)
         if mat_path is None:
             abort(404, description=f"Unknown file_id {file_id}")
         video_path = video_path_for_mat(mat_path)
@@ -175,7 +164,7 @@ def register_media_routes(server, store, config: dict) -> None:
             abort(403)
         if cam < 1:
             abort(400, description="cam must be >= 1")
-        mat_path = _lookup_mat_path(db_path, file_id)
+        mat_path = _lookup_mat_path(store, file_id)
         if mat_path is None:
             abort(404, description=f"Unknown file_id {file_id}")
         paths = companion_video_paths(mat_path)
@@ -247,7 +236,7 @@ def register_media_routes(server, store, config: dict) -> None:
             if cached and (now - cached[1]) < _SNAPSHOT_TTL_SEC:
                 jpeg, captured_at = cached
             else:
-                mat_path = _latest_mat_with_video(db_path)
+                mat_path = _latest_mat_with_video(store)
                 if mat_path is None:
                     abort(404,
                             description="No recorded videos available")

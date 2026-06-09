@@ -84,8 +84,7 @@ VIDEO_DOM_ID = "lfp-video"
 # ===================================================================== #
 
 def _sessions_with_video(store: Store) -> list[dict]:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT session_dir, session_name, COUNT(*) AS n_videos
                FROM processed_files
@@ -94,15 +93,12 @@ def _sessions_with_video(store: Store) -> list[dict]:
                ORDER BY MAX(chunk_datetime) DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 def _files_with_video(store: Store, session_dir: str) -> list[dict]:
     if not session_dir:
         return []
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT id, file_path, chunk_datetime
                FROM processed_files
@@ -111,19 +107,14 @@ def _files_with_video(store: Store, session_dir: str) -> list[dict]:
             (session_dir,),
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 def _file_path_for_id(store: Store, file_id: int) -> str | None:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT file_path FROM processed_files WHERE id = ?", (file_id,),
         ).fetchone()
         return row["file_path"] if row else None
-    finally:
-        conn.close()
 
 
 def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
@@ -133,8 +124,7 @@ def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
     to one detected stim event, so this is exactly the list of onsets.
     Returns an empty array for files that haven't been MATLAB-processed.
     """
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         rows = conn.execute(
             """SELECT DISTINCT epoch_time_sec
                FROM evoked_features
@@ -142,8 +132,6 @@ def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
                ORDER BY epoch_time_sec""",
             (file_id,),
         ).fetchall()
-    finally:
-        conn.close()
     return np.asarray([r["epoch_time_sec"] for r in rows], dtype=np.float64)
 
 
@@ -190,14 +178,11 @@ def _should_stim_blank(channel: int,
 
 
 def _session_dir_for_file(store: Store, file_id: int) -> str | None:
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT session_dir FROM processed_files WHERE id = ?", (file_id,),
         ).fetchone()
         return row["session_dir"] if row else None
-    finally:
-        conn.close()
 
 
 def _animal_ids_from_picker(animal_value: str | None
@@ -226,16 +211,13 @@ def _pi_flag_note_for_file(store, file_id: int) -> str:
     without leaving the tab.
     """
     assert isinstance(file_id, int), "file_id must be int"
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             """SELECT note FROM review_state
                WHERE file_id = ? AND status = 'pi_flagged'
                ORDER BY updated_at DESC LIMIT 1""",
             (file_id,),
         ).fetchone()
-    finally:
-        conn.close()
     return (row["note"] or "") if row else ""
 
 
@@ -272,8 +254,7 @@ def _build_csv_file_meta(store, file_id: int, channel: int
     session_dir = _session_dir_for_file(store, file_id)
     chunk = get_chunk(file_path)
     fs = float(chunk.fs)
-    conn = store._connect()
-    try:
+    with store.connection() as conn:
         row = conn.execute(
             "SELECT chunk_datetime FROM processed_files "
             "WHERE id = ?", (file_id,),
@@ -283,8 +264,6 @@ def _build_csv_file_meta(store, file_id: int, channel: int
             "SELECT channel_names FROM session_config "
             "WHERE session_dir = ?", (session_dir,),
         ).fetchone()
-    finally:
-        conn.close()
     # Animal id = the prefix of the chosen channel's name (e.g.
     # "BCH062SLM" -> "BCH062"). Falls back to "unknown" if the
     # channel doesn't look like an animal channel.
@@ -2305,15 +2284,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if file_id is None:
             return no_update, no_update
         # Get the session_dir + file_path of the chosen file.
-        conn = store._connect()
-        try:
+        with store.connection() as conn:
             row = conn.execute(
                 "SELECT session_dir, file_path "
                 "FROM processed_files WHERE id = ?",
                 (int(file_id),),
             ).fetchone()
-        finally:
-            conn.close()
         if not row:
             return no_update, no_update
         # The Video Review file-dropdown's value is the file_id
@@ -2917,8 +2893,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # pull it cheaply).
         file_label = f"#{int(file_id)}"
         try:
-            conn = store._connect()
-            try:
+            with store.connection() as conn:
                 row = conn.execute(
                     "SELECT chunk_datetime FROM processed_files "
                     "WHERE id = ?", (int(file_id),),
@@ -2926,8 +2901,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 if row and row["chunk_datetime"]:
                     file_label = (f"#{int(file_id)} · "
                                    f"{row['chunk_datetime'][:16]}")
-            finally:
-                conn.close()
         except Exception:
             pass  # cheap preview; don't crash on a transient DB read
         return [
@@ -4077,19 +4050,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
 
 def _render_history(store: Store, file_id: int):
-    conn = store._connect()
     try:
-        rows = conn.execute(
-            """SELECT timestamp, user_email, note
-               FROM annotations
-               WHERE file_id = ? AND category = 'video_review'
-               ORDER BY timestamp DESC LIMIT 50""",
-            (file_id,),
-        ).fetchall()
+        with store.connection() as conn:
+            rows = conn.execute(
+                """SELECT timestamp, user_email, note
+                   FROM annotations
+                   WHERE file_id = ? AND category = 'video_review'
+                   ORDER BY timestamp DESC LIMIT 50""",
+                (file_id,),
+            ).fetchall()
     except sqlite3.OperationalError:
         rows = []
-    finally:
-        conn.close()
 
     if not rows:
         return html.Span("No video-review notes yet for this file.")
