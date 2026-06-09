@@ -1869,9 +1869,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         email = current_user_email() or ""
         my_animals = _assignments.animals_for_user(
             config, email, cache_only=True)
+        # When the warmer has completed at least one iteration
+        # (or the WARMER_TIMEOUT_SEC has elapsed without it
+        # completing), treat None as 'sheet is empty / not
+        # reachable' rather than spinning forever on
+        # 'Loading...'. The Sheet tab could be genuinely empty,
+        # the tab name could be wrong, or the API could be
+        # unreachable; any of those should fall back to the
+        # all-animals view, not deadlock the UI.
         if my_animals is None:
-            return ([], None,
-                     "Loading assignments from Google Sheets...")
+            if _assignments.warmer_should_have_settled():
+                my_animals = []
+            else:
+                return ([], None,
+                         "Loading assignments from Google "
+                         "Sheets...")
         try:
             unassigned = _assignments.unassigned_animals(
                 config, store, cache_only=True)

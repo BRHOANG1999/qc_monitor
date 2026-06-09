@@ -34,6 +34,21 @@ _cache_version: int = 0
 _warmer_started: bool = False
 _warmer_lock = threading.Lock()
 
+# Wall-clock timestamp of the FIRST completed warmer iteration
+# (regardless of success or failure of the underlying Sheets API
+# call). The picker uses this + a hard timeout so it doesn't spin
+# forever on 'Loading...' when the Sheet tab is empty, missing,
+# or unreachable. 0.0 means "warmer hasn't completed once yet".
+_warmer_first_completed_at: float = 0.0
+_warmer_started_at: float = 0.0
+
+# How long the picker is willing to wait for the warmer before
+# treating the cache as populated-but-empty. 5 s is comfortably
+# longer than a healthy Sheets round trip (~0.5-1 s) and short
+# enough that a totally-unreachable Sheet doesn't render the tab
+# unusable.
+WARMER_TIMEOUT_SEC: float = 5.0
+
 
 @dataclass(frozen=True)
 class Assignment:
@@ -246,11 +261,12 @@ def start_warmer(config: dict) -> None:
         logger.debug("assignments warmer not started (no sheet "
                       "configured)")
         return
-    global _warmer_started
+    global _warmer_started, _warmer_started_at
     with _warmer_lock:
         if _warmer_started:
             return
         _warmer_started = True
+        _warmer_started_at = time.time()
     t = threading.Thread(
         target=_warmer_loop, args=(config,),
         daemon=True, name="qc-assignments-warmer",
@@ -268,7 +284,7 @@ def _warmer_loop(config: dict) -> None:
     the lab's NASA JPL Rule 2 we still cap iterations and assert
     at the top. At a 30-min refresh the cap covers ~60,000 years.
     """
-    global _cache_version
+    global _cache_version, _warmer_first_completed_at
     assert isinstance(config, dict), "config must be a dict"
     interval = _warmer_interval_sec(config)
     max_iter = 10 ** 9
@@ -285,7 +301,43 @@ def _warmer_loop(config: dict) -> None:
             logger.exception(
                 "assignments warmer iteration failed; "
                 "will retry in %.0f s", interval)
+        # Stamp first-completion regardless of success: a
+        # failed Sheets API call (tab missing, network down,
+        # auth expired) should still let the picker fall back
+        # to "no assignments" instead of spinning forever on
+        # the cold-cache loading message.
+        if _warmer_first_completed_at == 0.0:
+            _warmer_first_completed_at = time.time()
         time.sleep(interval)
+
+
+def cache_settled() -> bool:
+    """True once the warmer has completed at least one full
+    iteration (regardless of whether it succeeded). Lets UI
+    code distinguish 'haven't tried yet' from 'tried and got
+    nothing' so empty Sheets don't spin the picker forever.
+    """
+    return _warmer_first_completed_at > 0.0
+
+
+def warmer_should_have_settled() -> bool:
+    """True when the picker should give up waiting for the
+    warmer and fall back to treating the cache as empty.
+
+    Two conditions OR'd together:
+      * warmer has completed at least one iteration
+        (``cache_settled``), OR
+      * ``WARMER_TIMEOUT_SEC`` has elapsed since the warmer
+        was started (defensive: if the daemon thread itself
+        failed to spawn or hung before the first iteration,
+        the picker still recovers).
+    """
+    if cache_settled():
+        return True
+    if _warmer_started_at <= 0.0:
+        return False
+    return (time.time() - _warmer_started_at
+              ) >= WARMER_TIMEOUT_SEC
 
 
 def _peek_sheet_cache(sheet_id: str,
