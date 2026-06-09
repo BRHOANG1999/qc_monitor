@@ -114,15 +114,14 @@ def main():
         min_file_age_sec=watch_cfg.get("min_file_age_sec", 60),
     )
 
-    dispatcher = Dispatcher(store, config)
+    dispatcher = Dispatcher(store, config, emailer=EmailAlerter(config))
 
     # Create initial settings version
     version_id = store.create_settings_version(config, label="initial")
     logger.info("Settings version: %d", version_id)
 
-    emailer = EmailAlerter(config)
-    alert_engine = AlertRuleEngine(store, emailer, config)
-    digest_scheduler = DigestScheduler(config, emailer, store=store)
+    alert_engine = AlertRuleEngine(store, dispatcher.emailer, config)
+    digest_scheduler = DigestScheduler(config, dispatcher.emailer, store=store)
 
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds

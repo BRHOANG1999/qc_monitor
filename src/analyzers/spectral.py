@@ -4,6 +4,11 @@ import numpy as np
 from scipy.signal import welch
 from src.utils.mat_loader import ChunkData
 
+# np.trapz was deprecated in NumPy 2.0 and removed in 2.2 -- prefer the
+# new name when available so this module imports cleanly under either
+# release. Both functions take the same (y, x) signature.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 DEFAULT_BANDS = {
     "delta": (0.5, 4),
     "theta": (4, 8),
@@ -36,17 +41,17 @@ def analyze_spectral(chunk: ChunkData,
 
         # Band powers
         metrics = {}
-        total_power = float(np.trapz(psd, freqs))
+        total_power = float(_trapezoid(psd, freqs))
         metrics["total_power"] = total_power
 
         for band_name, (flo, fhi) in bands.items():
             mask = (freqs >= flo) & (freqs <= fhi)
-            band_power = float(np.trapz(psd[mask], freqs[mask])) if np.any(mask) else 0.0
+            band_power = float(_trapezoid(psd[mask], freqs[mask])) if np.any(mask) else 0.0
             metrics[f"{band_name}_power"] = band_power
 
         # Line noise (60Hz ± 2Hz)
         noise_mask = (freqs >= line_noise_freq - 2) & (freqs <= line_noise_freq + 2)
-        line_noise_power = float(np.trapz(psd[noise_mask], freqs[noise_mask])) if np.any(noise_mask) else 0.0
+        line_noise_power = float(_trapezoid(psd[noise_mask], freqs[noise_mask])) if np.any(noise_mask) else 0.0
         metrics["line_noise_power"] = line_noise_power
         metrics["line_noise_ratio"] = line_noise_power / total_power if total_power > 0 else 0.0
 
