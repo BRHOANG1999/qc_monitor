@@ -34,8 +34,15 @@ from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
 from src.dashboard.tabs import alerts as tabs_alerts
+from src.dashboard.tabs import signal_quality as tabs_signal_quality
+from src.dashboard.tabs import stim as tabs_stim
 from src.dashboard.components import (
     card as _card, pill as _pill, section_header as _section_header,
+)
+from src.dashboard.data_helpers import (
+    channel_map as _get_channel_map,
+    color_for_role as _color_for_role,
+    parse_json_field as _parse_json_field,
 )
 # Side-effect import: registers the qc_dark Plotly template as default
 from src.dashboard import plotly_template  # noqa: F401
@@ -204,38 +211,10 @@ TAB_SELECTED_STYLE = {
     "fontWeight": "600",
 }
 
-DARK_TABLE_STYLE = {
-    "style_header": {
-        "backgroundColor": COLOR_SURFACE_2,
-        "color": COLOR_TEXT_PRIMARY,
-        "fontWeight": "600",
-        "border": "none",
-        "borderBottom": f"1px solid {COLOR_DIVIDER}",
-        "fontSize": FONT_SIZE_CAPTION,
-        "textTransform": "uppercase",
-        "letterSpacing": "0.5px",
-    },
-    "style_data": {
-        "backgroundColor": COLOR_SURFACE_1,
-        "color": COLOR_TEXT_SECONDARY,
-        "border": "none",
-        "borderBottom": f"1px solid {COLOR_DIVIDER}",
-        "fontSize": FONT_SIZE_BODY,
-    },
-    "style_cell": {
-        "textAlign": "left",
-        "padding": f"{SPACE_3} {SPACE_4}",
-        "fontSize": FONT_SIZE_BODY,
-        "fontFamily": FONT_STACK,
-    },
-    "style_filter": {
-        "backgroundColor": COLOR_SURFACE_2,
-        "color": COLOR_TEXT_PRIMARY,
-    },
-}
-
-# Zebra stripe — very subtle, just a lighter surface.
-ZEBRA_STRIPE = {"if": {"row_index": "odd"}, "backgroundColor": COLOR_SURFACE_2}
+# DARK_TABLE_STYLE / ZEBRA_STRIPE live in src/dashboard/components.py
+# so the four tab modules that still inline DataTable usage in this
+# file and the carved-out tabs share one source of truth.
+from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE  # noqa: E402,F401
 
 SECTION_STYLE = {
     "background": COLOR_SURFACE_1,
@@ -378,39 +357,10 @@ def _save_config(cfg: dict):
                   allow_unicode=True)
 
 
-def _parse_json_field(val):
-    """Parse a JSON string from the DB or return the value as-is."""
-    if isinstance(val, str):
-        try:
-            return json.loads(val)
-        except (json.JSONDecodeError, TypeError):
-            return val
-    return val
-
-
-def _get_channel_map(store: Store, session_dir: str) -> dict:
-    """Build channel_index -> {name, role} map from session_config."""
-    cfg = store.get_session_config(session_dir)
-    if not cfg:
-        return {}
-    names = _parse_json_field(cfg.get("channel_names")) or []
-    eeg_chs = _parse_json_field(cfg.get("eeg_channels")) or []
-    stim_chs = _parse_json_field(cfg.get("stim_copy_channels")) or []
-    ref_chs = _parse_json_field(cfg.get("reference_channels")) or []
-
-    ch_map = {}
-    for i, name in enumerate(names):
-        role = "eeg"
-        if i in stim_chs:
-            role = "stim_copy"
-        elif i in ref_chs:
-            role = "reference"
-        ch_map[i] = {"name": name, "role": role}
-    return ch_map
-
-
-def _color_for_role(role: str) -> str:
-    return ROLE_COLORS.get(role, "#636EFA")
+# _parse_json_field, _get_channel_map, and _color_for_role moved to
+# src/dashboard/data_helpers.py so the tab modules carved out of this
+# file can reuse them without importing the app shell. The aliased
+# imports above preserve every existing in-module callsite.
 
 
 def _status_card(title: str, value: str, color: str = "#636EFA"):
@@ -1477,7 +1427,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(
                     _waveforms_tab_layout(store, default_session=session_hint))
             elif tab == "signal":
-                return _enable_persistence(_signal_quality_tab(store))
+                return _enable_persistence(tabs_signal_quality.layout(store))
             elif tab == "evoked":
                 return _enable_persistence(_evoked_tab_layout(store))
             elif tab == "criticality":
@@ -1493,7 +1443,7 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "session_compare":
                 return _enable_persistence(_session_compare_tab_layout(store))
             elif tab == "stim":
-                return _enable_persistence(_stim_tab(store))
+                return _enable_persistence(tabs_stim.layout(store))
             elif tab == "settings":
                 return _enable_persistence(_settings_tab_layout(store))
             elif tab == "activity_log":
@@ -2813,6 +2763,8 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_maintenance.register_callbacks(app, store, config)
     tabs_data_log_xref.register_callbacks(app, store, config)
     tabs_alerts.register_callbacks(app, store, config)
+    tabs_signal_quality.register_callbacks(app, store, config)
+    tabs_stim.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -4811,60 +4763,7 @@ def _waveforms_tab_layout(store: Store, default_session: str | None = None):
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Signal Quality tab (existing)
-# ------------------------------------------------------------------ #
-
-def _signal_quality_tab(store: Store):
-    sessions = store.get_sessions()
-    if not sessions:
-        return html.Div("No sessions found.", style={"color": "#888"})
-
-    session_dir = sessions[0].get("session_dir", "")
-    ch_map = _get_channel_map(store, session_dir)
-
-    data = store.get_qc_timeseries(session_dir=session_dir, hours=48)
-    if not data:
-        return html.Div("No QC data yet.", style={"color": "#888"})
-
-    channels = sorted(set(d["channel"] for d in data))
-
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        subplot_titles=["RMS Amplitude", "Artifact %", "Line Noise Ratio"],
-                        vertical_spacing=0.08)
-
-    for ch in channels:
-        ch_data = [d for d in data if d["channel"] == ch]
-        ch_times = [d["chunk_datetime"] for d in ch_data]
-
-        info = ch_map.get(ch, {"name": f"Ch{ch}", "role": "eeg"})
-        ch_name = info["name"]
-        color = _color_for_role(info["role"])
-
-        fig.add_trace(go.Scatter(
-            x=ch_times, y=[d["rms_amplitude"] for d in ch_data],
-            name=ch_name, legendgroup=ch_name,
-            line=dict(color=color), marker=dict(size=2),
-        ), row=1, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=ch_times, y=[d["artifact_pct"] for d in ch_data],
-            name=ch_name, legendgroup=ch_name, showlegend=False,
-            line=dict(color=color), marker=dict(size=2),
-        ), row=2, col=1)
-
-        fig.add_trace(go.Scatter(
-            x=ch_times, y=[d["line_noise_ratio"] for d in ch_data],
-            name=ch_name, legendgroup=ch_name, showlegend=False,
-            line=dict(color=color), marker=dict(size=2),
-        ), row=3, col=1)
-
-    fig.update_layout(
-        height=750, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig.update_annotations(font=dict(color="white"))
-
-    return html.Div([dcc.Graph(figure=fig)])
+# Signal Quality tab moved to src/dashboard/tabs/signal_quality.py.
 
 
 # ------------------------------------------------------------------ #
@@ -5206,48 +5105,7 @@ def _session_compare_tab_layout(store: Store):
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Stim QC tab (existing)
-# ------------------------------------------------------------------ #
-
-def _stim_tab(store: Store):
-    with store.connection() as conn:
-        rows = conn.execute(
-            """SELECT pf.chunk_datetime, pf.session_name, sq.*
-               FROM stim_qc sq JOIN processed_files pf ON sq.file_id = pf.id
-               ORDER BY pf.chunk_datetime DESC LIMIT 500"""
-        ).fetchall()
-
-    if not rows:
-        return html.Div("No stimulation data yet.", style={"color": "#888"})
-
-    data = [dict(r) for r in rows]
-    return html.Div([
-        html.H3("Stimulation Delivery QC", style={"color": "white", "marginBottom": "12px"}),
-        dash_table.DataTable(
-            data=[{
-                "time": d["chunk_datetime"][:16],
-                "session": d.get("session_name", ""),
-                "channel": d["stim_channel"],
-                "charge_nC": f"{d['charge_nC']:.1f}" if d["charge_nC"] else "",
-                "freq_Hz": f"{d['frequency_hz']:.1f}" if d["frequency_hz"] else "",
-                "pulses": d["total_pulses"],
-                "expected": d["expected_pulses"],
-                "delivery_%": f"{d['delivery_pct']:.1f}" if d["delivery_pct"] else "N/A",
-            } for d in data],
-            columns=[{"name": c, "id": c} for c in
-                     ["time", "session", "channel", "charge_nC", "freq_Hz",
-                      "pulses", "expected", "delivery_%"]],
-            **DARK_TABLE_STYLE,
-            style_data_conditional=[ZEBRA_STRIPE,
-                {"if": {"filter_query": "{delivery_%} contains '0.0'"},
-                 "backgroundColor": "#3d1111", "color": "#ff6b6b"},
-            ],
-            page_size=25,
-            filter_action="native",
-            sort_action="native",
-        ),
-    ])
+# Stim QC tab moved to src/dashboard/tabs/stim.py.
 
 
 # ------------------------------------------------------------------ #

@@ -19,7 +19,8 @@ from src.dashboard.design import (
     COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_SURFACE_3,
     COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
     COLOR_WARNING, FONT_SIZE_BODY, FONT_SIZE_CAPTION, FONT_SIZE_HEADER,
-    RADIUS_MD, RADIUS_SM, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+    FONT_STACK, RADIUS_MD, RADIUS_SM,
+    SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
 )
 from src.dashboard.icons import icon
 
@@ -282,6 +283,51 @@ TABLE_STYLE: dict = {
         "textAlign": "left",
         "whiteSpace": "normal", "height": "auto",
     },
+}
+
+
+# --------------------------------------------------------------------- #
+#  DARK_TABLE_STYLE -- read-only "log table" variant with uppercase
+#  caption-sized headers, smaller padding, and a filter row. Used by
+#  tabs/alerts, tabs/stim, and the in-app Activity Log + Annotations
+#  tables.
+# --------------------------------------------------------------------- #
+
+DARK_TABLE_STYLE: dict = {
+    "style_header": {
+        "backgroundColor": COLOR_SURFACE_2,
+        "color": COLOR_TEXT_PRIMARY,
+        "fontWeight": "600",
+        "border": "none",
+        "borderBottom": f"1px solid {COLOR_DIVIDER}",
+        "fontSize": FONT_SIZE_CAPTION,
+        "textTransform": "uppercase",
+        "letterSpacing": "0.5px",
+    },
+    "style_data": {
+        "backgroundColor": COLOR_SURFACE_1,
+        "color": COLOR_TEXT_SECONDARY,
+        "border": "none",
+        "borderBottom": f"1px solid {COLOR_DIVIDER}",
+        "fontSize": FONT_SIZE_BODY,
+    },
+    "style_cell": {
+        "textAlign": "left",
+        "padding": f"{SPACE_3} {SPACE_4}",
+        "fontSize": FONT_SIZE_BODY,
+        "fontFamily": FONT_STACK,
+    },
+    "style_filter": {
+        "backgroundColor": COLOR_SURFACE_2,
+        "color": COLOR_TEXT_PRIMARY,
+    },
+}
+
+# Zebra stripe -- very subtle, just a lighter surface. Pair with
+# DARK_TABLE_STYLE via style_data_conditional=[ZEBRA_STRIPE, ...].
+ZEBRA_STRIPE: dict = {
+    "if": {"row_index": "odd"},
+    "backgroundColor": COLOR_SURFACE_2,
 }
 
 

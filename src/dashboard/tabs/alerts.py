@@ -17,49 +17,8 @@ from __future__ import annotations
 
 from dash import dash_table, html
 
+from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE
 from src.db.store import Store
-from src.dashboard.design import (
-    COLOR_DIVIDER, COLOR_SURFACE_1, COLOR_SURFACE_2,
-    COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
-    FONT_SIZE_BODY, FONT_SIZE_CAPTION, FONT_STACK,
-    SPACE_3, SPACE_4,
-)
-
-# Same shared dash_table style + zebra stripe used by every other
-# read-only data table in the dashboard. Defined locally rather than
-# imported from app.py so the tab module has no upward dependency on
-# the app shell.
-_DARK_TABLE_STYLE = {
-    "style_header": {
-        "backgroundColor": COLOR_SURFACE_2,
-        "color": COLOR_TEXT_PRIMARY,
-        "fontWeight": "600",
-        "border": "none",
-        "borderBottom": f"1px solid {COLOR_DIVIDER}",
-        "fontSize": FONT_SIZE_CAPTION,
-        "textTransform": "uppercase",
-        "letterSpacing": "0.5px",
-    },
-    "style_data": {
-        "backgroundColor": COLOR_SURFACE_1,
-        "color": COLOR_TEXT_SECONDARY,
-        "border": "none",
-        "borderBottom": f"1px solid {COLOR_DIVIDER}",
-        "fontSize": FONT_SIZE_BODY,
-    },
-    "style_cell": {
-        "textAlign": "left",
-        "padding": f"{SPACE_3} {SPACE_4}",
-        "fontSize": FONT_SIZE_BODY,
-        "fontFamily": FONT_STACK,
-    },
-    "style_filter": {
-        "backgroundColor": COLOR_SURFACE_2,
-        "color": COLOR_TEXT_PRIMARY,
-    },
-}
-_ZEBRA_STRIPE = {"if": {"row_index": "odd"},
-                  "backgroundColor": COLOR_SURFACE_2}
 
 
 def layout(store: Store):
@@ -78,8 +37,8 @@ def layout(store: Store):
             columns=[{"name": c, "id": c}
                      for c in ["time", "severity", "type",
                                 "message", "session"]],
-            **_DARK_TABLE_STYLE,
-            style_data_conditional=[_ZEBRA_STRIPE,
+            **DARK_TABLE_STYLE,
+            style_data_conditional=[ZEBRA_STRIPE,
                 {"if": {"filter_query": "{severity} = critical"},
                  "backgroundColor": "#3d1111", "color": "#ff6b6b"},
                 {"if": {"filter_query": "{severity} = warning"},
