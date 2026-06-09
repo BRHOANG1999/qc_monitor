@@ -33,6 +33,7 @@ from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
+from src.dashboard.tabs import alerts as tabs_alerts
 from src.dashboard.components import (
     card as _card, pill as _pill, section_header as _section_header,
 )
@@ -1500,7 +1501,7 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "annotations":
                 return _enable_persistence(_annotations_tab_layout(store))
             elif tab == "alerts":
-                return _enable_persistence(_alerts_tab(store))
+                return _enable_persistence(tabs_alerts.layout(store))
             elif tab == "sessions":
                 return _enable_persistence(_sessions_tab(store))
             elif tab == "surgeries":
@@ -2811,6 +2812,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_surgeries.register_callbacks(app, store, config)
     tabs_maintenance.register_callbacks(app, store, config)
     tabs_data_log_xref.register_callbacks(app, store, config)
+    tabs_alerts.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -5850,38 +5852,6 @@ def _annotations_table_data(annotations: list[dict]) -> list[dict]:
         }
         for a in annotations
     ]
-
-
-# ------------------------------------------------------------------ #
-#  Alerts tab (existing)
-# ------------------------------------------------------------------ #
-
-def _alerts_tab(store: Store):
-    alerts = store.get_recent_alerts(hours=168)  # 7 days
-    return html.Div([
-        html.H3(f"Alert History (last 7 days) -- {len(alerts)} alerts",
-                 style={"color": "white", "marginBottom": "12px"}),
-        dash_table.DataTable(
-            data=[{"time": a["sent_at"][:19], "severity": a["severity"],
-                   "type": a["alert_type"], "message": a["message"],
-                   "session": a.get("session_dir", "")}
-                  for a in alerts],
-            columns=[{"name": c, "id": c}
-                     for c in ["time", "severity", "type", "message", "session"]],
-            **DARK_TABLE_STYLE,
-            style_data_conditional=[ZEBRA_STRIPE,
-                {"if": {"filter_query": "{severity} = critical"},
-                 "backgroundColor": "#3d1111", "color": "#ff6b6b"},
-                {"if": {"filter_query": "{severity} = warning"},
-                 "backgroundColor": "#3d3011", "color": "#ffd93d"},
-                {"if": {"filter_query": "{severity} = info"},
-                 "backgroundColor": "#112233", "color": "#6bb5ff"},
-            ],
-            page_size=25,
-            filter_action="native",
-            sort_action="native",
-        ) if alerts else html.P("No alerts in the last 7 days", style={"color": "#888"}),
-    ])
 
 
 # ------------------------------------------------------------------ #
