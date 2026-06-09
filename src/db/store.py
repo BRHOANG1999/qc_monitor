@@ -1457,18 +1457,26 @@ class Store:
         """Atomic: write review_state row + matching event-log entry.
 
         status ∈ {'claimed', 'no_events', 'has_events',
-                   'abandoned'}. Returns the review_state row id.
-        Finalising (no_events / has_events / abandoned) emits a
-        'finish' (or 'abandon') log event; claiming emits 'claim'.
+                   'abandoned', 'pending_pi_review',
+                   'pi_approved', 'pi_flagged'}.
+
+        Returns the review_state row id. Finalising statuses
+        (no_events / has_events / pending_pi_review /
+        pi_approved) emit a 'finish' log event; flagged emits
+        'pi_flag'; abandoned emits 'abandon'; claiming emits
+        'claim'.
         """
         assert isinstance(file_id, int), "file_id must be int"
         assert user_email, "user_email required"
         assert status in ("claimed", "no_events", "has_events",
-                           "abandoned"), f"bad status {status!r}"
+                           "abandoned", "pending_pi_review",
+                           "pi_approved", "pi_flagged"), \
+            f"bad status {status!r}"
         now = datetime.now().isoformat()
         markers_json = json.dumps(markers or [])
         log_action = ("claim" if status == "claimed"
                        else "abandon" if status == "abandoned"
+                       else "pi_flag" if status == "pi_flagged"
                        else "finish")
         conn = self._connect()
         try:
