@@ -34,6 +34,7 @@ from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
 from src.dashboard.tabs import alerts as tabs_alerts
+from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
 from src.dashboard.components import (
@@ -105,13 +106,8 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "con
 CONFIG_PATH = os.path.normpath(CONFIG_PATH)
 
 # Standard time-range options used across tabs
-TIME_RANGE_OPTIONS = [
-    {"label": "Last 24h", "value": 24},
-    {"label": "Last 48h", "value": 48},
-    {"label": "Last 1 week", "value": 168},
-    {"label": "Last 1 month", "value": 720},
-    {"label": "All time", "value": 0},
-]
+# TIME_RANGE_OPTIONS moved to src/dashboard/data_helpers.py.
+from src.dashboard.data_helpers import TIME_RANGE_OPTIONS  # noqa: E402,F401
 
 # --------------------------------------------------------------------- #
 #  Navigation taxonomy — top-level groups with sub-tabs.
@@ -223,28 +219,12 @@ SECTION_STYLE = {
     "border": f"1px solid {COLOR_DIVIDER}",
     "marginBottom": SPACE_4,
 }
-LABEL_STYLE = {
-    "color": COLOR_TEXT_TERTIARY,
-    "fontSize": FONT_SIZE_CAPTION,
-    "marginBottom": SPACE_2,
-    "display": "block",
-    "letterSpacing": "0.4px",
-    "textTransform": "uppercase",
-    "fontWeight": "600",
-}
-INPUT_STYLE = {
-    "backgroundColor": COLOR_SURFACE_3,
-    "color": COLOR_TEXT_PRIMARY,
-    "border": f"1px solid {COLOR_DIVIDER}",
-    "borderRadius": RADIUS_SM,
-    "padding": f"{SPACE_2} {SPACE_3}",
-    "width": "100%",
-    "fontSize": FONT_SIZE_BODY,
-    "fontFamily": FONT_STACK,
-    "transition": "border-color 0.15s ease, box-shadow 0.15s ease",
-}
-FIELD_STYLE = {"flex": "1", "minWidth": "200px"}
-DROPDOWN_STYLE = {"backgroundColor": COLOR_SURFACE_3, "color": COLOR_TEXT_PRIMARY}
+# LABEL_STYLE / INPUT_STYLE / FIELD_STYLE / DROPDOWN_STYLE moved to
+# src/dashboard/components.py so the tab modules carved out of this
+# file can share one source of truth.
+from src.dashboard.components import (  # noqa: E402,F401
+    DROPDOWN_STYLE, FIELD_STYLE, INPUT_STYLE, LABEL_STYLE,
+)
 
 # ====================================================================== #
 #  Helpers
@@ -415,33 +395,9 @@ def _status_pill(title: str, value: str, color: str = "#636EFA"):
     })
 
 
-def _empty_fig(text: str = "Nothing to show yet",
-               hint: str | None = None,
-               height: int = 400) -> go.Figure:
-    """Friendly empty figure used in place of a plot when there's no data.
-
-    *text* is the headline. *hint* is an optional one-liner explaining
-    what the user can do next, rendered below the headline in a quieter
-    color. Apple HIG: empty states should be informative, not silent.
-    """
-    fig = go.Figure()
-    annotations = [dict(
-        text=f"<b>{text}</b>", showarrow=False, xref="paper", yref="paper",
-        x=0.5, y=0.55, font=dict(size=14, color=COLOR_TEXT_SECONDARY),
-    )]
-    if hint:
-        annotations.append(dict(
-            text=hint, showarrow=False, xref="paper", yref="paper",
-            x=0.5, y=0.42, font=dict(size=11, color=COLOR_TEXT_TERTIARY),
-        ))
-    fig.update_layout(
-        height=height,
-        plot_bgcolor=COLOR_SURFACE_1, paper_bgcolor=COLOR_SURFACE_1,
-        annotations=annotations,
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
-    return fig
+# _empty_fig moved to src/dashboard/data_helpers.empty_fig. The
+# alias below keeps the 19 in-module callsites working unchanged.
+from src.dashboard.data_helpers import empty_fig as _empty_fig  # noqa: E402,F401
 
 
 def _empty_state(headline: str, hint: str = "",
@@ -1431,7 +1387,7 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "evoked":
                 return _enable_persistence(_evoked_tab_layout(store))
             elif tab == "criticality":
-                return _enable_persistence(_criticality_tab_layout(store))
+                return _enable_persistence(tabs_criticality.layout(store))
             elif tab == "lfp":
                 return _enable_persistence(
                     _lfp_browser_tab_layout(store, default_session=session_hint))
@@ -1755,58 +1711,7 @@ def create_app(config: dict, store: Store) -> Dash:
         )
         return fig
 
-    # ------------------------------------------------------------------ #
-    #  Criticality callback
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        Output("criticality-plot", "figure"),
-        [Input("criticality-session-dropdown", "value"),
-         Input("criticality-hours-dropdown", "value")],
-    )
-    def update_criticality(session_dir, hours):
-        if not session_dir:
-            return _empty_fig("Select a session", 550)
-
-        ch_map = _get_channel_map(store, session_dir)
-
-        try:
-            data = store.query_criticality_timeseries(
-                session_dir=session_dir,
-                hours=int(hours) if hours else None,
-            )
-        except Exception as e:
-            return _empty_fig(f"Error: {e}", 550)
-
-        if not data:
-            return _empty_fig("No criticality data", 550)
-
-        channels = sorted(set(d["channel"] for d in data))
-
-        fig = go.Figure()
-        for ch in channels:
-            ch_data = [d for d in data if d["channel"] == ch]
-            times = [d["chunk_datetime"] for d in ch_data]
-            vals = [d["db_value"] for d in ch_data]
-
-            info = ch_map.get(ch, {"name": f"Ch{ch}", "role": "eeg"})
-            if ch_map and info["role"] != "eeg":
-                continue
-
-            fig.add_trace(go.Scatter(
-                x=times, y=vals, mode="lines+markers",
-                name=info["name"],
-                line=dict(color=_color_for_role(info["role"])),
-                marker=dict(size=3),
-            ))
-
-        fig.update_layout(
-            title="Criticality (dB) Over Time -- EEG Channels",
-            xaxis_title="Time",
-            yaxis_title="dB Value",
-            height=550,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        return fig
+    # Criticality callback moved to src/dashboard/tabs/criticality.py.
 
     # ------------------------------------------------------------------ #
     #  LFP Browser callbacks
@@ -2765,6 +2670,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_alerts.register_callbacks(app, store, config)
     tabs_signal_quality.register_callbacks(app, store, config)
     tabs_stim.register_callbacks(app, store, config)
+    tabs_criticality.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -4833,43 +4739,7 @@ def _evoked_tab_layout(store: Store):
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Criticality tab (existing)
-# ------------------------------------------------------------------ #
-
-def _criticality_tab_layout(store: Store):
-    """Build the Criticality tab layout -- data loaded via callback."""
-    sessions = store.get_sessions()
-    session_options = [{"label": s["session_name"], "value": s["session_dir"]}
-                       for s in sessions]
-    default_session = sessions[0]["session_dir"] if sessions else None
-
-    return html.Div([
-        html.Div([
-            html.Div([
-                html.Label("Session", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="criticality-session-dropdown",
-                    options=session_options,
-                    value=default_session,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "250px"}),
-            html.Div([
-                html.Label("Time Range", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="criticality-hours-dropdown",
-                    options=TIME_RANGE_OPTIONS,
-                    value=48,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "0 0 180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
-
-        dcc.Graph(id="criticality-plot", style={"height": "550px"}),
-    ])
+# Criticality tab moved to src/dashboard/tabs/criticality.py.
 
 
 # ------------------------------------------------------------------ #

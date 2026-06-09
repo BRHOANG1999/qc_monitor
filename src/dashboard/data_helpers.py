@@ -1,22 +1,68 @@
-"""Shared store-aware helpers for dashboard tabs.
+"""Shared helpers for dashboard tabs.
 
-Helpers that wrap ``Store`` calls or do JSON-field unwrapping for
-multiple tabs live here instead of being duplicated across each tab
-module. The functions themselves came out of ``src/dashboard/app.py``
-where they were used by 8+ render paths.
+Helpers used by more than one tab (store-aware accessors, JSON
+unwrapping, the canonical "empty figure" plotly builder, the
+time-range dropdown options) live here instead of being duplicated
+across each tab module. The functions themselves came out of
+``src/dashboard/app.py`` where they were used by 8+ render paths.
 
-Anything UI-shaped (Dash components, dash_table styles) belongs in
-``src/dashboard/components.py``; anything purely about colors/typography
-belongs in ``src/dashboard/design.py``. This module is for plumbing
-that *reads from the store* on behalf of a tab.
+Anything UI-shaped (Dash components, dash_table + form-control
+styles) belongs in ``src/dashboard/components.py``; anything purely
+about colors / typography belongs in ``src/dashboard/design.py``.
 """
 
 from __future__ import annotations
 
 import json
 
-from src.dashboard.design import ROLE_COLORS
+import plotly.graph_objects as go
+
+from src.dashboard.design import (
+    COLOR_SURFACE_1, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
+    ROLE_COLORS,
+)
 from src.db.store import Store
+
+
+# Standard time-range dropdown options used across tabs (Criticality,
+# Evoked, Activity log, ...). Value is hours; 0 means "all time".
+TIME_RANGE_OPTIONS: list[dict] = [
+    {"label": "Last 24h", "value": 24},
+    {"label": "Last 48h", "value": 48},
+    {"label": "Last 1 week", "value": 168},
+    {"label": "Last 1 month", "value": 720},
+    {"label": "All time", "value": 0},
+]
+
+
+def empty_fig(text: str = "Nothing to show yet",
+              hint: str | None = None,
+              height: int = 400) -> go.Figure:
+    """Friendly empty figure used in place of a plot when there's no
+    data. *text* is the headline; *hint* is an optional one-liner
+    rendered below the headline in a quieter color. Apple HIG: empty
+    states should be informative, not silent."""
+    fig = go.Figure()
+    annotations = [dict(
+        text=f"<b>{text}</b>", showarrow=False,
+        xref="paper", yref="paper",
+        x=0.5, y=0.55,
+        font=dict(size=14, color=COLOR_TEXT_SECONDARY),
+    )]
+    if hint:
+        annotations.append(dict(
+            text=hint, showarrow=False, xref="paper", yref="paper",
+            x=0.5, y=0.42,
+            font=dict(size=11, color=COLOR_TEXT_TERTIARY),
+        ))
+    fig.update_layout(
+        height=height,
+        plot_bgcolor=COLOR_SURFACE_1, paper_bgcolor=COLOR_SURFACE_1,
+        annotations=annotations,
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        margin=dict(l=20, r=20, t=20, b=20),
+    )
+    return fig
 
 
 def parse_json_field(val):

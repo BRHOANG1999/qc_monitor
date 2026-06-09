@@ -332,6 +332,40 @@ ZEBRA_STRIPE: dict = {
 
 
 # --------------------------------------------------------------------- #
+#  Form-control styles -- every dropdown / labelled input across the
+#  dashboard uses these. Lifted out of app.py so tab modules carved
+#  out of it (criticality, session_compare, etc.) can share one
+#  source of truth.
+# --------------------------------------------------------------------- #
+
+LABEL_STYLE: dict = {
+    "color": COLOR_TEXT_TERTIARY,
+    "fontSize": FONT_SIZE_CAPTION,
+    "marginBottom": SPACE_2,
+    "display": "block",
+    "letterSpacing": "0.4px",
+    "textTransform": "uppercase",
+    "fontWeight": "600",
+}
+INPUT_STYLE: dict = {
+    "backgroundColor": COLOR_SURFACE_3,
+    "color": COLOR_TEXT_PRIMARY,
+    "border": f"1px solid {COLOR_DIVIDER}",
+    "borderRadius": RADIUS_SM,
+    "padding": f"{SPACE_2} {SPACE_3}",
+    "width": "100%",
+    "fontSize": FONT_SIZE_BODY,
+    "fontFamily": FONT_STACK,
+    "transition": "border-color 0.15s ease, box-shadow 0.15s ease",
+}
+FIELD_STYLE: dict = {"flex": "1", "minWidth": "200px"}
+DROPDOWN_STYLE: dict = {
+    "backgroundColor": COLOR_SURFACE_3,
+    "color": COLOR_TEXT_PRIMARY,
+}
+
+
+# --------------------------------------------------------------------- #
 #  Row -- horizontal flex helper, used by status grids.
 # --------------------------------------------------------------------- #
 
