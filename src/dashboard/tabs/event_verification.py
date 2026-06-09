@@ -24,12 +24,16 @@ from pathlib import Path
 from dash import ALL, Input, Output, State, callback_context
 from dash import dcc, html, no_update
 
+import numpy as np
+import plotly.graph_objects as go
+
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.dashboard.tabs.review_status import _is_pi
 from src.utils import bhz_csv as _bhz_csv
 from src.utils import event_clip as _event_clip
 from src.utils.animal import split_animal_electrode, is_animal_channel
+from src.utils.decimate import envelope, choose_target_bins
 
 logger = logging.getLogger("qc_monitor.tabs.event_verification")
 
@@ -149,6 +153,11 @@ def layout(store: Store, config: dict | None = None):
                           "fontSize": "12px",
                           "minHeight": "16px",
                           "marginBottom": "12px"}),
+        # Pending overwrite plan (filled by the Finalize
+        # callback when overwrite mode would remove rows).
+        # The modal below renders from it.
+        dcc.Store(id="evtv-overwrite-plan", data=None),
+        _overwrite_modal(),
         # File list. Each row carries a checkbox + per-file
         # Approve/Flag buttons + the event summary.
         dcc.Loading(
@@ -166,6 +175,12 @@ def layout(store: Store, config: dict | None = None):
         # Detail view container -- populated by callback.
         html.Div(id="evtv-detail-panel",
                   style={"marginTop": "20px"}),
+        # Auto-poll: ticks every 3 s; only fires the detail
+        # re-render when a clip is still extracting (status
+        # in pending/running). The clientside guard below
+        # bumps n_intervals only when the panel is open.
+        dcc.Interval(id="evtv-detail-poll", interval=3000,
+                       n_intervals=0, disabled=True),
     ], style={"padding": "20px 24px"})
 
 
@@ -199,6 +214,118 @@ def _btn_style(*, accent: bool = False, warning: bool = False,
 
 
 # --------------------------------------------------------------- #
+# Destructive-overwrite confirmation modal
+# --------------------------------------------------------------- #
+
+def _overwrite_modal() -> html.Div:
+    """The destructive-overwrite confirmation modal.
+
+    Hidden by default. The Finalize callback sets style.display
+    to 'flex' when the proposed overwrite would remove rows
+    from one or more existing CSVs. The modal body is rendered
+    by the plan-watcher callback from the
+    ``evtv-overwrite-plan`` Store; Confirm executes the writes;
+    Cancel discards them.
+    """
+    return html.Div(
+        id="evtv-overwrite-modal",
+        style={"position": "fixed", "inset": "0",
+                "display": "none",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "background": "rgba(10,10,20,0.65)",
+                "backdropFilter": "blur(6px)",
+                "zIndex": "10001"},
+        children=html.Div(
+            id="evtv-overwrite-modal-card",
+            style={"width": "min(640px, 92vw)",
+                    "maxHeight": "82vh",
+                    "overflowY": "auto",
+                    "background": "#13131f",
+                    "border":
+                        "1px solid rgba(255,159,10,0.30)",
+                    "borderRadius": "10px",
+                    "padding": "24px",
+                    "boxShadow":
+                        "0 24px 48px rgba(0,0,0,0.55)"},
+            children=[
+                html.Div(
+                    "⚠️  Destructive overwrite — confirm",
+                    style={"color": "#ff9f0a",
+                            "fontWeight": "600",
+                            "fontSize": "16px",
+                            "marginBottom": "6px"}),
+                html.Div(
+                    "Overwrite mode rebuilds the CSV from "
+                    "the current pi_approved set. The "
+                    "following rows would be REMOVED from "
+                    "existing files. Continue?",
+                    style={"color": "#a0a0b0",
+                            "fontSize": "12px",
+                            "marginBottom": "14px"}),
+                html.Div(id="evtv-overwrite-modal-body",
+                          style={"color": "#f0f0f5",
+                                  "fontSize": "12px",
+                                  "fontFamily":
+                                      "ui-monospace, monospace",
+                                  "background": "#0a0a14",
+                                  "border":
+                                      "1px solid rgba(255,255,255,0.08)",
+                                  "borderRadius": "6px",
+                                  "padding": "10px 12px",
+                                  "marginBottom": "16px"}),
+                html.Div([
+                    html.Button(
+                        "Cancel",
+                        id="evtv-overwrite-cancel-btn",
+                        n_clicks=0,
+                        style=_btn_style(secondary=True)),
+                    html.Button(
+                        "Confirm overwrite",
+                        id="evtv-overwrite-confirm-btn",
+                        n_clicks=0,
+                        style=_btn_style(warning=True)),
+                ], style={"display": "flex",
+                           "gap": "10px",
+                           "justifyContent": "flex-end"}),
+            ]))
+
+
+def _render_overwrite_modal_body(plan: list[dict]
+                                    ) -> list:
+    """Per-group breakdown of which rows would be lost."""
+    if not plan:
+        return [html.Div("Nothing pending.")]
+    blocks: list = []
+    for entry in plan:
+        if not entry.get("removed"):
+            continue
+        blocks.append(html.Div([
+            html.Div(
+                f"{entry['animal']}  ·  {entry['day']}",
+                style={"color": "#ff9f0a",
+                        "fontWeight": "600",
+                        "marginBottom": "2px"}),
+            html.Div(
+                f"  {entry['csv_path']}",
+                style={"color": "#666", "fontSize": "10px",
+                        "marginBottom": "4px"}),
+            html.Div(
+                [html.Div(f"  − {fn}",
+                            style={"color": "#ff453a"})
+                 for fn in entry["removed"]]),
+            html.Div(
+                f"  ({len(entry.get('added') or [])} added, "
+                f"{len(entry.get('modified') or [])} modified)",
+                style={"color": "#a0a0b0",
+                        "marginTop": "4px"}),
+        ], style={"marginBottom": "10px"}))
+    if not blocks:
+        return [html.Div("No removals proposed.")]
+    return blocks
+
+
+# --------------------------------------------------------------- #
 # File list rendering
 # --------------------------------------------------------------- #
 
@@ -209,6 +336,122 @@ def _animal_for_session(store, session_dir: str) -> str:
             a, _ = split_animal_electrode(n)
             return a
     return "unknown"
+
+
+def _first_animal_channel_index(store, session_dir: str) -> int:
+    """Pick the first animal-bearing channel for the LFP stitch.
+
+    The undergrad's review payload doesn't carry the channel
+    index; for PI replay we default to the same heuristic the
+    Video Review tab uses -- the first ``is_animal_channel``
+    contact in session_config. Falls back to channel 0.
+    """
+    names = store._channel_names_for_session(session_dir)
+    for i, n in enumerate(names):
+        if isinstance(n, str) and is_animal_channel(n):
+            return i
+    return 0
+
+
+def _build_lfp_stitch_figure(spec: '_event_clip.ClipSpec',
+                                channel: int,
+                                eo_sec: float, bb_sec: float,
+                                store,
+                                ) -> go.Figure:
+    """Stitched LFP trace with EO/BB markers + boundary line.
+
+    The decimation is the same envelope/min-max pattern the
+    Video Review tab uses so the visual density matches.
+    Boundaries between segments are visible as NaN gaps (set
+    by ``extract_lfp_clip``); we also annotate the gap with a
+    dashed vertical so the PI can see exactly where the
+    stitch happened.
+    """
+    t, signal, fs = _event_clip.extract_lfp_clip(
+        spec, int(channel), store)
+    if len(signal) < 4 or fs <= 0:
+        return _empty_fig(
+            "Could not load LFP for this event.")
+    # Decimate for visual density (no point in pushing 6 M
+    # samples through Plotly).
+    target = choose_target_bins(len(signal)) or 4000
+    td, display, _decim = envelope(signal, fs, target,
+                                       t_start=0.0)
+    fig = go.Figure()
+    fig.add_trace(go.Scattergl(
+        x=td, y=display, mode="lines",
+        line=dict(color="#5e7ce2", width=0.9),
+        hovertemplate="t=%{x:.2f}s<br>%{y:.1f} μV<extra></extra>",
+    ))
+    # The window starts at clip_start = max(0, eo - pre); EO
+    # within the stitched clip is at (eo - clip_start), same
+    # for BB.
+    clip_start = max(0.0, eo_sec - spec.pre_sec)
+    eo_x = max(0.0, eo_sec - clip_start)
+    bb_x = max(0.0, bb_sec - clip_start)
+    shapes = [
+        dict(type="line", xref="x", yref="paper",
+              x0=eo_x, x1=eo_x, y0=0, y1=1,
+              line=dict(color="#ff453a", width=2, dash="solid"),
+              opacity=0.85),
+        dict(type="line", xref="x", yref="paper",
+              x0=bb_x, x1=bb_x, y0=0, y1=1,
+              line=dict(color="#30d158", width=2, dash="solid"),
+              opacity=0.85),
+    ]
+    # Boundary annotations. Find NaN runs in the signal --
+    # extract_lfp_clip inserts one NaN at each file boundary.
+    nan_idx = np.where(np.isnan(signal))[0]
+    if len(nan_idx):
+        for idx in nan_idx[:8]:  # NASA Rule 3 cap
+            t_boundary = float(idx) / float(fs)
+            shapes.append(dict(
+                type="line", xref="x", yref="paper",
+                x0=t_boundary, x1=t_boundary, y0=0, y1=1,
+                line=dict(color="#ff9f0a", width=1, dash="dot"),
+                opacity=0.55,
+            ))
+    fig.update_layout(
+        plot_bgcolor="#13131f", paper_bgcolor="#13131f",
+        height=220,
+        margin=dict(l=60, r=20, t=10, b=40),
+        dragmode="pan",
+        xaxis=dict(title="Time within clip (s)",
+                    showgrid=True,
+                    gridcolor="rgba(255,255,255,0.05)",
+                    zeroline=False),
+        yaxis=dict(title="μV", showgrid=True,
+                    gridcolor="rgba(255,255,255,0.05)",
+                    zeroline=False),
+        shapes=shapes,
+        showlegend=False,
+        hovermode="x unified",
+        annotations=[
+            dict(x=eo_x, y=1.02, xref="x", yref="paper",
+                  text="EO", showarrow=False,
+                  font=dict(color="#ff453a", size=10)),
+            dict(x=bb_x, y=1.02, xref="x", yref="paper",
+                  text="BB", showarrow=False,
+                  font=dict(color="#30d158", size=10)),
+        ],
+    )
+    return fig
+
+
+def _empty_fig(text: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        height=220,
+        plot_bgcolor="#13131f", paper_bgcolor="#13131f",
+        annotations=[dict(text=text, showarrow=False,
+                            x=0.5, y=0.5, xref="paper",
+                            yref="paper",
+                            font=dict(size=12,
+                                       color="#a0a0b0"))],
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        margin=dict(l=20, r=20, t=20, b=20),
+    )
+    return fig
 
 
 def _format_event_row(idx: int, ev: dict) -> html.Div:
@@ -430,10 +673,10 @@ def _render_event_detail(target: dict, store,
                     "background": "#000",
                     "borderRadius": "8px"})
     else:
-        msg = ("Extracting clip… the PI tab will poll. "
-                "Re-open this detail panel to refresh." if
-                clip_status.get("status") in ("pending",
-                                              "running")
+        msg = ("Extracting clip…  this panel auto-refreshes "
+                "every 3 s while the worker runs."
+                if clip_status.get("status")
+                    in ("pending", "running")
                 else f"Clip not ready: "
                       f"{clip_status.get('status')}")
         video_block = html.Div(
@@ -443,21 +686,71 @@ def _render_event_detail(target: dict, store,
                     "padding": "60px 20px",
                     "textAlign": "center",
                     "borderRadius": "8px"})
+    # Build the stitched LFP figure for this window.
+    channel = _first_animal_channel_index(
+        store, row.get("session_dir") or "")
+    try:
+        lfp_fig = _build_lfp_stitch_figure(
+            spec, channel, eo, bb, store)
+    except Exception as e:
+        logger.exception("LFP stitch render failed")
+        lfp_fig = _empty_fig(f"LFP load error: {e}")
     return html.Div([
         header,
         video_block,
-        html.Div("LFP stitch for this window renders in a "
-                  "follow-up; the video clip is the primary "
-                  "PI surface today.",
-                  style={"color": "#666",
-                          "fontStyle": "italic",
-                          "fontSize": "11px",
-                          "marginTop": "6px"}),
+        html.Div([
+            html.Div(
+                f"LFP for channel {channel} "
+                f"(stitched across file boundaries when "
+                f"the EO−5min / BB+5min window crosses "
+                f"recording boundaries)",
+                style={"color": "#a0a0b0",
+                        "fontSize": "11px",
+                        "marginTop": "10px",
+                        "marginBottom": "4px"}),
+            dcc.Graph(
+                figure=lfp_fig,
+                config={
+                    "displayModeBar": True,
+                    "displaylogo": False,
+                    "doubleClick": "reset",
+                    "modeBarButtonsToRemove": [
+                        "select2d", "lasso2d", "autoScale2d",
+                    ],
+                    "scrollZoom": True,
+                },
+            ),
+        ]),
+        # Inline marker chip strip so the PI can see every
+        # landmark this event carries without scrolling back
+        # to the list.
+        html.Div(
+            [_marker_chip(k, ev.get(f"{k}_sec"))
+             for k in ("EO", "LAS", "BO", "PID", "BB")
+             if ev.get(f"{k}_sec") is not None],
+            style={"display": "flex", "gap": "8px",
+                    "flexWrap": "wrap",
+                    "marginTop": "10px"}),
     ], style={"padding": "14px",
                "background": "rgba(94,124,226,0.04)",
                "border":
                    "1px solid rgba(94,124,226,0.18)",
                "borderRadius": "8px"})
+
+
+def _marker_chip(label: str, sec: float | None) -> html.Span:
+    if sec is None:
+        return html.Span()
+    return html.Span(
+        f"{label}  {float(sec):.1f}s",
+        style={"padding": "3px 8px",
+                "background": "rgba(255,255,255,0.05)",
+                "border":
+                    "1px solid rgba(255,255,255,0.10)",
+                "borderRadius": "4px",
+                "color": "#cfd0d6",
+                "fontSize": "11px",
+                "fontFamily": "ui-monospace, monospace"})
 
 
 # --------------------------------------------------------------- #
@@ -605,8 +898,9 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("evtv-detail-panel", "children"),
         Input("evtv-detail-target", "data"),
         Input("refresh-trigger", "data"),
+        Input("evtv-detail-poll", "n_intervals"),
     )
-    def _render_detail(target, _refresh):
+    def _render_detail(target, _refresh, _tick):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return []
@@ -614,31 +908,209 @@ def register_callbacks(app, store, config: dict) -> None:
             return []
         return _render_event_detail(target, store, config)
 
+    # Auto-poll controller: enable the Interval ONLY while a
+    # detail panel is open AND its clip is still extracting.
+    # Saves bandwidth + DB queries the rest of the time.
+    @app.callback(
+        Output("evtv-detail-poll", "disabled"),
+        Input("evtv-detail-target", "data"),
+        Input("evtv-detail-poll", "n_intervals"),
+    )
+    def _toggle_detail_poll(target, _tick):
+        if not target:
+            return True
+        # Cheap check: peek the clip status from the
+        # cache/DB; only keep polling while pending/running.
+        file_id = int(target.get("file_id") or 0)
+        idx = int(target.get("idx") or 0)
+        rows = store.pi_pending_files(limit=500)
+        row = next((r for r in rows
+                      if int(r["file_id"]) == file_id), None)
+        if not row:
+            return True
+        events = row.get("events") or []
+        if idx < 0 or idx >= len(events):
+            return True
+        ev = events[idx]
+        eo = ev.get("EO_sec")
+        bb = ev.get("BB_sec")
+        if eo is None or bb is None:
+            return True
+        spec = _event_clip.ClipSpec(
+            file_id=file_id, eo_sec=float(eo),
+            bb_sec=float(bb))
+        try:
+            segs = _event_clip.resolve_clip_segments(
+                spec, store)
+            h = _event_clip.spec_hash(spec, segs)
+            info = _event_clip.poll_video_clip_status(h, store)
+        except Exception:
+            return True  # silence the loop on lookup errors
+        return info.get("status") not in ("pending", "running")
+
     @app.callback(
         Output("evtv-finalize-status", "children"),
+        Output("evtv-overwrite-plan", "data"),
+        Output("evtv-overwrite-modal", "style"),
         Input("evtv-finalize-csv-btn", "n_clicks"),
         State("evtv-overwrite-mode", "value"),
+        State("evtv-overwrite-modal", "style"),
         prevent_initial_call=True,
     )
-    def _on_finalize(n_clicks, ow_value):
+    def _on_finalize_click(n_clicks, ow_value, modal_style):
+        """Two-phase: append mode writes immediately;
+        overwrite mode does a dry-run first and surfaces the
+        modal when any rows would be lost.
+        """
+        nope = (no_update, no_update, no_update)
         if not n_clicks:
-            return no_update
+            return nope
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
-            return "Not authorised."
+            return ("Not authorised.", None, no_update)
         overwrite = bool(ow_value and "ow" in ow_value)
+        if not overwrite:
+            # Append mode is non-destructive; write through.
+            try:
+                summary = _finalize_approved_to_csv(
+                    store, config, overwrite=False)
+            except Exception as e:
+                logger.exception("Finalize (append) failed")
+                return (f"Finalize failed: {e}",
+                         None, no_update)
+            return (summary, None, no_update)
+        # Overwrite mode: dry-run + maybe modal.
         try:
-            summary = _finalize_approved_to_csv(
-                store, config, overwrite=overwrite)
+            plan = _finalize_dry_run(store, config)
         except Exception as e:
-            logger.exception("Finalize failed")
-            return f"Finalize failed: {e}"
-        return summary
+            logger.exception("Finalize dry-run failed")
+            return (f"Dry-run failed: {e}", None, no_update)
+        if not plan:
+            return ("Nothing to finalize -- no pi_approved "
+                     "files.", None, no_update)
+        any_removed = any(p.get("removed") for p in plan)
+        if not any_removed:
+            # Safe overwrite (no rows lost). Write through.
+            try:
+                summary = _finalize_approved_to_csv(
+                    store, config, overwrite=True)
+            except Exception as e:
+                logger.exception(
+                    "Finalize (safe-overwrite) failed")
+                return (f"Finalize failed: {e}",
+                         None, no_update)
+            return (summary, None, no_update)
+        # Destructive overwrite: stash the plan + show modal.
+        new_style = dict(modal_style or {})
+        new_style["display"] = "flex"
+        return ("Confirm the destructive overwrite to write.",
+                 plan, new_style)
+
+    @app.callback(
+        Output("evtv-overwrite-modal-body", "children"),
+        Input("evtv-overwrite-plan", "data"),
+    )
+    def _render_modal_body(plan):
+        return _render_overwrite_modal_body(plan or [])
+
+    @app.callback(
+        Output("evtv-finalize-status", "children",
+                allow_duplicate=True),
+        Output("evtv-overwrite-plan", "data",
+                allow_duplicate=True),
+        Output("evtv-overwrite-modal", "style",
+                allow_duplicate=True),
+        Input("evtv-overwrite-cancel-btn", "n_clicks"),
+        Input("evtv-overwrite-confirm-btn", "n_clicks"),
+        State("evtv-overwrite-modal", "style"),
+        prevent_initial_call=True,
+    )
+    def _on_modal_action(_cancel, _confirm, modal_style):
+        trig = callback_context.triggered_id
+        new_style = dict(modal_style or {})
+        new_style["display"] = "none"
+        if trig == "evtv-overwrite-cancel-btn":
+            return ("Overwrite cancelled. No CSV changes.",
+                     None, new_style)
+        if trig == "evtv-overwrite-confirm-btn":
+            email = (current_user_email() or "").lower()
+            if not _is_pi(config or {}, email):
+                return ("Not authorised.", None, new_style)
+            try:
+                summary = _finalize_approved_to_csv(
+                    store, config, overwrite=True)
+            except Exception as e:
+                logger.exception(
+                    "Confirmed overwrite failed")
+                return (f"Confirmed overwrite failed: {e}",
+                         None, new_style)
+            return (summary, None, new_style)
+        return (no_update, no_update, no_update)
 
 
 # --------------------------------------------------------------- #
 # Finalize: write all pi_approved rows to CSV
 # --------------------------------------------------------------- #
+
+def _finalize_dry_run(store, config: dict) -> list[dict]:
+    """Return one row per (animal, day) group with the
+    proposed CsvDiff. Caller decides whether to show the
+    confirmation modal (only when any group's
+    ``removed_filenames`` is non-empty).
+
+    Each dict is JSON-safe so it can ride in a dcc.Store while
+    the modal is open. Re-runs are cheap; the actual write
+    happens on Confirm.
+    """
+    bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
+    if not bhz_cfg.get("enabled"):
+        return []
+    rows = _fetch_approved_rows(store)
+    if not rows:
+        return []
+    bucket: dict[tuple[str, date], list[dict]] = {}
+    for r in rows:
+        animal, chunk_dt = _animal_and_date(store, r)
+        if not chunk_dt:
+            continue
+        bucket.setdefault((animal, chunk_dt.date()), []).append(r)
+    plan: list[dict] = []
+    for (animal, day), items in sorted(bucket.items()):
+        csv_path = _bhz_csv.resolve_csv_path(
+            bhz_cfg.get("base_dir", ""),
+            bhz_cfg.get("filename_template",
+                         "{date}_{animal}.csv"),
+            day, animal,
+        )
+        events_by_fn: dict[str, list[dict]] = {}
+        meta_by_fn: dict[str, dict] = {}
+        for r in items:
+            file_meta = _file_meta_for_row(store, r, bhz_cfg)
+            if file_meta is None:
+                continue
+            fn = file_meta["filename"]
+            meta_by_fn[fn] = file_meta
+            events_by_fn[fn] = r.get("events") or []
+        try:
+            diff = _bhz_csv.overwrite_day_csv(
+                csv_path, events_by_fn, meta_by_fn,
+                fs=_pick_fs(items), dry_run=True,
+            )
+        except Exception as e:
+            logger.warning("dry_run failed for %s/%s: %s",
+                            animal, day, e)
+            continue
+        plan.append({
+            "animal": animal,
+            "day": day.isoformat(),
+            "csv_path": str(csv_path),
+            "n_files": len(events_by_fn),
+            "added": list(diff.added_filenames),
+            "removed": list(diff.removed_filenames),
+            "modified": list(diff.modified_filenames),
+        })
+    return plan
+
 
 def _finalize_approved_to_csv(store, config: dict,
                                 *, overwrite: bool) -> str:
@@ -650,10 +1122,9 @@ def _finalize_approved_to_csv(store, config: dict,
     EventEO contract.
 
     Overwrite mode: groups events by (animal, day) and calls
-    ``bhz_csv.overwrite_day_csv``. Returns a summary that
-    includes any rows that would be removed (the PI sees this
-    in the toast and re-runs without overwrite if they want
-    to back out).
+    ``bhz_csv.overwrite_day_csv``. The destructive-overwrite
+    confirmation is gated upstream by the modal; by the time
+    this function runs, the PI has approved the diff.
     """
     bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
     if not bhz_cfg.get("enabled"):

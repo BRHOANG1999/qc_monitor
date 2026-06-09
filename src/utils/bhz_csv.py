@@ -350,7 +350,8 @@ def _row_canonical(row: dict) -> tuple:
 def overwrite_day_csv(csv_path: str | Path,
                        events_by_filename: dict[str, list[dict]],
                        file_meta_by_filename: dict[str, dict],
-                       fs: float) -> CsvDiff:
+                       fs: float, *,
+                       dry_run: bool = False) -> CsvDiff:
     """Rewrite *csv_path* with the canonical set of approved
     rows.
 
@@ -364,6 +365,11 @@ def overwrite_day_csv(csv_path: str | Path,
     The PI tab uses this diff to gate the actual write behind
     a confirmation modal when ``removed_filenames`` is
     non-empty.
+
+    ``dry_run=True`` computes + returns the diff without
+    writing -- the PI tab uses this to preview the destructive
+    overwrite BEFORE asking for confirmation. The same call
+    with ``dry_run=False`` is the actual write.
 
     Thread-safe via a module-level lock so two simultaneous PI
     overwrites can't trample each other.
@@ -407,7 +413,9 @@ def overwrite_day_csv(csv_path: str | Path,
             removed_filenames=removed,
             modified_filenames=modified,
         )
-        # Write atomically: tmp file, fsync, rename.
+        if dry_run:
+            return diff
+        # Write atomically: tmp file, then os.replace.
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8", newline="") as f:
