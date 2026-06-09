@@ -7,3 +7,17 @@ psutil>=5.9
 pyyaml>=6.0
 numpy>=1.24
 scipy>=1.11
+# Imported by src/utils/mat_loader.py for MATLAB v7.3 (HDF5) files.
+h5py>=3.8
+# Imported by src/analyzers/video_qc.py, src/dashboard/media_routes.py,
+# and src/dashboard/tabs/video.py for OpenCV-based frame sampling.
+opencv-python>=4.8
+# Imported by src/dashboard/tabs/{surgeries,maintenance,data_log_xref}.py
+# and src/utils/assignments.py for Google Sheets dataframes.
+pandas>=2.0
+# Imported by src/dashboard/tabs/surgeries.py for the published-CSV path.
+requests>=2.31
+# Imported by src/dashboard/tabs/surgeries.py (lazy) for the
+# service-account Sheets API path used by maintenance + assignments.
+google-api-python-client>=2.100
+google-auth>=2.20
