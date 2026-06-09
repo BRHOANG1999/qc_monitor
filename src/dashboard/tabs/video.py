@@ -871,7 +871,7 @@ def layout(store: Store):
                 dcc.Dropdown(
                     id="video-queue-animal",
                     options=[],
-                    placeholder="Loading your animals…",
+                    placeholder="Pick an animal",
                     style=DROPDOWN_STYLE,
                     className="dark-dropdown",
                 ),
@@ -1882,20 +1882,33 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             unassigned = []
         options: list[dict] = []
         if my_animals:
+            # User HAS sheet rows -> mark them with a star and
+            # offer the rest of the lab's animals below the
+            # divider as a fallback.
             for a in my_animals:
                 options.append({
                     "label": f"⭐  {a}  (assigned to you)",
                     "value": a,
                 })
-        # Always offer the unassigned pool as a sentinel value so a
-        # user with no assignment can still review.
-        if unassigned:
-            options.append({"label": "── Unassigned pool ──",
-                            "value": "__UNASSIGNED__",
-                            "disabled": True})
+            if unassigned:
+                options.append({"label": "── Other animals ──",
+                                "value": "__UNASSIGNED__",
+                                "disabled": True})
+                for a in unassigned:
+                    options.append({
+                        "label": f"   {a}",
+                        "value": f"_pool_{a}",
+                    })
+        else:
+            # Sheet is empty for this user (or empty period).
+            # Don't frame the lab's animals as an "Unassigned
+            # pool" -- just list them as plain selectable
+            # options. The queue still pretends they came from
+            # the pool (the value stays _pool_<animal>) so
+            # downstream callbacks don't need to change.
             for a in unassigned:
                 options.append({
-                    "label": f"   {a}",
+                    "label": a,
                     "value": f"_pool_{a}",
                 })
         # Blank on first load. The reviewer explicitly picks an
@@ -1907,11 +1920,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if new_value is not None and all(
                 o["value"] != new_value for o in options):
             new_value = None
-        status = ""
-        if not my_animals:
-            status = ("You have no animals assigned. Pick from the "
-                       "unassigned pool below, or ask the PI to add "
-                       "you to the Reviewer Assignments sheet.")
+        # Friendlier status copy: don't shout "no animals
+        # assigned" at the user when the lab simply hasn't
+        # filled in the sheet yet.
+        if not my_animals and not unassigned:
+            status = "No animals in the DB yet."
+        elif not my_animals:
+            status = (f"Sheet has no assignments yet. "
+                       f"Showing all {len(unassigned)} "
+                       f"animal{'' if len(unassigned) == 1 else 's'} "
+                       "in the DB.")
         else:
             status = (f"Assigned to you: "
                        f"{', '.join(my_animals)}. "
