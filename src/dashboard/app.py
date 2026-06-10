@@ -38,6 +38,7 @@ from src.dashboard.tabs import alerts as tabs_alerts
 from src.dashboard.tabs import annotations as tabs_annotations
 from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import electrode_health as tabs_electrode_health
+from src.dashboard.tabs import evoked as tabs_evoked
 from src.dashboard.tabs import session_compare as tabs_session_compare
 from src.dashboard.tabs import sessions as tabs_sessions
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
@@ -1309,7 +1310,7 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "signal":
                 return _enable_persistence(tabs_signal_quality.layout(store))
             elif tab == "evoked":
-                return _enable_persistence(_evoked_tab_layout(store))
+                return _enable_persistence(tabs_evoked.layout(store))
             elif tab == "criticality":
                 return _enable_persistence(tabs_criticality.layout(store))
             elif tab == "lfp":
@@ -1354,107 +1355,7 @@ def create_app(config: dict, store: Store) -> Dash:
             return html.Div(f"Error rendering tab: {e}",
                             style={"color": COLOR_DANGER, "padding": SPACE_5})
 
-    # ------------------------------------------------------------------ #
-    #  Evoked Features callback — separate row per selected feature
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        [Output("evoked-multi-plots", "children"),
-         Output("evoked-stats", "children")],
-        [Input("evoked-feature-checklist", "value"),
-         Input("evoked-session-dropdown", "value"),
-         Input("evoked-hours-dropdown", "value")],
-    )
-    def update_evoked_multi(selected_features, session_dir, hours):
-        if not selected_features or not session_dir:
-            return html.P("Select features and a session", style={"color": "#888"}), ""
-
-        plots = []
-        stats_rows = []
-        hrs = int(hours) if hours else 0
-
-        for feature_name in selected_features:
-            try:
-                data = store.get_evoked_feature_timeseries(
-                    feature_name=feature_name,
-                    session_dir=session_dir,
-                    hours=hrs,
-                )
-            except Exception as e:
-                plots.append(html.P(f"Error loading {feature_name}: {e}", style={"color": "#ff6b6b"}))
-                continue
-
-            if not data:
-                plots.append(html.P(f"No data for {feature_name}", style={"color": "#888"}))
-                continue
-
-            clean_t, clean_v = [], []
-            artifact_t, artifact_v = [], []
-            ictal_t, ictal_v = [], []
-            all_values = []
-
-            for d in data:
-                # Use epoch_time_sec for continuous x-axis (seconds within file)
-                # Add to chunk_datetime for absolute timestamp
-                epoch_sec = d.get("epoch_time_sec")
-                chunk_dt = d.get("chunk_datetime", "")
-                v = d.get("value")
-                if v is None:
-                    continue
-                # Build absolute epoch time: chunk start + epoch offset
-                if epoch_sec is not None and chunk_dt:
-                    try:
-                        from datetime import datetime as _dt, timedelta as _td
-                        base = _dt.fromisoformat(chunk_dt.replace("_", "-").replace("--", " ").replace("__", "T"))
-                        t = (base + _td(seconds=float(epoch_sec))).isoformat()
-                    except Exception:
-                        t = chunk_dt  # fallback to file-level timestamp
-                else:
-                    t = chunk_dt
-                all_values.append(v)
-                if d.get("is_artifact", 0):
-                    artifact_t.append(t); artifact_v.append(v)
-                elif d.get("is_ictal", 0):
-                    ictal_t.append(t); ictal_v.append(v)
-                else:
-                    clean_t.append(t); clean_v.append(v)
-
-            label = EVOKED_FEATURE_LABELS.get(feature_name, feature_name)
-            fig = go.Figure()
-            if clean_t:
-                fig.add_trace(go.Scatter(x=clean_t, y=clean_v, mode="markers", name="Clean",
-                                         marker=dict(color="#636EFA", size=4, opacity=0.6)))
-            if artifact_t:
-                fig.add_trace(go.Scatter(x=artifact_t, y=artifact_v, mode="markers", name="Artifact",
-                                         marker=dict(color="#EF553B", size=5, opacity=0.7)))
-            if ictal_t:
-                fig.add_trace(go.Scatter(x=ictal_t, y=ictal_v, mode="markers", name="Ictal",
-                                         marker=dict(color="#FFA15A", size=5, opacity=0.7)))
-
-            fig.update_layout(
-                title=label,
-                xaxis_title="Time",
-                yaxis_title=label,
-                height=300,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-
-            plots.append(dcc.Graph(figure=fig, style={"marginBottom": "8px"}))
-
-            # Per-feature stats
-            n_total = len(all_values)
-            n_art = len(artifact_v)
-            n_clean = len(clean_v)
-            mean_val = statistics.mean(all_values) if all_values else 0
-            std_val = statistics.stdev(all_values) if len(all_values) > 1 else 0
-            stats_rows.append(f"{label}: mean={mean_val:.4g}, std={std_val:.4g}, "
-                              f"N={n_total} (clean={n_clean}, artifact={n_art})")
-
-        summary = html.Div([
-            html.P(s, style={"color": "#aaa", "margin": "2px 0", "fontSize": "12px"})
-            for s in stats_rows
-        ]) if stats_rows else ""
-
-        return html.Div(plots), summary
+    # Evoked Features callbacks moved to src/dashboard/tabs/evoked.py.
 
     # Evoked Waveforms callbacks moved to src/dashboard/tabs/waveforms.py.
 
@@ -2162,6 +2063,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_sessions.register_callbacks(app, store, config)
     tabs_electrode_health.register_callbacks(app, store, config)
     tabs_waveforms.register_callbacks(app, store, config)
+    tabs_evoked.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -2216,10 +2118,10 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_session_compare.layout, tabs_activity_log.layout,
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
-        tabs_video.layout, tabs_surgeries.layout,
-        tabs_maintenance.layout, tabs_data_log_xref.layout,
-        _overview_tab, _evoked_tab_layout,
-        _lfp_browser_tab_layout,
+        tabs_evoked.layout, tabs_video.layout,
+        tabs_surgeries.layout, tabs_maintenance.layout,
+        tabs_data_log_xref.layout,
+        _overview_tab, _lfp_browser_tab_layout,
         _settings_tab_layout,
     ]
     # review_status + event_verification are imported inline in
@@ -4245,71 +4147,7 @@ def _build_behavioral_seizure_status_card(store):
 # Signal Quality tab moved to src/dashboard/tabs/signal_quality.py.
 
 
-# ------------------------------------------------------------------ #
-#  Evoked Features tab (renamed from Evoked Response)
-# ------------------------------------------------------------------ #
-
-def _evoked_tab_layout(store: Store):
-    """Build the Evoked Features tab — separate row per selected feature."""
-    sessions = store.get_sessions()
-    session_options = [{"label": s["session_name"], "value": s["session_dir"]}
-                       for s in sessions]
-    plottable = [f for f in EVOKED_FEATURE_COLS
-                 if f not in ("is_artifact", "is_ictal", "epoch_time_sec")]
-    feature_options = [{"label": EVOKED_FEATURE_LABELS.get(f, f), "value": f}
-                       for f in plottable]
-
-    default_session = sessions[0]["session_dir"] if sessions else None
-    # Default: show 3 key features
-    default_features = ["peak_amplitude", "line_length", "recovery_tau"]
-
-    return html.Div([
-        html.H3("Evoked Features", style={"color": "white", "marginBottom": "12px"}),
-        html.Div([
-            html.Div([
-                html.Label("Session", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="evoked-session-dropdown",
-                    options=session_options,
-                    value=default_session,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "250px"}),
-            html.Div([
-                html.Label("Time Range", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="evoked-hours-dropdown",
-                    options=TIME_RANGE_OPTIONS,
-                    value=0,  # all time by default
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "0 0 180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "12px", "flexWrap": "wrap"}),
-
-        html.Div([
-            html.Label("Select features to display (each gets its own plot row):", style=LABEL_STYLE),
-            dcc.Checklist(
-                id="evoked-feature-checklist",
-                options=feature_options,
-                value=default_features,
-                inline=True,
-                style={"fontSize": "12px"},
-                inputStyle={"marginRight": "4px"},
-                labelStyle={"color": "#ddd",
-                             "marginRight": "16px",
-                             "marginBottom": "4px"},
-            ),
-        ], style={**SECTION_STYLE, "marginBottom": "16px"}),
-
-        # Hidden single-select for backward compat with callback
-        dcc.Dropdown(id="evoked-feature-dropdown", value="peak_amplitude",
-                     style={"display": "none"}),
-
-        html.Div(id="evoked-multi-plots"),
-        html.Div(id="evoked-stats"),
-    ])
+# Evoked Features tab moved to src/dashboard/tabs/evoked.py.
 
 
 # Criticality tab moved to src/dashboard/tabs/criticality.py.
