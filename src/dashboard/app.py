@@ -37,10 +37,12 @@ from src.dashboard.tabs import activity_log as tabs_activity_log
 from src.dashboard.tabs import alerts as tabs_alerts
 from src.dashboard.tabs import annotations as tabs_annotations
 from src.dashboard.tabs import criticality as tabs_criticality
+from src.dashboard.tabs import electrode_health as tabs_electrode_health
 from src.dashboard.tabs import session_compare as tabs_session_compare
 from src.dashboard.tabs import sessions as tabs_sessions
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
+from src.dashboard.tabs import waveforms as tabs_waveforms
 from src.dashboard.components import (
     card as _card, pill as _pill, section_header as _section_header,
 )
@@ -83,9 +85,13 @@ from src.dashboard.design import (
     as_css_root_block,
 )
 
-# Config file path
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "config.yaml")
-CONFIG_PATH = os.path.normpath(CONFIG_PATH)
+# CONFIG_PATH + _load_config + _save_config moved to data_helpers.
+from src.dashboard.data_helpers import (  # noqa: E402,F401
+    CONFIG_PATH,
+    load_config as _load_config,
+    processed_files_for_session as _get_processed_files_for_session,
+    save_config as _save_config,
+)
 
 # Standard time-range options used across tabs
 # TIME_RANGE_OPTIONS moved to src/dashboard/data_helpers.py.
@@ -296,22 +302,6 @@ def _qc_monitor_version() -> str:
 _QC_MONITOR_VERSION = _qc_monitor_version()
 
 
-def _load_config() -> dict:
-    # Force UTF-8 -- config contains emoji in the maintenance tab names
-    # and Windows' default cp1252 codec chokes on them. (Same fix that
-    # was applied to main.py's load_config.)
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def _save_config(cfg: dict):
-    # UTF-8 + allow_unicode keep emoji intact through a round-trip
-    # (matters for the maintenance tab names in the config block).
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False,
-                  allow_unicode=True)
-
-
 # _parse_json_field, _get_channel_map, and _color_for_role moved to
 # src/dashboard/data_helpers.py so the tab modules carved out of this
 # file can reuse them without importing the app shell. The aliased
@@ -388,37 +378,13 @@ from src.dashboard.data_helpers import (  # noqa: E402,F401
 )
 
 
-def _default_session(store: Store, hint: str | None = None) -> str | None:
-    """Return a default session_dir for tab dropdowns.
-
-    *hint* is an explicit choice from the click-through Store (set when
-    a user clicks a row in the Sessions table). If the hint matches a
-    real session it wins, so the destination tab opens with that
-    session pre-selected. Otherwise we fall back to the session with
-    the most processed files.
-    """
-    sessions = store.get_sessions()
-    if not sessions:
-        return None
-    if hint:
-        valid = {s["session_dir"] for s in sessions}
-        if hint in valid:
-            return hint
-    best = max(sessions, key=lambda s: s.get("processed", 0))
-    return best["session_dir"] if best.get("processed", 0) > 0 else sessions[0]["session_dir"]
+# _default_session moved to src/dashboard/data_helpers.default_session.
+from src.dashboard.data_helpers import (  # noqa: E402,F401
+    default_session as _default_session,
+)
 
 
-def _get_processed_files_for_session(store: Store, session_dir: str) -> list[dict]:
-    """Return processed file rows for a session, ordered by chunk_datetime."""
-    with store.connection() as conn:
-        rows = conn.execute(
-            """SELECT id, file_path, chunk_datetime, session_name
-               FROM processed_files
-               WHERE session_dir = ? AND status = 'done'
-               ORDER BY chunk_datetime""",
-            (session_dir,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+# _get_processed_files_for_session moved to data_helpers (re-imported above).
 
 
 # ====================================================================== #
@@ -1339,7 +1305,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(_overview_tab(store, config))
             elif tab == "waveforms":
                 return _enable_persistence(
-                    _waveforms_tab_layout(store, default_session=session_hint))
+                    tabs_waveforms.layout(store, default=session_hint))
             elif tab == "signal":
                 return _enable_persistence(tabs_signal_quality.layout(store))
             elif tab == "evoked":
@@ -1353,7 +1319,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_video.layout(store))
             elif tab == "electrode_health":
                 return _enable_persistence(
-                    _electrode_health_tab_layout(store, default_session=session_hint))
+                    tabs_electrode_health.layout(store, default=session_hint))
             elif tab == "session_compare":
                 return _enable_persistence(
                     tabs_session_compare.layout(store))
@@ -1490,185 +1456,7 @@ def create_app(config: dict, store: Store) -> Dash:
 
         return html.Div(plots), summary
 
-    # ------------------------------------------------------------------ #
-    #  Evoked Waveforms callbacks
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        [Output("waveform-file-dropdown", "options"),
-         Output("waveform-file-dropdown", "value")],
-        [Input("waveform-session-dropdown", "value")],
-    )
-    def update_waveform_file_list(session_dir):
-        if not session_dir:
-            return [], None
-        files = _get_processed_files_for_session(store, session_dir)
-        options = [{"label": f["chunk_datetime"], "value": f["id"]} for f in files]
-        latest = options[-1]["value"] if options else None
-        return options, latest
-
-    @app.callback(
-        Output("waveform-plot", "figure"),
-        [Input("waveform-file-dropdown", "value"),
-         Input("waveform-smooth", "value")],
-        [State("waveform-session-dropdown", "value")],
-    )
-    def update_waveform_plot(file_id, smooth_ms, session_dir):
-        if not file_id:
-            return _empty_fig("Select a file", 400)
-
-        try:
-            waveforms = store.get_evoked_waveform_by_file(file_id)
-        except Exception as e:
-            logger.error("Waveform query error: %s", e, exc_info=True)
-            return _empty_fig(f"Error: {e}", 400)
-
-        if not waveforms:
-            return _empty_fig("No evoked waveforms for this file", 400)
-
-        try:
-            return _build_waveform_figure(waveforms, store, session_dir,
-                                            smooth_ms=smooth_ms or 0)
-        except Exception as e:
-            logger.error("Waveform plot error: %s", e, exc_info=True)
-            return _empty_fig(f"Plot error: {e}", 400)
-
-    def _build_waveform_figure(waveforms, store, session_dir,
-                                smooth_ms: float = 0.0):
-
-        cfg = _load_config()
-        fa = cfg.get("feature_analysis", {})
-        ana_start = fa.get("analysis_start_ms", fa.get("window_start_ms", 2))
-        ana_end = fa.get("analysis_end_ms", fa.get("window_end_ms", 50))
-
-        # Group latest waveform per LFP channel
-        latest_per_ch = {}
-        for wf in waveforms:
-            ch = wf.get("channel", 0)
-            latest_per_ch[ch] = wf
-
-        ch_map = _get_channel_map(store, session_dir)
-        lfp_chs = sorted(latest_per_ch.keys())
-
-        # For each LFP channel: 2 rows
-        #   Row A: Stim artifact vs LFP superimposed (-1 to 1ms)
-        #   Row B: LFP evoked response zoomed to analysis window
-        # The stim_mean_trace is stored ON each LFP waveform (not as separate channel)
-
-        n_rows = len(lfp_chs) * 2
-        if n_rows == 0:
-            return _empty_fig("No waveform data", 400)
-
-        titles = []
-        for ch in lfp_chs:
-            name = latest_per_ch[ch].get("channel_name", ch_map.get(ch, {}).get("name", f"Ch{ch}"))
-            titles.append(f"Stim Artifact vs {name} (-1 to 1 ms)")
-            titles.append(f"Evoked: {name} ({ana_start}-{ana_end} ms)")
-
-        fig = make_subplots(
-            rows=n_rows, cols=1, shared_xaxes=False,
-            subplot_titles=titles,
-            vertical_spacing=0.06,
-        )
-
-        row = 1
-        for ch in lfp_chs:
-            wf = latest_per_ch[ch]
-            name = wf.get("channel_name", f"Ch{ch}")
-            t = wf["time_axis_ms"]
-            m = wf["mean_trace"]
-            s = wf.get("sem_trace")
-            stim_tr = wf.get("stim_mean_trace")
-            n_ep = wf.get("n_epochs", 0)
-
-            # Optional smoothing (Gaussian, in display-ms). Apply to
-            # mean + SEM + stim mean so the band stays consistent.
-            if smooth_ms and smooth_ms > 0 and m and len(t) > 1:
-                try:
-                    dt_ms = float(t[1] - t[0])
-                    if dt_ms > 0:
-                        fs_proxy = 1000.0 / dt_ms
-                        m = apply_filter(
-                            np.asarray(m, dtype=np.float32),
-                            fs_proxy, smoothing_ms=smooth_ms).tolist()
-                        if s and len(s) == len(m):
-                            s = apply_filter(
-                                np.asarray(s, dtype=np.float32),
-                                fs_proxy, smoothing_ms=smooth_ms).tolist()
-                        if stim_tr and len(stim_tr) > 1:
-                            stim_tr = apply_filter(
-                                np.asarray(stim_tr, dtype=np.float32),
-                                fs_proxy, smoothing_ms=smooth_ms).tolist()
-                except Exception as e:
-                    logger.debug("Smoothing skipped: %s", e)
-
-            # Helper: compute y-range from data within x-range
-            def _yrange(times, values, x0, x1):
-                vals = [v for tv, v in zip(times, values) if x0 <= tv <= x1]
-                if not vals:
-                    return None
-                mn, mx = min(vals), max(vals)
-                pad = (mx - mn) * 0.1 if mx > mn else 0.001
-                return [mn - pad, mx + pad]
-
-            # Row A: Artifact comparison — stim copy (orange) vs LFP (blue), zoomed -1 to 1ms
-            art_yvals = []
-            if stim_tr and len(stim_tr) > 0:
-                stim_t = t[:len(stim_tr)] if len(stim_tr) <= len(t) else t
-                fig.add_trace(go.Scatter(
-                    x=stim_t, y=stim_tr, mode="lines",
-                    name="StimCopy", line=dict(color="#FFA15A", width=2),
-                    showlegend=(row == 1),
-                ), row=row, col=1)
-                art_yvals += [v for tv, v in zip(stim_t, stim_tr) if -1 <= tv <= 1]
-            fig.add_trace(go.Scatter(
-                x=t, y=m, mode="lines",
-                name=name, line=dict(color="#636EFA", width=2),
-                showlegend=(row == 1),
-            ), row=row, col=1)
-            art_yvals += [v for tv, v in zip(t, m) if -1 <= tv <= 1]
-            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
-            fig.update_xaxes(range=[-1, 1], title_text="ms", row=row, col=1)
-            if art_yvals:
-                mn, mx = min(art_yvals), max(art_yvals)
-                pad = (mx - mn) * 0.1 if mx > mn else 0.001
-                fig.update_yaxes(range=[mn - pad, mx + pad], row=row, col=1)
-            row += 1
-
-            # Row B: LFP evoked response zoomed to analysis window
-            if s and len(s) == len(m):
-                upper = [mv + sv for mv, sv in zip(m, s)]
-                lower = [mv - sv for mv, sv in zip(m, s)]
-                fig.add_trace(go.Scatter(
-                    x=list(t) + list(reversed(t)), y=upper + list(reversed(lower)),
-                    fill="toself", fillcolor="rgba(99,110,250,0.15)",
-                    line=dict(width=0), showlegend=False, hoverinfo="skip",
-                ), row=row, col=1)
-            fig.add_trace(go.Scatter(
-                x=t, y=m, mode="lines",
-                name=f"{name} (n={n_ep})",
-                line=dict(color="#636EFA", width=2),
-                showlegend=False,
-            ), row=row, col=1)
-            fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"), row=row, col=1)
-            fig.update_xaxes(range=[ana_start, ana_end], title_text="ms", row=row, col=1)
-            yr = _yrange(t, m, ana_start, ana_end)
-            if yr:
-                # Include SEM bounds if available
-                if s and len(s) == len(m):
-                    sem_vals = [mv + sv for tv, mv, sv in zip(t, m, s) if ana_start <= tv <= ana_end]
-                    sem_vals += [mv - sv for tv, mv, sv in zip(t, m, s) if ana_start <= tv <= ana_end]
-                    if sem_vals:
-                        yr = [min(yr[0], min(sem_vals)), max(yr[1], max(sem_vals))]
-                        pad = (yr[1] - yr[0]) * 0.1
-                        yr = [yr[0] - pad, yr[1] + pad]
-                fig.update_yaxes(range=yr, row=row, col=1)
-            row += 1
-
-        fig.update_layout(
-            height=250 * n_rows,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        return fig
+    # Evoked Waveforms callbacks moved to src/dashboard/tabs/waveforms.py.
 
     # Criticality callback moved to src/dashboard/tabs/criticality.py.
 
@@ -2007,78 +1795,8 @@ def create_app(config: dict, store: Store) -> Dash:
                  "value": f["file_path"]} for f in files]
 
     # ------------------------------------------------------------------ #
-    #  Electrode Health callback
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        Output("electrode-health-plot", "figure"),
-        [Input("electrode-health-session-dropdown", "value"),
-         Input("electrode-health-hours-dropdown", "value")],
-    )
-    def update_electrode_health(session_dir, hours):
-        if not session_dir:
-            return _empty_fig("Select a session", 700)
-
-        hours_val = int(hours) if hours else 0
-        try:
-            data = store.get_qc_timeseries(session_dir=session_dir, hours=hours_val)
-        except Exception as e:
-            return _empty_fig(f"Error: {e}", 700)
-
-        if not data:
-            return _empty_fig("No QC data available", 700)
-
-        # Separate by channel_role
-        stim_copy_data = [d for d in data if d.get("channel_role") == "stim_copy"]
-        reference_data = [d for d in data if d.get("channel_role") == "reference"]
-
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                            subplot_titles=["Stim Copy RMS", "Reference RMS",
-                                            "Line Noise Ratio (60 Hz indicator)"],
-                            vertical_spacing=0.08)
-
-        # Stim copy RMS
-        stim_channels = sorted(set(d["channel"] for d in stim_copy_data))
-        for ch in stim_channels:
-            ch_data = [d for d in stim_copy_data if d["channel"] == ch]
-            ch_name = ch_data[0].get("channel_name") or f"Ch{ch}"
-            fig.add_trace(go.Scatter(
-                x=[d["chunk_datetime"] for d in ch_data],
-                y=[d["rms_amplitude"] for d in ch_data],
-                mode="lines+markers", name=f"{ch_name} (stim_copy)",
-                line=dict(color="#888888"), marker=dict(size=3),
-            ), row=1, col=1)
-
-        # Reference RMS
-        ref_channels = sorted(set(d["channel"] for d in reference_data))
-        for ch in ref_channels:
-            ch_data = [d for d in reference_data if d["channel"] == ch]
-            ch_name = ch_data[0].get("channel_name") or f"Ch{ch}"
-            fig.add_trace(go.Scatter(
-                x=[d["chunk_datetime"] for d in ch_data],
-                y=[d["rms_amplitude"] for d in ch_data],
-                mode="lines+markers", name=f"{ch_name} (reference)",
-                line=dict(color="#00CC96"), marker=dict(size=3),
-            ), row=2, col=1)
-
-        # Line noise ratio for ALL channels (aggregate trend)
-        all_channels = sorted(set(d["channel"] for d in data))
-        ch_map = _get_channel_map(store, session_dir)
-        for ch in all_channels:
-            ch_data = [d for d in data if d["channel"] == ch]
-            info = ch_map.get(ch, {"name": f"Ch{ch}", "role": "eeg"})
-            fig.add_trace(go.Scatter(
-                x=[d["chunk_datetime"] for d in ch_data],
-                y=[d["line_noise_ratio"] for d in ch_data],
-                mode="lines", name=info["name"],
-                line=dict(color=_color_for_role(info["role"]), width=1),
-                showlegend=False,
-            ), row=3, col=1)
-
-        fig.update_layout(
-            height=700, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        fig.update_annotations(font=dict(color="white"))
-        return fig
+    # Electrode Health callback moved to
+    # src/dashboard/tabs/electrode_health.py.
 
     # Session Compare callback moved to
     # src/dashboard/tabs/session_compare.py.
@@ -2442,6 +2160,8 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_activity_log.register_callbacks(app, store, config)
     tabs_annotations.register_callbacks(app, store, config)
     tabs_sessions.register_callbacks(app, store, config)
+    tabs_electrode_health.register_callbacks(app, store, config)
+    tabs_waveforms.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -2495,10 +2215,11 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_stim.layout, tabs_criticality.layout,
         tabs_session_compare.layout, tabs_activity_log.layout,
         tabs_annotations.layout, tabs_sessions.layout,
+        tabs_electrode_health.layout, tabs_waveforms.layout,
         tabs_video.layout, tabs_surgeries.layout,
         tabs_maintenance.layout, tabs_data_log_xref.layout,
-        _overview_tab, _waveforms_tab_layout, _evoked_tab_layout,
-        _lfp_browser_tab_layout, _electrode_health_tab_layout,
+        _overview_tab, _evoked_tab_layout,
+        _lfp_browser_tab_layout,
         _settings_tab_layout,
     ]
     # review_status + event_verification are imported inline in
@@ -4518,57 +4239,7 @@ def _build_behavioral_seizure_status_card(store):
                               "borderRadius": RADIUS_MD})
 
 
-# ------------------------------------------------------------------ #
-#  Evoked Waveforms tab (NEW)
-# ------------------------------------------------------------------ #
-
-def _waveforms_tab_layout(store: Store, default_session: str | None = None):
-    session_options = _session_dropdown_options(store)
-    default = _default_session(store, hint=default_session)
-
-    # Build file options for the default session
-    file_options = []
-    default_file = None
-    if default:
-        files = _get_processed_files_for_session(store, default)
-        file_options = [{"label": f["chunk_datetime"], "value": f["id"]} for f in files]
-        if file_options:
-            default_file = file_options[-1]["value"]  # latest file
-
-    return html.Div([
-        html.H3("Evoked Waveforms", style={"color": "white", "marginBottom": "12px"}),
-        html.Div([
-            html.Div([
-                html.Label("Session", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="waveform-session-dropdown",
-                    options=session_options,
-                    value=default,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "300px"}),
-            html.Div([
-                html.Label("File", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="waveform-file-dropdown",
-                    options=file_options,
-                    value=default_file,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "300px"}),
-            html.Div([
-                html.Label("Smooth (ms)", style=LABEL_STYLE),
-                dcc.Input(id="waveform-smooth", type="number", min=0,
-                          step=0.5, value=0,
-                          style={"backgroundColor": "#262638",
-                                 "color": "#f0f0f5", "width": "80px"}),
-            ], style={"flex": "0 0 110px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
-
-        dcc.Graph(id="waveform-plot"),
-    ])
+# Evoked Waveforms tab moved to src/dashboard/tabs/waveforms.py.
 
 
 # Signal Quality tab moved to src/dashboard/tabs/signal_quality.py.
@@ -4797,41 +4468,7 @@ def _lfp_browser_tab_layout(store: Store, default_session: str | None = None):
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Electrode Health tab (NEW)
-# ------------------------------------------------------------------ #
-
-def _electrode_health_tab_layout(store: Store, default_session: str | None = None):
-    session_options = _session_dropdown_options(store)
-    default = _default_session(store, hint=default_session)
-
-    return html.Div([
-        html.H3("Electrode Health", style={"color": "white", "marginBottom": "12px"}),
-        html.Div([
-            html.Div([
-                html.Label("Session", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="electrode-health-session-dropdown",
-                    options=session_options,
-                    value=default,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "250px"}),
-            html.Div([
-                html.Label("Time Range", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="electrode-health-hours-dropdown",
-                    options=TIME_RANGE_OPTIONS,
-                    value=48,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "0 0 180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
-
-        dcc.Graph(id="electrode-health-plot", figure=_empty_fig("Select a session", 700)),
-    ])
+# Electrode Health tab moved to src/dashboard/tabs/electrode_health.py.
 
 
 # Session Compare tab moved to src/dashboard/tabs/session_compare.py.

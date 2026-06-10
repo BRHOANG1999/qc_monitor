@@ -2,9 +2,10 @@
 
 Helpers used by more than one tab (store-aware accessors, JSON
 unwrapping, the canonical "empty figure" plotly builder, the
-time-range dropdown options) live here instead of being duplicated
-across each tab module. The functions themselves came out of
-``src/dashboard/app.py`` where they were used by 8+ render paths.
+time-range dropdown options, config-file I/O) live here instead of
+being duplicated across each tab module. The functions themselves
+came out of ``src/dashboard/app.py`` where they were used by 8+
+render paths.
 
 Anything UI-shaped (Dash components, dash_table + form-control
 styles) belongs in ``src/dashboard/components.py``; anything purely
@@ -14,14 +15,54 @@ about colors / typography belongs in ``src/dashboard/design.py``.
 from __future__ import annotations
 
 import json
+import os
 
 import plotly.graph_objects as go
+import yaml
 
 from src.dashboard.design import (
     COLOR_SURFACE_1, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
     ROLE_COLORS,
 )
 from src.db.store import Store
+
+
+# config/config.yaml lives at the project root. Resolved relative to
+# this module so the dashboard works regardless of cwd at boot.
+CONFIG_PATH: str = os.path.normpath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "config", "config.yaml"))
+
+
+def load_config() -> dict:
+    """Read config/config.yaml as a dict. UTF-8 because the
+    maintenance + surgery section names contain emoji that Windows'
+    default cp1252 codec chokes on."""
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def save_config(cfg: dict) -> None:
+    """Round-trip the config dict back to disk. allow_unicode=True
+    preserves the emoji in maintenance / surgery section names."""
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
+
+
+def processed_files_for_session(store: Store,
+                                  session_dir: str) -> list[dict]:
+    """Return ``status='done'`` processed-files rows for one session,
+    ordered by chunk_datetime (oldest first). Each row dict carries
+    ``id``, ``file_path``, ``chunk_datetime``, ``session_name``."""
+    with store.connection() as conn:
+        rows = conn.execute(
+            """SELECT id, file_path, chunk_datetime, session_name
+               FROM processed_files
+               WHERE session_dir = ? AND status = 'done'
+               ORDER BY chunk_datetime""",
+            (session_dir,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # Standard time-range dropdown options used across tabs (Criticality,
@@ -172,3 +213,26 @@ def session_dropdown_options(store: Store) -> list[dict]:
         {"label": s["session_name"], "value": s["session_dir"]}
         for s in sessions
     ]
+
+
+def default_session(store: Store, hint: str | None = None) -> str | None:
+    """Return a default session_dir for tab dropdowns.
+
+    *hint* is an explicit choice from the click-through Store (set
+    when a user clicks a row in the Sessions table). If the hint
+    matches a real session it wins, so the destination tab opens
+    with that session pre-selected. Otherwise we fall back to the
+    session with the most processed files; if every session is empty,
+    return the first one so the tab still has something to render.
+    """
+    sessions = store.get_sessions()
+    if not sessions:
+        return None
+    if hint:
+        valid = {s["session_dir"] for s in sessions}
+        if hint in valid:
+            return hint
+    best = max(sessions, key=lambda s: s.get("processed", 0))
+    if best.get("processed", 0) > 0:
+        return best["session_dir"]
+    return sessions[0]["session_dir"]
