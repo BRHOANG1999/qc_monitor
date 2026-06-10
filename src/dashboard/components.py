@@ -20,7 +20,7 @@ from src.dashboard.design import (
     COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
     COLOR_WARNING, FONT_SIZE_BODY, FONT_SIZE_CAPTION, FONT_SIZE_HEADER,
     FONT_STACK, RADIUS_MD, RADIUS_SM,
-    SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+    SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SPACE_6,
 )
 from src.dashboard.icons import icon
 
@@ -216,6 +216,31 @@ def refresh_bar(refresh_btn_id: str) -> html.Div:
 #  Empty state -- replace italic-gray "Nothing to show" text everywhere.
 # --------------------------------------------------------------------- #
 
+def tab_empty_state(headline: str, hint: str = "",
+                     glyph: str = "·") -> html.Div:
+    """Tab-level empty state: small glyph, headline, and a friendly
+    hint. Used by whole-tab empty renders (no sessions discovered, no
+    videos to review). Larger / more centered than ``empty_state``,
+    which is for empty *sub-panels*.
+    """
+    return html.Div([
+        html.Div(glyph, style={"fontSize": "32px",
+                               "color": COLOR_TEXT_TERTIARY,
+                               "marginBottom": SPACE_3,
+                               "letterSpacing": "0"}),
+        html.Div(headline, style={"fontSize": FONT_SIZE_HEADER,
+                                  "fontWeight": "600",
+                                  "color": COLOR_TEXT_PRIMARY,
+                                  "marginBottom": SPACE_2}),
+        html.Div(hint, style={"fontSize": FONT_SIZE_BODY,
+                              "color": COLOR_TEXT_SECONDARY,
+                              "maxWidth": "520px",
+                              "lineHeight": "1.5"}),
+    ], style={"textAlign": "center",
+              "padding": f"{SPACE_6} {SPACE_5}",
+              "marginTop": SPACE_6})
+
+
 def empty_state(label: str, hint: str | None = None,
                  icon_name: str = "inbox") -> html.Div:
     """Friendly empty placeholder with a faded icon + label.
@@ -362,6 +387,16 @@ FIELD_STYLE: dict = {"flex": "1", "minWidth": "200px"}
 DROPDOWN_STYLE: dict = {
     "backgroundColor": COLOR_SURFACE_3,
     "color": COLOR_TEXT_PRIMARY,
+}
+
+# Card-like wrapper for a form / panel section. The Annotations,
+# Settings, and several home blocks use this as their outer box.
+SECTION_STYLE: dict = {
+    "background": COLOR_SURFACE_1,
+    "padding": f"{SPACE_5} {SPACE_5}",
+    "borderRadius": RADIUS_MD,
+    "border": f"1px solid {COLOR_DIVIDER}",
+    "marginBottom": SPACE_4,
 }
 
 

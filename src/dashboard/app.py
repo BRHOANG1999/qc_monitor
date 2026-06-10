@@ -33,9 +33,12 @@ from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
+from src.dashboard.tabs import activity_log as tabs_activity_log
 from src.dashboard.tabs import alerts as tabs_alerts
+from src.dashboard.tabs import annotations as tabs_annotations
 from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import session_compare as tabs_session_compare
+from src.dashboard.tabs import sessions as tabs_sessions
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
 from src.dashboard.components import (
@@ -191,18 +194,11 @@ TAB_SELECTED_STYLE = {
 # file and the carved-out tabs share one source of truth.
 from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE  # noqa: E402,F401
 
-SECTION_STYLE = {
-    "background": COLOR_SURFACE_1,
-    "padding": f"{SPACE_5} {SPACE_5}",
-    "borderRadius": RADIUS_MD,
-    "border": f"1px solid {COLOR_DIVIDER}",
-    "marginBottom": SPACE_4,
-}
-# LABEL_STYLE / INPUT_STYLE / FIELD_STYLE / DROPDOWN_STYLE moved to
-# src/dashboard/components.py so the tab modules carved out of this
-# file can share one source of truth.
+# SECTION_STYLE / LABEL_STYLE / INPUT_STYLE / FIELD_STYLE /
+# DROPDOWN_STYLE moved to src/dashboard/components.py so the tab
+# modules carved out of this file can share one source of truth.
 from src.dashboard.components import (  # noqa: E402,F401
-    DROPDOWN_STYLE, FIELD_STYLE, INPUT_STYLE, LABEL_STYLE,
+    DROPDOWN_STYLE, FIELD_STYLE, INPUT_STYLE, LABEL_STYLE, SECTION_STYLE,
 )
 
 # ====================================================================== #
@@ -379,29 +375,11 @@ def _status_pill(title: str, value: str, color: str = "#636EFA"):
 from src.dashboard.data_helpers import empty_fig as _empty_fig  # noqa: E402,F401
 
 
-def _empty_state(headline: str, hint: str = "",
-                 glyph: str = "·") -> html.Div:
-    """Tab-level empty state: small glyph, headline, and a friendly hint.
-
-    Used by tabs that have no data to render at all (e.g. no sessions
-    discovered, no files with videos). Looks consistent across the app.
-    """
-    return html.Div([
-        html.Div(glyph, style={"fontSize": "32px",
-                               "color": COLOR_TEXT_TERTIARY,
-                               "marginBottom": SPACE_3,
-                               "letterSpacing": "0"}),
-        html.Div(headline, style={"fontSize": FONT_SIZE_HEADER,
-                                  "fontWeight": "600",
-                                  "color": COLOR_TEXT_PRIMARY,
-                                  "marginBottom": SPACE_2}),
-        html.Div(hint, style={"fontSize": FONT_SIZE_BODY,
-                              "color": COLOR_TEXT_SECONDARY,
-                              "maxWidth": "520px",
-                              "lineHeight": "1.5"}),
-    ], style={"textAlign": "center",
-              "padding": f"{SPACE_6} {SPACE_5}",
-              "marginTop": SPACE_6})
+# _empty_state moved to src/dashboard/components.tab_empty_state.
+# Aliased here so the in-module callsites keep working.
+from src.dashboard.components import (  # noqa: E402,F401
+    tab_empty_state as _empty_state,
+)
 
 
 # _session_dropdown_options moved to src/dashboard/data_helpers.
@@ -1384,13 +1362,13 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "settings":
                 return _enable_persistence(_settings_tab_layout(store))
             elif tab == "activity_log":
-                return _enable_persistence(_activity_log_tab_layout(store))
+                return _enable_persistence(tabs_activity_log.layout(store))
             elif tab == "annotations":
-                return _enable_persistence(_annotations_tab_layout(store))
+                return _enable_persistence(tabs_annotations.layout(store))
             elif tab == "alerts":
                 return _enable_persistence(tabs_alerts.layout(store))
             elif tab == "sessions":
-                return _enable_persistence(_sessions_tab(store))
+                return _enable_persistence(tabs_sessions.layout(store))
             elif tab == "surgeries":
                 return _enable_persistence(tabs_surgeries.layout(store, config))
             elif tab == "maintenance":
@@ -2105,68 +2083,11 @@ def create_app(config: dict, store: Store) -> Dash:
     # Session Compare callback moved to
     # src/dashboard/tabs/session_compare.py.
 
-    # ------------------------------------------------------------------ #
-    #  Activity Log callback
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        Output("activity-log-table", "data"),
-        [Input("activity-log-hours-dropdown", "value"),
-         Input("activity-log-level-dropdown", "value")],
-    )
-    def update_activity_log(hours, level):
-        hours_val = int(hours) if hours else 24
-        level_val = level if level and level != "ALL" else None
-        try:
-            logs = store.get_activity_log(hours=hours_val, level=level_val, limit=500)
-        except Exception:
-            logs = []
-        return [
-            {
-                "timestamp": entry.get("timestamp", "")[:19],
-                "level": entry.get("level", ""),
-                "action": entry.get("action", ""),
-                "message": (entry.get("message") or "")[:200],
-                "file_path": os.path.basename(entry.get("file_path") or ""),
-                "duration": f"{entry['duration_sec']:.2f}" if entry.get("duration_sec") else "",
-            }
-            for entry in logs
-        ]
+    # Activity Log callback moved to
+    # src/dashboard/tabs/activity_log.py.
 
-    # ------------------------------------------------------------------ #
-    #  Annotations callbacks
-    # ------------------------------------------------------------------ #
-    @app.callback(
-        [Output("annotation-status", "children"),
-         Output("annotation-table", "data")],
-        Input("annotation-submit-btn", "n_clicks"),
-        [State("annotation-timestamp", "value"),
-         State("annotation-note", "value"),
-         State("annotation-category", "value"),
-         State("annotation-session-dropdown", "value")],
-        prevent_initial_call=True,
-    )
-    def submit_annotation(n_clicks, timestamp_val, note, category, session_dir):
-        if not n_clicks:
-            return no_update, no_update
-        if not note or not note.strip():
-            return html.Div("Note cannot be empty", style={"color": "#EF553B"}), no_update
-        ts = timestamp_val or datetime.now().isoformat()
-        try:
-            ann_id = store.add_annotation(
-                timestamp=ts,
-                note=note.strip(),
-                category=category or "observation",
-                session_dir=session_dir or None,
-                user_email=current_user_email(),
-            )
-            all_ann = store.get_annotations()
-            table_data = _annotations_table_data(all_ann)
-            return (
-                html.Div(f"Annotation #{ann_id} saved", style={"color": "#00CC96"}),
-                table_data,
-            )
-        except Exception as e:
-            return html.Div(f"Error: {e}", style={"color": "#EF553B"}), no_update
+    # Annotations callback moved to
+    # src/dashboard/tabs/annotations.py.
 
     # ------------------------------------------------------------------ #
     #  Settings callbacks
@@ -2518,6 +2439,9 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_stim.register_callbacks(app, store, config)
     tabs_criticality.register_callbacks(app, store, config)
     tabs_session_compare.register_callbacks(app, store, config)
+    tabs_activity_log.register_callbacks(app, store, config)
+    tabs_annotations.register_callbacks(app, store, config)
+    tabs_sessions.register_callbacks(app, store, config)
     # PI verification tab (gated on pi_emails). Import inline
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
@@ -5189,297 +5113,17 @@ def _settings_tab_layout(store: Store):
     ])
 
 
-# ------------------------------------------------------------------ #
-#  Activity Log tab (NEW)
-# ------------------------------------------------------------------ #
-
-def _activity_log_tab_layout(store: Store):
-    # Pre-load initial data
-    try:
-        initial_logs = store.get_activity_log(hours=24, limit=500)
-    except Exception:
-        initial_logs = []
-
-    initial_data = [
-        {
-            "timestamp": entry.get("timestamp", "")[:19],
-            "level": entry.get("level", ""),
-            "action": entry.get("action", ""),
-            "message": (entry.get("message") or "")[:200],
-            "file_path": os.path.basename(entry.get("file_path") or ""),
-            "duration": f"{entry['duration_sec']:.2f}" if entry.get("duration_sec") else "",
-        }
-        for entry in initial_logs
-    ]
-
-    return html.Div([
-        html.H3("Activity Log", style={"color": "white", "marginBottom": "12px"}),
-        html.Div([
-            html.Div([
-                html.Label("Time Range", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="activity-log-hours-dropdown",
-                    options=TIME_RANGE_OPTIONS,
-                    value=24,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "0 0 180px"}),
-            html.Div([
-                html.Label("Level", style=LABEL_STYLE),
-                dcc.Dropdown(
-                    id="activity-log-level-dropdown",
-                    options=[
-                        {"label": "ALL", "value": "ALL"},
-                        {"label": "INFO", "value": "INFO"},
-                        {"label": "WARNING", "value": "WARNING"},
-                        {"label": "ERROR", "value": "ERROR"},
-                    ],
-                    value="ALL",
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "0 0 150px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "16px", "flexWrap": "wrap"}),
-
-        dash_table.DataTable(
-            id="activity-log-table",
-            data=initial_data,
-            columns=[
-                {"name": "Timestamp", "id": "timestamp"},
-                {"name": "Level", "id": "level"},
-                {"name": "Action", "id": "action"},
-                {"name": "Message", "id": "message"},
-                {"name": "File", "id": "file_path"},
-                {"name": "Duration (s)", "id": "duration"},
-            ],
-            **DARK_TABLE_STYLE,
-            style_data_conditional=[ZEBRA_STRIPE,
-                {"if": {"filter_query": "{level} = ERROR"},
-                 "backgroundColor": "#3d1111", "color": "#ff6b6b"},
-                {"if": {"filter_query": "{level} = WARNING"},
-                 "backgroundColor": "#3d3011", "color": "#ffd93d"},
-                {"if": {"filter_query": "{level} = INFO"},
-                 "color": "#6bb5ff"},
-            ],
-            page_size=30,
-            filter_action="native",
-            sort_action="native",
-        ),
-    ])
+# Activity Log tab moved to src/dashboard/tabs/activity_log.py.
 
 
-# ------------------------------------------------------------------ #
-#  Annotations tab (NEW)
-# ------------------------------------------------------------------ #
-
-def _annotations_tab_layout(store: Store):
-    session_options = _session_dropdown_options(store)
-
-    try:
-        all_annotations = store.get_annotations()
-    except Exception:
-        all_annotations = []
-
-    table_data = _annotations_table_data(all_annotations)
-
-    return html.Div([
-        html.H3("Annotations", style={"color": "white", "marginBottom": "12px"}),
-
-        # Existing annotations table
-        dash_table.DataTable(
-            id="annotation-table",
-            data=table_data,
-            columns=[
-                {"name": "ID", "id": "id"},
-                {"name": "Timestamp", "id": "timestamp"},
-                {"name": "Category", "id": "category"},
-                {"name": "Note", "id": "note"},
-                {"name": "Session", "id": "session_dir"},
-                {"name": "User", "id": "user"},
-                {"name": "Created At", "id": "created_at"},
-            ],
-            **DARK_TABLE_STYLE,
-            style_data_conditional=[ZEBRA_STRIPE,
-                {"if": {"filter_query": "{category} = electrode"},
-                 "color": "#FFA15A"},
-                {"if": {"filter_query": "{category} = injection"},
-                 "color": "#AB63FA"},
-                {"if": {"filter_query": "{category} = experiment"},
-                 "color": "#636EFA"},
-                {"if": {"filter_query": "{category} = observation"},
-                 "color": "#00CC96"},
-            ],
-            page_size=20,
-            filter_action="native",
-            sort_action="native",
-        ),
-
-        # Add Note form
-        html.Div([
-            html.H4("Add Note", style={"color": "white", "marginTop": "24px", "marginBottom": "12px"}),
-            html.Div([
-                html.Div([
-                    html.Label("Timestamp", style=LABEL_STYLE),
-                    dcc.Input(
-                        id="annotation-timestamp",
-                        value=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                        type="text",
-                        style=INPUT_STYLE,
-                        placeholder="YYYY-MM-DDTHH:MM:SS",
-                    ),
-                ], style={"flex": "1", "minWidth": "220px"}),
-                html.Div([
-                    html.Label("Category", style=LABEL_STYLE),
-                    dcc.Dropdown(
-                        id="annotation-category",
-                        options=[
-                            {"label": "Electrode", "value": "electrode"},
-                            {"label": "Injection", "value": "injection"},
-                            {"label": "Experiment", "value": "experiment"},
-                            {"label": "Observation", "value": "observation"},
-                        ],
-                        value="observation",
-                        style=DROPDOWN_STYLE,
-                        className="dark-dropdown",
-                    ),
-                ], style={"flex": "0 0 180px"}),
-                html.Div([
-                    html.Label("Session (optional)", style=LABEL_STYLE),
-                    dcc.Dropdown(
-                        id="annotation-session-dropdown",
-                        options=session_options,
-                        style=DROPDOWN_STYLE,
-                        className="dark-dropdown",
-                    ),
-                ], style={"flex": "1", "minWidth": "250px"}),
-            ], style={"display": "flex", "gap": "16px", "marginBottom": "12px", "flexWrap": "wrap"}),
-
-            html.Div([
-                html.Label("Note", style=LABEL_STYLE),
-                dcc.Textarea(
-                    id="annotation-note",
-                    style={**INPUT_STYLE, "height": "80px", "resize": "vertical"},
-                    placeholder="Enter your annotation...",
-                ),
-            ], style={"marginBottom": "12px"}),
-
-            html.Button("Submit Annotation", id="annotation-submit-btn", n_clicks=0,
-                        style={"backgroundColor": "#00CC96", "color": "white",
-                               "border": "none", "padding": "10px 24px",
-                               "borderRadius": "6px", "cursor": "pointer",
-                               "fontSize": "14px", "fontWeight": "bold"}),
-            html.Div(id="annotation-status", style={"marginTop": "8px"}),
-        ], style=SECTION_STYLE),
-    ])
-
-
-def _annotations_table_data(annotations: list[dict]) -> list[dict]:
-    return [
-        {
-            "id": a.get("id", ""),
-            "timestamp": (a.get("timestamp") or "")[:19],
-            "category": a.get("category", ""),
-            "note": a.get("note", ""),
-            "session_dir": os.path.basename(a.get("session_dir") or ""),
-            "user": a.get("user_email", "") or "",
-            "created_at": (a.get("created_at") or "")[:19],
-        }
-        for a in annotations
-    ]
+# Annotations tab moved to src/dashboard/tabs/annotations.py.
 
 
 # ------------------------------------------------------------------ #
 #  Sessions tab (existing)
 # ------------------------------------------------------------------ #
 
-def _sessions_tab(store: Store):
-    sessions = store.get_sessions()
-    if not sessions:
-        return _empty_state(
-            "No sessions yet",
-            "Sessions appear here once the watcher discovers .mat files in "
-            "the network share configured under watch.paths.",
-        )
-
-    all_configs = store.get_all_session_configs()
-    config_by_dir = {c["session_dir"]: c for c in all_configs}
-
-    rows = []
-    for s in sessions:
-        cfg = config_by_dir.get(s["session_dir"], {})
-        ch_names = _parse_json_field(cfg.get("channel_names"))
-        num_ch = cfg.get("num_channels") or (len(ch_names) if ch_names else "")
-        sr = cfg.get("sampling_rate", "")
-        stim_freq = cfg.get("stim_frequency_hz", "")
-        stim_charge = cfg.get("stim_charge_nC", "")
-
-        rows.append({
-            "name": s["session_name"],
-            "dir": s["session_dir"],
-            "files": s["num_files"],
-            "processed": s["processed"],
-            "errors": s["errors"],
-            "first": s["first_chunk"][:16] if s["first_chunk"] else "",
-            "last": s["last_chunk"][:16] if s["last_chunk"] else "",
-            "channels": num_ch,
-            "sr": sr,
-            "stim_freq": f"{stim_freq}" if stim_freq else "",
-            "stim_charge": f"{stim_charge}" if stim_charge else "",
-        })
-
-    return html.Div([
-        html.Div([
-            html.H3(f"Sessions ({len(sessions)})",
-                    style={"color": COLOR_TEXT_PRIMARY,
-                           "fontSize": FONT_SIZE_HEADER,
-                           "fontWeight": "600",
-                           "margin": "0"}),
-            html.Span(
-                "Click any row to open that session in Evoked Waveforms.",
-                style={"color": COLOR_TEXT_TERTIARY,
-                       "fontSize": FONT_SIZE_CAPTION,
-                       "marginLeft": SPACE_3},
-            ),
-        ], style={"display": "flex", "alignItems": "baseline",
-                  "marginBottom": SPACE_4}),
-        dash_table.DataTable(
-            id="sessions-table",
-            data=rows,
-            columns=[
-                {"name": "Session", "id": "name"},
-                {"name": "Directory", "id": "dir"},
-                {"name": "Files", "id": "files"},
-                {"name": "Processed", "id": "processed"},
-                {"name": "Errors", "id": "errors"},
-                {"name": "First Chunk", "id": "first"},
-                {"name": "Last Chunk", "id": "last"},
-                {"name": "Channels", "id": "channels"},
-                {"name": "SR (Hz)", "id": "sr"},
-                {"name": "Stim Freq", "id": "stim_freq"},
-                {"name": "Stim Charge (nC)", "id": "stim_charge"},
-            ],
-            **DARK_TABLE_STYLE,
-            style_data_conditional=[ZEBRA_STRIPE,
-                {"if": {"filter_query": "{errors} > 0"},
-                 "backgroundColor": "rgba(255,69,58,0.10)",
-                 "color": COLOR_DANGER},
-                {"if": {"state": "active"},
-                 "backgroundColor": "rgba(94,124,226,0.18)",
-                 "border": f"1px solid {COLOR_ACCENT}"},
-            ],
-            style_cell_conditional=[
-                {"if": {"column_id": "name"},
-                 "cursor": "pointer", "fontWeight": "600",
-                 "color": COLOR_ACCENT},
-            ],
-            page_size=20,
-            sort_action="native",
-            filter_action="native",
-            cell_selectable=True,
-            active_cell=None,
-        ),
-    ])
+# Sessions tab moved to src/dashboard/tabs/sessions.py.
 
 
 # ------------------------------------------------------------------ #
