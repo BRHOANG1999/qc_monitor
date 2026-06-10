@@ -44,6 +44,7 @@ from src.utils.peakseek import peakseek
 from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.dashboard.tabs import video_events as _events
+from src.utils import mass_analyze as _mass_analyze
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
 )
@@ -721,6 +722,134 @@ def _details_card(summary_text: str, content,
     })
 
 
+def _video_mass_analyze_panel() -> html.Details:
+    """Undergrad bulk pre-screen via Hilbert envelope thresholding.
+
+    Mirrors event_verification._mass_analyze_panel but with
+    ``video-ma-*`` ids and undergrad-scoped animal options
+    (populated by callback off the existing queue picker's
+    options, so the dropdown reflects the user's assignments
+    automatically). Files with zero peaks above the cutoff
+    auto-submit as 'no events seen' on Confirm; the PI still
+    verifies in the Event Verification tab."""
+    return html.Details([
+        html.Summary([
+            html.Span("Mass Analyze pending files ",
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+            html.Span("(skip files with no events)",
+                       style={"color": "#a0a0b0",
+                               "fontSize": "11px",
+                               "marginLeft": "6px"}),
+        ], style={"cursor": "pointer",
+                   "padding": "10px 14px",
+                   "listStyle": "none",
+                   "userSelect": "none"}),
+        html.Div([
+            html.Div(
+                "Run BHZ detection over every pending file for "
+                "an animal at the threshold below. Files with "
+                "zero peaks above the threshold are auto-"
+                "submitted as 'no events seen' (the PI still "
+                "verifies). Files with any peaks above the "
+                "threshold stay in your queue for normal "
+                "scoring.",
+                style={"color": "#a0a0b0",
+                        "fontSize": "11px",
+                        "padding": "8px 12px",
+                        "background": "rgba(94,124,226,0.04)",
+                        "border":
+                            "1px solid rgba(94,124,226,0.18)",
+                        "borderRadius": "6px",
+                        "margin": "0 14px 10px"}),
+            html.Div([
+                html.Label("Animal:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="video-ma-animal-dropdown",
+                    options=[],
+                    placeholder="Pick an animal",
+                    style={"flex": "1 1 220px",
+                            "minWidth": "200px"},
+                    className="dark-dropdown",
+                ),
+                html.Label("Cutoff:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginLeft": "14px",
+                                    "marginRight": "6px"}),
+                dcc.Input(
+                    id="video-ma-cutoff-input",
+                    type="number", min=0, step=0.005,
+                    value=0.05,
+                    style={"flex": "0 0 110px",
+                            "padding": "6px 10px",
+                            "background": "#262638",
+                            "color": "#f0f0f5",
+                            "border":
+                                "1px solid rgba(255,255,255,0.10)",
+                            "borderRadius": "4px",
+                            "fontSize": "12px"}),
+                html.Button(
+                    "Scan files",
+                    id="video-ma-scan-btn", n_clicks=0,
+                    style={"background": "#5e7ce2",
+                            "color": "white",
+                            "border": "none",
+                            "padding": "6px 14px",
+                            "borderRadius": "5px",
+                            "cursor": "pointer",
+                            "fontSize": "12px",
+                            "fontWeight": "600"}),
+                html.Button(
+                    "Cancel scan",
+                    id="video-ma-cancel-btn", n_clicks=0,
+                    style={"background": "transparent",
+                            "color": "#cfd0d6",
+                            "border":
+                                "1px solid rgba(255,255,255,0.15)",
+                            "padding": "6px 14px",
+                            "borderRadius": "5px",
+                            "cursor": "pointer",
+                            "fontSize": "12px"}),
+            ], style={"display": "flex",
+                       "alignItems": "center",
+                       "gap": "8px",
+                       "flexWrap": "wrap",
+                       "padding": "0 14px",
+                       "marginBottom": "10px"}),
+            html.Div(id="video-ma-progress",
+                      style={"color": "#a0a0b0",
+                              "fontSize": "12px",
+                              "minHeight": "16px",
+                              "padding": "0 14px",
+                              "marginBottom": "8px"}),
+            html.Div(id="video-ma-summary",
+                      style={"padding": "0 14px",
+                              "marginBottom": "10px"}),
+            html.Div(id="video-ma-confirm-row",
+                      style={"display": "flex", "gap": "8px",
+                              "alignItems": "center",
+                              "padding": "0 14px",
+                              "marginBottom": "10px"}),
+            # State stores + polling.
+            dcc.Store(id="video-ma-job-id", data=None),
+            dcc.Interval(id="video-ma-poll",
+                           interval=1500, n_intervals=0,
+                           disabled=True),
+        ]),
+    ], open=False,
+       style={"padding": "0",
+               "background": "#13131f",
+               "border":
+                   "1px solid rgba(255,255,255,0.06)",
+               "borderRadius": "8px",
+               "marginTop": "10px",
+               "marginBottom": "16px"})
+
+
 def layout(store: Store):
     sessions = _sessions_with_video(store)
     session_options = [
@@ -831,6 +960,14 @@ def layout(store: Store):
                       "Pick which animal you're reviewing. Recordings "
                       "show up oldest first (FIFO) so the backlog "
                       "clears from the front — work top to bottom."),
+
+        # --- Mass Analyze (optional, collapsed by default) ----------- #
+        # Hilbert envelope thresholding pre-screen. Lets the
+        # undergrad sweep a cutoff and auto-clear zero-peak files
+        # before they start manually scoring the rest. Same
+        # underlying job/cache as the PI Mass Analyze in
+        # Event Verification, just scoped to assigned animals.
+        _video_mass_analyze_panel(),
 
         # --- My queue picker ----------------------------------------- #
         # Card-style row: animal picker on left, queue list on the
@@ -4047,6 +4184,228 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-lfp-trace", "clickData"),
         State("video-lfp-duration", "data"),
     )
+
+    # =================================================================== #
+    #  Mass Analyze (undergrad bulk pre-screen)
+    # =================================================================== #
+    # Five callbacks: populate-animals piggy-backs on the queue picker's
+    # options so the MA dropdown reflects assignments without a second
+    # Sheets fetch. Scan/Poll/Cancel/Commit mirror event_verification's
+    # shape with two differences: no PI gate (any signed-in reviewer
+    # with at least one assigned animal can scan), and the commit
+    # callback refreshes ``video-queue-list`` instead of the PI pending
+    # list so zero-peak files drop out of the FIFO immediately.
+
+    @app.callback(
+        Output("video-ma-animal-dropdown", "options"),
+        Input("video-queue-animal", "options"),
+    )
+    def _on_video_ma_populate(queue_options):
+        return queue_options or []
+
+    @app.callback(
+        Output("video-ma-job-id", "data"),
+        Output("video-ma-poll", "disabled"),
+        Output("video-ma-progress", "children",
+                allow_duplicate=True),
+        Input("video-ma-scan-btn", "n_clicks"),
+        State("video-ma-animal-dropdown", "value"),
+        State("video-ma-cutoff-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_scan(n_clicks, animal_id, cutoff):
+        if not n_clicks:
+            return no_update, no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not email:
+            return None, True, "Sign in first."
+        if not animal_id:
+            return None, True, "Pick an animal first."
+        try:
+            cutoff = float(cutoff)
+        except (TypeError, ValueError):
+            return None, True, f"Invalid cutoff: {cutoff!r}"
+        if cutoff <= 0:
+            return None, True, "Cutoff must be > 0."
+        try:
+            job_id = _mass_analyze.create_job(
+                store, email, animal_id, cutoff)
+        except Exception as e:
+            logger.exception("Mass Analyze create_job failed")
+            return None, True, f"Failed to start: {e}"
+        return job_id, False, "Scan queued…"
+
+    @app.callback(
+        Output("video-ma-progress", "children"),
+        Output("video-ma-summary", "children"),
+        Output("video-ma-confirm-row", "children"),
+        Output("video-ma-poll", "disabled",
+                allow_duplicate=True),
+        Input("video-ma-poll", "n_intervals"),
+        Input("video-ma-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_poll(_n, job_id):
+        if not job_id:
+            return ("", "", [], True)
+        job = _mass_analyze.get_job(store, int(job_id))
+        if not job:
+            return ("Job vanished.", "", [], True)
+        status = job.get("status") or "?"
+        scanned = int(job.get("scanned_files") or 0)
+        total = int(job.get("total_files") or 0)
+        n_zero = int(job.get("n_zero_peaks") or 0)
+        n_with = int(job.get("n_with_peaks") or 0)
+        progress = (
+            f"{status}  ·  scanned {scanned}"
+            + (f" of {total}" if total else "")
+            + f"  ·  zero-peak: {n_zero}  ·  "
+              f">=1 peak: {n_with}"
+        )
+        summary = []
+        confirm_row = []
+        polling_disabled = status in ("done", "failed",
+                                         "cancelled")
+        if status == "done":
+            summary = html.Div([
+                html.Div([
+                    html.Span("OK ",
+                               style={"color": "#30d158",
+                                       "marginRight": "6px",
+                                       "fontWeight": "700"}),
+                    html.Span(
+                        f"{n_zero} files with 0 peaks above "
+                        f"{job['cutoff']:g}  ·  will mark as "
+                        "no-events pending PI review",
+                        style={"color": "#30d158",
+                                "fontWeight": "600"}),
+                ], style={"fontSize": "12px",
+                           "marginBottom": "4px"}),
+                html.Div([
+                    html.Span("- ",
+                               style={"color": "#a0a0b0",
+                                       "marginRight": "6px"}),
+                    html.Span(
+                        f"{n_with} files with >=1 peak  ·  "
+                        "stay in your queue for normal review",
+                        style={"color": "#a0a0b0"}),
+                ], style={"fontSize": "12px"}),
+            ])
+            confirm_row = [
+                html.Button(
+                    f"Confirm threshold -> mark {n_zero} files "
+                    "as no-events pending PI review",
+                    id="video-ma-confirm-btn", n_clicks=0,
+                    style={"background": ("#5e7ce2" if n_zero > 0
+                                            else "transparent"),
+                            "color": ("white" if n_zero > 0
+                                       else "#cfd0d6"),
+                            "border": ("none" if n_zero > 0
+                                        else "1px solid "
+                                              "rgba(255,255,255,0.15)"),
+                            "padding": "6px 14px",
+                            "borderRadius": "5px",
+                            "cursor": ("pointer" if n_zero > 0
+                                        else "not-allowed"),
+                            "fontSize": "12px",
+                            "fontWeight": "600"},
+                    disabled=(n_zero == 0)),
+                html.Button(
+                    "Discard scan",
+                    id="video-ma-discard-btn", n_clicks=0,
+                    style={"background": "transparent",
+                            "color": "#cfd0d6",
+                            "border":
+                                "1px solid rgba(255,255,255,0.15)",
+                            "padding": "6px 14px",
+                            "borderRadius": "5px",
+                            "cursor": "pointer",
+                            "fontSize": "12px"}),
+            ]
+        elif status == "failed":
+            err = job.get("error") or "unknown"
+            summary = html.Div(f"Scan failed: {err}",
+                                 style={"color": "#ff453a",
+                                         "fontSize": "12px"})
+        elif status == "cancelled":
+            summary = html.Div(
+                f"Cancelled at scanned {scanned} of {total}.",
+                style={"color": "#ff9f0a",
+                        "fontSize": "12px"})
+        return (progress, summary, confirm_row,
+                polling_disabled)
+
+    @app.callback(
+        Output("video-ma-job-id", "data",
+                allow_duplicate=True),
+        Output("video-ma-progress", "children",
+                allow_duplicate=True),
+        Output("video-ma-poll", "disabled",
+                allow_duplicate=True),
+        Input("video-ma-cancel-btn", "n_clicks"),
+        State("video-ma-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_cancel(n_clicks, job_id):
+        if not n_clicks or not job_id:
+            return no_update, no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not email:
+            return no_update, "Sign in first.", no_update
+        _mass_analyze.cancel_job(store, int(job_id))
+        return no_update, "Cancel requested.", no_update
+
+    @app.callback(
+        Output("video-ma-progress", "children",
+                allow_duplicate=True),
+        Output("video-ma-summary", "children",
+                allow_duplicate=True),
+        Output("video-ma-confirm-row", "children",
+                allow_duplicate=True),
+        Output("video-ma-job-id", "data",
+                allow_duplicate=True),
+        Output("video-queue-animal", "value",
+                allow_duplicate=True),
+        Input("video-ma-confirm-btn", "n_clicks"),
+        Input("video-ma-discard-btn", "n_clicks"),
+        State("video-ma-animal-dropdown", "value"),
+        State("video-ma-cutoff-input", "value"),
+        State("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_commit(_confirm_n, _discard_n,
+                              animal_id, cutoff, queue_animal):
+        trig = callback_context.triggered_id
+        if trig == "video-ma-discard-btn":
+            return ("", "", [], None, no_update)
+        if trig != "video-ma-confirm-btn":
+            return (no_update, no_update, no_update,
+                     no_update, no_update)
+        email = (current_user_email() or "").lower()
+        if not email:
+            return ("Sign in first.", "", [], None, no_update)
+        try:
+            cutoff = float(cutoff)
+        except (TypeError, ValueError):
+            return (f"Invalid cutoff: {cutoff!r}",
+                     "", [], None, no_update)
+        try:
+            result = _mass_analyze.commit_threshold(
+                store, animal_id, cutoff, email)
+        except Exception as e:
+            logger.exception(
+                "Mass Analyze commit_threshold failed")
+            return (f"Commit failed: {e}", "", [], None,
+                     no_update)
+        msg = (f"OK  {result['n_cleared']} files moved to "
+                "pending_pi_review. The PI will verify them.")
+        # Force the queue list to re-render: bump video-queue-animal
+        # value (round-trip through the existing render callback).
+        # If the user wasn't already on this animal, leave their
+        # selection alone -- only refresh when they were viewing it.
+        new_animal = animal_id if queue_animal == animal_id \
+                      else no_update
+        return (msg, "", [], None, new_animal)
 
 
 def _render_history(store: Store, file_id: int):
