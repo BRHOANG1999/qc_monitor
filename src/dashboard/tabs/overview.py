@@ -38,6 +38,7 @@ from dash import (Input, Output, Patch, State, callback_context,
 from plotly.subplots import make_subplots
 
 from src.dashboard.components import (
+    DARK_TABLE_STYLE, ZEBRA_STRIPE,
     card as _card, pill as _pill, section_header as _section_header,
 )
 from src.dashboard.data_helpers import (
