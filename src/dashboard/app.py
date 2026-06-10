@@ -2447,7 +2447,138 @@ def create_app(config: dict, store: Store) -> Dash:
     from src.dashboard.tabs import event_verification as _tabs_evtv
     _tabs_evtv.register_callbacks(app, store, config)
 
+    # Opt-in dev diagnostic: with suppress_callback_exceptions=True a
+    # callback wired to an id that no layout produces fails *silently*
+    # at click time, which is exactly the regression the tab-extraction
+    # work risks. Set QC_MONITOR_CHECK_CALLBACKS=1 to log any such
+    # dangling ids at boot. Never raises; off by default so production
+    # boot stays fast.
+    if os.environ.get("QC_MONITOR_CHECK_CALLBACKS"):
+        _diagnose_callback_wiring(app, store, config)
+
     return app
+
+
+# ====================================================================== #
+#  Callback-wiring diagnostic (opt-in, dev only)
+# ====================================================================== #
+
+def _collect_component_ids(component, into: set) -> None:
+    """Recursively collect every plain-string component id in a Dash
+    component tree. Dict (pattern-matching ALL/MATCH) ids are skipped
+    -- they can't be resolved statically."""
+    cid = getattr(component, "id", None)
+    if isinstance(cid, str):
+        into.add(cid)
+    children = getattr(component, "children", None)
+    if children is None:
+        return
+    if isinstance(children, (list, tuple)):
+        for ch in children:
+            if hasattr(ch, "children") or getattr(ch, "id", None):
+                _collect_component_ids(ch, into)
+    elif hasattr(children, "children") or getattr(children, "id", None):
+        _collect_component_ids(children, into)
+
+
+def _known_component_ids(store: Store, config: dict) -> set:
+    """Union of plain-string ids from the base layout plus every tab
+    layout we can materialize. Each tab layout is built best-effort
+    inside try/except so one failing tab doesn't blind the check for
+    the rest."""
+    ids: set = set()
+    # Each modular tab. (store) and (store, config) signatures both
+    # appear, so try the bare call and fall back to passing config.
+    # The base shell layout is seeded separately by the caller.
+    tab_layouts = [
+        tabs_alerts.layout, tabs_signal_quality.layout,
+        tabs_stim.layout, tabs_criticality.layout,
+        tabs_session_compare.layout, tabs_activity_log.layout,
+        tabs_annotations.layout, tabs_sessions.layout,
+        tabs_video.layout, tabs_surgeries.layout,
+        tabs_maintenance.layout, tabs_data_log_xref.layout,
+        _overview_tab, _waveforms_tab_layout, _evoked_tab_layout,
+        _lfp_browser_tab_layout, _electrode_health_tab_layout,
+        _settings_tab_layout,
+    ]
+    # review_status + event_verification are imported inline in
+    # render_tab; pull them in here too so their ids count as known.
+    try:
+        from src.dashboard.tabs import review_status as _rs
+        tab_layouts.append(_rs.layout)
+    except Exception:
+        pass
+    try:
+        from src.dashboard.tabs import event_verification as _ev
+        tab_layouts.append(_ev.layout)
+    except Exception:
+        pass
+    for fn in tab_layouts:
+        try:
+            comp = fn(store)
+        except TypeError:
+            try:
+                comp = fn(store, config)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        _collect_component_ids(comp, ids)
+    return ids
+
+
+def _callback_referenced_ids(app) -> set:
+    """Collect plain-string ids referenced as Output/Input/State by
+    any registered callback. Dict ids and clientside-only specs are
+    skipped."""
+    ids: set = set()
+    for cb in getattr(app, "_callback_list", []):
+        for key in ("output", "inputs", "state"):
+            spec = cb.get(key)
+            if spec is None:
+                continue
+            items = spec if isinstance(spec, (list, tuple)) else [spec]
+            for item in items:
+                comp_id = None
+                if isinstance(item, dict):
+                    comp_id = item.get("id")
+                else:
+                    comp_id = getattr(item, "component_id", None)
+                if isinstance(comp_id, str):
+                    ids.add(comp_id)
+    return ids
+
+
+def _diagnose_callback_wiring(app, store: Store, config: dict) -> None:
+    """Log any callback-referenced component id that no known layout
+    produces. Best-effort + never raises: a noisy warning is far
+    cheaper than a silently-dead tab.
+
+    Caveats it can't see through (so a listed id may be a false
+    positive): components created *inside* a callback's returned
+    children, and pattern-matching dict ids. Treat the output as a
+    lead, not a verdict."""
+    try:
+        known = _known_component_ids(store, config)
+        # Seed the base shell ids too.
+        if getattr(app, "layout", None) is not None:
+            _collect_component_ids(app.layout, known)
+        referenced = _callback_referenced_ids(app)
+        dangling = sorted(referenced - known)
+        logger.info(
+            "Callback wiring check: %d callbacks, %d referenced ids, "
+            "%d not found in any static layout.",
+            len(getattr(app, "_callback_list", [])),
+            len(referenced), len(dangling),
+        )
+        if dangling:
+            logger.warning(
+                "Callback ids not found in any static layout "
+                "(may be dynamically created, or genuinely dangling): "
+                "%s", ", ".join(dangling),
+            )
+    except Exception as e:
+        logger.debug("Callback wiring check skipped: %s", e)
 
 
 # ====================================================================== #
