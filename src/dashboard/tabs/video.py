@@ -1039,6 +1039,10 @@ def layout(store: Store):
         # on every render so the watchers always fire.
         dcc.Store(id="video-lfp-loadtoken", data=0),
         dcc.Store(id="video-hilbert-loadtoken", data=0),
+        # Write-only sink for the soft-claim callback (claiming a file
+        # has no visible output; this just gives the callback an Output
+        # to satisfy Dash).
+        dcc.Store(id="video-claim-sink", data=0),
 
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
@@ -2873,6 +2877,28 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             changed = True
         return next_state if changed else no_update
 
+    # Soft-claim: when a reviewer loads a recording, claim it so it
+    # drops out of OTHER reviewers' queues for the TTL window (see
+    # Store.claim_file / CLAIM_TTL_MINUTES). Claim on load only -- no
+    # heartbeat, so a reviewer who leaves a tab open and walks away
+    # releases the file once the TTL lapses rather than holding it
+    # indefinitely. The matching release happens on submit.
+    @app.callback(
+        Output("video-claim-sink", "data"),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _claim_on_load(file_id):
+        if not file_id:
+            return no_update
+        email = current_user_email()
+        if email:
+            try:
+                store.claim_file(int(file_id), email)
+            except Exception as e:
+                logger.warning("claim_file failed: %s", e)
+        return no_update
+
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful
     # here because we're flipping DOM attributes, not Dash
@@ -3319,6 +3345,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
             return (f"Save failed: {e}", *nop7[1:])
+        # Submitted -> drop the soft-claim so the row doesn't linger
+        # (the file is now excluded from queues by its pending_pi_review
+        # status anyway; this just keeps file_claim tidy).
+        try:
+            store.release_claim(int(file_id))
+        except Exception as e:
+            logger.warning("release_claim failed: %s", e)
         from datetime import datetime as _dt
         decision_label = ("0 events"
                            if decision == "no_events"

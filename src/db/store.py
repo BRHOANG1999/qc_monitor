@@ -10,6 +10,13 @@ from .schema import SCHEMA_SQL
 
 
 class Store:
+    # Soft-claim TTL: a reviewer who opens a file holds it (hidden from
+    # other reviewers' queues) for this long. Generous vs. the ~40s
+    # videos / few-minute reviews so a heartbeat isn't needed; if a
+    # reviewer wanders off the claim simply expires and the file
+    # returns to the pool.
+    CLAIM_TTL_MINUTES = 20
+
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
@@ -1535,6 +1542,76 @@ class Store:
         finally:
             conn.close()
 
+    # ------------------------------------------------------------------ #
+    # Soft-claim: file_claim table (see schema.py). Keeps two reviewers
+    # off the same recording without a hard lock.
+    # ------------------------------------------------------------------ #
+
+    def claim_cutoff_iso(self) -> str:
+        """ISO timestamp marking the oldest still-valid claim. Claims
+        with ``claimed_at`` >= this are 'fresh'; older ones have
+        expired. Shared by the queue and the Mass Analyze pre-screen so
+        both agree on what 'actively being reviewed' means."""
+        cutoff = datetime.now() - timedelta(
+            minutes=self.CLAIM_TTL_MINUTES)
+        return cutoff.isoformat()
+
+    def claim_file(self, file_id: int, user_email: str) -> None:
+        """Mark *file_id* as being reviewed by *user_email* (UPSERT --
+        one claim per file). Logs a 'claim' audit event only when this
+        is a genuinely new claim (no prior row, or a different/expired
+        prior claimer) so re-opening the same file doesn't spam
+        review_event_log."""
+        assert isinstance(file_id, int), "file_id must be int"
+        assert user_email, "user_email required"
+        email = user_email.lower()
+        now = datetime.now().isoformat()
+        cutoff = self.claim_cutoff_iso()
+        conn = self._connect()
+        try:
+            prior = conn.execute(
+                "SELECT user_email, claimed_at FROM file_claim "
+                "WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            is_new_claim = (
+                prior is None
+                or prior["user_email"] != email
+                or (prior["claimed_at"] or "") < cutoff
+            )
+            conn.execute(
+                """INSERT INTO file_claim
+                   (file_id, user_email, claimed_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(file_id) DO UPDATE SET
+                       user_email = excluded.user_email,
+                       claimed_at = excluded.claimed_at""",
+                (file_id, email, now),
+            )
+            if is_new_claim:
+                conn.execute(
+                    """INSERT INTO review_event_log
+                       (file_id, user_email, action, payload_json, at)
+                       VALUES (?, ?, 'claim', ?, ?)""",
+                    (file_id, email, json.dumps({}), now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def release_claim(self, file_id: int) -> None:
+        """Drop the claim on *file_id* (called after a successful
+        submit so the row doesn't linger). Best-effort; a missing row
+        is fine."""
+        assert isinstance(file_id, int), "file_id must be int"
+        conn = self._connect()
+        try:
+            conn.execute(
+                "DELETE FROM file_claim WHERE file_id = ?", (file_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     @staticmethod
     def _eeg_channel_names_for_config(channel_names_json: str | None,
                                           eeg_channels_json: str | None
@@ -1671,11 +1748,25 @@ class Store:
             ["sc.channel_names LIKE ?"] * len(animal_ids)
         )
         like_args = [f'%"{a}%' for a in animal_ids]
-        params: list = list(like_args)
+        email_l = (user_email or "").lower()
+        claim_cutoff = self.claim_cutoff_iso()
         extra_where = ""
         if since_iso:
-            extra_where += " AND pf.chunk_datetime >= ?"
-            params.append(since_iso)
+            extra_where = " AND pf.chunk_datetime >= ?"
+        # Params are appended in the EXACT order their ? placeholders
+        # appear in the SQL below. (A prior version appended since_iso
+        # before user_email, which transposed the two whenever a
+        # since_iso floor was supplied.)
+        params: list = list(like_args)        # {like_clauses}
+        params.append(email_l)                # rs2.user_email = ?
+        params.append(email_l)                # fc.user_email != ?
+        params.append(claim_cutoff)           # fc.claimed_at >= ?
+        if since_iso:
+            params.append(since_iso)          # {extra_where}
+        # Over-fetch a little so the post-filter (rejecting rows
+        # whose decoded animal list doesn't actually intersect)
+        # still has enough hits.
+        params.append(limit * 3)              # LIMIT
         sql = f"""
             SELECT pf.id, pf.file_path, pf.session_dir,
                     pf.session_name, pf.chunk_datetime,
@@ -1709,15 +1800,20 @@ class Store:
                                       'pending_pi_review',
                                       'pi_approved')
               )
+              -- Soft-claim: hide a recording another reviewer is
+              -- actively reviewing (claimed within the TTL). The
+              -- reviewer's OWN claim stays visible so they can resume;
+              -- expired claims (claimed_at < cutoff) don't hide it.
+              AND NOT EXISTS (
+                SELECT 1 FROM file_claim fc
+                WHERE fc.file_id = pf.id
+                  AND fc.user_email != ?
+                  AND fc.claimed_at >= ?
+              )
               {extra_where}
             ORDER BY pf.chunk_datetime ASC
             LIMIT ?
         """
-        params.append((user_email or "").lower())
-        # Over-fetch a little so the post-filter (rejecting rows
-        # whose decoded animal list doesn't actually intersect)
-        # still has enough hits.
-        params.append(limit * 3)
         wanted = {a for a in animal_ids}
         conn = self._connect()
         try:

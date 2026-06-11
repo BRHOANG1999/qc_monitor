@@ -45,7 +45,7 @@ EXPECTED_TABLES = {
     "evoked_waveforms", "processing_log", "annotations",
     "system_health", "users", "video_qc",
     "review_state", "review_event_log", "envelope_peak_cache",
-    "mass_analyze_job", "event_clip_job",
+    "mass_analyze_job", "event_clip_job", "file_claim",
 }
 
 

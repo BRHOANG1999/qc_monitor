@@ -376,6 +376,24 @@ CREATE INDEX IF NOT EXISTS idx_review_event_log_user
     ON review_event_log(user_email);
 
 -- ----------------------------------------------------------------------
+-- file_claim: soft-lock so two reviewers don't double-score the same
+-- recording. When a reviewer opens a file the queue claims it; the
+-- queue hides files claimed by OTHER reviewers within a TTL window
+-- (see Store.CLAIM_TTL_MINUTES). Kept separate from review_state on
+-- purpose -- review_state is append-only and Mass Analyze excludes on
+-- 'claimed' there, so writing claims into it would permanently hide
+-- files. One row per file (PK on file_id); claims UPSERT and expire by
+-- timestamp, so no row bloat and no manual cleanup.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS file_claim (
+    file_id INTEGER PRIMARY KEY REFERENCES processed_files(id),
+    user_email TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_claim_claimed_at
+    ON file_claim(claimed_at);
+
+-- ----------------------------------------------------------------------
 -- envelope_peak_cache: per-(file, channel, cutoff) peakseek result so
 -- the PI's Mass Analyze panel can re-sweep thresholds without paying
 -- the FFT cost twice. UNIQUE constraint makes the cache-aside lookup a

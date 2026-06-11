@@ -228,8 +228,16 @@ def pending_files_for_animal(store, animal_id: str
                          'pi_approved'
                      )
                  )
+                 -- Don't pre-screen a file someone is actively
+                 -- reviewing (claimed within the TTL); auto-clearing
+                 -- it would race the human's submission.
+                 AND NOT EXISTS (
+                   SELECT 1 FROM file_claim fc
+                   WHERE fc.file_id = pf.id
+                     AND fc.claimed_at >= ?
+                 )
                ORDER BY pf.chunk_datetime ASC""",
-            (f'%"{animal_id}%',),  # animal prefix match
+            (f'%"{animal_id}%', store.claim_cutoff_iso()),
         ).fetchall()
     # Post-filter: the LIKE is loose ("BCH062" would also match
     # "BCH0620"); use the parser to be precise.
@@ -284,8 +292,13 @@ def count_pending_for_animal(store, animal_id: str) -> int:
                          'abandoned', 'pending_pi_review',
                          'pi_approved'
                      )
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM file_claim fc
+                   WHERE fc.file_id = pf.id
+                     AND fc.claimed_at >= ?
                  )""",
-            (f'%"{animal_id}%',),
+            (f'%"{animal_id}%', store.claim_cutoff_iso()),
         ).fetchone()
     return int(row["n"]) if row else 0
 
