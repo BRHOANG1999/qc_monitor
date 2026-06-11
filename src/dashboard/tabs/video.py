@@ -1029,6 +1029,16 @@ def layout(store: Store):
                   className="video-load-pill",
                   style={"display": "none"}),
         dcc.Store(id="video-load-state", data={}),
+        # Per-leg "render completed" tokens. The LFP / Hilbert
+        # status strings are a pure function of duration + point
+        # count + stim/candidate count, so consecutive fixed-
+        # length recordings produce an IDENTICAL status -- the
+        # done-watchers (which fire on a status *change*) would
+        # never see the second load complete and the pill would
+        # hang on "loading". These tokens carry a fresh timestamp
+        # on every render so the watchers always fire.
+        dcc.Store(id="video-lfp-loadtoken", data=0),
+        dcc.Store(id="video-hilbert-loadtoken", data=0),
 
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
@@ -2832,14 +2842,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         next_state["video"] = "done"
         return next_state
 
+    # Watch the per-render TOKEN, not the human-readable status:
+    # the status string is identical across same-duration / same-
+    # candidate-count recordings, so a status-change Input would
+    # miss the second load and leave the leg stuck on "loading".
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
-        Input("video-lfp-status", "children"),
+        Input("video-lfp-loadtoken", "data"),
         State("video-load-state", "data"),
         prevent_initial_call=True,
     )
-    def _mark_lfp_done(_status, state):
+    def _mark_lfp_done(_token, state):
         if not state or state.get("lfp") != "loading":
             return no_update
         next_state = dict(state)
@@ -2849,11 +2863,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
-        Input("video-analysis-status", "children"),
+        Input("video-hilbert-loadtoken", "data"),
         State("video-load-state", "data"),
         prevent_initial_call=True,
     )
-    def _mark_hilbert_done(_status, state):
+    def _mark_hilbert_done(_token, state):
         if not state or state.get("hilbert") != "loading":
             return no_update
         next_state = dict(state)
@@ -3582,6 +3596,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-lfp-status", "children"),
         Output("video-filter-state", "data"),
         Output("video-lfp-duration", "data"),
+        Output("video-lfp-loadtoken", "data"),
         Input("video-file-dropdown", "value"),
         Input("video-channel-dropdown", "value"),
         Input("video-apply-filter-btn", "n_clicks"),
@@ -3593,18 +3608,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _update_lfp(file_id, channel, _n_apply,
                      hp, lp, notch, smooth_ms):
+        # Fresh token each fire so the load-pill done-watcher
+        # triggers even when the human-readable status string is
+        # identical to the previous recording (fixed-length rig).
+        tok = datetime.now().timestamp()
         if not file_id:
             return (_empty_lfp_fig(
                 "Pick a recording above to see the brain signal here."),
-                    "", no_update, 0.0)
+                    "", no_update, 0.0, tok)
         if channel is None:
             return (_empty_lfp_fig(
                 "Pick a brain channel to display."),
-                    "", no_update, 0.0)
+                    "", no_update, 0.0, tok)
         file_path = _file_path_for_id(store, file_id)
         if not file_path:
             return (_empty_lfp_fig("File not found in DB."),
-                    "", no_update, 0.0)
+                    "", no_update, 0.0, tok)
 
         # Stim-blank ONLY the LFP channel that sits directly after a
         # stim_copy channel in the channel list. The stim artifact
@@ -3631,7 +3650,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("LFP load failed file=%s ch=%s: %s",
                            file_id, channel, e)
             return (_empty_lfp_fig(f"LFP load error: {e}"),
-                    "", no_update, 0.0)
+                    "", no_update, 0.0, tok)
 
         # Apply live filter (HP/LP/notch/smooth) on the *decimated*
         # display series so we don't pay the cost of filtering the
@@ -3676,12 +3695,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         new_state = {"hp": hp, "lp": lp, "notch": notch,
                      "smooth": smooth_ms}
         return (fig, " · ".join(status_bits), new_state,
-                float(duration))
+                float(duration), tok)
 
     # ---- Time-locked analysis trace (feature vs time) ----
     @app.callback(
         Output("video-analysis-trace", "figure"),
         Output("video-analysis-status", "children"),
+        Output("video-hilbert-loadtoken", "data"),
         Input("video-file-dropdown", "value"),
         Input("video-analysis-feature", "value"),
         Input("video-analysis-apply-btn", "n_clicks"),
@@ -3702,6 +3722,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _update_analysis(file_id, feature, _n_apply,
                           channel, ma_cutoff,
                           smooth_sec, rollwin, postproc):
+        # Thin wrapper: delegate, then stamp a fresh token so the
+        # load-pill done-watcher fires even when the status string
+        # repeats (0-candidate fixed-length recordings all render
+        # an identical hilbert status).
+        fig, status = _compute_analysis(
+            file_id, feature, channel, ma_cutoff,
+            smooth_sec, rollwin, postproc)
+        return fig, status, datetime.now().timestamp()
+
+    def _compute_analysis(file_id, feature,
+                           channel, ma_cutoff,
+                           smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
                 "Pick a recording above to see the feature trace."), "")
