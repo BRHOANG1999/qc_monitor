@@ -933,7 +933,7 @@ def _video_mass_analyze_panel() -> html.Details:
                "marginBottom": "16px"})
 
 
-def layout(store: Store):
+def layout(store: Store, bridge: dict | None = None):
     sessions = _sessions_with_video(store)
     session_options = [
         {"label": f"{s['session_name']} ({s['n_videos']} videos)",
@@ -941,6 +941,14 @@ def layout(store: Store):
         for s in sessions
     ]
     default_session = sessions[0]["session_dir"] if sessions else None
+    # Deep-link hand-off (LFP Browser / Event Verification): pre-select
+    # the requested session AT BUILD TIME so the file/channel cascade
+    # (_update_files / _update_player, which read the bridge as State)
+    # loads the exact recording on mount instead of the newest default.
+    if isinstance(bridge, dict):
+        want = bridge.get("session_dir")
+        if want and any(o["value"] == want for o in session_options):
+            default_session = want
 
     if not sessions:
         return html.Div([

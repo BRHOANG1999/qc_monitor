@@ -1032,8 +1032,9 @@ def create_app(config: dict, store: Store) -> Dash:
         Output("tab-content", "children"),
         Input("tabs", "value"),
         State("selected-session-dir", "data"),
+        State("lfp-to-video-bridge", "data"),
     )
-    def render_tab(tab, session_hint):
+    def render_tab(tab, session_hint, video_bridge):
         try:
             if tab == "overview":
                 return _enable_persistence(tabs_overview.layout(store, config))
@@ -1050,7 +1051,14 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(
                     tabs_lfp_browser.layout(store, default=session_hint))
             elif tab == "video":
-                return _enable_persistence(tabs_video.layout(store))
+                # Pass the LFP-Browser / Event-Verification hand-off
+                # bridge so the session is pre-selected AT BUILD TIME.
+                # Consuming it via a post-mount callback raced the lazy
+                # tab render (the callback fired before the dropdown
+                # existed), so deep-links silently fell back to the
+                # newest file.
+                return _enable_persistence(
+                    tabs_video.layout(store, bridge=video_bridge))
             elif tab == "electrode_health":
                 return _enable_persistence(
                     tabs_electrode_health.layout(store, default=session_hint))
