@@ -253,6 +253,43 @@ def pending_files_for_animal(store, animal_id: str
     return out
 
 
+def count_pending_for_animal(store, animal_id: str) -> int:
+    """Cheap count of queue-eligible files for *animal_id*.
+
+    Same filter as ``pending_files_for_animal`` but stops at
+    ``COUNT(DISTINCT pf.id)`` so the UI scope counter doesn't pay
+    the post-filter cost just to learn the count. The post-filter
+    in ``pending_files_for_animal`` (``split_animal_electrode``)
+    can only trim the SQL result, never expand it -- the count
+    here is therefore an upper bound. In practice the LIKE pattern
+    is tight enough that the two agree on every animal id format
+    the lab uses; if the counter ever overcounts it's a small UX
+    bug, not a correctness issue (the actual scan still walks the
+    precise list).
+    """
+    assert isinstance(animal_id, str) and animal_id, \
+        "animal_id required"
+    with store.connection() as conn:
+        row = conn.execute(
+            """SELECT COUNT(DISTINCT pf.id) AS n
+               FROM processed_files pf
+               JOIN session_config sc
+                 ON sc.session_dir = pf.session_dir
+               WHERE sc.channel_names LIKE ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM review_state rs
+                   WHERE rs.file_id = pf.id
+                     AND rs.status IN (
+                         'claimed', 'no_events', 'has_events',
+                         'abandoned', 'pending_pi_review',
+                         'pi_approved'
+                     )
+                 )""",
+            (f'%"{animal_id}%',),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 # --------------------------------------------------------------- #
 # Job lifecycle
 # --------------------------------------------------------------- #

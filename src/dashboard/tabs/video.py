@@ -725,13 +725,12 @@ def _details_card(summary_text: str, content,
 def _video_mass_analyze_panel() -> html.Details:
     """Undergrad bulk pre-screen via Hilbert envelope thresholding.
 
-    Mirrors event_verification._mass_analyze_panel but with
-    ``video-ma-*`` ids and undergrad-scoped animal options
-    (populated by callback off the existing queue picker's
-    options, so the dropdown reflects the user's assignments
-    automatically). Files with zero peaks above the cutoff
-    auto-submit as 'no events seen' on Confirm; the PI still
-    verifies in the Event Verification tab."""
+    Reads the animal from the Step 1 queue picker rather than
+    keeping a separate dropdown -- one source of truth so the user
+    can't get confused about which animal they're operating on.
+    The scope counter ('92 pending files eligible') updates live
+    as the queue picker / cutoff change. Scan opens a confirmation
+    modal explaining the steps before any worker job is created."""
     return html.Details([
         html.Summary([
             html.Span("Mass Analyze pending files ",
@@ -748,12 +747,13 @@ def _video_mass_analyze_panel() -> html.Details:
         html.Div([
             html.Div(
                 "Run BHZ detection over every pending file for "
-                "an animal at the threshold below. Files with "
-                "zero peaks above the threshold are auto-"
-                "submitted as 'no events seen' (the PI still "
-                "verifies). Files with any peaks above the "
-                "threshold stay in your queue for normal "
-                "scoring.",
+                "the animal you picked in Step 1 at the threshold "
+                "below. Files with zero peaks above the threshold "
+                "are auto-submitted as 'no events seen' (the PI "
+                "still verifies). Files with any peaks above the "
+                "threshold stay in your queue for normal scoring. "
+                "Tip: click anywhere on the Hilbert envelope plot "
+                "to set the threshold to that line.",
                 style={"color": "#a0a0b0",
                         "fontSize": "11px",
                         "padding": "8px 12px",
@@ -762,23 +762,22 @@ def _video_mass_analyze_panel() -> html.Details:
                             "1px solid rgba(94,124,226,0.18)",
                         "borderRadius": "6px",
                         "margin": "0 14px 10px"}),
+            # Read-only animal display (mirrors Step 1 picker).
+            html.Div(id="video-ma-animal-display",
+                      style={"color": "#cfd0d6",
+                              "fontSize": "12px",
+                              "padding": "0 14px",
+                              "marginBottom": "6px"}),
+            # Live scope counter -- 'BCH061: 92 pending files'.
+            html.Div(id="video-ma-scope",
+                      style={"color": "#a0a0b0",
+                              "fontSize": "11px",
+                              "padding": "0 14px",
+                              "marginBottom": "10px"}),
             html.Div([
-                html.Label("Animal:",
-                            style={"color": "#a0a0b0",
-                                    "fontSize": "12px",
-                                    "marginRight": "6px"}),
-                dcc.Dropdown(
-                    id="video-ma-animal-dropdown",
-                    options=[],
-                    placeholder="Pick an animal",
-                    style={"flex": "1 1 220px",
-                            "minWidth": "200px"},
-                    className="dark-dropdown",
-                ),
                 html.Label("Cutoff:",
                             style={"color": "#a0a0b0",
                                     "fontSize": "12px",
-                                    "marginLeft": "14px",
                                     "marginRight": "6px"}),
                 dcc.Input(
                     id="video-ma-cutoff-input",
@@ -839,6 +838,72 @@ def _video_mass_analyze_panel() -> html.Details:
             dcc.Interval(id="video-ma-poll",
                            interval=1500, n_intervals=0,
                            disabled=True),
+            # Confirmation modal (hidden by default; the scan
+            # button opens it, Confirm here creates the job).
+            html.Div(
+                id="video-ma-confirm-modal",
+                style={"position": "fixed", "inset": "0",
+                        "display": "none",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "background": "rgba(10,10,20,0.65)",
+                        "backdropFilter": "blur(6px)",
+                        "zIndex": "10001"},
+                children=html.Div(
+                    style={"width": "min(640px, 92vw)",
+                            "maxHeight": "82vh",
+                            "overflowY": "auto",
+                            "background": "#13131f",
+                            "border":
+                                "1px solid rgba(94,124,226,0.30)",
+                            "borderRadius": "10px",
+                            "padding": "24px",
+                            "boxShadow":
+                                "0 24px 48px rgba(0,0,0,0.55)"},
+                    children=[
+                        html.Div(
+                            "Confirm Mass Analyze scan",
+                            style={"color": "#f0f0f5",
+                                    "fontWeight": "600",
+                                    "fontSize": "16px",
+                                    "marginBottom": "10px"}),
+                        html.Div(
+                            id="video-ma-modal-body",
+                            style={"color": "#cfd0d6",
+                                    "fontSize": "12px",
+                                    "lineHeight": "1.55",
+                                    "marginBottom": "16px"}),
+                        html.Div([
+                            html.Button(
+                                "Cancel",
+                                id="video-ma-modal-cancel-btn",
+                                n_clicks=0,
+                                style={"background": "transparent",
+                                        "color": "#cfd0d6",
+                                        "border":
+                                            "1px solid rgba(255,255,255,0.15)",
+                                        "padding": "8px 16px",
+                                        "borderRadius": "5px",
+                                        "cursor": "pointer",
+                                        "fontSize": "12px",
+                                        "marginRight": "8px"}),
+                            html.Button(
+                                "Confirm scan",
+                                id="video-ma-modal-confirm-btn",
+                                n_clicks=0,
+                                style={"background": "#5e7ce2",
+                                        "color": "white",
+                                        "border": "none",
+                                        "padding": "8px 16px",
+                                        "borderRadius": "5px",
+                                        "cursor": "pointer",
+                                        "fontSize": "12px",
+                                        "fontWeight": "600"}),
+                        ], style={"display": "flex",
+                                   "justifyContent": "flex-end"}),
+                    ],
+                ),
+            ),
         ]),
     ], open=False,
        style={"padding": "0",
@@ -3615,12 +3680,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # channel=None). State would leave the Hilbert envelope
         # stuck on the empty 'Pick a brain channel' message.
         Input("video-channel-dropdown", "value"),
+        # Mass Analyze cutoff drives the dashed-line threshold +
+        # the BHZ peak detection on this view. Listening as an
+        # Input means typing in the MA cutoff (or click-to-set
+        # from the plot) immediately redraws the threshold.
+        Input("video-ma-cutoff-input", "value"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
     )
     def _update_analysis(file_id, feature, _n_apply,
-                          channel,
+                          channel, ma_cutoff,
                           smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
@@ -3631,10 +3701,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Hilbert envelope (BHZ default). Continuous-time trace
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":
+            # Use the Mass Analyze cutoff so the dashed threshold
+            # line tracks the MA input live. Falls back to the
+            # lab default if the input is invalid/blank.
+            try:
+                cutoff = float(ma_cutoff) if ma_cutoff is not None \
+                          else _BHZ_CUTOFF
+                if cutoff <= 0:
+                    cutoff = _BHZ_CUTOFF
+            except (TypeError, ValueError):
+                cutoff = _BHZ_CUTOFF
             return _render_hilbert_trace(
                 store, int(file_id), channel,
                 blank_pre_ms=blank_pre_ms,
                 blank_post_ms=blank_post_ms,
+                cutoff=cutoff,
             )
         try:
             rows = store.query_evoked_features(int(file_id))
@@ -4188,39 +4269,258 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # =================================================================== #
     #  Mass Analyze (undergrad bulk pre-screen)
     # =================================================================== #
-    # Five callbacks: populate-animals piggy-backs on the queue picker's
-    # options so the MA dropdown reflects assignments without a second
-    # Sheets fetch. Scan/Poll/Cancel/Commit mirror event_verification's
-    # shape with two differences: no PI gate (any signed-in reviewer
-    # with at least one assigned animal can scan), and the commit
-    # callback refreshes ``video-queue-list`` instead of the PI pending
-    # list so zero-peak files drop out of the FIFO immediately.
+    # Reads the animal from the Step 1 queue picker (one source of
+    # truth). The scope counter updates live so the user knows
+    # whether there's anything to scan BEFORE they click. Scan opens
+    # a confirmation modal explaining the steps + showing the count;
+    # Confirm in the modal is the only path that actually creates a
+    # worker job.
 
     @app.callback(
-        Output("video-ma-animal-dropdown", "options"),
-        Input("video-queue-animal", "options"),
+        Output("video-ma-animal-display", "children"),
+        Input("video-queue-animal", "value"),
     )
-    def _on_video_ma_populate(queue_options):
-        return queue_options or []
+    def _on_video_ma_animal_display(animal):
+        if not animal:
+            return html.Span([
+                html.Span("Will scan: ",
+                           style={"color": "#a0a0b0"}),
+                html.Span("(pick an animal in Step 1)",
+                           style={"color": "#ff9f0a",
+                                   "fontStyle": "italic"}),
+            ])
+        return html.Span([
+            html.Span("Will scan: ",
+                       style={"color": "#a0a0b0"}),
+            html.Span(str(animal),
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+        ])
+
+    @app.callback(
+        Output("video-ma-scope", "children"),
+        Input("video-queue-animal", "value"),
+        Input("video-ma-job-id", "data"),
+    )
+    def _on_video_ma_scope_count(animal, _job_id):
+        if not animal:
+            return ""
+        try:
+            n = _mass_analyze.count_pending_for_animal(
+                store, str(animal))
+        except Exception as e:
+            logger.warning(
+                "count_pending_for_animal failed: %s", e)
+            return html.Span(f"(scope count failed: {e})",
+                              style={"color": "#ff453a"})
+        if n == 0:
+            return html.Span([
+                f"Nothing to scan -- {animal} has 0 pending "
+                "files (you've cleared the backlog, or all "
+                "files are currently claimed by other "
+                "reviewers).",
+            ], style={"color": "#ff9f0a"})
+        return html.Span([
+            f"{animal}: ",
+            html.Span(f"{n} pending file"
+                       + ("" if n == 1 else "s"),
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+            " eligible to scan (files this reviewer hasn't "
+            "started or finalised).",
+        ])
+
+    @app.callback(
+        Output("video-ma-confirm-modal", "style"),
+        Output("video-ma-modal-body", "children"),
+        Input("video-ma-scan-btn", "n_clicks"),
+        Input("video-ma-modal-cancel-btn", "n_clicks"),
+        Input("video-ma-modal-confirm-btn", "n_clicks"),
+        State("video-queue-animal", "value"),
+        State("video-ma-cutoff-input", "value"),
+        State("video-ma-confirm-modal", "style"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_modal_toggle(_scan_n, _cancel_n,
+                                     _confirm_n,
+                                     animal, cutoff,
+                                     current_style):
+        trig = callback_context.triggered_id
+        hidden = dict(current_style or {})
+        hidden["display"] = "none"
+        # Cancel + Confirm both close the modal. Confirm's
+        # job-creation lives in _on_video_ma_modal_confirm
+        # (separate callback so it can write its own outputs).
+        if trig in ("video-ma-modal-cancel-btn",
+                     "video-ma-modal-confirm-btn"):
+            return hidden, no_update
+        if trig != "video-ma-scan-btn":
+            return no_update, no_update
+        # Open path: build the preview body using the current
+        # animal + cutoff + scope count.
+        try:
+            cutoff_f = float(cutoff)
+        except (TypeError, ValueError):
+            cutoff_f = 0.0
+        if not animal:
+            body = html.Div(
+                "Pick an animal in Step 1 first -- Mass "
+                "Analyze reads from the queue picker.",
+                style={"color": "#ff9f0a"})
+        elif cutoff_f <= 0:
+            body = html.Div(
+                f"Invalid cutoff {cutoff!r} -- must be > 0.",
+                style={"color": "#ff453a"})
+        else:
+            try:
+                n = _mass_analyze.count_pending_for_animal(
+                    store, str(animal))
+            except Exception as e:
+                n = 0
+                logger.warning(
+                    "modal count_pending failed: %s", e)
+            if n == 0:
+                body = html.Div(
+                    f"{animal} has 0 pending files. Nothing "
+                    "to scan.", style={"color": "#ff9f0a"})
+            else:
+                # ~5 s per file cold, ~250 ms per file warm.
+                # Typical zero-peak ratio at 0.05 is 70-85% on
+                # the BHZ pipeline -- midpoint = 78%.
+                est_total_s = int(n * 5)
+                est_min = est_total_s // 60
+                est_sec_rem = est_total_s % 60
+                if est_min:
+                    est_str = (f"~{est_min} min "
+                                f"{est_sec_rem:02d} s")
+                else:
+                    est_str = f"~{est_total_s} s"
+                est_zero = int(round(n * 0.78))
+                est_with = n - est_zero
+                body = [
+                    html.Div([
+                        html.Span(
+                            f"Scan {animal} at cutoff "
+                            f"{cutoff_f:g}?",
+                            style={"color": "#f0f0f5",
+                                    "fontWeight": "600",
+                                    "fontSize": "13px"}),
+                    ], style={"marginBottom": "10px"}),
+                    html.Ul([
+                        html.Li([
+                            html.Span("Files in scope: ",
+                                       style={"color": "#a0a0b0"}),
+                            html.Span(f"{n}",
+                                       style={"color": "#f0f0f5",
+                                               "fontWeight": "600"}),
+                        ]),
+                        html.Li([
+                            html.Span(
+                                "Per-file: ~5 s of Hilbert + "
+                                "peakseek (instant on cache hit)",
+                                style={"color": "#a0a0b0"}),
+                        ]),
+                        html.Li([
+                            html.Span(
+                                "Estimated total time: ",
+                                style={"color": "#a0a0b0"}),
+                            html.Span(est_str,
+                                       style={"color": "#f0f0f5",
+                                               "fontWeight": "600"}),
+                            html.Span(
+                                " (cold cache; re-scans are "
+                                "instant)",
+                                style={"color": "#a0a0b0"}),
+                        ]),
+                    ], style={"margin": "0 0 14px 18px",
+                               "padding": "0"}),
+                    html.Div(
+                        "What happens after you click Confirm",
+                        style={"color": "#f0f0f5",
+                                "fontWeight": "600",
+                                "marginBottom": "4px"}),
+                    html.Ol([
+                        html.Li(
+                            "Worker computes the 20-200 Hz "
+                            "Hilbert envelope on each file's "
+                            "first animal channel and counts "
+                            f"peaks above {cutoff_f:g}.",
+                            style={"color": "#a0a0b0"}),
+                        html.Li(
+                            "Results are cached so re-running "
+                            "at the same cutoff is free.",
+                            style={"color": "#a0a0b0"}),
+                        html.Li(
+                            "Each file is classified as 0-peak "
+                            "(auto-clear candidate) or >=1-peak "
+                            "(stays in your queue).",
+                            style={"color": "#a0a0b0"}),
+                    ], style={"margin": "0 0 14px 18px",
+                               "padding": "0"}),
+                    html.Div(
+                        "Worked example",
+                        style={"color": "#f0f0f5",
+                                "fontWeight": "600",
+                                "marginBottom": "4px"}),
+                    html.Div([
+                        f"Typical animal: ~78% of files have "
+                        "0 peaks above this cutoff.",
+                        html.Br(),
+                        f"At {n} files, expect roughly:",
+                    ], style={"color": "#a0a0b0",
+                               "marginBottom": "4px"}),
+                    html.Ul([
+                        html.Li([
+                            html.Span(f"~{est_zero}",
+                                       style={"color": "#30d158",
+                                               "fontWeight": "600"}),
+                            html.Span(
+                                " files marked as no-events, "
+                                "queued for PI verification",
+                                style={"color": "#a0a0b0"}),
+                        ]),
+                        html.Li([
+                            html.Span(f"~{est_with}",
+                                       style={"color": "#ff9f0a",
+                                               "fontWeight": "600"}),
+                            html.Span(
+                                " files stay in your queue for "
+                                "manual scoring",
+                                style={"color": "#a0a0b0"}),
+                        ]),
+                    ], style={"margin": "0 0 8px 18px",
+                               "padding": "0"}),
+                    html.Div(
+                        "(Estimates only -- the actual split "
+                        "depends on the recording. The scan "
+                        "doesn't commit anything; you'll get a "
+                        "separate Confirm step after it finishes.)",
+                        style={"color": "#6c6c80",
+                                "fontSize": "11px",
+                                "fontStyle": "italic"}),
+                ]
+        open_style = dict(current_style or {})
+        open_style["display"] = "flex"
+        return open_style, body
 
     @app.callback(
         Output("video-ma-job-id", "data"),
         Output("video-ma-poll", "disabled"),
         Output("video-ma-progress", "children",
                 allow_duplicate=True),
-        Input("video-ma-scan-btn", "n_clicks"),
-        State("video-ma-animal-dropdown", "value"),
+        Input("video-ma-modal-confirm-btn", "n_clicks"),
+        State("video-queue-animal", "value"),
         State("video-ma-cutoff-input", "value"),
         prevent_initial_call=True,
     )
-    def _on_video_ma_scan(n_clicks, animal_id, cutoff):
+    def _on_video_ma_modal_confirm(n_clicks, animal_id, cutoff):
         if not n_clicks:
             return no_update, no_update, no_update
         email = (current_user_email() or "").lower()
         if not email:
             return None, True, "Sign in first."
         if not animal_id:
-            return None, True, "Pick an animal first."
+            return None, True, "Pick an animal in Step 1 first."
         try:
             cutoff = float(cutoff)
         except (TypeError, ValueError):
@@ -4233,7 +4533,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.exception("Mass Analyze create_job failed")
             return None, True, f"Failed to start: {e}"
-        return job_id, False, "Scan queued…"
+        return job_id, False, "Scan queued..."
 
     @app.callback(
         Output("video-ma-progress", "children"),
@@ -4368,13 +4668,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Input("video-ma-confirm-btn", "n_clicks"),
         Input("video-ma-discard-btn", "n_clicks"),
-        State("video-ma-animal-dropdown", "value"),
         State("video-ma-cutoff-input", "value"),
         State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
     def _on_video_ma_commit(_confirm_n, _discard_n,
-                              animal_id, cutoff, queue_animal):
+                              cutoff, queue_animal):
         trig = callback_context.triggered_id
         if trig == "video-ma-discard-btn":
             return ("", "", [], None, no_update)
@@ -4384,6 +4683,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         email = (current_user_email() or "").lower()
         if not email:
             return ("Sign in first.", "", [], None, no_update)
+        if not queue_animal:
+            return ("Pick an animal in Step 1 first.",
+                     "", [], None, no_update)
         try:
             cutoff = float(cutoff)
         except (TypeError, ValueError):
@@ -4391,7 +4693,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "", [], None, no_update)
         try:
             result = _mass_analyze.commit_threshold(
-                store, animal_id, cutoff, email)
+                store, queue_animal, cutoff, email)
         except Exception as e:
             logger.exception(
                 "Mass Analyze commit_threshold failed")
@@ -4399,13 +4701,37 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      no_update)
         msg = (f"OK  {result['n_cleared']} files moved to "
                 "pending_pi_review. The PI will verify them.")
-        # Force the queue list to re-render: bump video-queue-animal
-        # value (round-trip through the existing render callback).
-        # If the user wasn't already on this animal, leave their
-        # selection alone -- only refresh when they were viewing it.
-        new_animal = animal_id if queue_animal == animal_id \
-                      else no_update
-        return (msg, "", [], None, new_animal)
+        # Round-trip the queue picker's value to force the queue
+        # list to re-render -- zero-peak files should drop out
+        # of the FIFO immediately so the undergrad sees the new
+        # state.
+        return (msg, "", [], None, queue_animal)
+
+    # Click-to-set on the Hilbert envelope plot. Clientside so
+    # the dashed threshold line snaps to the click without a
+    # server round-trip. Writes the click's y value (rounded to
+    # 4 decimals) into the MA cutoff input -- the existing
+    # Input("video-ma-cutoff-input", "value") on _update_analysis
+    # then triggers a redraw of the trace with the new threshold.
+    app.clientside_callback(
+        """
+        function(clickData) {
+            if (!clickData || !clickData.points
+                    || !clickData.points.length) {
+                return window.dash_clientside.no_update;
+            }
+            var y = clickData.points[0].y;
+            if (typeof y !== 'number' || !isFinite(y)
+                    || y <= 0) {
+                return window.dash_clientside.no_update;
+            }
+            return Math.round(y * 10000) / 10000;
+        }
+        """,
+        Output("video-ma-cutoff-input", "value"),
+        Input("video-analysis-trace", "clickData"),
+        prevent_initial_call=True,
+    )
 
 
 def _render_history(store: Store, file_id: int):
