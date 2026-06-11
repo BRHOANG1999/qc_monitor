@@ -23,7 +23,10 @@ if _ROOT not in sys.path:
 
 from src.dashboard.tabs.event_verification import (  # noqa: E402
     _has_real_click,
+    _pending_table_rows,
+    _format_chunk_dt,
 )
+from src.db.store import Store  # noqa: E402
 
 
 def test_recreation_with_null_nclicks_is_not_a_click():
@@ -70,6 +73,51 @@ def test_mixed_recreation_plus_one_real_click_counts():
         {"prop_id": "c.n_clicks", "value": None},
     ]
     assert _has_real_click(triggered) is True
+
+
+import json  # noqa: E402
+
+
+def test_format_chunk_dt():
+    assert _format_chunk_dt("2026_03_10__04_59_00") == "2026-03-10 04:59"
+    assert _format_chunk_dt("garbage") == "garbage"
+    assert _format_chunk_dt(None) == ""
+
+
+def _seed_pending(tmp_path):
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO session_config
+               (session_dir, channel_names, eeg_channels, discovered_at)
+               VALUES ('S1', ?, ?, '2026-01-01T00:00:00')""",
+            (json.dumps(["stimCopy", "BCH061SR", "stimCopy", "BCH061SLM"]),
+             json.dumps([1, 3])),
+        )
+        conn.execute(
+            """INSERT INTO processed_files
+               (id, file_path, session_dir, chunk_datetime, has_video)
+               VALUES (1, '/f/a.mat', 'S1', '2026_03_10__04_59_00', 1)""")
+        conn.commit()
+    # One pending submission with 2 events, one no-event submission.
+    store.mark_review(1, "u@lab", "pending_pi_review",
+                       markers=[{"type": "sz"}, {"type": "sz"}])
+    return store
+
+
+def test_pending_table_rows_shape(tmp_path):
+    store = _seed_pending(tmp_path)
+    rows = store.pi_pending_files(limit=50)
+    data = _pending_table_rows(store, rows)
+    assert len(data) == 1
+    r = data[0]
+    assert r["id"] == 1
+    assert r["animal"] == "BCH061"
+    assert r["date"] == "2026-03-10 04:59"
+    assert r["n_events"] == 2
+    assert r["submitter"] == "u@lab"
+    assert r["view"] == "Open >"
 
 
 if __name__ == "__main__":

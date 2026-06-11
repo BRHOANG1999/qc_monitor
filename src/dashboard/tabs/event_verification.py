@@ -21,20 +21,16 @@ import logging
 from datetime import date, datetime
 from pathlib import Path
 
-from dash import ALL, Input, Output, State, callback_context
-from dash import dcc, html, no_update
-
-import numpy as np
-import plotly.graph_objects as go
+from dash import Input, Output, State, callback_context
+from dash import dash_table, dcc, html, no_update
 
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
+from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE
 from src.dashboard.tabs.review_status import _is_pi
 from src.utils import bhz_csv as _bhz_csv
-from src.utils import event_clip as _event_clip
 from src.utils import mass_analyze as _mass_analyze
 from src.utils.animal import split_animal_electrode, is_animal_channel
-from src.utils.decimate import envelope, choose_target_bins
 
 logger = logging.getLogger("qc_monitor.tabs.event_verification")
 
@@ -56,40 +52,18 @@ def layout(store: Store, config: dict | None = None):
     email = current_user_email()
     if not _is_pi(config or {}, email):
         return _NOT_AUTHORISED
-    ffmpeg_ok = _event_clip.probe_ffmpeg(config or {})
     return html.Div([
         html.H3("Event Verification",
                  style={"color": "#f0f0f5",
                          "marginBottom": "4px"}),
         html.Div(
-            "PI review gate. Approve flips files to "
-            "'pi_approved' and queues a CSV write; Flag "
-            "sends them back to the undergrad's queue "
-            "with a note.",
+            "PI review gate. Tick rows and Approve to flip them "
+            "to 'pi_approved' (queues a CSV write); Flag sends "
+            "them back to the undergrad's queue with a note. "
+            "Click a row's Open to inspect the recording in "
+            "Video Review.",
             style={"color": "#a0a0b0", "fontSize": "12px",
                     "marginBottom": "16px"}),
-        # ffmpeg health.
-        html.Div(
-            "ffmpeg not on PATH -- event clips will not "
-            "extract until it's installed (see "
-            "config.event_clip.ffmpeg_bin)."
-            if not ffmpeg_ok else
-            "ffmpeg available. Cold clip extraction ~30-90 s "
-            "per event; cache hits are instant.",
-            style={"color": ("#ff453a" if not ffmpeg_ok
-                              else "#30d158"),
-                    "fontSize": "11px",
-                    "padding": "6px 10px",
-                    "marginBottom": "14px",
-                    "background":
-                        "rgba(255,69,58,0.08)"
-                        if not ffmpeg_ok
-                        else "rgba(48,209,88,0.08)",
-                    "border":
-                        "1px solid rgba(255,69,58,0.30)"
-                        if not ffmpeg_ok
-                        else "1px solid rgba(48,209,88,0.30)",
-                    "borderRadius": "6px"}),
         # Mass Analyze panel (collapsed-by-default details
         # card). Runs hilbert_envelope_20_200 + peakseek over
         # every pending file for an animal at the chosen
@@ -165,34 +139,47 @@ def layout(store: Store, config: dict | None = None):
         # The modal below renders from it.
         dcc.Store(id="evtv-overwrite-plan", data=None),
         _overwrite_modal(),
-        # File list. Each row carries a checkbox + per-file
-        # Approve/Flag buttons + the event summary.
+        # Pending files table. Native multi-select (clientside, no
+        # server redraw on select -> no flash), native sort by
+        # Animal/Date, paginated for large backlogs. Each row's id
+        # is the file_id so selection survives sort/paging. Click a
+        # row's "Open" cell to inspect it in Video Review.
         dcc.Loading(
             id="evtv-pending-loading",
             type="circle",
             color="#5e7ce2",
             delay_show=180,
-            children=html.Div(id="evtv-pending-list"),
+            children=dash_table.DataTable(
+                id="evtv-pending-table",
+                columns=[
+                    {"name": "Animal", "id": "animal"},
+                    {"name": "Date", "id": "date"},
+                    {"name": "Events", "id": "n_events",
+                     "type": "numeric"},
+                    {"name": "Submitter", "id": "submitter"},
+                    {"name": "", "id": "view"},
+                ],
+                data=[],
+                row_selectable="multi",
+                sort_action="native",
+                sort_by=[{"column_id": "date",
+                           "direction": "asc"}],
+                page_action="native",
+                page_size=25,
+                cell_selectable=True,
+                style_as_list_view=True,
+                **DARK_TABLE_STYLE,
+                style_data_conditional=[
+                    ZEBRA_STRIPE,
+                    {"if": {"column_id": "view"},
+                     "color": "#5e7ce2", "cursor": "pointer",
+                     "fontWeight": "600"},
+                ],
+            ),
         ),
-        # Selection store: list of file_ids.
-        dcc.Store(id="evtv-selection", data=[]),
         # Signature of the currently-rendered pending set so the
-        # 10s auto-refresh can skip re-rendering the (now large)
-        # list when nothing actually changed -- the redundant
-        # redraw was making the list visibly blink on and off.
+        # 10s auto-refresh can skip pushing identical data.
         dcc.Store(id="evtv-list-sig", data=None),
-        # Detail panel's currently-open (file_id, event_idx)
-        # or None. Surfaces under the list when set.
-        dcc.Store(id="evtv-detail-target", data=None),
-        # Detail view container -- populated by callback.
-        html.Div(id="evtv-detail-panel",
-                  style={"marginTop": "20px"}),
-        # Auto-poll: ticks every 3 s; only fires the detail
-        # re-render when a clip is still extracting (status
-        # in pending/running). The clientside guard below
-        # bumps n_intervals only when the panel is open.
-        dcc.Interval(id="evtv-detail-poll", interval=3000,
-                       n_intervals=0, disabled=True),
     ], style={"padding": "20px 24px"})
 
 
@@ -474,124 +461,6 @@ def _first_animal_channel_index(store, session_dir: str) -> int:
     return 0
 
 
-def _build_lfp_stitch_figure(spec: '_event_clip.ClipSpec',
-                                channel: int,
-                                eo_sec: float, bb_sec: float,
-                                store,
-                                ) -> go.Figure:
-    """Stitched LFP trace with EO/BB markers + boundary line.
-
-    The decimation is the same envelope/min-max pattern the
-    Video Review tab uses so the visual density matches.
-    Boundaries between segments are visible as NaN gaps (set
-    by ``extract_lfp_clip``); we also annotate the gap with a
-    dashed vertical so the PI can see exactly where the
-    stitch happened.
-    """
-    t, signal, fs = _event_clip.extract_lfp_clip(
-        spec, int(channel), store)
-    if len(signal) < 4 or fs <= 0:
-        return _empty_fig(
-            "Could not load LFP for this event.")
-    # Decimate for visual density (no point in pushing 6 M
-    # samples through Plotly).
-    target = choose_target_bins(len(signal)) or 4000
-    td, display, _decim = envelope(signal, fs, target,
-                                       t_start=0.0)
-    fig = go.Figure()
-    fig.add_trace(go.Scattergl(
-        x=td, y=display, mode="lines",
-        line=dict(color="#5e7ce2", width=0.9),
-        hovertemplate="t=%{x:.2f}s<br>%{y:.1f} μV<extra></extra>",
-    ))
-    # The window starts at clip_start = max(0, eo - pre); EO
-    # within the stitched clip is at (eo - clip_start), same
-    # for BB.
-    clip_start = max(0.0, eo_sec - spec.pre_sec)
-    eo_x = max(0.0, eo_sec - clip_start)
-    bb_x = max(0.0, bb_sec - clip_start)
-    shapes = [
-        dict(type="line", xref="x", yref="paper",
-              x0=eo_x, x1=eo_x, y0=0, y1=1,
-              line=dict(color="#ff453a", width=2, dash="solid"),
-              opacity=0.85),
-        dict(type="line", xref="x", yref="paper",
-              x0=bb_x, x1=bb_x, y0=0, y1=1,
-              line=dict(color="#30d158", width=2, dash="solid"),
-              opacity=0.85),
-    ]
-    # Boundary annotations. Find NaN runs in the signal --
-    # extract_lfp_clip inserts one NaN at each file boundary.
-    nan_idx = np.where(np.isnan(signal))[0]
-    if len(nan_idx):
-        for idx in nan_idx[:8]:  # NASA Rule 3 cap
-            t_boundary = float(idx) / float(fs)
-            shapes.append(dict(
-                type="line", xref="x", yref="paper",
-                x0=t_boundary, x1=t_boundary, y0=0, y1=1,
-                line=dict(color="#ff9f0a", width=1, dash="dot"),
-                opacity=0.55,
-            ))
-    fig.update_layout(
-        plot_bgcolor="#13131f", paper_bgcolor="#13131f",
-        height=220,
-        margin=dict(l=60, r=20, t=10, b=40),
-        dragmode="pan",
-        xaxis=dict(title="Time within clip (s)",
-                    showgrid=True,
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False),
-        yaxis=dict(title="μV", showgrid=True,
-                    gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False),
-        shapes=shapes,
-        showlegend=False,
-        hovermode="x unified",
-        annotations=[
-            dict(x=eo_x, y=1.02, xref="x", yref="paper",
-                  text="EO", showarrow=False,
-                  font=dict(color="#ff453a", size=10)),
-            dict(x=bb_x, y=1.02, xref="x", yref="paper",
-                  text="BB", showarrow=False,
-                  font=dict(color="#30d158", size=10)),
-        ],
-    )
-    return fig
-
-
-def _empty_fig(text: str) -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(
-        height=220,
-        plot_bgcolor="#13131f", paper_bgcolor="#13131f",
-        annotations=[dict(text=text, showarrow=False,
-                            x=0.5, y=0.5, xref="paper",
-                            yref="paper",
-                            font=dict(size=12,
-                                       color="#a0a0b0"))],
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
-        margin=dict(l=20, r=20, t=20, b=20),
-    )
-    return fig
-
-
-def _format_event_row(idx: int, ev: dict) -> html.Div:
-    et = ev.get("type") or "?"
-    eo = ev.get("EO_sec")
-    bb = ev.get("BB_sec")
-    racine = ev.get("racine")
-    parts = [f"Event {idx + 1}: {et}"]
-    if eo is not None:
-        parts.append(f"EO {float(eo):.1f}s")
-    if bb is not None:
-        parts.append(f"BB {float(bb):.1f}s")
-    if racine is not None:
-        parts.append(f"Racine {racine}")
-    return html.Div(
-        " · ".join(parts),
-        style={"color": "#a0a0b0", "fontSize": "11px"})
-
-
 def _has_real_click(triggered: list) -> bool:
     """True iff a callback was driven by an actual button click.
 
@@ -613,286 +482,34 @@ def _pending_signature(rows: list[dict]) -> str:
     return ",".join(str(i) for i in ids)
 
 
-def _render_pending_list(rows: list[dict], selection: list[int]
-                          ) -> list:
-    """Top-level: one card per pending file."""
-    if not rows:
-        return [html.Div(
-            "🎉  No pending files. Undergrads are caught up.",
-            style={"color": "#a0a0b0", "fontSize": "13px",
-                    "padding": "24px",
-                    "textAlign": "center"})]
-    sel_set = set(int(x) for x in (selection or []))
-    cards: list = []
-    for r in rows:
-        cards.append(_render_pending_card(r,
-                                             r["file_id"] in sel_set))
-    return cards
-
-
-def _render_pending_card(row: dict, is_selected: bool
-                          ) -> html.Div:
-    file_id = int(row["file_id"])
-    chunk_dt_raw = row.get("chunk_datetime") or ""
+def _format_chunk_dt(raw: str | None) -> str:
+    """KMrecorder chunk_datetime (``YYYY_MM_DD__HH_MM_SS``) to a
+    sortable human label. Falls back to the raw string."""
+    raw = raw or ""
     try:
-        ts = datetime.strptime(chunk_dt_raw,
-                                 "%Y_%m_%d__%H_%M_%S")
-        ts_label = ts.strftime("%Y-%m-%d  %H:%M")
+        ts = datetime.strptime(raw, "%Y_%m_%d__%H_%M_%S")
+        return ts.strftime("%Y-%m-%d %H:%M")
     except ValueError:
-        ts_label = chunk_dt_raw
-    events = row.get("events") or []
-    n_events = len(events)
-    submitter = row.get("user_email") or "—"
-    title_parts = [
-        html.Span(ts_label,
-                   style={"color": "#f0f0f5",
-                           "fontWeight": "600",
-                           "fontSize": "13px"}),
-        html.Span(" · ", style={"color": "#666"}),
-        html.Span(f"{n_events} event"
-                   f"{'' if n_events == 1 else 's'}",
-                   style={"color": "#5e7ce2",
-                           "fontSize": "12px"}),
-        html.Span(" · ", style={"color": "#666"}),
-        html.Span(submitter,
-                   style={"color": "#a0a0b0",
-                           "fontSize": "11px"}),
-    ]
-    event_rows = [_format_event_row(i, e)
-                   for i, e in enumerate(events)]
-    if n_events == 0:
-        event_rows = [html.Div(
-            "No events scored (undergrad picked "
-            "'No events seen').",
-            style={"color": "#a0a0b0", "fontSize": "11px",
-                    "fontStyle": "italic"})]
-    # Per-event detail-open buttons (only when there are events).
-    open_buttons = []
-    for i, ev in enumerate(events):
-        if ev.get("EO_sec") is None or ev.get("BB_sec") is None:
-            continue
-        open_buttons.append(html.Button(
-            f"Open detail · event {i + 1}",
-            id={"type": "evtv-open-detail",
-                 "file_id": file_id, "idx": i},
-            n_clicks=0,
-            style={"background": "transparent",
-                    "color": "#5e7ce2",
-                    "border": "1px solid #5e7ce2",
-                    "borderRadius": "4px",
-                    "padding": "3px 10px",
-                    "fontSize": "11px",
-                    "cursor": "pointer",
-                    "marginRight": "6px",
-                    "marginTop": "4px"}))
-    return html.Div([
-        html.Div([
-            dcc.Checklist(
-                id={"type": "evtv-row-check",
-                     "file_id": file_id},
-                options=[{"label": "", "value": "sel"}],
-                value=["sel"] if is_selected else [],
-                style={"display": "inline-block",
-                        "marginRight": "8px"},
-                inputStyle={"transform": "scale(1.2)"}),
-            html.Div(title_parts,
-                      style={"display": "inline-block",
-                              "verticalAlign": "middle"}),
-            html.Div([
-                html.Button(
-                    "Approve",
-                    id={"type": "evtv-approve-one-btn",
-                         "file_id": file_id},
-                    n_clicks=0,
-                    style=_btn_style(accent=True)),
-                html.Button(
-                    "Flag",
-                    id={"type": "evtv-flag-one-btn",
-                         "file_id": file_id},
-                    n_clicks=0,
-                    style=_btn_style(warning=True)),
-            ], style={"display": "flex", "gap": "6px",
-                       "marginLeft": "auto"}),
-        ], style={"display": "flex",
-                   "alignItems": "center",
-                   "marginBottom": "8px"}),
-        html.Div(event_rows,
-                  style={"marginLeft": "40px"}),
-        html.Div(open_buttons,
-                  style={"marginLeft": "40px"}),
-    ], style={"padding": "10px 14px",
-               "marginBottom": "8px",
-               "background": ("rgba(94,124,226,0.08)"
-                              if is_selected
-                              else "#13131f"),
-               "border": "1px solid rgba(255,255,255,0.06)",
-               "borderRadius": "6px"})
+        return raw
 
 
-# --------------------------------------------------------------- #
-# Detail panel
-# --------------------------------------------------------------- #
-
-def _render_event_detail(target: dict, store,
-                          config: dict) -> html.Div:
-    """Build the per-event detail panel: stitched video +
-    LFP placeholder + Approve/Flag/Edit toolbar.
-
-    Video clip is lazy-loaded: this function only kicks off
-    the extraction job; the actual <video src=...> source is
-    the /media/clip/<spec_hash> route which 202s while the
-    ffmpeg job runs.
-    """
-    if not target:
-        return html.Div()
-    file_id = int(target.get("file_id") or 0)
-    idx = int(target.get("idx") or 0)
-    # Look up the pending file + its events.
-    rows = store.pi_pending_files(limit=500)
-    row = next((r for r in rows
-                  if int(r["file_id"]) == file_id), None)
-    if not row:
-        return html.Div(
-            "This file is no longer pending PI review.",
-            style={"color": "#a0a0b0",
-                    "padding": "16px"})
-    events = row.get("events") or []
-    if idx < 0 or idx >= len(events):
-        return html.Div(
-            "Event index out of range.",
-            style={"color": "#a0a0b0",
-                    "padding": "16px"})
-    ev = events[idx]
-    eo = float(ev.get("EO_sec") or 0)
-    bb = float(ev.get("BB_sec") or 0)
-    spec = _event_clip.ClipSpec(
-        file_id=file_id, eo_sec=eo, bb_sec=bb,
-    )
-    # Submit the job (cache hit returns instantly).
-    try:
-        h = _event_clip.submit_video_clip_job(spec, store,
-                                                 config or {})
-        clip_status = _event_clip.poll_video_clip_status(
-            h, store)
-    except Exception as e:
-        logger.warning("clip submit failed: %s", e)
-        h = ""
-        clip_status = {"status": "failed", "error": str(e)}
-    video_url = (f"/media/clip/{h}"
-                  if h and clip_status.get("status") == "done"
-                  else None)
-    header = html.Div([
-        html.Div([
-            html.Span(
-                f"Event {idx + 1} of {len(events)} · "
-                f"{ev.get('type', '?')} · "
-                f"EO {eo:.1f}s · BB {bb:.1f}s · "
-                f"Racine {ev.get('racine', '?')}",
-                style={"color": "#f0f0f5",
-                        "fontWeight": "600"}),
-            html.Button("× Close detail",
-                         id="evtv-close-detail-btn",
-                         n_clicks=0,
-                         style=_btn_style(secondary=True)),
-        ], style={"display": "flex",
-                   "justifyContent": "space-between",
-                   "alignItems": "center"}),
-        html.Div(
-            f"Video clip status: {clip_status.get('status')}"
-            + (f" — {clip_status.get('error')}"
-                if clip_status.get('error') else ""),
-            style={"color": "#a0a0b0",
-                    "fontSize": "11px",
-                    "marginTop": "4px"}),
-    ], style={"marginBottom": "10px"})
-    if video_url:
-        video_block = html.Video(
-            src=video_url,
-            controls=True,
-            preload="metadata",
-            style={"width": "100%",
-                    "maxHeight": "440px",
-                    "background": "#000",
-                    "borderRadius": "8px"})
-    else:
-        msg = ("Extracting clip…  this panel auto-refreshes "
-                "every 3 s while the worker runs."
-                if clip_status.get("status")
-                    in ("pending", "running")
-                else f"Clip not ready: "
-                      f"{clip_status.get('status')}")
-        video_block = html.Div(
-            msg,
-            style={"color": "#a0a0b0",
-                    "background": "#13131f",
-                    "padding": "60px 20px",
-                    "textAlign": "center",
-                    "borderRadius": "8px"})
-    # Build the stitched LFP figure for this window.
-    channel = _first_animal_channel_index(
-        store, row.get("session_dir") or "")
-    try:
-        lfp_fig = _build_lfp_stitch_figure(
-            spec, channel, eo, bb, store)
-    except Exception as e:
-        logger.exception("LFP stitch render failed")
-        lfp_fig = _empty_fig(f"LFP load error: {e}")
-    return html.Div([
-        header,
-        video_block,
-        html.Div([
-            html.Div(
-                f"LFP for channel {channel} "
-                f"(stitched across file boundaries when "
-                f"the EO−5min / BB+5min window crosses "
-                f"recording boundaries)",
-                style={"color": "#a0a0b0",
-                        "fontSize": "11px",
-                        "marginTop": "10px",
-                        "marginBottom": "4px"}),
-            dcc.Graph(
-                figure=lfp_fig,
-                config={
-                    "displayModeBar": True,
-                    "displaylogo": False,
-                    "doubleClick": "reset",
-                    "modeBarButtonsToRemove": [
-                        "select2d", "lasso2d", "autoScale2d",
-                    ],
-                    "scrollZoom": True,
-                },
-            ),
-        ]),
-        # Inline marker chip strip so the PI can see every
-        # landmark this event carries without scrolling back
-        # to the list.
-        html.Div(
-            [_marker_chip(k, ev.get(f"{k}_sec"))
-             for k in ("EO", "LAS", "BO", "PID", "BB")
-             if ev.get(f"{k}_sec") is not None],
-            style={"display": "flex", "gap": "8px",
-                    "flexWrap": "wrap",
-                    "marginTop": "10px"}),
-    ], style={"padding": "14px",
-               "background": "rgba(94,124,226,0.04)",
-               "border":
-                   "1px solid rgba(94,124,226,0.18)",
-               "borderRadius": "8px"})
-
-
-def _marker_chip(label: str, sec: float | None) -> html.Span:
-    if sec is None:
-        return html.Span()
-    return html.Span(
-        f"{label}  {float(sec):.1f}s",
-        style={"padding": "3px 8px",
-                "background": "rgba(255,255,255,0.05)",
-                "border":
-                    "1px solid rgba(255,255,255,0.10)",
-                "borderRadius": "4px",
-                "color": "#cfd0d6",
-                "fontSize": "11px",
-                "fontFamily": "ui-monospace, monospace"})
+def _pending_table_rows(store, rows: list[dict]) -> list[dict]:
+    """One DataTable record per pending file. ``id`` is the file_id so
+    native selection (selected_row_ids) survives sort + pagination."""
+    out: list[dict] = []
+    max_iter = len(rows) + 1
+    for i, r in enumerate(rows):
+        assert i < max_iter, "row scan runaway"
+        fid = int(r["file_id"])
+        out.append({
+            "id": fid,
+            "animal": _animal_for_session(store, r["session_dir"]),
+            "date": _format_chunk_dt(r.get("chunk_datetime")),
+            "n_events": len(r.get("events") or []),
+            "submitter": r.get("user_email") or "-",
+            "view": "Open >",
+        })
+    return out
 
 
 # --------------------------------------------------------------- #
@@ -904,217 +521,123 @@ def register_callbacks(app, store, config: dict) -> None:
     assert app is not None, "app required"
 
     @app.callback(
-        Output("evtv-pending-list", "children"),
+        Output("evtv-pending-table", "data"),
         Output("evtv-sel-status", "children"),
         Output("evtv-list-sig", "data"),
         Input("evtv-refresh-btn", "n_clicks"),
-        Input("evtv-selection", "data"),
         Input("refresh-trigger", "data"),
         State("evtv-list-sig", "data"),
     )
-    def _render_list(_n, selection, _refresh, prev_sig):
+    def _render_list(_n, _refresh, prev_sig):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return [], "", no_update
         rows = store.pi_pending_files(limit=500)
         sig = _pending_signature(rows)
         # The 10s refresh-trigger fires whether or not the pending
-        # set changed. Re-rendering hundreds of rows on every tick
-        # made the list blink on and off. When the ONLY trigger is
-        # the periodic tick and the signature is unchanged, skip the
-        # redraw entirely. User actions (refresh button, selection
-        # change) always re-render so highlights stay responsive.
+        # set changed. Skip pushing identical data so the table
+        # doesn't churn. User-driven refresh always rebuilds.
         trig = callback_context.triggered_id
         if trig == "refresh-trigger" and sig == prev_sig:
             return no_update, no_update, no_update
-        sel = list(selection or [])
-        sel_count = len([f for f in sel
-                          if f in {r["file_id"] for r in rows}])
-        sel_label = (f"{sel_count} selected of "
-                      f"{len(rows)} pending"
-                      if sel_count
-                      else f"{len(rows)} pending")
-        return _render_pending_list(rows, sel), sel_label, sig
+        return (_pending_table_rows(store, rows),
+                f"{len(rows)} pending", sig)
 
     @app.callback(
-        Output("evtv-selection", "data",
-                allow_duplicate=True),
-        Input({"type": "evtv-row-check",
-                "file_id": ALL}, "value"),
-        State("evtv-selection", "data"),
-        prevent_initial_call=True,
-    )
-    def _on_row_check(values, current):
-        ctx = callback_context.triggered_id
-        if not isinstance(ctx, dict):
-            return no_update
-        # Same recreation trap as _on_action: when the list re-renders,
-        # every checkbox is recreated and the ALL-pattern callback fires
-        # with many entries in `triggered` at once. A genuine user toggle
-        # changes exactly one checkbox, so ignore multi-entry fires to
-        # avoid churning the selection (which would re-trigger the list).
-        if len(callback_context.triggered or []) != 1:
-            return no_update
-        file_id = int(ctx.get("file_id") or 0)
-        # The triggered_id check tells us WHICH row was toggled.
-        # Find its current value in the list.
-        new_sel = list(int(x) for x in (current or []))
-        # The values list mirrors the DOM order of every
-        # evtv-row-check (ALL); we need the triggered one's
-        # state. Use callback_context.triggered to get it.
-        triggered = callback_context.triggered or []
-        toggled_value = None
-        for t in triggered:
-            toggled_value = t.get("value") or []
-        if toggled_value and file_id not in new_sel:
-            new_sel.append(file_id)
-        elif not toggled_value and file_id in new_sel:
-            new_sel = [f for f in new_sel if f != file_id]
-        return new_sel
-
-    @app.callback(
-        Output("evtv-selection", "data",
+        Output("evtv-pending-table", "selected_row_ids",
                 allow_duplicate=True),
         Input("evtv-select-all-btn", "n_clicks"),
         Input("evtv-clear-sel-btn", "n_clicks"),
+        State("evtv-pending-table", "data"),
         prevent_initial_call=True,
     )
-    def _on_select_all(_a, _b):
+    def _on_select_all(_a, _b, data):
         trig = callback_context.triggered_id
         if trig == "evtv-clear-sel-btn":
             return []
-        rows = store.pi_pending_files(limit=500)
-        return [int(r["file_id"]) for r in rows]
+        return [r["id"] for r in (data or [])]
 
     @app.callback(
-        Output("evtv-pending-list", "children",
+        Output("evtv-pending-table", "data",
                 allow_duplicate=True),
-        Output("evtv-selection", "data",
+        Output("evtv-pending-table", "selected_row_ids",
                 allow_duplicate=True),
         Output("evtv-sel-status", "children",
                 allow_duplicate=True),
+        Output("evtv-list-sig", "data",
+                allow_duplicate=True),
         Input("evtv-approve-sel-btn", "n_clicks"),
         Input("evtv-flag-sel-btn", "n_clicks"),
-        Input({"type": "evtv-approve-one-btn",
-                "file_id": ALL}, "n_clicks"),
-        Input({"type": "evtv-flag-one-btn",
-                "file_id": ALL}, "n_clicks"),
-        State("evtv-selection", "data"),
+        State("evtv-pending-table", "selected_row_ids"),
         State("evtv-flag-note", "value"),
         prevent_initial_call=True,
     )
-    def _on_action(_bulk_a, _bulk_f, _one_a, _one_f,
-                    selection, note):
+    def _on_action(_bulk_a, _bulk_f, selected_ids, note):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
-            return no_update, no_update, no_update
-        # CRITICAL: the per-row approve/flag buttons are pattern-
-        # matching components recreated on every list re-render, which
-        # re-fires this callback with n_clicks=None. Without this guard
-        # a redraw silently approves a file (and self-triggers a loop
-        # that approves one per cycle). Only proceed on a real click.
+            return no_update, no_update, no_update, no_update
+        # Guard against the bulk buttons firing with no real click
+        # (cheap; the per-row pattern buttons that used to cause
+        # silent approvals are gone entirely now).
         if not _has_real_click(callback_context.triggered):
-            return no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update
         trig = callback_context.triggered_id
-        targets: list[int] = []
-        action = None
-        if isinstance(trig, dict):
-            tt = trig.get("type")
-            if tt == "evtv-approve-one-btn":
-                targets = [int(trig.get("file_id"))]
-                action = "approve"
-            elif tt == "evtv-flag-one-btn":
-                targets = [int(trig.get("file_id"))]
-                action = "flag"
-        elif trig == "evtv-approve-sel-btn":
-            targets = [int(x) for x in (selection or [])]
-            action = "approve"
-        elif trig == "evtv-flag-sel-btn":
-            targets = [int(x) for x in (selection or [])]
-            action = "flag"
-        if not targets or action is None:
-            return no_update, no_update, no_update
-        if action == "approve":
+        targets = [int(x) for x in (selected_ids or [])]
+        if not targets:
+            return (no_update, no_update,
+                     "Tick at least one row first.", no_update)
+        if trig == "evtv-approve-sel-btn":
             n = store.pi_bulk_approve(targets, email)
-            msg = (f"Approved {n} file"
-                    f"{'' if n == 1 else 's'}.")
-        else:
+            msg = f"Approved {n} file{'' if n == 1 else 's'}."
+        elif trig == "evtv-flag-sel-btn":
             n = store.pi_bulk_flag(targets, email,
                                      note=(note or ""))
-            msg = (f"Flagged {n} file"
-                    f"{'' if n == 1 else 's'}.")
+            msg = f"Flagged {n} file{'' if n == 1 else 's'}."
+        else:
+            return no_update, no_update, no_update, no_update
         rows = store.pi_pending_files(limit=500)
-        return (_render_pending_list(rows, []), [], msg)
+        return (_pending_table_rows(store, rows), [], msg,
+                _pending_signature(rows))
 
+    # Click a row's "Open >" cell -> hand the recording to Video
+    # Review via the same lfp-to-video-bridge the LFP Browser uses
+    # (lfp_browser._on_view_video). Reuses the whole synchronized
+    # player; zero changes on the video side.
     @app.callback(
-        Output("evtv-detail-target", "data"),
-        Input({"type": "evtv-open-detail",
-                "file_id": ALL, "idx": ALL}, "n_clicks"),
-        Input("evtv-close-detail-btn", "n_clicks"),
+        Output("lfp-to-video-bridge", "data"),
+        Output("group-tabs", "value", allow_duplicate=True),
+        Output("tabs", "value", allow_duplicate=True),
+        Input("evtv-pending-table", "active_cell"),
         prevent_initial_call=True,
     )
-    def _on_detail_open(_clicks, _close):
-        trig = callback_context.triggered_id
-        if trig == "evtv-close-detail-btn":
-            return None
-        if not isinstance(trig, dict):
-            return no_update
-        return {"file_id": int(trig.get("file_id")),
-                 "idx": int(trig.get("idx"))}
-
-    @app.callback(
-        Output("evtv-detail-panel", "children"),
-        Input("evtv-detail-target", "data"),
-        Input("refresh-trigger", "data"),
-        Input("evtv-detail-poll", "n_intervals"),
-    )
-    def _render_detail(target, _refresh, _tick):
-        email = (current_user_email() or "").lower()
-        if not _is_pi(config or {}, email):
-            return []
-        if not target:
-            return []
-        return _render_event_detail(target, store, config)
-
-    # Auto-poll controller: enable the Interval ONLY while a
-    # detail panel is open AND its clip is still extracting.
-    # Saves bandwidth + DB queries the rest of the time.
-    @app.callback(
-        Output("evtv-detail-poll", "disabled"),
-        Input("evtv-detail-target", "data"),
-        Input("evtv-detail-poll", "n_intervals"),
-    )
-    def _toggle_detail_poll(target, _tick):
-        if not target:
-            return True
-        # Cheap check: peek the clip status from the
-        # cache/DB; only keep polling while pending/running.
-        file_id = int(target.get("file_id") or 0)
-        idx = int(target.get("idx") or 0)
-        rows = store.pi_pending_files(limit=500)
-        row = next((r for r in rows
-                      if int(r["file_id"]) == file_id), None)
-        if not row:
-            return True
-        events = row.get("events") or []
-        if idx < 0 or idx >= len(events):
-            return True
-        ev = events[idx]
-        eo = ev.get("EO_sec")
-        bb = ev.get("BB_sec")
-        if eo is None or bb is None:
-            return True
-        spec = _event_clip.ClipSpec(
-            file_id=file_id, eo_sec=float(eo),
-            bb_sec=float(bb))
-        try:
-            segs = _event_clip.resolve_clip_segments(
-                spec, store)
-            h = _event_clip.spec_hash(spec, segs)
-            info = _event_clip.poll_video_clip_status(h, store)
-        except Exception:
-            return True  # silence the loop on lookup errors
-        return info.get("status") not in ("pending", "running")
+    def _open_in_video_review(active_cell):
+        if (not active_cell
+                or active_cell.get("column_id") != "view"):
+            return no_update, no_update, no_update
+        fid = active_cell.get("row_id")
+        if fid is None:
+            return no_update, no_update, no_update
+        file_id = int(fid)
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT session_dir, duration_sec "
+                "FROM processed_files WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+        if not row or not row["session_dir"]:
+            return no_update, no_update, no_update
+        session_dir = row["session_dir"]
+        channel = _first_animal_channel_index(store, session_dir)
+        bridge = {
+            "session_dir": session_dir,
+            "file_id": file_id,
+            "channel": int(channel),
+            "hp": 0, "lp": 0, "notch": 0, "smooth": 0,
+            "start_sec": 0.0,
+            "lfp_dur": float(row["duration_sec"] or 0.0),
+            "seq": int(datetime.now().timestamp() * 1000),
+        }
+        return bridge, "analysis", "video"
 
     @app.callback(
         Output("evtv-finalize-status", "children"),
@@ -1362,7 +885,9 @@ def register_callbacks(app, store, config: dict) -> None:
                 allow_duplicate=True),
         Output("evtv-ma-job-id", "data",
                 allow_duplicate=True),
-        Output("evtv-pending-list", "children",
+        Output("evtv-pending-table", "data",
+                allow_duplicate=True),
+        Output("evtv-list-sig", "data",
                 allow_duplicate=True),
         Input("evtv-ma-confirm-btn", "n_clicks"),
         Input("evtv-ma-discard-btn", "n_clicks"),
@@ -1374,34 +899,34 @@ def register_callbacks(app, store, config: dict) -> None:
                        animal_id, cutoff):
         trig = callback_context.triggered_id
         if trig == "evtv-ma-discard-btn":
-            return ("", "", [], None, no_update)
+            return ("", "", [], None, no_update, no_update)
         if trig != "evtv-ma-confirm-btn":
             return (no_update, no_update, no_update,
-                     no_update, no_update)
+                     no_update, no_update, no_update)
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return ("Not authorised.", "", [], None,
-                     no_update)
+                     no_update, no_update)
         try:
             cutoff = float(cutoff)
         except (TypeError, ValueError):
             return (f"Invalid cutoff: {cutoff!r}",
-                     "", [], None, no_update)
+                     "", [], None, no_update, no_update)
         try:
             result = _mass_analyze.commit_threshold(
                 store, animal_id, cutoff, email)
         except Exception as e:
             logger.exception("commit_threshold failed")
             return (f"Commit failed: {e}", "", [],
-                     None, no_update)
+                     None, no_update, no_update)
         msg = (f"✓ {result['n_cleared']} files moved to "
                 "pending_pi_review. Approve them in the list "
                 "below.")
-        # Force a list re-render so the new pending files
-        # show up immediately.
+        # Refresh the table so the new pending files show up.
         rows = store.pi_pending_files(limit=500)
         return (msg, "", [], None,
-                 _render_pending_list(rows, []))
+                 _pending_table_rows(store, rows),
+                 _pending_signature(rows))
 
 
 # --------------------------------------------------------------- #
