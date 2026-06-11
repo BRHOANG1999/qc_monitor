@@ -176,6 +176,11 @@ def layout(store: Store, config: dict | None = None):
         ),
         # Selection store: list of file_ids.
         dcc.Store(id="evtv-selection", data=[]),
+        # Signature of the currently-rendered pending set so the
+        # 10s auto-refresh can skip re-rendering the (now large)
+        # list when nothing actually changed -- the redundant
+        # redraw was making the list visibly blink on and off.
+        dcc.Store(id="evtv-list-sig", data=None),
         # Detail panel's currently-open (file_id, event_idx)
         # or None. Surfaces under the list when set.
         dcc.Store(id="evtv-detail-target", data=None),
@@ -587,6 +592,16 @@ def _format_event_row(idx: int, ev: dict) -> html.Div:
         style={"color": "#a0a0b0", "fontSize": "11px"})
 
 
+def _pending_signature(rows: list[dict]) -> str:
+    """Cheap content signature of the pending set. Each submission
+    appends a new review_state row with a unique state_id, so the
+    sorted state_id tuple uniquely identifies which files are pending
+    -- a new submission, an approval, or a flag all change it. Used to
+    skip the redundant 10s re-render that made the list blink."""
+    ids = sorted(int(r.get("state_id") or 0) for r in rows)
+    return ",".join(str(i) for i in ids)
+
+
 def _render_pending_list(rows: list[dict], selection: list[int]
                           ) -> list:
     """Top-level: one card per pending file."""
@@ -880,15 +895,27 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("evtv-pending-list", "children"),
         Output("evtv-sel-status", "children"),
+        Output("evtv-list-sig", "data"),
         Input("evtv-refresh-btn", "n_clicks"),
         Input("evtv-selection", "data"),
         Input("refresh-trigger", "data"),
+        State("evtv-list-sig", "data"),
     )
-    def _render_list(_n, selection, _refresh):
+    def _render_list(_n, selection, _refresh, prev_sig):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
-            return [], ""
+            return [], "", no_update
         rows = store.pi_pending_files(limit=500)
+        sig = _pending_signature(rows)
+        # The 10s refresh-trigger fires whether or not the pending
+        # set changed. Re-rendering hundreds of rows on every tick
+        # made the list blink on and off. When the ONLY trigger is
+        # the periodic tick and the signature is unchanged, skip the
+        # redraw entirely. User actions (refresh button, selection
+        # change) always re-render so highlights stay responsive.
+        trig = callback_context.triggered_id
+        if trig == "refresh-trigger" and sig == prev_sig:
+            return no_update, no_update, no_update
         sel = list(selection or [])
         sel_count = len([f for f in sel
                           if f in {r["file_id"] for r in rows}])
@@ -896,7 +923,7 @@ def register_callbacks(app, store, config: dict) -> None:
                       f"{len(rows)} pending"
                       if sel_count
                       else f"{len(rows)} pending")
-        return _render_pending_list(rows, sel), sel_label
+        return _render_pending_list(rows, sel), sel_label, sig
 
     @app.callback(
         Output("evtv-selection", "data",
