@@ -487,7 +487,8 @@ def _decimated_lfp(file_path: str, channel: int,
     return t, display, duration, n_blanked
 
 
-def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figure:
+def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
+                       uirevision: str | None = None) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scattergl(
         x=t, y=signal,
@@ -507,6 +508,12 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str) -> go.Figur
         height=220,
         margin=dict(l=60, r=20, t=10, b=40),
         dragmode="pan",
+        # uirevision (stable per recording) tells Plotly to preserve
+        # the user's zoom/pan across figure updates -- the cursor
+        # mirror + re-decimate redraws no longer snap the view back.
+        # It changes when the file/channel changes, so a new recording
+        # resets to full view.
+        uirevision=uirevision,
         xaxis=dict(title="Time (s)", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
         yaxis=dict(title="μV", showgrid=True,
@@ -593,6 +600,7 @@ def _render_hilbert_trace(store, file_id: int,
     fig = _build_lfp_figure(
         t, display,
         "Hilbert envelope (20-200 Hz)",
+        uirevision=f"{file_id}:{channel}",
     )
     fig.data[0].line.color = "#30d158"
     fig.data[0].hovertemplate = (
@@ -1043,6 +1051,10 @@ def layout(store: Store):
         # has no visible output; this just gives the callback an Output
         # to satisfy Dash).
         dcc.Store(id="video-claim-sink", data=0),
+        # Write-only sink for the x-axis sync callbacks: they drive the
+        # partner graph via Plotly.relayout and return no_update, so
+        # they just need a harmless Output.
+        dcc.Store(id="video-xsync-sink", data=0),
 
         # --- Step 1: pick a recording ---------------------------------- #
         _step_header("1", "Pick a recording",
@@ -3700,7 +3712,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("Video filter failed (using unfiltered): %s", e)
             filtered = signal
 
-        fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}")
+        fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}",
+                                 uirevision=f"{file_id}:{channel}")
         filt_bits = []
         if hp and hp > 0: filt_bits.append(f"HP={hp:g}")
         if lp and lp > 0: filt_bits.append(f"LP={lp:g}")
@@ -3926,56 +3939,70 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             bits.append(" + ".join(applied_bits))
         return fig, " · ".join(bits)
 
-    # ---- X-axis sync: LFP zoom drives analysis zoom (and back) ----
-    # Bidirectional clientside listeners on relayoutData so either
-    # plot's pan/zoom/reset propagates to the other. We patch only
-    # layout.xaxis.range / autorange -- the existing zoom-decimate
-    # callback on the LFP still fires on its own relayoutData input
-    # without seeing this clientside echo (Dash skips clientside
-    # outputs when the input value is the same as last time).
-    # Use Patch (not a full-figure return) so only layout.xaxis
-    # is touched. Returning `{data: fig.data, ...}` from the
-    # full-figure variant created a race on file/channel switch:
-    # the State("...figure") snapshot was captured at chain
-    # start, potentially BEFORE _update_analysis or _update_lfp
-    # had written the new figure for the new file. Writing
-    # back fig.data then clobbered the new envelope with the
-    # previous file's data, producing the "Hilbert looks like
-    # raw instantaneous amplitude" symptom the user reported.
-    # Patch is merged atomically against whatever the figure
-    # currently is, so the data array stays whatever the
-    # latest _update_* callback wrote.
-    _XAXIS_SYNC_JS = """
-    function(rel) {
-        if (!rel) { return window.dash_clientside.no_update; }
-        var has_range = ('xaxis.range[0]' in rel
-                          && 'xaxis.range[1]' in rel);
-        var has_auto = !!rel['xaxis.autorange'];
-        if (!has_range && !has_auto) {
+    # ---- X-axis sync: zoom/pan one plot drives the other ----
+    # The LFP and Hilbert share a time axis, so a zoom on one should
+    # move the other. Plotly's `matches` only links axes WITHIN one
+    # figure, so for two separate dcc.Graphs we drive the partner
+    # directly: on a relayout we call Plotly.relayout on the other
+    # graph's DOM node. (The previous version returned a clientside
+    # Patch to the partner's `figure` prop; it silently no-op'd --
+    # the plots never moved together.) An echo guard -- skip if the
+    # target already shows this range -- breaks the A->B->A relayout
+    # loop. We side-effect via Plotly only and return no_update, so
+    # the Dash figure prop is never rewritten; combined with the
+    # uirevision set per recording in _build_lfp_figure, the zoom
+    # also survives the cursor + re-decimate figure updates.
+    def _xsync_js(target_id: str) -> str:
+        return ("""
+        function(rel) {
+            if (!rel) { return window.dash_clientside.no_update; }
+            var hasRange = ('xaxis.range[0]' in rel
+                             && 'xaxis.range[1]' in rel);
+            var hasAuto = !!rel['xaxis.autorange'];
+            if (!hasRange && !hasAuto) {
+                return window.dash_clientside.no_update;
+            }
+            var host = document.getElementById('%s');
+            var gd = null;
+            if (host) {
+                gd = host.classList
+                      && host.classList.contains('js-plotly-plot')
+                     ? host : host.querySelector('.js-plotly-plot');
+            }
+            if (!gd || !window.Plotly) {
+                return window.dash_clientside.no_update;
+            }
+            var cur = (gd.layout && gd.layout.xaxis)
+                       ? gd.layout.xaxis.range : null;
+            if (hasRange) {
+                var x0 = rel['xaxis.range[0]'];
+                var x1 = rel['xaxis.range[1]'];
+                if (cur && Math.abs(cur[0] - x0) < 1e-6
+                        && Math.abs(cur[1] - x1) < 1e-6) {
+                    return window.dash_clientside.no_update;
+                }
+                window.Plotly.relayout(gd, {
+                    'xaxis.range[0]': x0, 'xaxis.range[1]': x1});
+            } else {
+                if (gd.layout && gd.layout.xaxis
+                        && gd.layout.xaxis.autorange === true) {
+                    return window.dash_clientside.no_update;
+                }
+                window.Plotly.relayout(gd, {'xaxis.autorange': true});
+            }
             return window.dash_clientside.no_update;
         }
-        var p = new window.dash_clientside.Patch();
-        if (has_range) {
-            p.layout.xaxis.range = [rel['xaxis.range[0]'],
-                                     rel['xaxis.range[1]']];
-            p.layout.xaxis.autorange = false;
-        } else {
-            p.layout.xaxis.autorange = true;
-            delete p.layout.xaxis.range;
-        }
-        return p;
-    }
-    """
+        """ % target_id)
+
     app.clientside_callback(
-        _XAXIS_SYNC_JS,
-        Output("video-analysis-trace", "figure",
-                allow_duplicate=True),
+        _xsync_js("video-analysis-trace"),
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-lfp-trace", "relayoutData"),
         prevent_initial_call=True,
     )
     app.clientside_callback(
-        _XAXIS_SYNC_JS,
-        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        _xsync_js("video-lfp-trace"),
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-analysis-trace", "relayoutData"),
         prevent_initial_call=True,
     )
