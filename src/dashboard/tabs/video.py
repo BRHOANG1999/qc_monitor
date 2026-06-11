@@ -4373,6 +4373,44 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             "started or finalised).",
         ])
 
+    # Reattach the progress poll after a tab reload. The scan
+    # worker is a server-side daemon, so a scan started before
+    # the reload keeps running -- but the job-id Store and the
+    # poll Interval both reset to their defaults on reload, so
+    # the panel would otherwise come back blank with no hint
+    # that work is still happening. On animal pick, look for an
+    # in-progress job for that animal and re-arm the poll.
+    @app.callback(
+        Output("video-ma-job-id", "data", allow_duplicate=True),
+        Output("video-ma-poll", "disabled",
+                allow_duplicate=True),
+        Output("video-ma-progress", "children",
+                allow_duplicate=True),
+        Input("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_reattach(picker_value):
+        animal = _ma_animal_from_picker(picker_value)
+        if not animal:
+            return None, True, ""
+        try:
+            job = _mass_analyze.active_job_for_animal(
+                store, str(animal))
+        except Exception as e:
+            logger.warning(
+                "active_job_for_animal failed: %s", e)
+            return no_update, no_update, no_update
+        if not job:
+            # Animal with no running scan: drop any stale poll
+            # attachment from a previously-viewed animal.
+            return None, True, no_update
+        return (job["id"], False,
+                html.Span(
+                    f"Reconnected to a scan already running for "
+                    f"{animal} (started before this reload). "
+                    "Progress will update below.",
+                    style={"color": "#5e7ce2"}))
+
     @app.callback(
         Output("video-ma-confirm-modal", "style"),
         Output("video-ma-modal-body", "children"),

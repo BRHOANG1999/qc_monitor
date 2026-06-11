@@ -327,6 +327,32 @@ def get_job(store, job_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def active_job_for_animal(store, animal_id: str) -> dict | None:
+    """Most-recent still-active (pending/running) scan for
+    *animal_id*, or None.
+
+    The worker runs server-side in a daemon thread, so a scan
+    started before a tab reload keeps going. This lets the UI
+    reattach its progress poll on reload instead of showing a
+    blank panel while work is silently happening in the
+    background. Only pending/running jobs qualify -- a finished
+    'done' job isn't surfaced here (it would re-show a stale
+    Confirm button); re-running the scan is instant off the
+    cache if the user needs the Confirm step back.
+    """
+    assert isinstance(animal_id, str) and animal_id, \
+        "animal_id required"
+    with store.connection() as conn:
+        row = conn.execute(
+            """SELECT * FROM mass_analyze_job
+               WHERE animal_id = ?
+                 AND status IN ('pending', 'running')
+               ORDER BY created_at DESC LIMIT 1""",
+            (animal_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def cancel_job(store, job_id: int) -> bool:
     """Flip a pending/running job to 'cancelled'. The worker
     checks this between files and bails cleanly."""
