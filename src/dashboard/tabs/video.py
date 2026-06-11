@@ -203,6 +203,16 @@ def _animal_ids_from_picker(animal_value: str | None
     return [animal_value]
 
 
+def _ma_animal_from_picker(animal_value: str | None
+                             ) -> str | None:
+    """Single plain animal id from the Step-1 picker value, or
+    None. Mass Analyze operates on one animal, so it takes the
+    first id ``_animal_ids_from_picker`` resolves (strips the
+    ``_pool_`` prefix / drops the ``__UNASSIGNED__`` sentinel)."""
+    ids = _animal_ids_from_picker(animal_value)
+    return ids[0] if ids else None
+
+
 def _pi_flag_note_for_file(store, file_id: int) -> str:
     """Return the most-recent ``pi_flag`` note for *file_id* or
     an empty string if there isn't one.
@@ -4280,7 +4290,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-ma-animal-display", "children"),
         Input("video-queue-animal", "value"),
     )
-    def _on_video_ma_animal_display(animal):
+    def _on_video_ma_animal_display(picker_value):
+        animal = _ma_animal_from_picker(picker_value)
         if not animal:
             return html.Span([
                 html.Span("Will scan: ",
@@ -4302,7 +4313,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-animal", "value"),
         Input("video-ma-job-id", "data"),
     )
-    def _on_video_ma_scope_count(animal, _job_id):
+    def _on_video_ma_scope_count(picker_value, _job_id):
+        animal = _ma_animal_from_picker(picker_value)
         if not animal:
             return ""
         try:
@@ -4343,8 +4355,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _on_video_ma_modal_toggle(_scan_n, _cancel_n,
                                      _confirm_n,
-                                     animal, cutoff,
+                                     picker_value, cutoff,
                                      current_style):
+        animal = _ma_animal_from_picker(picker_value)
         trig = callback_context.triggered_id
         hidden = dict(current_style or {})
         hidden["display"] = "none"
@@ -4513,9 +4526,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-ma-cutoff-input", "value"),
         prevent_initial_call=True,
     )
-    def _on_video_ma_modal_confirm(n_clicks, animal_id, cutoff):
+    def _on_video_ma_modal_confirm(n_clicks, picker_value, cutoff):
         if not n_clicks:
             return no_update, no_update, no_update
+        animal_id = _ma_animal_from_picker(picker_value)
         email = (current_user_email() or "").lower()
         if not email:
             return None, True, "Sign in first."
@@ -4673,17 +4687,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _on_video_ma_commit(_confirm_n, _discard_n,
-                              cutoff, queue_animal):
+                              cutoff, picker_value):
         trig = callback_context.triggered_id
         if trig == "video-ma-discard-btn":
             return ("", "", [], None, no_update)
         if trig != "video-ma-confirm-btn":
             return (no_update, no_update, no_update,
                      no_update, no_update)
+        animal = _ma_animal_from_picker(picker_value)
         email = (current_user_email() or "").lower()
         if not email:
             return ("Sign in first.", "", [], None, no_update)
-        if not queue_animal:
+        if not animal:
             return ("Pick an animal in Step 1 first.",
                      "", [], None, no_update)
         try:
@@ -4693,7 +4708,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "", [], None, no_update)
         try:
             result = _mass_analyze.commit_threshold(
-                store, queue_animal, cutoff, email)
+                store, animal, cutoff, email)
         except Exception as e:
             logger.exception(
                 "Mass Analyze commit_threshold failed")
@@ -4701,11 +4716,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      no_update)
         msg = (f"OK  {result['n_cleared']} files moved to "
                 "pending_pi_review. The PI will verify them.")
-        # Round-trip the queue picker's value to force the queue
-        # list to re-render -- zero-peak files should drop out
-        # of the FIFO immediately so the undergrad sees the new
-        # state.
-        return (msg, "", [], None, queue_animal)
+        # Round-trip the queue picker's raw value (NOT the
+        # resolved animal id -- the dropdown speaks _pool_/
+        # sentinel) to force the queue list to re-render so
+        # zero-peak files drop out of the FIFO immediately.
+        return (msg, "", [], None, picker_value)
 
     # Click-to-set on the Hilbert envelope plot. Clientside so
     # the dashed threshold line snaps to the click without a
