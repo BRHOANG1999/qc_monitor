@@ -592,6 +592,17 @@ def _format_event_row(idx: int, ev: dict) -> html.Div:
         style={"color": "#a0a0b0", "fontSize": "11px"})
 
 
+def _has_real_click(triggered: list) -> bool:
+    """True iff a callback was driven by an actual button click.
+
+    Dash recreates the per-row approve/flag pattern buttons every time
+    the pending list re-renders, which re-fires the ALL-pattern
+    callback with ``n_clicks=None``. A real click carries a truthy
+    n_clicks; recreation carries None/0. Guarding on this stops a
+    redraw from silently approving/flagging a file."""
+    return any((t.get("value") or 0) for t in (triggered or []))
+
+
 def _pending_signature(rows: list[dict]) -> str:
     """Cheap content signature of the pending set. Each submission
     appends a new review_state row with a unique state_id, so the
@@ -937,6 +948,13 @@ def register_callbacks(app, store, config: dict) -> None:
         ctx = callback_context.triggered_id
         if not isinstance(ctx, dict):
             return no_update
+        # Same recreation trap as _on_action: when the list re-renders,
+        # every checkbox is recreated and the ALL-pattern callback fires
+        # with many entries in `triggered` at once. A genuine user toggle
+        # changes exactly one checkbox, so ignore multi-entry fires to
+        # avoid churning the selection (which would re-trigger the list).
+        if len(callback_context.triggered or []) != 1:
+            return no_update
         file_id = int(ctx.get("file_id") or 0)
         # The triggered_id check tells us WHICH row was toggled.
         # Find its current value in the list.
@@ -989,6 +1007,13 @@ def register_callbacks(app, store, config: dict) -> None:
                     selection, note):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
+            return no_update, no_update, no_update
+        # CRITICAL: the per-row approve/flag buttons are pattern-
+        # matching components recreated on every list re-render, which
+        # re-fires this callback with n_clicks=None. Without this guard
+        # a redraw silently approves a file (and self-triggers a loop
+        # that approves one per cycle). Only proceed on a real click.
+        if not _has_real_click(callback_context.triggered):
             return no_update, no_update, no_update
         trig = callback_context.triggered_id
         targets: list[int] = []
