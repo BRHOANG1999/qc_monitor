@@ -2828,51 +2828,50 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # that only changes once per file/channel load. The
     # callback chain that should trip "done" still trips;
     # cursor ticks no longer fire these watchers at all.
+    # Single owner of the leg "done" transitions. Three separate
+    # done-watchers each did read-modify-write on video-load-state
+    # with allow_duplicate; when the LFP and Hilbert render tokens
+    # both landed in the same Dash batch (the normal case once the
+    # tokens made the marks reliable), the two callbacks read the
+    # SAME state snapshot and each wrote its own copy back -- the
+    # last write clobbered the other, leaving one leg stuck on
+    # "loading" forever (LFP usually won; Hilbert hung). Collapsing
+    # them into one callback makes the multi-leg transition a single
+    # atomic write keyed off callback_context.triggered, so both
+    # legs flip together. Watches the cheap per-render TOKENS (not
+    # the figures) to keep the 10 Hz cursor Patch from re-firing
+    # this -- the original OOM guard.
     @app.callback(
         Output("video-load-state", "data",
                 allow_duplicate=True),
         Input("video-player-container", "children"),
-        State("video-load-state", "data"),
-        prevent_initial_call=True,
-    )
-    def _mark_video_done(_children, state):
-        if not state or state.get("video") != "loading":
-            return no_update
-        next_state = dict(state)
-        next_state["video"] = "done"
-        return next_state
-
-    # Watch the per-render TOKEN, not the human-readable status:
-    # the status string is identical across same-duration / same-
-    # candidate-count recordings, so a status-change Input would
-    # miss the second load and leave the leg stuck on "loading".
-    @app.callback(
-        Output("video-load-state", "data",
-                allow_duplicate=True),
         Input("video-lfp-loadtoken", "data"),
-        State("video-load-state", "data"),
-        prevent_initial_call=True,
-    )
-    def _mark_lfp_done(_token, state):
-        if not state or state.get("lfp") != "loading":
-            return no_update
-        next_state = dict(state)
-        next_state["lfp"] = "done"
-        return next_state
-
-    @app.callback(
-        Output("video-load-state", "data",
-                allow_duplicate=True),
         Input("video-hilbert-loadtoken", "data"),
         State("video-load-state", "data"),
         prevent_initial_call=True,
     )
-    def _mark_hilbert_done(_token, state):
-        if not state or state.get("hilbert") != "loading":
+    def _mark_legs_done(_children, _lfp_token, _hil_token, state):
+        if not state:
             return no_update
+        triggered = {
+            t["prop_id"].split(".")[0]
+            for t in callback_context.triggered
+        }
         next_state = dict(state)
-        next_state["hilbert"] = "done"
-        return next_state
+        changed = False
+        if ("video-player-container" in triggered
+                and next_state.get("video") == "loading"):
+            next_state["video"] = "done"
+            changed = True
+        if ("video-lfp-loadtoken" in triggered
+                and next_state.get("lfp") == "loading"):
+            next_state["lfp"] = "done"
+            changed = True
+        if ("video-hilbert-loadtoken" in triggered
+                and next_state.get("hilbert") == "loading"):
+            next_state["hilbert"] = "done"
+            changed = True
+        return next_state if changed else no_update
 
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful
