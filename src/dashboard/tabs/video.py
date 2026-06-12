@@ -157,6 +157,49 @@ def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
     return set()
 
 
+def _animal_for_session(store: Store, session_dir: str) -> str:
+    """First animal id in the session's channel naming, or '?'."""
+    if not session_dir:
+        return "?"
+    names = store._channel_names_for_session(session_dir)
+    for n in names:
+        if isinstance(n, str) and is_animal_channel(n):
+            a, _ = split_animal_electrode(n)
+            return a
+    return "?"
+
+
+def _now_viewing_info(store: Store, file_id: int) -> dict | None:
+    """Orientation for the loaded recording: animal, date/time, its
+    position among the session's hour-chunks, and the neighbouring
+    file ids for prev/next-hour stepping. None if not resolvable."""
+    session_dir = _session_dir_for_file(store, file_id)
+    if not session_dir:
+        return None
+    files = _files_with_video(store, session_dir)  # chunk_datetime asc
+    ids = [int(f["id"]) for f in files]
+    try:
+        i = ids.index(int(file_id))
+    except ValueError:
+        return None
+    cdt = files[i].get("chunk_datetime") or ""
+    try:
+        ts = datetime.strptime(cdt, "%Y_%m_%d__%H_%M_%S")
+        date_label = ts.strftime("%Y-%m-%d")
+        time_label = ts.strftime("%H:%M")
+    except ValueError:
+        date_label, time_label = cdt, ""
+    return {
+        "animal": _animal_for_session(store, session_dir),
+        "date": date_label,
+        "time": time_label,
+        "index": i + 1,
+        "total": len(ids),
+        "prev_id": ids[i - 1] if i > 0 else None,
+        "next_id": ids[i + 1] if i < len(ids) - 1 else None,
+    }
+
+
 def _session_dir_for_file(store: Store, file_id: int) -> str | None:
     with store.connection() as conn:
         row = conn.execute(
@@ -1249,6 +1292,48 @@ def layout(store: Store, bridge: dict | None = None):
                       "Video plays in sync with the LFP and Hilbert "
                       "envelope on the right. Scroll down to score "
                       "events; the video pips to the corner."),
+
+        # --- Now-viewing banner + hour stepping ----------------------- #
+        # Tells the reviewer exactly which animal / day / hour is loaded
+        # (a recurring "which file am I on?" confusion) and lets them
+        # walk the recording hour by hour without reopening the picker.
+        html.Div([
+            html.Div(id="video-now-viewing",
+                      style={"flex": "1 1 auto",
+                              "color": "#f0f0f5",
+                              "fontSize": "13px",
+                              "fontWeight": "600"}),
+            html.Button("◀ Prev hour",
+                         id="video-prev-hour-btn", n_clicks=0,
+                         title="Load the previous hour-chunk in this "
+                               "session.",
+                         style={"background": "transparent",
+                                 "color": "#cfd0d6",
+                                 "border": "1px solid "
+                                            "rgba(255,255,255,0.15)",
+                                 "borderRadius": "5px",
+                                 "padding": "5px 12px",
+                                 "cursor": "pointer",
+                                 "fontSize": "12px",
+                                 "marginRight": "6px"}),
+            html.Button("Next hour ▶",
+                         id="video-next-hour-btn", n_clicks=0,
+                         title="Load the next hour-chunk in this "
+                               "session.",
+                         style={"background": "transparent",
+                                 "color": "#cfd0d6",
+                                 "border": "1px solid "
+                                            "rgba(255,255,255,0.15)",
+                                 "borderRadius": "5px",
+                                 "padding": "5px 12px",
+                                 "cursor": "pointer",
+                                 "fontSize": "12px"}),
+        ], style={"display": "flex", "alignItems": "center",
+                   "gap": "8px", "flexWrap": "wrap",
+                   "padding": "8px 12px", "marginBottom": "10px",
+                   "background": "rgba(94,124,226,0.06)",
+                   "border": "1px solid rgba(94,124,226,0.18)",
+                   "borderRadius": "8px"}),
 
         # --- Two-column Step 2: video LEFT | LFP+Hilbert RIGHT ----- #
         # CSS Grid: video spans both rows in column 1; the LFP block
@@ -2918,6 +3003,60 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             except Exception as e:
                 logger.warning("claim_file failed: %s", e)
         return no_update
+
+    # ---- Now-viewing banner + hour stepping (orientation) ---- #
+    @app.callback(
+        Output("video-now-viewing", "children"),
+        Output("video-prev-hour-btn", "disabled"),
+        Output("video-next-hour-btn", "disabled"),
+        Input("video-file-dropdown", "value"),
+    )
+    def _render_now_viewing(file_id):
+        if not file_id:
+            return ("No recording loaded -- pick one above.",
+                    True, True)
+        info = _now_viewing_info(store, int(file_id))
+        if not info:
+            return ("Recording loaded.", True, True)
+        label = html.Span([
+            html.Span("Now viewing: ",
+                       style={"color": "#a0a0b0",
+                               "fontWeight": "400"}),
+            html.Span(info["animal"],
+                       style={"color": "#5e7ce2"}),
+            html.Span(f"  ·  {info['date']}  ·  {info['time']}"),
+            html.Span(f"   (hour {info['index']} of "
+                       f"{info['total']})",
+                       style={"color": "#a0a0b0",
+                               "fontWeight": "400",
+                               "fontSize": "11px"}),
+        ])
+        return (label, info["prev_id"] is None,
+                info["next_id"] is None)
+
+    @app.callback(
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Input("video-prev-hour-btn", "n_clicks"),
+        Input("video-next-hour-btn", "n_clicks"),
+        State("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _step_hour(_prev, _next, file_id):
+        if not file_id:
+            return no_update
+        # Only act on a real click (pattern: button recreation /
+        # initial fires carry n_clicks 0/None).
+        if not any((t.get("value") or 0)
+                    for t in (callback_context.triggered or [])):
+            return no_update
+        info = _now_viewing_info(store, int(file_id))
+        if not info:
+            return no_update
+        trig = callback_context.triggered_id
+        target = (info["prev_id"] if trig == "video-prev-hour-btn"
+                   else info["next_id"])
+        return target if target is not None else no_update
 
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful
