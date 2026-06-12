@@ -757,7 +757,7 @@ def _details_card(summary_text: str, content,
             "borderRadius": "6px",
         }),
         html.Div(content, style={"padding": "0 6px 6px 6px"}),
-    ], open=open_default, style={
+    ], open=open_default, className="qc-expandable", style={
         "background": "rgba(255,255,255,0.02)",
         "border": "1px solid rgba(255,255,255,0.06)",
         "borderRadius": "6px",
@@ -948,7 +948,7 @@ def _video_mass_analyze_panel() -> html.Details:
                 ),
             ),
         ]),
-    ], open=False,
+    ], open=False, className="qc-expandable",
        style={"padding": "0",
                "background": "#13131f",
                "border":
@@ -1066,7 +1066,7 @@ def layout(store: Store, bridge: dict | None = None):
                             "marginTop": "8px", "fontStyle": "italic"},
                 ),
             ], style={"padding": "0 14px 14px 14px"}),
-        ], open=True, style={
+        ], open=True, className="qc-expandable", style={
             "background": "rgba(94, 124, 226, 0.08)",
             "border": "1px solid rgba(94, 124, 226, 0.25)",
             "borderRadius": "8px",

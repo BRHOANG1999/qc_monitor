@@ -430,6 +430,46 @@ button:focus-visible {
     display: none !important;
 }
 
+/* --- Expandable <details> cards: make the affordance obvious --- */
+details.qc-expandable {
+    transition: border-color 0.15s ease;
+}
+details.qc-expandable > summary {
+    position: relative;
+    padding-right: 36px !important;   /* room for the chevron */
+}
+/* hide the browser's default disclosure triangle; we draw our own */
+details.qc-expandable > summary::-webkit-details-marker { display: none; }
+details.qc-expandable > summary::marker { content: ""; }
+/* CSS chevron: a rotated square corner. Points RIGHT when collapsed. */
+details.qc-expandable > summary::after {
+    content: "";
+    position: absolute;
+    right: 14px;
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    border-right: 2px solid #9aa0b5;
+    border-bottom: 2px solid #9aa0b5;
+    transform: translateY(-65%) rotate(-45deg);
+    transition: transform 0.18s ease, border-color 0.15s ease;
+}
+/* Points DOWN when expanded. */
+details.qc-expandable[open] > summary::after {
+    transform: translateY(-30%) rotate(45deg);
+}
+/* Hover lights up the row + chevron + card border so it reads as a
+   clickable control, not static text. */
+details.qc-expandable > summary:hover {
+    background: rgba(94, 124, 226, 0.12) !important;
+}
+details.qc-expandable > summary:hover::after {
+    border-color: #5e7ce2;
+}
+details.qc-expandable:hover {
+    border-color: rgba(94, 124, 226, 0.35) !important;
+}
+
 /* --- Accessibility: honor reduced-motion --- */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
