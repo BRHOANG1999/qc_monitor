@@ -3412,6 +3412,43 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return patch
 
     @app.callback(
+        Output("video-analysis-trace", "figure",
+                allow_duplicate=True),
+        Input("video-events-store", "data"),
+        State("video-analysis-trace", "figure"),
+        prevent_initial_call=True,
+    )
+    def _render_marker_shapes_hilbert(events, fig):
+        """Same landmark verticals on the Hilbert envelope. The
+        Hilbert keeps two reserved shapes -- shapes[0] cursor,
+        shapes[1] the dashed detection threshold -- so preserve both
+        and append landmarks past them."""
+        if not fig:
+            return no_update
+        existing = (fig.get("layout") or {}).get("shapes") or []
+        new_shapes: list[dict] = list(existing[:2])  # cursor+threshold
+        for i, e in enumerate(events or []):
+            if i >= 16:  # NASA Rule 3
+                break
+            for field, color in LANDMARK_COLORS.items():
+                t_sec = e.get(f"{field}_sec")
+                if t_sec is None:
+                    continue
+                try:
+                    t = float(t_sec)
+                except (TypeError, ValueError):
+                    continue
+                new_shapes.append({
+                    "type": "line", "xref": "x", "yref": "paper",
+                    "x0": t, "x1": t, "y0": 0, "y1": 1,
+                    "line": {"color": color, "width": 2},
+                    "opacity": 0.85,
+                })
+        patch = Patch()
+        patch["layout"]["shapes"] = new_shapes
+        return patch
+
+    @app.callback(
         Output("video-review-marker-store", "data",
                 allow_duplicate=True),
         Input("video-review-clear-markers-btn", "n_clicks"),
@@ -4170,14 +4207,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     && lfp_dur && lfp_dur > 0) {
                 t = currentTime * (lfp_dur / v.duration);
             }
+            // Keep shapes[1:] (threshold line + landmark verticals);
+            // only shapes[0] (the cursor) moves. Replacing the whole
+            // array here used to wipe the markers 10x/sec.
+            var keep = ((fig.layout && fig.layout.shapes)
+                         || []).slice(1);
+            var cursor = {
+                type: 'line', xref: 'x', yref: 'paper',
+                x0: t, x1: t, y0: 0, y1: 1,
+                line: {color: '#ff9f0a', width: 2}
+            };
             const newFig = {
                 data: fig.data,
                 layout: Object.assign({}, fig.layout, {
-                    shapes: [{
-                        type: 'line', xref: 'x', yref: 'paper',
-                        x0: t, x1: t, y0: 0, y1: 1,
-                        line: {color: '#ff9f0a', width: 2}
-                    }]
+                    shapes: [cursor].concat(keep)
                 })
             };
             return newFig;
@@ -4463,15 +4506,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     && lfp_dur && lfp_dur > 0) {
                 t = currentTime * (lfp_dur / v.duration);
             }
+            // Preserve shapes[1:] (landmark verticals) -- only the
+            // cursor (shapes[0]) moves. A full replace here wiped the
+            // markers _render_marker_shapes painted.
+            var keep = ((fig.layout && fig.layout.shapes)
+                         || []).slice(1);
+            var cursor = {
+                type: 'line', xref: 'x', yref: 'paper',
+                x0: t, x1: t, y0: 0, y1: 1,
+                line: {color: '#ff9f0a', width: 2}
+            };
             const newFig = {
                 data: fig.data,
                 layout: Object.assign({}, fig.layout, {
-                    shapes: [{
-                        type: 'line', xref: 'x', yref: 'paper',
-                        x0: t, x1: t,
-                        y0: 0, y1: 1,
-                        line: {color: '#ff9f0a', width: 2}
-                    }]
+                    shapes: [cursor].concat(keep)
                 })
             };
             return newFig;
