@@ -64,6 +64,7 @@ COLUMNS: tuple[str, ...] = (
 
 ONSET_LVF = "LVF (Low Voltage Fast Onset)"
 ONSET_HYP = "Hyp (Hypersynchronous)"
+ONSET_UNDEFINED = "Undefined"
 NO_EVENTS_COMMENT = "No events in file for current threshold"
 
 # Column groups that are numeric (NaN when unset) vs string
@@ -155,6 +156,7 @@ def _event_to_row(event: dict, file_meta: dict,
     etype = event.get("type") or ""
     onset_str = (ONSET_LVF if etype == "LVF"
                   else ONSET_HYP if etype == "HYP"
+                  else ONSET_UNDEFINED if etype == "Undefined"
                   else "")
     row: dict = {c: "" for c in COLUMNS}
     row.update(file_meta)
@@ -171,6 +173,7 @@ def _event_to_row(event: dict, file_meta: dict,
     row["scorecomment"] = event.get("score_comment", "")
     row["Roomlight"] = event.get("roomlight", "")
     row["VideoQuality"] = event.get("video_quality", "")
+    row["Light"] = event.get("light")
     row["Mode"] = "manual"
     row["Target"] = file_meta.get("Target") or "LFP"
     return row

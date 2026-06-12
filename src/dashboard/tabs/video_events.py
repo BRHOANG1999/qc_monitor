@@ -76,6 +76,7 @@ def blank_event() -> dict:
         "PID_sec": None,
         "BB_sec": None,
         "racine": None,
+        "light": None,        # 0 = no light, 1 = poor, 2 = good
         "onset_comment": "",
         "behavior_comment": "",
         "score_comment": "",
@@ -93,6 +94,7 @@ def required_fields(event: dict) -> tuple[str, ...]:
     assert isinstance(event, dict), "event must be dict"
     if event.get("type") == "HYP":
         return ("EO", "BO", "PID", "BB")
+    # LVF and Undefined both use the full landmark set (incl. LAS).
     return ("EO", "LAS", "BO", "PID", "BB")
 
 
@@ -101,7 +103,7 @@ def is_event_complete(event: dict) -> bool:
     landmark has a timestamp, AND Racine 1-8 is chosen.
     """
     assert isinstance(event, dict), "event must be dict"
-    if event.get("type") not in ("LVF", "HYP"):
+    if event.get("type") not in ("LVF", "HYP", "Undefined"):
         return False
     for f in required_fields(event):
         if event.get(f + "_sec") in (None, ""):
@@ -260,10 +262,13 @@ def _racine_picker(event: dict, idx: int) -> html.Div:
 
 
 def _comment_box(event: dict, idx: int, field: str,
-                   placeholder: str) -> html.Div:
-    """Per-event comment textarea."""
+                   placeholder: str,
+                   label: str | None = None) -> html.Div:
+    """Per-event comment textarea. *label* overrides the
+    auto-derived field title (used to spell out what each box is
+    for)."""
     return html.Div([
-        html.Label(field.replace("_", " ").capitalize(),
+        html.Label(label or field.replace("_", " ").capitalize(),
                     style={"color": COLOR_TEXT_TERTIARY,
                             "fontSize": FONT_SIZE_CAPTION,
                             "display": "block",
@@ -300,8 +305,36 @@ def _type_radio(event: dict, idx: int) -> html.Div:
                  "value": "LVF"},
                 {"label": " HYP (Hypersynchronous)",
                  "value": "HYP"},
+                {"label": " Undefined",
+                 "value": "Undefined"},
             ],
             value=event.get("type") or None, inline=True,
+            labelStyle={"color": COLOR_TEXT_PRIMARY,
+                         "fontSize": FONT_SIZE_BODY,
+                         "marginRight": SPACE_4},
+            inputStyle={"marginRight": "4px"},
+        ),
+    ], style={"display": "flex", "alignItems": "center",
+              "padding": f"{SPACE_1} 0"})
+
+
+def _light_picker(event: dict, idx: int) -> html.Div:
+    """Light quality: No / Poor / Good -> 0 / 1 / 2 (Light column)."""
+    return html.Div([
+        html.Span("Light:",
+                   style={"color": COLOR_TEXT_SECONDARY,
+                           "fontSize": FONT_SIZE_BODY,
+                           "marginRight": SPACE_3}),
+        dcc.RadioItems(
+            id={"type": "event-light", "idx": idx},
+            options=[
+                {"label": " No light (0)", "value": 0},
+                {"label": " Poor light (1)", "value": 1},
+                {"label": " Good light (2)", "value": 2},
+            ],
+            value=(event.get("light")
+                    if event.get("light") in (0, 1, 2) else None),
+            inline=True,
             labelStyle={"color": COLOR_TEXT_PRIMARY,
                          "fontSize": FONT_SIZE_BODY,
                          "marginRight": SPACE_4},
@@ -347,22 +380,32 @@ def render_event_card(event: dict, idx: int) -> html.Div:
               "paddingBottom": SPACE_2,
               "marginBottom": SPACE_2}))
     children.append(_type_radio(event, idx))
-    if event.get("type") in ("LVF", "HYP"):
-        # Only show landmark rows after a type is chosen.
+    if event.get("type") in ("LVF", "HYP", "Undefined"):
+        # Only show landmark rows after a type is chosen. LVF and
+        # Undefined use the full set; HYP omits the LAS row.
         for f in EVENT_FIELDS:
             if f == "LAS" and event.get("type") == "HYP":
                 continue
             children.append(_field_row(event, idx, f))
         children.append(_racine_picker(event, idx))
+        children.append(_light_picker(event, idx))
         children.append(_comment_box(
             event, idx, "onset_comment",
-            "How did the seizure onset look on the LFP?"))
+            "e.g. abrupt low-voltage fast activity at the contact",
+            label="LFP onset -- how the onset looked on the LFP"))
         children.append(_comment_box(
             event, idx, "behavior_comment",
-            "What behavior change marked the BO?"))
+            "e.g. sudden arrest, head turn, forelimb twitch",
+            label="Behavioral onset -- the FIRST change in behavior "
+                  "related to the seizure"))
         children.append(_comment_box(
             event, idx, "score_comment",
-            "Behavioral observation for the Racine score."))
+            "e.g. reared then fell -> Racine 5",
+            label="Score rationale -- what justified the Racine score"))
+        children.append(_comment_box(
+            event, idx, "video_quality",
+            "e.g. clear / partially occluded by bedding / dim",
+            label="Video quality notes (-> VideoQuality column)"))
     return html.Div(
         children,
         style={"background": COLOR_SURFACE_1,
@@ -604,6 +647,30 @@ def register_callbacks(app, store) -> None:
     @app.callback(
         Output("video-events-store", "data",
                 allow_duplicate=True),
+        Input({"type": "event-light", "idx": ALL}, "value"),
+        State("video-events-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _set_light(values, events):
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx = trig.get("idx")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        new_val = None
+        for t in (callback_context.triggered or []):
+            new_val = t.get("value")
+        if new_val not in (0, 1, 2):
+            return no_update
+        events[idx] = dict(events[idx])
+        events[idx]["light"] = int(new_val)
+        return events
+
+    @app.callback(
+        Output("video-events-store", "data",
+                allow_duplicate=True),
         Input({"type": "event-field-btn", "idx": ALL,
                 "field": ALL}, "n_clicks"),
         State("video-events-store", "data"),
@@ -700,7 +767,7 @@ def register_callbacks(app, store) -> None:
         if idx is None or idx < 0 or idx >= len(events):
             return no_update
         if field not in ("onset_comment", "behavior_comment",
-                          "score_comment"):
+                          "score_comment", "video_quality"):
             return no_update
         triggered = callback_context.triggered or []
         new_val = ""
