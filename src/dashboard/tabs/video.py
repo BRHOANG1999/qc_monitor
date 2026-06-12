@@ -1594,6 +1594,26 @@ def layout(store: Store, bridge: dict | None = None):
                         className="dark-dropdown",
                     ),
                 ], style={"flex": "0 0 280px"}),
+                # Detection threshold (Hilbert feature only). This is
+                # the dashed line on the envelope: BHZ flags a candidate
+                # when the 20-200 Hz envelope crosses it. Typing here or
+                # clicking the plot both move the line. Synced to the
+                # Mass Analyze cutoff so one threshold drives both.
+                html.Div([
+                    html.Label("Detection threshold",
+                                style=LABEL_STYLE,
+                                title="The dashed line on the Hilbert "
+                                       "envelope. A candidate event is "
+                                       "flagged when the envelope crosses "
+                                       "it. Type a value or click the plot "
+                                       "to move it. Lower = more sensitive."),
+                    dcc.Input(
+                        id="video-threshold-input",
+                        type="number", min=0, step=0.005,
+                        value=0.05,
+                        style={"backgroundColor": "#262638",
+                                "color": "#f0f0f5", "width": "90px"}),
+                ], style={"flex": "0 0 150px"}),
                 html.Span(id="video-analysis-status",
                            style={"color": "#888", "fontSize": "11px",
                                    "marginLeft": "16px",
@@ -3057,6 +3077,43 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         target = (info["prev_id"] if trig == "video-prev-hour-btn"
                    else info["next_id"])
         return target if target is not None else no_update
+
+    # ---- Detection threshold <-> Mass Analyze cutoff sync ---- #
+    # The scoring-view "Detection threshold" input and the Mass Analyze
+    # cutoff are the same logical value; keep them mirrored so typing in
+    # one (or click-to-set on the plot, which writes the MA cutoff) moves
+    # the Hilbert threshold line everywhere. Echo-guarded (skip when the
+    # values already match) to break the A->B->A loop.
+    def _near(a, b) -> bool:
+        try:
+            return a is not None and b is not None \
+                and abs(float(a) - float(b)) < 1e-9
+        except (TypeError, ValueError):
+            return False
+
+    @app.callback(
+        Output("video-ma-cutoff-input", "value",
+                allow_duplicate=True),
+        Input("video-threshold-input", "value"),
+        State("video-ma-cutoff-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _sync_threshold_to_ma(v, cur):
+        if v is None or _near(v, cur):
+            return no_update
+        return v
+
+    @app.callback(
+        Output("video-threshold-input", "value",
+                allow_duplicate=True),
+        Input("video-ma-cutoff-input", "value"),
+        State("video-threshold-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _sync_ma_to_threshold(v, cur):
+        if v is None or _near(v, cur):
+            return no_update
+        return v
 
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful
