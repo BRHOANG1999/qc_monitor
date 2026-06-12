@@ -965,14 +965,27 @@ def layout(store: Store, bridge: dict | None = None):
          "value": s["session_dir"]}
         for s in sessions
     ]
-    default_session = sessions[0]["session_dir"] if sessions else None
+    # Nothing auto-loads: the reviewer picks an animal (queue) or a
+    # session (manual picker) first. Defaulting to the newest session
+    # used to silently load a recording the reviewer never chose.
+    default_session = None
     # Deep-link hand-off (LFP Browser / Event Verification): pre-select
     # the requested session AT BUILD TIME so the file/channel cascade
     # (_update_files / _update_player, which read the bridge as State)
-    # loads the exact recording on mount instead of the newest default.
+    # loads the exact recording on mount. Honor the bridge ONLY when
+    # it's fresh (set within the last 30 s) -- the bridge persists in
+    # memory for the page session, so without this a stale hand-off
+    # would re-load that recording every time the tab is reopened.
     if isinstance(bridge, dict):
         want = bridge.get("session_dir")
-        if want and any(o["value"] == want for o in session_options):
+        try:
+            age_ms = datetime.now().timestamp() * 1000 - float(
+                bridge.get("seq") or 0)
+        except (TypeError, ValueError):
+            age_ms = 1e12
+        fresh = age_ms < 30_000
+        if (fresh and want
+                and any(o["value"] == want for o in session_options)):
             default_session = want
 
     if not sessions:
