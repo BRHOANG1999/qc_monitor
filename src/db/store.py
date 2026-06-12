@@ -1612,6 +1612,69 @@ class Store:
         finally:
             conn.close()
 
+    # ------------------------------------------------------------------ #
+    #  Rejected BHZ candidate peaks (the pink triangles)
+    # ------------------------------------------------------------------ #
+
+    def reject_peak(self, file_id: int, channel: int,
+                     peak_time_sec: float, user_email: str | None = None
+                     ) -> None:
+        """Mark a candidate peak at *peak_time_sec* as a false positive
+        for (file, channel). Idempotent (UNIQUE)."""
+        assert isinstance(file_id, int), "file_id must be int"
+        assert isinstance(channel, int), "channel must be int"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO rejected_peak
+                   (file_id, channel, peak_time_sec, rejected_by,
+                    rejected_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (file_id, channel, round(float(peak_time_sec), 3),
+                 (user_email or "").lower() or None, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_rejected_peaks(self, file_id: int, channel: int
+                            ) -> list[float]:
+        """Rejected candidate times (seconds) for (file, channel)."""
+        assert isinstance(file_id, int), "file_id must be int"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT peak_time_sec FROM rejected_peak
+                   WHERE file_id = ? AND channel = ?
+                   ORDER BY peak_time_sec""",
+                (file_id, int(channel)),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [float(r["peak_time_sec"]) for r in rows]
+
+    def unreject_last_peak(self, file_id: int, channel: int) -> bool:
+        """Undo the most-recent rejection for (file, channel). Returns
+        True if a row was removed."""
+        assert isinstance(file_id, int), "file_id must be int"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id FROM rejected_peak
+                   WHERE file_id = ? AND channel = ?
+                   ORDER BY rejected_at DESC, id DESC LIMIT 1""",
+                (file_id, int(channel)),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM rejected_peak WHERE id = ?",
+                         (int(row["id"]),))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
     @staticmethod
     def _eeg_channel_names_for_config(channel_names_json: str | None,
                                           eeg_channels_json: str | None

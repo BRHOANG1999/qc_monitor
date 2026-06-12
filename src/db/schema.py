@@ -394,6 +394,24 @@ CREATE INDEX IF NOT EXISTS idx_file_claim_claimed_at
     ON file_claim(claimed_at);
 
 -- ----------------------------------------------------------------------
+-- rejected_peak: BHZ candidate peaks (the pink triangles) a reviewer
+-- has hand-rejected as false positives. The detector is tuned for high
+-- sensitivity, so per file the reviewer prunes the candidates not tied
+-- to a real seizure. Persisted so the curated set survives reload.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rejected_peak (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    channel INTEGER NOT NULL,
+    peak_time_sec REAL NOT NULL,
+    rejected_by TEXT,
+    rejected_at TEXT NOT NULL,
+    UNIQUE(file_id, channel, peak_time_sec)
+);
+CREATE INDEX IF NOT EXISTS idx_rejected_peak_file
+    ON rejected_peak(file_id, channel);
+
+-- ----------------------------------------------------------------------
 -- envelope_peak_cache: per-(file, channel, cutoff) peakseek result so
 -- the PI's Mass Analyze panel can re-sweep thresholds without paying
 -- the FFT cost twice. UNIQUE constraint makes the cache-aside lookup a

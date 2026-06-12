@@ -80,5 +80,28 @@ def test_undefined_event_can_be_complete():
     assert is_event_complete(e) is False
 
 
+def test_reject_peak_roundtrip(tmp_path):
+    from src.db.store import Store
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO processed_files (id, file_path) "
+            "VALUES (1, '/f/a.mat')")
+        conn.commit()
+    store.reject_peak(1, 0, 12.345, "pi@lab")
+    store.reject_peak(1, 0, 99.0, "pi@lab")
+    store.reject_peak(1, 0, 12.345, "pi@lab")  # idempotent
+    assert store.get_rejected_peaks(1, 0) == [12.345, 99.0]
+    # Channel scoping.
+    assert store.get_rejected_peaks(1, 1) == []
+    # Undo removes the most recent.
+    assert store.unreject_last_peak(1, 0) is True
+    assert store.get_rejected_peaks(1, 0) == [12.345]
+    assert store.unreject_last_peak(1, 0) is True
+    assert store.get_rejected_peaks(1, 0) == []
+    assert store.unreject_last_peak(1, 0) is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

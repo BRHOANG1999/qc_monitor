@@ -619,6 +619,18 @@ def _render_hilbert_trace(store, file_id: int,
         env, minpeakdist=min_peak_dist, minpeakh=float(cutoff),
     )
     peak_times = peak_locs.astype(np.float64) / float(fs)
+    # Drop candidates the reviewer hand-rejected as false positives
+    # (within 0.5 s of a saved rejection time). Curated set persists.
+    try:
+        rejected = store.get_rejected_peaks(int(file_id), int(channel))
+    except Exception:
+        rejected = []
+    if rejected and len(peak_times):
+        rej = np.asarray(rejected, dtype=np.float64)
+        keep = np.array(
+            [np.all(np.abs(rej - t) > 0.5) for t in peak_times],
+            dtype=bool)
+        peak_times = peak_times[keep]
 
     target_bins = choose_target_bins(len(env)) or 4000
     t, display, _decim = envelope(env, fs, target_bins, t_start=0.0)
@@ -1654,6 +1666,42 @@ def layout(store: Store, bridge: dict | None = None):
                         style={"backgroundColor": "#262638",
                                 "color": "#f0f0f5", "width": "90px"}),
                 ], style={"flex": "0 0 150px"}),
+                # Remove false-positive candidate peaks (the pink
+                # triangles). When the mode is on, clicking a triangle
+                # rejects it (persisted per file); Undo restores the
+                # last one.
+                html.Div([
+                    html.Label("Curate peaks", style=LABEL_STYLE,
+                                title="The detector flags candidates "
+                                       "generously. Turn this on, then "
+                                       "click a pink triangle that isn't "
+                                       "a real seizure to remove it. "
+                                       "Removals are saved per recording."),
+                    html.Div([
+                        dcc.Checklist(
+                            id="video-remove-peaks-mode",
+                            options=[{"label": " Remove-peaks mode",
+                                       "value": "on"}],
+                            value=[],
+                            labelStyle={"color": "#cfd0d6",
+                                         "fontSize": "12px"},
+                            style={"display": "inline-block",
+                                    "marginRight": "8px"}),
+                        html.Button(
+                            "Undo removal",
+                            id="video-undo-reject-btn", n_clicks=0,
+                            style={"background": "transparent",
+                                    "color": "#cfd0d6",
+                                    "border": "1px solid "
+                                               "rgba(255,255,255,0.15)",
+                                    "borderRadius": "5px",
+                                    "padding": "3px 10px",
+                                    "cursor": "pointer",
+                                    "fontSize": "11px"}),
+                    ], style={"display": "flex",
+                               "alignItems": "center"}),
+                ], style={"flex": "0 0 220px"}),
+                dcc.Store(id="video-rejected-version", data=0),
                 html.Span(id="video-analysis-status",
                            style={"color": "#888", "fontSize": "11px",
                                    "marginLeft": "16px",
@@ -3155,6 +3203,61 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update
         return v
 
+    # ---- Curate candidate peaks: click a triangle to reject ---- #
+    @app.callback(
+        Output("video-rejected-version", "data",
+                allow_duplicate=True),
+        Input("video-analysis-trace", "clickData"),
+        State("video-remove-peaks-mode", "value"),
+        State("video-file-dropdown", "value"),
+        State("video-channel-dropdown", "value"),
+        State("video-rejected-version", "data"),
+        prevent_initial_call=True,
+    )
+    def _reject_peak(click_data, mode, file_id, channel, ver):
+        if "on" not in (mode or []):
+            return no_update
+        if not file_id or channel is None or not click_data:
+            return no_update
+        pts = click_data.get("points") or []
+        if not pts:
+            return no_update
+        p = pts[0]
+        # Only the candidate-marker trace (curveNumber 1) is a peak;
+        # curveNumber 0 is the envelope line itself.
+        if p.get("curveNumber") != 1:
+            return no_update
+        x = p.get("x")
+        if x is None:
+            return no_update
+        try:
+            store.reject_peak(int(file_id), int(channel), float(x),
+                               current_user_email())
+        except Exception as e:
+            logger.warning("reject_peak failed: %s", e)
+            return no_update
+        return int(ver or 0) + 1
+
+    @app.callback(
+        Output("video-rejected-version", "data",
+                allow_duplicate=True),
+        Input("video-undo-reject-btn", "n_clicks"),
+        State("video-file-dropdown", "value"),
+        State("video-channel-dropdown", "value"),
+        State("video-rejected-version", "data"),
+        prevent_initial_call=True,
+    )
+    def _undo_reject(n_clicks, file_id, channel, ver):
+        if not n_clicks or not file_id or channel is None:
+            return no_update
+        try:
+            removed = store.unreject_last_peak(
+                int(file_id), int(channel))
+        except Exception as e:
+            logger.warning("unreject_last_peak failed: %s", e)
+            return no_update
+        return int(ver or 0) + 1 if removed else no_update
+
     # Layout presets: switch the Step-2 grid class clientside (the CSS
     # classes carry !important grid-template-columns that override the
     # inline default). No server round-trip.
@@ -4063,12 +4166,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # from the plot) immediately redraws the threshold.
         Input("video-ma-cutoff-input", "value"),
         Input("video-blank-raw", "value"),
+        Input("video-rejected-version", "data"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
     )
     def _update_analysis(file_id, feature, _n_apply,
-                          channel, ma_cutoff, blank_raw,
+                          channel, ma_cutoff, blank_raw, _rej_ver,
                           smooth_sec, rollwin, postproc):
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
@@ -5180,7 +5284,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     || !clickData.points.length) {
                 return window.dash_clientside.no_update;
             }
-            var y = clickData.points[0].y;
+            var pt = clickData.points[0];
+            // Only the envelope line (curveNumber 0) sets the cutoff.
+            // Clicking a candidate triangle (curveNumber 1, drawn near
+            // the top) must NOT yank the threshold up to the marker.
+            if (pt.curveNumber !== 0) {
+                return window.dash_clientside.no_update;
+            }
+            var y = pt.y;
             if (typeof y !== 'number' || !isFinite(y)
                     || y <= 0) {
                 return window.dash_clientside.no_update;

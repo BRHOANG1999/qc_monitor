@@ -46,6 +46,7 @@ EXPECTED_TABLES = {
     "system_health", "users", "video_qc",
     "review_state", "review_event_log", "envelope_peak_cache",
     "mass_analyze_job", "event_clip_job", "file_claim",
+    "rejected_peak",
 }
 
 
