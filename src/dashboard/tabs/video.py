@@ -157,27 +157,6 @@ def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
     return set()
 
 
-def _should_stim_blank(channel: int,
-                        stim_copy: set[int]) -> bool:
-    """Whether the display trace for *channel* should be stim-blanked.
-
-    The lab's recording rig wires each animal's LFP electrode
-    immediately after its corresponding stim-copy channel. The shared
-    stim artifact bleeds into the immediately-following LFP via
-    capacitive coupling but the next LFP (two slots after stim_copy)
-    is far enough away to read cleanly. So the rule is: blank iff
-    ``channel - 1`` is a stim-copy channel AND ``channel`` itself
-    isn't.
-
-    Example: channel_names ``["stimCopy", "BCH061SLM", "stimCopy",
-    "BCH062SR", "BCH062SLM"]`` -> blank Ch1 and Ch3 only. Ch4 is
-    two slots away from a stim-copy so it stays raw.
-    """
-    if channel in stim_copy:
-        return False
-    return (channel - 1) in stim_copy
-
-
 def _session_dir_for_file(store: Store, file_id: int) -> str | None:
     with store.connection() as conn:
         row = conn.execute(
@@ -542,6 +521,7 @@ def _render_hilbert_trace(store, file_id: int,
                             blank_post_ms: float = 15.0,
                             cutoff: float = _BHZ_CUTOFF,
                             min_peak_dist_sec: float = _BHZ_MIN_PEAK_DIST_SEC,
+                            show_raw: bool = False,
                             ) -> tuple:
     """Return (figure, status_text) for the BHZ Hilbert detector.
 
@@ -571,7 +551,9 @@ def _render_hilbert_trace(store, file_id: int,
                 "")
     session_dir = _session_dir_for_file(store, file_id)
     stim_copy = _stim_copy_channels(store, session_dir)
-    do_blank = _should_stim_blank(int(channel), stim_copy)
+    # Blank by default (match _update_lfp) so the envelope reflects the
+    # EEG, not the stim artifact; never blank a stim_copy channel.
+    do_blank = (int(channel) not in stim_copy) and (not show_raw)
     stim_times = (_stim_times_for_file(store, file_id)
                    if do_blank
                    else np.asarray([], dtype=np.float64))
@@ -1380,6 +1362,24 @@ def layout(store: Store, bridge: dict | None = None):
                               style={"backgroundColor": "#262638",
                                      "color": "#f0f0f5", "width": "90px"}),
                 ], style={"flex": "0 0 130px"}),
+                html.Div([
+                    html.Label("Stim artifact", style=LABEL_STYLE,
+                                title="By default the brief stim pulses "
+                                       "are blanked out (gaps in the "
+                                       "trace) so the EEG underneath is "
+                                       "visible. Tick this to show the "
+                                       "raw signal WITH the stim artifact "
+                                       "instead."),
+                    dcc.Checklist(
+                        id="video-blank-raw",
+                        options=[{"label": " Show raw",
+                                   "value": "raw"}],
+                        value=[],
+                        labelStyle={"color": "#cfd0d6",
+                                     "fontSize": "12px"},
+                        style={"paddingTop": "6px"},
+                    ),
+                ], style={"flex": "0 0 120px"}),
                 html.Div([
                     html.Label(" ", style=LABEL_STYLE),
                     html.Button("Apply",
@@ -3656,10 +3656,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-filter-lp", "value"),
         State("video-filter-notch", "value"),
         State("video-filter-smooth", "value"),
+        Input("video-blank-raw", "value"),
         prevent_initial_call="initial_duplicate",
     )
     def _update_lfp(file_id, channel, _n_apply,
-                     hp, lp, notch, smooth_ms):
+                     hp, lp, notch, smooth_ms, blank_raw):
         # Fresh token each fire so the load-pill done-watcher
         # triggers even when the human-readable status string is
         # identical to the previous recording (fixed-length rig).
@@ -3677,16 +3678,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return (_empty_lfp_fig("File not found in DB."),
                     "", no_update, 0.0, tok)
 
-        # Stim-blank ONLY the LFP channel that sits directly after a
-        # stim_copy channel in the channel list. The stim artifact
-        # cross-talks into the immediately-following electrode via
-        # capacitive coupling; channels further along read cleanly.
-        # Stim-copy channels themselves are never blanked (you'd
-        # erase the signal you want to see).
+        # Stim-blank by DEFAULT on every real LFP channel so the EEG is
+        # visible through stimulation (the artifact otherwise dwarfs the
+        # signal). The only channel never blanked is a stim_copy channel
+        # itself -- that IS the stim signal. "Show raw" lets the
+        # reviewer deliberately inspect the unblanked artifact.
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
         is_stim_copy = channel in stim_copy
-        do_blank = _should_stim_blank(channel, stim_copy)
+        show_raw = "raw" in (blank_raw or [])
+        do_blank = (not is_stim_copy) and (not show_raw)
         stim_times = (_stim_times_for_file(store, file_id)
                        if do_blank
                        else np.asarray([], dtype=np.float64))
@@ -3731,11 +3732,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         status_bits = [f"{duration:.1f}s", f"{len(t):,} display points"]
         if is_stim_copy:
             status_bits.append("stim-copy channel · not blanked")
-        elif not do_blank:
-            # Channel exists but isn't directly after a stim_copy
-            # contact, so it stays raw even when stim events exist.
-            status_bits.append(
-                "two slots from stim-copy · not blanked")
+        elif show_raw:
+            status_bits.append("RAW · stim artifact shown")
         elif n_blanked:
             status_bits.append(
                 f"stim-blanked: {n_blanked} pulses "
@@ -3768,24 +3766,25 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Input means typing in the MA cutoff (or click-to-set
         # from the plot) immediately redraws the threshold.
         Input("video-ma-cutoff-input", "value"),
+        Input("video-blank-raw", "value"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
     )
     def _update_analysis(file_id, feature, _n_apply,
-                          channel, ma_cutoff,
+                          channel, ma_cutoff, blank_raw,
                           smooth_sec, rollwin, postproc):
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
         # repeats (0-candidate fixed-length recordings all render
         # an identical hilbert status).
         fig, status = _compute_analysis(
-            file_id, feature, channel, ma_cutoff,
+            file_id, feature, channel, ma_cutoff, blank_raw,
             smooth_sec, rollwin, postproc)
         return fig, status, datetime.now().timestamp()
 
     def _compute_analysis(file_id, feature,
-                           channel, ma_cutoff,
+                           channel, ma_cutoff, blank_raw,
                            smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
@@ -3811,6 +3810,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 blank_pre_ms=blank_pre_ms,
                 blank_post_ms=blank_post_ms,
                 cutoff=cutoff,
+                show_raw="raw" in (blank_raw or []),
             )
         try:
             rows = store.query_evoked_features(int(file_id))
@@ -4093,9 +4093,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
         State("video-filter-state", "data"),
+        State("video-blank-raw", "value"),
         prevent_initial_call=True,
     )
-    def _video_lfp_zoom(relayout, file_id, channel, filter_state):
+    def _video_lfp_zoom(relayout, file_id, channel, filter_state,
+                         blank_raw):
         if not file_id or channel is None or not relayout:
             return no_update
         x0, x1, is_reset = parse_relayout(relayout)
@@ -4108,12 +4110,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
-        # Mirror the same "blank only the LFP directly after a
-        # stim_copy contact" rule from _update_lfp so the
-        # re-decimated zoom view shows the same NaN gaps the wider
-        # view does. Anything else (stim-copy itself, or an LFP two
-        # slots away) re-decimates raw.
-        do_blank = _should_stim_blank(channel, stim_copy)
+        # Match _update_lfp: blank by default on every real LFP
+        # channel (so the zoomed view shows the same NaN gaps), never
+        # blank a stim_copy channel, and honor the "Show raw" toggle.
+        do_blank = (channel not in stim_copy) and (
+            "raw" not in (blank_raw or []))
         stim_times = (_stim_times_for_file(store, file_id)
                        if do_blank
                        else np.asarray([], dtype=np.float64))
