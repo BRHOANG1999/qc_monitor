@@ -660,15 +660,28 @@ def _render_hilbert_trace(store, file_id: int,
             mode="markers",
             marker=dict(symbol="triangle-down", size=10,
                          color="#ff2d92", line=dict(width=0)),
-            hovertemplate="candidate @ t=%{x:.2f}s<extra></extra>",
+            hovertemplate=(
+                "kept peak @ t=%{x:.2f}s<br>"
+                f"local max ≥ {cutoff:.3g}, ≥ "
+                f"{int(min_peak_dist_sec)} s from any larger peak"
+                "<extra></extra>"),
             name="BHZ candidate",
             showlegend=False,
         ))
+    # How many times the envelope rose above the threshold at all --
+    # usually far more than the kept peaks, because peakseek keeps only
+    # one local maximum per min-distance window. Spelling both out
+    # makes the "many crossings, few triangles" behaviour legible.
+    crossings = (int(np.sum((env[:-1] <= cutoff) & (env[1:] > cutoff)))
+                  if len(env) > 1 else 0)
+    n_kept = len(peak_times)
     status = (
         f"BHZ detection · cutoff={cutoff:.3g} · "
-        f"min_dist={int(min_peak_dist_sec)}s · "
-        f"{len(peak_times)} candidate"
-        f"{'' if len(peak_times) == 1 else 's'} · "
+        f"{n_kept} peak{'' if n_kept == 1 else 's'} kept of "
+        f"{crossings} threshold crossing"
+        f"{'' if crossings == 1 else 's'} "
+        f"(kept = a local maximum ≥ cutoff AND ≥ "
+        f"{int(min_peak_dist_sec)} s from any larger peak) · "
         f"{len(env)/fs:.1f} s @ {int(fs)} Hz"
     )
     return (fig, status)
