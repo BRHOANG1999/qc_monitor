@@ -147,10 +147,24 @@ dashboard:
   refresh_interval_sec: 10
 auth:
   enabled: true
+  # Identity method: 'cf_access' (Cloudflare Access, default) or
+  # 'google_oauth' (the app runs Google sign-in itself).
+  method: cf_access
   cf_team_domain: ''
   cf_audience: ''
+  # dev_bypass short-circuits BOTH methods for local development.
+  # Set to false before exposing the dashboard.
   dev_bypass: true
   dev_bypass_email: hoang392@umn.edu
+  # --- app-level Google OAuth (used when method: google_oauth) ---
+  # 1. Google Cloud Console -> APIs & Services -> Credentials ->
+  #    Create OAuth client ID -> Web application.
+  # 2. Authorized redirect URI: <oauth_redirect_base>/auth/google/callback
+  # 3. Put the client ID below; keep the SECRET out of git -- set env
+  #    QC_GOOGLE_CLIENT_SECRET or write it to secrets/google_client_secret.
+  google_client_id: ''
+  allowed_domain: umn.edu
+  oauth_redirect_base: http://localhost:8050
 maintenance:
   enabled: true
   refresh_minutes: 10
