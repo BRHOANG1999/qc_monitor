@@ -1348,6 +1348,20 @@ def layout(store: Store, bridge: dict | None = None):
                    "border": "1px solid rgba(94,124,226,0.18)",
                    "borderRadius": "8px"}),
 
+        # --- Layout presets: resize the video / LFP split ---------- #
+        html.Div([
+            html.Span("Layout:",
+                       style={"color": "#a0a0b0", "fontSize": "11px",
+                               "marginRight": "8px"}),
+            html.Button("Big video", id="video-layout-bigvideo",
+                         n_clicks=0, className="video-layout-btn"),
+            html.Button("50 / 50", id="video-layout-5050",
+                         n_clicks=0, className="video-layout-btn"),
+            html.Button("Big LFP", id="video-layout-biglfp",
+                         n_clicks=0, className="video-layout-btn"),
+        ], style={"display": "flex", "alignItems": "center",
+                   "gap": "6px", "marginBottom": "8px"}),
+
         # --- Two-column Step 2: video LEFT | LFP+Hilbert RIGHT ----- #
         # CSS Grid: video spans both rows in column 1; the LFP block
         # lives in column 2 row 1, the Hilbert block in column 2 row
@@ -1769,7 +1783,7 @@ def layout(store: Store, bridge: dict | None = None):
                 title="Dock the PiP back into the page (P).",
                 className="qc-pip-dock-btn",
             ),
-        ], id="video-step2-grid",
+        ], id="video-step2-grid", className="layout-5050",
            style={"display": "grid",
                    "gridTemplateColumns": "minmax(420px, 1.2fr) "
                                             "minmax(420px, 1fr)",
@@ -3127,6 +3141,29 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if v is None or _near(v, cur):
             return no_update
         return v
+
+    # Layout presets: switch the Step-2 grid class clientside (the CSS
+    # classes carry !important grid-template-columns that override the
+    # inline default). No server round-trip.
+    app.clientside_callback(
+        """
+        function(_a, _b, _c) {
+            var ctx = window.dash_clientside.callback_context;
+            if (!ctx || !ctx.triggered || !ctx.triggered.length) {
+                return window.dash_clientside.no_update;
+            }
+            var id = ctx.triggered[0].prop_id.split('.')[0];
+            if (id === 'video-layout-bigvideo') return 'layout-bigvideo';
+            if (id === 'video-layout-biglfp') return 'layout-biglfp';
+            return 'layout-5050';
+        }
+        """,
+        Output("video-step2-grid", "className"),
+        Input("video-layout-bigvideo", "n_clicks"),
+        Input("video-layout-5050", "n_clicks"),
+        Input("video-layout-biglfp", "n_clicks"),
+        prevent_initial_call=True,
+    )
 
     # Clientside: paint data-focused="true"/"false" on each
     # .video-cam-wrapper based on the Store. Patch isn't useful

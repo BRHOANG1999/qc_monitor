@@ -470,6 +470,31 @@ details.qc-expandable:hover {
     border-color: rgba(94, 124, 226, 0.35) !important;
 }
 
+/* --- Video Review Step-2 layout presets --- */
+#video-step2-grid { transition: grid-template-columns 0.15s ease; }
+#video-step2-grid.layout-bigvideo {
+    grid-template-columns: minmax(560px, 2.4fr) minmax(300px, 1fr) !important;
+}
+#video-step2-grid.layout-5050 {
+    grid-template-columns: 1fr 1fr !important;
+}
+#video-step2-grid.layout-biglfp {
+    grid-template-columns: minmax(300px, 1fr) minmax(560px, 2.4fr) !important;
+}
+.video-layout-btn {
+    background: transparent;
+    color: #cfd0d6;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 5px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.video-layout-btn:hover {
+    background: rgba(94, 124, 226, 0.15);
+    border-color: #5e7ce2;
+}
+
 /* --- Accessibility: honor reduced-motion --- */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
