@@ -182,6 +182,24 @@ def _field_row(event: dict, idx: int, field: str) -> html.Div:
                 },
             ),
             html.Button(
+                "Set on LFP",
+                id={"type": "event-field-lfp", "idx": idx,
+                     "field": field},
+                n_clicks=0,
+                title="Arm this landmark, then click the LFP trace at "
+                       "the moment you see it -- no video needed.",
+                style={
+                    "background": "transparent",
+                    "color": COLOR_ACCENT,
+                    "border": f"1px solid {COLOR_ACCENT}",
+                    "borderRadius": RADIUS_SM,
+                    "padding": f"3px {SPACE_3}",
+                    "cursor": "pointer",
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "marginRight": SPACE_2,
+                },
+            ),
+            html.Button(
                 "Clear",
                 id={"type": "event-field-clear", "idx": idx,
                      "field": field},
@@ -370,6 +388,13 @@ def render_events_panel() -> html.Div:
                           "border": f"1px solid {COLOR_DIVIDER}",
                           "borderRadius": RADIUS_SM,
                           "fontSize": FONT_SIZE_BODY}),
+        # Armed-landmark banner: when a "Set on LFP" button is armed,
+        # the next click on the LFP trace drops that landmark.
+        html.Div(id="video-armed-banner",
+                  style={"minHeight": "0", "marginBottom": SPACE_2}),
+        # Which (event idx, field) the next LFP click will set; None
+        # = clicking the LFP just seeks the video as usual.
+        dcc.Store(id="video-armed-landmark", data=None),
         html.Div(id="video-events-list"),
         html.Button(
             "+ Add event",
@@ -424,6 +449,77 @@ def register_callbacks(app, store) -> None:
     the dispatcher DB; not used in the editor itself but kept
     on the signature for symmetry with other tab modules."""
     assert app is not None, "app required"
+
+    # ---- Set a landmark by clicking the LFP (no video needed) ---- #
+    @app.callback(
+        Output("video-armed-landmark", "data"),
+        Input({"type": "event-field-lfp", "idx": ALL,
+                "field": ALL}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _arm_landmark(_clicks):
+        # Guard against pattern-button recreation (n_clicks None/0).
+        if not any((t.get("value") or 0)
+                    for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        field = trig.get("field")
+        idx = trig.get("idx")
+        if idx is None or field not in EVENT_FIELDS:
+            return no_update
+        return {"idx": int(idx), "field": field}
+
+    @app.callback(
+        Output("video-armed-banner", "children"),
+        Input("video-armed-landmark", "data"),
+    )
+    def _armed_banner(armed):
+        if not armed:
+            return ""
+        return html.Div(
+            f"Armed: click the LFP trace to set "
+            f"{_field_label(armed.get('field', ''))} "
+            f"for event {int(armed.get('idx', 0)) + 1}.",
+            style={"padding": f"{SPACE_2} {SPACE_3}",
+                    "background": "rgba(94,124,226,0.12)",
+                    "border": f"1px solid {COLOR_ACCENT}",
+                    "borderRadius": RADIUS_SM,
+                    "color": COLOR_ACCENT,
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "fontWeight": "600"})
+
+    @app.callback(
+        Output("video-events-store", "data",
+                allow_duplicate=True),
+        Output("video-armed-landmark", "data",
+                allow_duplicate=True),
+        Input("video-lfp-trace", "clickData"),
+        State("video-armed-landmark", "data"),
+        State("video-events-store", "data"),
+        prevent_initial_call=True,
+    )
+    def _drop_landmark_from_lfp(click_data, armed, events):
+        # Only act when a landmark is armed; otherwise the LFP click
+        # just seeks the video (handled clientside in video.py).
+        if not armed or not isinstance(armed, dict):
+            return no_update, no_update
+        if (not click_data or not click_data.get("points")):
+            return no_update, no_update
+        x = click_data["points"][0].get("x")
+        if x is None:
+            return no_update, no_update
+        idx = int(armed.get("idx", -1))
+        field = armed.get("field")
+        if field not in EVENT_FIELDS:
+            return no_update, None
+        events = list(events or [])
+        if idx < 0 or idx >= len(events):
+            return no_update, None
+        events[idx] = dict(events[idx])
+        events[idx][f"{field}_sec"] = float(round(float(x), 3))
+        return events, None  # disarm after dropping
 
     @app.callback(
         Output("video-events-list", "children"),
