@@ -465,6 +465,7 @@ CREATE TABLE IF NOT EXISTS mass_analyze_job (
     cutoff REAL NOT NULL,
     auc_threshold REAL,
     auc_window_sec REAL,
+    electrode INTEGER DEFAULT 0,
     status TEXT NOT NULL
         CHECK(status IN ('pending', 'running',
                           'done', 'failed', 'cancelled')),
@@ -496,6 +497,7 @@ CREATE TABLE IF NOT EXISTS screen_eval_job (
     peak_cutoff REAL NOT NULL,
     auc_threshold REAL NOT NULL,
     auc_window_sec REAL NOT NULL,
+    electrode INTEGER DEFAULT 0,
     status TEXT NOT NULL
         CHECK(status IN ('pending', 'running',
                           'done', 'failed', 'cancelled')),

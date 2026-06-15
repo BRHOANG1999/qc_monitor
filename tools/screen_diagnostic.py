@@ -11,10 +11,13 @@ relative to the data, so you can pick a threshold that actually separates
 events from baseline.
 
 Run from repo root:
-    python tools/screen_diagnostic.py <db> <animal> <cutoff> <auc_thresh> <auc_win> [limit] [csv_out]
+    python tools/screen_diagnostic.py <db> <animal> <cutoff> <auc_thresh> <auc_win> [electrode] [limit] [csv_out]
+
+``electrode`` (default 0) picks which of the animal's contacts to scan --
+matches the Mass Analyze "Electrode" dropdown.
 
 Example:
-    python tools/screen_diagnostic.py data/monitor.db BCH062 0.018 0.065 5 40 diag.csv
+    python tools/screen_diagnostic.py data/monitor.db BCH062 0.018 0.065 5 0 40 diag.csv
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from src.utils.hilbert_envelope import (  # noqa: E402
     hilbert_envelope_20_200, windowed_auc)
 from src.utils.peakseek import peakseek  # noqa: E402
 from src.utils.mass_analyze import (  # noqa: E402
-    pending_files_for_animal, first_animal_channel_index,
+    pending_files_for_animal, animal_channel_index,
     DEFAULT_MIN_PEAK_DIST_SEC)
 
 
@@ -77,21 +80,23 @@ def main() -> int:
     cutoff, auc_thresh, auc_win = (float(sys.argv[3]),
                                     float(sys.argv[4]),
                                     float(sys.argv[5]))
-    limit = int(sys.argv[6]) if len(sys.argv) > 6 else 9999
-    csv_out = sys.argv[7] if len(sys.argv) > 7 else None
+    electrode = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+    limit = int(sys.argv[7]) if len(sys.argv) > 7 else 9999
+    csv_out = sys.argv[8] if len(sys.argv) > 8 else None
 
     store = Store(db)
     files = pending_files_for_animal(store, animal)[:limit]
     print(f"{animal}: scanning {len(files)} files fresh "
           f"(cutoff={cutoff:g}, auc_thresh={auc_thresh:g}, "
-          f"win={auc_win:g})\n")
+          f"win={auc_win:g}, electrode={electrode})\n")
     print(f"{'file':>8}  {'env_max':>9} {'env>cut':>7}  "
           f"{'auc_max':>9} {'auc>thr':>7}  pools")
 
     rows = []
     p1 = p2 = p3 = 0
     for f in files:
-        ch = first_animal_channel_index(store, f["session_dir"])
+        ch = animal_channel_index(
+            store, f["session_dir"], animal, electrode)
         r = _screen_one(store, int(f["file_id"]), ch,
                          cutoff, auc_thresh, auc_win)
         if r is None:

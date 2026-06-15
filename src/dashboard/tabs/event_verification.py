@@ -34,6 +34,14 @@ from src.utils.animal import split_animal_electrode, is_animal_channel
 
 logger = logging.getLogger("qc_monitor.tabs.event_verification")
 
+# Which of the scanned animal's electrodes the screen runs on (ordinal).
+_ELECTRODE_OPTIONS = [
+    {"label": "First electrode", "value": 0},
+    {"label": "Second", "value": 1},
+    {"label": "Third", "value": 2},
+    {"label": "Fourth", "value": 3},
+]
+
 
 _NOT_AUTHORISED = html.Div([
     html.Div("🔒  Not authorised",
@@ -286,6 +294,17 @@ def _mass_analyze_panel(store) -> html.Details:
                                 "1px solid rgba(255,255,255,0.10)",
                             "borderRadius": "4px",
                             "fontSize": "12px"}),
+                html.Label("Electrode:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginLeft": "14px",
+                                    "marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="evtv-ma-electrode",
+                    options=_ELECTRODE_OPTIONS, value=0,
+                    clearable=False,
+                    style={"flex": "0 0 140px", "minWidth": "120px"},
+                    className="dark-dropdown"),
                 html.Button(
                     "Scan files",
                     id="evtv-ma-scan-btn", n_clicks=0,
@@ -392,6 +411,13 @@ def _screen_compare_panel(store) -> html.Details:
                            type="number", min=0, step="any",
                            value=5, style={**num_style,
                                             "flex": "0 0 80px"}),
+                html.Label("Electrode:", style=lab),
+                dcc.Dropdown(
+                    id="evtv-sc-electrode",
+                    options=_ELECTRODE_OPTIONS, value=0,
+                    clearable=False,
+                    style={"flex": "0 0 140px", "minWidth": "120px"},
+                    className="dark-dropdown"),
                 html.Button("Compare screens",
                              id="evtv-sc-run-btn", n_clicks=0,
                              style=_btn_style(accent=True)),
@@ -896,9 +922,10 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("evtv-ma-scan-btn", "n_clicks"),
         State("evtv-ma-animal-dropdown", "value"),
         State("evtv-ma-cutoff-input", "value"),
+        State("evtv-ma-electrode", "value"),
         prevent_initial_call=True,
     )
-    def _on_ma_scan(n_clicks, animal_id, cutoff):
+    def _on_ma_scan(n_clicks, animal_id, cutoff, electrode):
         if not n_clicks:
             return no_update, no_update, no_update
         email = (current_user_email() or "").lower()
@@ -917,7 +944,8 @@ def register_callbacks(app, store, config: dict) -> None:
                      "Cutoff must be > 0.")
         try:
             job_id = _mass_analyze.create_job(
-                store, email, animal_id, cutoff)
+                store, email, animal_id, cutoff,
+                electrode=int(electrode or 0))
         except Exception as e:
             logger.exception("create_job failed")
             return (None, True, f"Failed to start: {e}")
@@ -1041,10 +1069,11 @@ def register_callbacks(app, store, config: dict) -> None:
         State("evtv-sc-cutoff-input", "value"),
         State("evtv-sc-auc-threshold-input", "value"),
         State("evtv-sc-auc-window-input", "value"),
+        State("evtv-sc-electrode", "value"),
         prevent_initial_call=True,
     )
     def _on_sc_run(n_clicks, animal_id, cutoff,
-                    auc_threshold, auc_window):
+                    auc_threshold, auc_window, electrode):
         if not n_clicks:
             return no_update, no_update, no_update
         email = (current_user_email() or "").lower()
@@ -1063,7 +1092,8 @@ def register_callbacks(app, store, config: dict) -> None:
             return None, True, "Cutoff, AUC threshold, window > 0."
         try:
             job_id = _mass_analyze.create_screen_eval_job(
-                store, email, animal_id, cutoff, auc_t, auc_w)
+                store, email, animal_id, cutoff, auc_t, auc_w,
+                electrode=int(electrode or 0))
         except Exception as e:
             logger.exception("create_screen_eval_job failed")
             return None, True, f"Failed to start: {e}"
@@ -1143,10 +1173,11 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("evtv-ma-discard-btn", "n_clicks"),
         State("evtv-ma-animal-dropdown", "value"),
         State("evtv-ma-cutoff-input", "value"),
+        State("evtv-ma-electrode", "value"),
         prevent_initial_call=True,
     )
     def _on_ma_commit(_confirm_n, _discard_n,
-                       animal_id, cutoff):
+                       animal_id, cutoff, electrode):
         trig = callback_context.triggered_id
         if trig == "evtv-ma-discard-btn":
             return ("", "", [], None, no_update, no_update)
@@ -1164,7 +1195,8 @@ def register_callbacks(app, store, config: dict) -> None:
                      "", [], None, no_update, no_update)
         try:
             result = _mass_analyze.commit_threshold(
-                store, animal_id, cutoff, email)
+                store, animal_id, cutoff, email,
+                electrode=int(electrode or 0))
         except Exception as e:
             logger.exception("commit_threshold failed")
             return (f"Commit failed: {e}", "", [],

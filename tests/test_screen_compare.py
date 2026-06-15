@@ -27,6 +27,31 @@ from src.db.store import Store  # noqa: E402
 # Ground truth
 # --------------------------------------------------------------- #
 
+def test_animal_channel_index_picks_the_scanned_animal(tmp_path):
+    import json
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO session_config
+               (session_dir, channel_names, eeg_channels,
+                discovered_at)
+               VALUES (?, ?, ?, ?)""",
+            ("s1",
+             json.dumps(["stimCopy", "BCH061SLM",
+                          "BCH062SR", "BCH062SLM"]),
+             json.dumps([1, 2, 3]), "2026-01-01"))
+        conn.commit()
+    # The scanned animal's electrodes, not the first animal channel.
+    assert ma.animal_channel_index(store, "s1", "BCH062", 0) == 2
+    assert ma.animal_channel_index(store, "s1", "BCH062", 1) == 3
+    assert ma.animal_channel_index(store, "s1", "BCH062", 9) == 3  # clamp
+    assert ma.animal_channel_index(store, "s1", "BCH061", 0) == 1
+    # Unknown animal falls back without raising.
+    assert isinstance(
+        ma.animal_channel_index(store, "s1", "ZZZ999", 0), int)
+
+
 def test_file_ground_truth_mapping():
     g = ma.file_ground_truth
     assert g("has_events", None) == "pos"
@@ -104,7 +129,8 @@ def test_run_screen_benchmark_accumulates(tmp_path, monkeypatch):
             {"file_id": fid, "session_dir": "s", "truth": t}
             for (fid, t, _e, _a) in fixtures])
     monkeypatch.setattr(
-        ma, "first_animal_channel_index", lambda store, sd: 0)
+        ma, "animal_channel_index",
+        lambda store, sd, animal, electrode=0: 0)
     monkeypatch.setattr(
         ma, "screen_file",
         lambda store, fid, ch, pc, at, win, **k: screen_by_id[fid])
@@ -165,7 +191,8 @@ def test_pool_files_two_screen_split(tmp_path, monkeypatch):
             {"file_id": fid, "session_dir": "s"}
             for fid in fixtures])
     monkeypatch.setattr(
-        ma, "first_animal_channel_index", lambda store, sd: 0)
+        ma, "animal_channel_index",
+        lambda store, sd, animal, electrode=0: 0)
 
     pools = ma.pool_files(store, "BCH001", 0.05, 0.5, 5.0)
     assert pools["pool1"] == [10, 11]        # envelope positives

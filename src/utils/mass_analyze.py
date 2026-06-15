@@ -171,6 +171,28 @@ def first_animal_channel_index(store, session_dir: str) -> int:
     return 0
 
 
+def animal_channel_index(store, session_dir: str, animal_id: str,
+                           electrode: int = 0) -> int:
+    """Channel index of *animal_id*'s *electrode*-th contact.
+
+    Cages hold two animals per session, so the scan must NOT just grab
+    the first animal channel (that may belong to the other animal).
+    Reuses ``store.electrodes_for_animal_in_session`` -- the same
+    ordered, animal-filtered electrode list the Video Review channel
+    picker uses -- so the scan channel matches the trace's default.
+    *electrode* is an ordinal (0 = first contact), clamped to what the
+    animal has. Falls back to ``first_animal_channel_index`` when no
+    channel parses to this animal.
+    """
+    if session_dir and animal_id:
+        elecs = store.electrodes_for_animal_in_session(
+            session_dir, animal_id)
+        if elecs:
+            e = max(0, min(int(electrode or 0), len(elecs) - 1))
+            return int(elecs[e]["channel_index"])
+    return first_animal_channel_index(store, session_dir)
+
+
 # --------------------------------------------------------------- #
 # Cache-aside peakseek
 # --------------------------------------------------------------- #
@@ -480,6 +502,7 @@ def pool_files(store, animal_id: str, peak_cutoff: float,
                  auc_threshold: float | None = None,
                  window_sec: float | None = None,
                  *,
+                 electrode: int = 0,
                  min_peak_dist_sec: float =
                      DEFAULT_MIN_PEAK_DIST_SEC,
                  ) -> dict:
@@ -513,7 +536,8 @@ def pool_files(store, animal_id: str, peak_cutoff: float,
     for i, f in enumerate(files):
         assert i < max_iter, "pool split runaway"
         fid = int(f["file_id"])
-        ch = first_animal_channel_index(store, f["session_dir"])
+        ch = animal_channel_index(
+            store, f["session_dir"], animal_id, electrode)
         with store.connection() as conn:
             prow = conn.execute(
                 """SELECT n_peaks FROM envelope_peak_cache
@@ -713,11 +737,14 @@ def screen_file(store, file_id: int, channel: int,
 def create_job(store, pi_email: str, animal_id: str,
                  cutoff: float,
                  auc_threshold: float | None = None,
-                 auc_window_sec: float | None = None) -> int:
+                 auc_window_sec: float | None = None,
+                 electrode: int = 0) -> int:
     """Insert a 'pending' job; returns the row id. The daemon
     worker picks it up. ``auc_threshold`` / ``auc_window_sec``
     drive the second (AUC) screen so the scan populates both
-    pools; omit them to scan the envelope screen only."""
+    pools; omit them to scan the envelope screen only.
+    ``electrode`` selects which of the animal's contacts to scan
+    (0 = first)."""
     assert pi_email, "pi_email required"
     assert isinstance(animal_id, str) and animal_id, \
         "animal_id required"
@@ -728,12 +755,12 @@ def create_job(store, pi_email: str, animal_id: str,
         cur = conn.execute(
             """INSERT INTO mass_analyze_job
                (pi_email, animal_id, cutoff, auc_threshold,
-                auc_window_sec, status, created_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                auc_window_sec, electrode, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
             (pi_email.lower(), animal_id, float(cutoff),
              float(auc_threshold) if auc_threshold else None,
              float(auc_window_sec) if auc_window_sec else None,
-             now),
+             int(electrode or 0), now),
         )
         conn.commit()
         job_id = int(cur.lastrowid)
@@ -815,6 +842,7 @@ def scan_for_animal(store, job_id: int,
     auc_threshold = job.get("auc_threshold")
     auc_window = job.get("auc_window_sec")
     run_auc = bool(auc_threshold) and bool(auc_window)
+    electrode = int(job.get("electrode") or 0)
     # Flip to running.
     now = datetime.now().isoformat()
     with store.connection() as conn:
@@ -841,7 +869,8 @@ def scan_for_animal(store, job_id: int,
     done = 0
 
     def _work(f):
-        channel = first_animal_channel_index(store, f["session_dir"])
+        channel = animal_channel_index(
+            store, f["session_dir"], animal_id, electrode)
         npk = None
         auc_pos = None
         try:
@@ -927,6 +956,7 @@ def _job_status(store, job_id: int) -> str:
 def commit_threshold(store, animal_id: str, cutoff: float,
                        pi_email: str,
                        *,
+                       electrode: int = 0,
                        min_peak_dist_sec: float =
                            DEFAULT_MIN_PEAK_DIST_SEC,
                        ) -> dict:
@@ -949,8 +979,8 @@ def commit_threshold(store, animal_id: str, cutoff: float,
     for i, f in enumerate(files):
         assert i < max_iter, "commit loop runaway"
         fid = int(f["file_id"])
-        ch = first_animal_channel_index(
-            store, f["session_dir"])
+        ch = animal_channel_index(
+            store, f["session_dir"], animal_id, electrode)
         with store.connection() as conn:
             row = conn.execute(
                 """SELECT n_peaks FROM envelope_peak_cache
@@ -998,7 +1028,8 @@ def commit_threshold(store, animal_id: str, cutoff: float,
 def create_screen_eval_job(store, pi_email: str, animal_id: str,
                              peak_cutoff: float,
                              auc_threshold: float,
-                             auc_window_sec: float) -> int:
+                             auc_window_sec: float,
+                             electrode: int = 0) -> int:
     """Insert a 'pending' benchmark job; returns the row id."""
     assert pi_email, "pi_email required"
     assert isinstance(animal_id, str) and animal_id, \
@@ -1010,10 +1041,11 @@ def create_screen_eval_job(store, pi_email: str, animal_id: str,
         cur = conn.execute(
             """INSERT INTO screen_eval_job
                (pi_email, animal_id, peak_cutoff, auc_threshold,
-                auc_window_sec, status, created_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                auc_window_sec, electrode, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
             (pi_email.lower(), animal_id, float(peak_cutoff),
-             float(auc_threshold), float(auc_window_sec), now),
+             float(auc_threshold), float(auc_window_sec),
+             int(electrode or 0), now),
         )
         conn.commit()
         job_id = int(cur.lastrowid)
@@ -1068,6 +1100,7 @@ def run_screen_benchmark(store, job_id: int,
     peak_cutoff = float(job["peak_cutoff"])
     auc_threshold = float(job["auc_threshold"])
     auc_window = float(job["auc_window_sec"])
+    electrode = int(job.get("electrode") or 0)
     with store.connection() as conn:
         conn.execute(
             """UPDATE screen_eval_job
@@ -1092,7 +1125,8 @@ def run_screen_benchmark(store, job_id: int,
     done = 0
 
     def _work(f):
-        channel = first_animal_channel_index(store, f["session_dir"])
+        channel = animal_channel_index(
+            store, f["session_dir"], animal_id, electrode)
         try:
             env_pos, auc_pos = screen_file(
                 store, int(f["file_id"]), channel,

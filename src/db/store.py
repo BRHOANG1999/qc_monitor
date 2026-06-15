@@ -78,6 +78,21 @@ class Store:
         if "n_disagree" not in existing_maj_cols:
             conn.execute("ALTER TABLE mass_analyze_job "
                          "ADD COLUMN n_disagree INTEGER DEFAULT 0")
+        # Animal-electrode selector for the scan channel.
+        if "electrode" not in existing_maj_cols:
+            conn.execute("ALTER TABLE mass_analyze_job "
+                         "ADD COLUMN electrode INTEGER DEFAULT 0")
+        try:
+            existing_sej_cols = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(screen_eval_job)")
+            }
+        except Exception:
+            existing_sej_cols = set()
+        if existing_sej_cols and "electrode" not in existing_sej_cols:
+            conn.execute("ALTER TABLE screen_eval_job "
+                         "ADD COLUMN electrode INTEGER DEFAULT 0")
         # PI verification rollout migration: widen the review_state
         # status CHECK + promote pre-existing finalised rows to
         # 'pi_approved' (their CSV row was already written under the

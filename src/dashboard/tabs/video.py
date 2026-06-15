@@ -812,6 +812,14 @@ def _details_card(summary_text: str, content,
     })
 
 
+_ELECTRODE_OPTIONS = [
+    {"label": "First electrode", "value": 0},
+    {"label": "Second", "value": 1},
+    {"label": "Third", "value": 2},
+    {"label": "Fourth", "value": 3},
+]
+
+
 _POOL_BTN_STYLE = {
     "flex": "1",
     "background": "rgba(94,124,226,0.18)",
@@ -936,6 +944,16 @@ def _video_mass_analyze_panel() -> html.Details:
                                 "1px solid rgba(255,255,255,0.10)",
                             "borderRadius": "4px",
                             "fontSize": "12px"}),
+                html.Label("Electrode:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="video-ma-electrode",
+                    options=_ELECTRODE_OPTIONS,
+                    value=0, clearable=False,
+                    style={"flex": "0 0 130px", "minWidth": "110px"},
+                    className="dark-dropdown"),
                 html.Button(
                     "Scan files",
                     id="video-ma-scan-btn", n_clicks=0,
@@ -5240,10 +5258,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-ma-cutoff-input", "value"),
         State("video-ma-auc-threshold-input", "value"),
         State("video-ma-auc-window-input", "value"),
+        State("video-ma-electrode", "value"),
         prevent_initial_call=True,
     )
     def _on_video_ma_modal_confirm(n_clicks, picker_value, cutoff,
-                                     auc_threshold, auc_window):
+                                     auc_threshold, auc_window,
+                                     electrode):
         if not n_clicks:
             return no_update, no_update, no_update
         animal_id = _ma_animal_from_picker(picker_value)
@@ -5272,7 +5292,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         try:
             job_id = _mass_analyze.create_job(
                 store, email, animal_id, cutoff,
-                auc_threshold=auc_t, auc_window_sec=auc_w)
+                auc_threshold=auc_t, auc_window_sec=auc_w,
+                electrode=int(electrode or 0))
         except Exception as e:
             logger.exception("Mass Analyze create_job failed")
             return None, True, f"Failed to start: {e}"
@@ -5389,7 +5410,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 pools = _mass_analyze.pool_files(
                     store, job["animal_id"], float(job["cutoff"]),
                     float(auc_t) if auc_t else None,
-                    float(auc_w) if auc_w else None)
+                    float(auc_w) if auc_w else None,
+                    electrode=int(job.get("electrode") or 0))
             except Exception as e:
                 logger.warning("pool_files failed: %s", e)
             pools_data = pools
@@ -5547,10 +5569,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-ma-discard-btn", "n_clicks"),
         State("video-ma-cutoff-input", "value"),
         State("video-queue-animal", "value"),
+        State("video-ma-electrode", "value"),
         prevent_initial_call=True,
     )
     def _on_video_ma_commit(_confirm_n, _discard_n,
-                              cutoff, picker_value):
+                              cutoff, picker_value, electrode):
         trig = callback_context.triggered_id
         if trig == "video-ma-discard-btn":
             return ("", "", [], None, no_update)
@@ -5571,7 +5594,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "", [], None, no_update)
         try:
             result = _mass_analyze.commit_threshold(
-                store, animal, cutoff, email)
+                store, animal, cutoff, email,
+                electrode=int(electrode or 0))
         except Exception as e:
             logger.exception(
                 "Mass Analyze commit_threshold failed")
