@@ -39,7 +39,8 @@ from src.utils import assignments as _assignments
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
-from src.utils.hilbert_envelope import hilbert_envelope_20_200
+from src.utils.hilbert_envelope import (
+    hilbert_envelope_20_200, windowed_auc)
 from src.utils.peakseek import peakseek
 from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
@@ -694,6 +695,63 @@ def _render_hilbert_trace(store, file_id: int,
         f"{'' if crossings == 1 else 's'} "
         f"(kept = a local maximum ≥ cutoff AND ≥ "
         f"{int(min_peak_dist_sec)} s from any larger peak) · "
+        f"{len(env)/fs:.1f} s @ {int(fs)} Hz"
+    )
+    return (fig, status)
+
+
+def _render_auc_trace(store, file_id: int, channel: int | None,
+                       window_sec: float,
+                       blank_pre_ms: float = -5.0,
+                       blank_post_ms: float = 15.0,
+                       show_raw: bool = False) -> tuple:
+    """Sliding-window AUC (moving integral) of the Hilbert envelope.
+
+    Sustained seizure events show as plateaus; transient noise spikes
+    stay near zero -- the visual the PI uses to rescue low-amplitude
+    events the peak detector misses."""
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig(
+            "Pick a brain channel (Step 1) to see the AUC."), "")
+    session_dir = _session_dir_for_file(store, file_id)
+    stim_copy = _stim_copy_channels(store, session_dir)
+    do_blank = (int(channel) not in stim_copy) and (not show_raw)
+    stim_times = (_stim_times_for_file(store, file_id)
+                   if do_blank
+                   else np.asarray([], dtype=np.float64))
+    try:
+        series, fs, _ = _get_blanked_series(
+            file_path, int(channel), stim_times,
+            blank_pre_ms, blank_post_ms)
+    except Exception as e:
+        logger.warning("AUC load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP for AUC: {e}"), "")
+    env = hilbert_envelope_20_200(series, fs)
+    try:
+        win = float(window_sec) if window_sec else 5.0
+        if win <= 0:
+            win = 5.0
+    except (TypeError, ValueError):
+        win = 5.0
+    auc = windowed_auc(env, fs, win)
+    target_bins = choose_target_bins(len(auc)) or 4000
+    t, display, _decim = envelope(auc, fs, target_bins, t_start=0.0)
+    fig = _build_lfp_figure(
+        t, display, f"Hilbert AUC ({win:g} s window)",
+        uirevision=f"{file_id}:{channel}:auc")
+    fig.data[0].line.color = "#30d158"
+    fig.data[0].hovertemplate = (
+        "t=%{x:.1f}s<br>AUC=%{y:.3g}<extra></extra>")
+    peak_auc = float(np.max(auc)) if len(auc) else 0.0
+    status = (
+        f"Sliding-window AUC · window={win:g} s · "
+        f"peak AUC={peak_auc:.3g} · "
+        f"sustained events plateau, spikes stay low · "
         f"{len(env)/fs:.1f} s @ {int(fs)} Hz"
     )
     return (fig, status)
@@ -1604,6 +1662,9 @@ def layout(store: Store, bridge: dict | None = None):
                             {"label": "Hilbert envelope "
                                        "(20-200 Hz, default)",
                                 "value": "hilbert"},
+                            {"label": "Hilbert AUC (sliding window) "
+                                       "-- catches sustained events",
+                                "value": "hilbert_auc"},
                             {"label": "Line length (per-event)",
                                 "value": "line_length"},
                             {"label": "Log(AUC) — area under the curve",
@@ -1666,6 +1727,22 @@ def layout(store: Store, bridge: dict | None = None):
                         style={"backgroundColor": "#262638",
                                 "color": "#f0f0f5", "width": "90px"}),
                 ], style={"flex": "0 0 150px"}),
+                # AUC window (only meaningful for the Hilbert AUC
+                # feature): how many seconds the sliding integral spans.
+                html.Div([
+                    html.Label("AUC window (s)", style=LABEL_STYLE,
+                                title="For the 'Hilbert AUC' feature: "
+                                       "the sliding integral spans this "
+                                       "many seconds. Longer favours "
+                                       "sustained events over brief "
+                                       "spikes."),
+                    dcc.Input(
+                        id="video-auc-window-input",
+                        type="number", min=0.5, step="any",
+                        value=5,
+                        style={"backgroundColor": "#262638",
+                                "color": "#f0f0f5", "width": "80px"}),
+                ], style={"flex": "0 0 130px"}),
                 # Remove false-positive candidate peaks (the pink
                 # triangles). When the mode is on, clicking a triangle
                 # rejects it (persisted per file); Undo restores the
@@ -4173,12 +4250,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-ma-cutoff-input", "value"),
         Input("video-blank-raw", "value"),
         Input("video-rejected-version", "data"),
+        Input("video-auc-window-input", "value"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
     )
     def _update_analysis(file_id, feature, _n_apply,
                           channel, ma_cutoff, blank_raw, _rej_ver,
+                          auc_window,
                           smooth_sec, rollwin, postproc):
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
@@ -4186,11 +4265,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # an identical hilbert status).
         fig, status = _compute_analysis(
             file_id, feature, channel, ma_cutoff, blank_raw,
-            smooth_sec, rollwin, postproc)
+            auc_window, smooth_sec, rollwin, postproc)
         return fig, status, datetime.now().timestamp()
 
     def _compute_analysis(file_id, feature,
                            channel, ma_cutoff, blank_raw,
+                           auc_window,
                            smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
@@ -4198,6 +4278,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not feature:
             return (_empty_lfp_fig(
                 "Pick a brain feature to plot."), "")
+        # Sliding-window AUC of the Hilbert envelope -- the
+        # sustained-vs-transient discriminator.
+        if feature == "hilbert_auc":
+            return _render_auc_trace(
+                store, int(file_id), channel, auc_window,
+                blank_pre_ms=blank_pre_ms,
+                blank_post_ms=blank_post_ms,
+                show_raw="raw" in (blank_raw or []))
         # Hilbert envelope (BHZ default). Continuous-time trace
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":

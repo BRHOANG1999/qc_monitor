@@ -86,3 +86,36 @@ def hilbert_envelope_20_200(signal: np.ndarray,
     # default padlen can still exceed; clamp.
     pad = min(3 * max(len(a), len(b)), n - 1)
     return filtfilt(b, a, envelope_data, padlen=pad)
+
+
+def windowed_auc(env: np.ndarray, fs: float,
+                  window_sec: float) -> np.ndarray:
+    """Sliding-window area under the envelope (a centered moving
+    integral over ``window_sec`` seconds), same length as *env*.
+
+    This is the feature that separates real behavioural seizures from
+    noise: a *sustained* elevation integrates to a large area even at
+    low amplitude, while a *transient* thin spike -- high but momentary
+    -- contributes almost nothing. Thresholding this trace catches
+    low-amplitude-but-prolonged events the peak detector misses.
+
+    Computed via a cumulative-sum difference, so it's O(n).
+    """
+    assert isinstance(env, np.ndarray), "env must be ndarray"
+    assert env.ndim == 1, "env must be 1-D"
+    assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
+    assert window_sec > 0, "window_sec > 0"
+    n = env.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    w = max(1, int(round(float(window_sec) * float(fs))))
+    x = np.nan_to_num(env.astype(np.float64, copy=False))
+    cs = np.concatenate(([0.0], np.cumsum(x)))  # len n+1
+    idx = np.arange(n)
+    half = w // 2
+    lo = np.maximum(0, idx - half)
+    hi = np.minimum(n, idx + half + 1)  # exclusive
+    window_sum = cs[hi] - cs[lo]
+    # Multiply by the sample period so the units are area
+    # (envelope * seconds), comparable across recordings.
+    return window_sum / float(fs)
