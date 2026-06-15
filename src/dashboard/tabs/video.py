@@ -819,6 +819,11 @@ _ELECTRODE_OPTIONS = [
     {"label": "Fourth", "value": 3},
 ]
 
+# "Show all timestamps" lists the whole per-animal queue. High ceiling
+# (vs the prev/next browse cap) so every recording appears; large enough
+# for any real single-animal backlog.
+_QUEUE_LIST_MAX = 100000
+
 
 _POOL_BTN_STYLE = {
     "flex": "1",
@@ -2793,8 +2798,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             animal_ids = [animal_value]
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
+        # The "Show all timestamps" list shows the WHOLE queue, not
+        # just the first queue_limit (that cap is for the prev/next
+        # browse card). High ceiling so every recording is listed.
         rows = store.get_review_queue(animal_ids, email,
-                                        limit=queue_limit,
+                                        limit=_QUEUE_LIST_MAX,
                                         since_iso=floor)
         if not rows:
             return html.Div([
@@ -2810,7 +2818,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         from datetime import datetime as _dt
         now = _dt.now()
         items = []
-        for r in rows[:queue_limit]:
+        for r in rows:
             ts_raw = r.get("chunk_datetime") or ""
             try:
                 ts = _dt.strptime(ts_raw,
@@ -2823,10 +2831,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             warn = age_days >= warn_age_days
             dur = r.get("duration_sec") or 0
             dur_h = dur / 3600.0 if dur else 0
+            fname = os.path.basename(r.get("file_path") or "")
             is_active = (active_file_id is not None
                           and int(r["id"]) == int(active_file_id))
             btn_style: dict = {
-                "display": "flex", "alignItems": "center",
+                "display": "flex", "flexDirection": "column",
+                "alignItems": "flex-start",
                 "width": "100%", "border": "none",
                 "background": ("rgba(94, 124, 226, 0.12)"
                                  if is_active else "transparent"),
@@ -2841,21 +2851,33 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "textAlign": "left",
             }
             items.append(html.Button([
-                html.Span(ts_label, style={
-                    "color": "#f0f0f5", "fontWeight": "600",
-                    "fontSize": "12px"}),
-                html.Span(f"  ({dur_h:.1f} h)", style={
-                    "color": "#888", "fontSize": "11px",
-                    "marginLeft": "4px"}),
+                html.Div([
+                    html.Span(ts_label, style={
+                        "color": "#f0f0f5", "fontWeight": "600",
+                        "fontSize": "12px"}),
+                    html.Span(f"  ({dur_h:.1f} h)", style={
+                        "color": "#888", "fontSize": "11px",
+                        "marginLeft": "4px"}),
+                    html.Span(
+                        f"  · {age_days:.1f} d old"
+                        if age_days >= 1 else
+                        f"  · {age_days * 24:.0f} h old",
+                        style={
+                            "color": ("#EF553B" if warn
+                                       else "#888"),
+                            "fontSize": "10px",
+                            "marginLeft": "auto"}),
+                ], style={"display": "flex", "alignItems": "center",
+                           "width": "100%"}),
                 html.Span(
-                    f"  · {age_days:.1f} d old"
-                    if age_days >= 1 else
-                    f"  · {age_days * 24:.0f} h old",
-                    style={
-                        "color": ("#EF553B" if warn
-                                   else "#888"),
-                        "fontSize": "10px",
-                        "marginLeft": "auto"}),
+                    fname, title=fname,
+                    style={"color": "#6f7080", "fontSize": "10px",
+                            "fontFamily": "ui-monospace, SF Mono, "
+                                           "monospace",
+                            "maxWidth": "100%",
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                            "whiteSpace": "nowrap"}),
             ], id={"type": "video-queue-item",
                     "file_id": int(r["id"])},
                 n_clicks=0, style=btn_style))
