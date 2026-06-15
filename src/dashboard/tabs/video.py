@@ -848,6 +848,29 @@ def _details_card(summary_text: str, content,
     })
 
 
+_POOL_BTN_STYLE = {
+    "flex": "1",
+    "background": "rgba(94,124,226,0.18)",
+    "color": "#cfd0d6",
+    "border": "1px solid rgba(94,124,226,0.4)",
+    "padding": "6px 12px",
+    "borderRadius": "5px",
+    "cursor": "pointer",
+    "fontSize": "12px",
+    "fontWeight": "600",
+}
+
+_POOL_NAV_STYLE = {
+    "background": "transparent",
+    "color": "#cfd0d6",
+    "border": "1px solid rgba(255,255,255,0.15)",
+    "padding": "5px 12px",
+    "borderRadius": "5px",
+    "cursor": "pointer",
+    "fontSize": "12px",
+}
+
+
 def _video_mass_analyze_panel() -> html.Details:
     """Undergrad bulk pre-screen via Hilbert envelope thresholding.
 
@@ -959,7 +982,49 @@ def _video_mass_analyze_panel() -> html.Details:
                               "alignItems": "center",
                               "padding": "0 14px",
                               "marginBottom": "10px"}),
+            # Two-pool browser (revealed once a scan completes).
+            # Pool 1 = peak hits; Pool 2 = peak misses to rescue
+            # by eyeballing the AUC trace.
+            html.Div(
+                id="video-ma-browse",
+                style={"display": "none",
+                        "padding": "0 14px",
+                        "marginBottom": "10px"},
+                children=[
+                    html.Div(id="video-ma-pool-counts",
+                              style={"fontSize": "12px",
+                                      "color": "#cfd0d6",
+                                      "marginBottom": "6px"}),
+                    html.Div([
+                        html.Button(
+                            "Browse peak-hits (Pool 1)",
+                            id="video-ma-browse-p1", n_clicks=0,
+                            style=_POOL_BTN_STYLE),
+                        html.Button(
+                            "Browse peak-misses (Pool 2)",
+                            id="video-ma-browse-p2", n_clicks=0,
+                            style=_POOL_BTN_STYLE),
+                    ], style={"display": "flex", "gap": "8px",
+                               "marginBottom": "6px"}),
+                    html.Div([
+                        html.Button(
+                            "< Prev", id="video-ma-pool-prev",
+                            n_clicks=0, style=_POOL_NAV_STYLE),
+                        html.Span(
+                            id="video-ma-pool-status",
+                            style={"fontSize": "12px",
+                                    "color": "#a0a0b0",
+                                    "minWidth": "150px",
+                                    "textAlign": "center"}),
+                        html.Button(
+                            "Next >", id="video-ma-pool-next",
+                            n_clicks=0, style=_POOL_NAV_STYLE),
+                    ], style={"display": "flex", "gap": "8px",
+                               "alignItems": "center"}),
+                ]),
             # State stores + polling.
+            dcc.Store(id="video-ma-pools", data=None),
+            dcc.Store(id="video-ma-pool-cursor", data=None),
             dcc.Store(id="video-ma-job-id", data=None),
             dcc.Interval(id="video-ma-poll",
                            interval=1500, n_intervals=0,
@@ -5204,16 +5269,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-ma-confirm-row", "children"),
         Output("video-ma-poll", "disabled",
                 allow_duplicate=True),
+        Output("video-ma-pools", "data"),
+        Output("video-ma-browse", "style"),
+        Output("video-ma-pool-counts", "children"),
         Input("video-ma-poll", "n_intervals"),
         Input("video-ma-job-id", "data"),
         prevent_initial_call=True,
     )
     def _on_video_ma_poll(_n, job_id):
+        _browse_hidden = {"display": "none", "padding": "0 14px",
+                           "marginBottom": "10px"}
         if not job_id:
-            return ("", "", [], True)
+            return ("", "", [], True, None, _browse_hidden, "")
         job = _mass_analyze.get_job(store, int(job_id))
         if not job:
-            return ("Job vanished.", "", [], True)
+            return ("Job vanished.", "", [], True,
+                    None, _browse_hidden, "")
         status = job.get("status") or "?"
         scanned = int(job.get("scanned_files") or 0)
         total = int(job.get("total_files") or 0)
@@ -5227,6 +5298,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         )
         summary = []
         confirm_row = []
+        pools_data = no_update
+        browse_style = no_update
+        pool_counts = no_update
         polling_disabled = status in ("done", "failed",
                                          "cancelled")
         if status == "done":
@@ -5285,6 +5359,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                             "cursor": "pointer",
                             "fontSize": "12px"}),
             ]
+            # Build the two browsable pools off the cache the scan
+            # just populated (read-only; no recompute).
+            try:
+                pools = _mass_analyze.pool_files(
+                    store, job["animal_id"], float(job["cutoff"]))
+            except Exception as e:
+                logger.warning("pool_files failed: %s", e)
+                pools = {"pool1": [], "pool2": []}
+            pools_data = pools
+            browse_style = {"display": "block",
+                             "padding": "0 14px",
+                             "marginBottom": "10px"}
+            pool_counts = (
+                f"Pool 1 (peak hits): {len(pools['pool1'])}  ·  "
+                f"Pool 2 (peak misses to rescue): "
+                f"{len(pools['pool2'])}")
         elif status == "failed":
             err = job.get("error") or "unknown"
             summary = html.Div(f"Scan failed: {err}",
@@ -5296,7 +5386,83 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 style={"color": "#ff9f0a",
                         "fontSize": "12px"})
         return (progress, summary, confirm_row,
-                polling_disabled)
+                polling_disabled, pools_data, browse_style,
+                pool_counts)
+
+    @app.callback(
+        Output("video-ma-pool-cursor", "data"),
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-analysis-feature", "value",
+                allow_duplicate=True),
+        Output("video-ma-pool-status", "children"),
+        Input("video-ma-browse-p1", "n_clicks"),
+        Input("video-ma-browse-p2", "n_clicks"),
+        Input("video-ma-pool-prev", "n_clicks"),
+        Input("video-ma-pool-next", "n_clicks"),
+        State("video-ma-pools", "data"),
+        State("video-ma-pool-cursor", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_pool_nav(_p1, _p2, _prev, _next, pools, cursor):
+        """Walk Pool 1 / Pool 2 file-by-file in the player.
+
+        Browse-pool-N picks a pool and jumps to its first file;
+        Prev/Next step within the active pool. Each move resolves
+        the file's session + id and drives the existing
+        session/file dropdowns (same hand-off as the queue
+        button). Pool 2 also flips the brain-feature trace to the
+        sliding-window AUC so the sustained low-amplitude humps
+        the peak detector missed are obvious.
+        """
+        # Real-click guard: pattern recreation / initial fires
+        # carry n_clicks 0/None across all buttons.
+        if not any((t.get("value") or 0)
+                    for t in (callback_context.triggered or [])):
+            return (no_update, no_update, no_update,
+                    no_update, no_update)
+        if not pools:
+            return (no_update, no_update, no_update,
+                    no_update, "Run a scan first.")
+        trig = callback_context.triggered_id
+        cursor = cursor or {"active": None, "idx": 0}
+        active = cursor.get("active")
+        idx = int(cursor.get("idx") or 0)
+        feature_out = no_update
+        if trig == "video-ma-browse-p1":
+            active, idx = "1", 0
+        elif trig == "video-ma-browse-p2":
+            active, idx = "2", 0
+            feature_out = "hilbert_auc"
+        elif trig == "video-ma-pool-prev":
+            idx = max(0, idx - 1)
+        elif trig == "video-ma-pool-next":
+            idx = idx + 1
+        if active not in ("1", "2"):
+            return (no_update, no_update, no_update,
+                    no_update, "Pick a pool to browse.")
+        files = pools.get("pool1" if active == "1" else "pool2", [])
+        n = len(files)
+        if n == 0:
+            return ({"active": active, "idx": 0},
+                    no_update, no_update, feature_out,
+                    f"Pool {active} is empty.")
+        idx = min(idx, n - 1)
+        file_id = int(files[idx])
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT session_dir FROM processed_files "
+                "WHERE id = ?", (file_id,)).fetchone()
+        if not row:
+            return ({"active": active, "idx": idx},
+                    no_update, no_update, feature_out,
+                    f"Pool {active} · file {idx + 1} of {n} "
+                    "(missing)")
+        status = f"Pool {active} · file {idx + 1} of {n}"
+        return ({"active": active, "idx": idx},
+                row["session_dir"], file_id, feature_out, status)
 
     @app.callback(
         Output("video-ma-job-id", "data",

@@ -49,5 +49,23 @@ def test_window_scales_area():
     assert a2[500] > a1[500]
 
 
+def test_auc_event_count_hump_vs_spike():
+    from src.utils.mass_analyze import auc_event_count
+    fs, n = 100.0, 3000
+    hump = np.zeros(n)
+    hump[1000:1500] = 0.02         # 5 s sustained hump
+    spike = np.zeros(n)
+    spike[2000] = 0.5              # one tall but momentary spike
+    # A threshold between the two integrated areas keeps the hump
+    # and drops the spike.
+    assert auc_event_count(hump, fs, 5.0, 0.03) == 1
+    assert auc_event_count(spike, fs, 5.0, 0.03) == 0
+
+
+def test_auc_event_count_empty():
+    from src.utils.mass_analyze import auc_event_count
+    assert auc_event_count(np.zeros(0), 100.0, 5.0, 0.03) == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

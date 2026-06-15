@@ -50,7 +50,10 @@ import numpy as np
 
 from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.chunk_cache import get_chunk
-from src.utils.hilbert_envelope import hilbert_envelope_20_200
+from src.utils.hilbert_envelope import (
+    hilbert_envelope_20_200,
+    windowed_auc,
+)
 from src.utils.peakseek import peakseek
 
 logger = logging.getLogger("qc_monitor.utils.mass_analyze")
@@ -259,6 +262,84 @@ def pending_files_for_animal(store, animal_id: str
         if match:
             out.append(dict(r))
     return out
+
+
+def auc_event_count(env: np.ndarray, fs: float,
+                      window_sec: float,
+                      auc_threshold: float) -> int:
+    """Count sustained-elevation events in *env* via the
+    sliding-window AUC.
+
+    A real behavioural seizure is a *prolonged* envelope hump; a
+    thin noise spike -- however tall -- integrates to almost
+    nothing over the window. We threshold ``windowed_auc`` and
+    count its peaks, spacing them one window apart so a single
+    plateau is counted once.
+
+    NASA Rule 5: asserts at the boundary.
+    """
+    assert isinstance(env, np.ndarray), "env must be ndarray"
+    assert env.ndim == 1, "env must be 1-D"
+    assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
+    assert window_sec > 0, "window_sec > 0"
+    assert auc_threshold > 0, "auc_threshold > 0"
+    if env.shape[0] == 0:
+        return 0
+    auc = windowed_auc(env, fs, window_sec)
+    min_dist = max(1, int(round(float(window_sec) * float(fs))))
+    locs, _heights = peakseek(
+        auc, minpeakdist=min_dist, minpeakh=float(auc_threshold))
+    return int(len(locs))
+
+
+# --------------------------------------------------------------- #
+# Two-pool split (Pool 1 = peak hits, Pool 2 = peak misses)
+# --------------------------------------------------------------- #
+
+def pool_files(store, animal_id: str, cutoff: float,
+                 *,
+                 min_peak_dist_sec: float =
+                     DEFAULT_MIN_PEAK_DIST_SEC,
+                 ) -> dict:
+    """Partition *animal_id*'s pending files by cached peak count.
+
+    Reads ``envelope_peak_cache`` only (no compute), so call this
+    AFTER a scan has populated the cache. Files not yet in the
+    cache are skipped. Returns::
+
+        {"pool1": [file_id, ...],   # >=1 peak above cutoff
+         "pool2": [file_id, ...]}   # 0 peaks -- rescue with AUC
+
+    Both lists keep ``pending_files_for_animal``'s chronological
+    order so Prev/Next browsing walks the recording timeline.
+    """
+    assert isinstance(animal_id, str) and animal_id, \
+        "animal_id required"
+    assert isinstance(cutoff, (int, float)) and cutoff > 0, \
+        "cutoff > 0"
+    files = pending_files_for_animal(store, animal_id)
+    pool1: list[int] = []
+    pool2: list[int] = []
+    max_iter = len(files) + 1
+    for i, f in enumerate(files):
+        assert i < max_iter, "pool split runaway"
+        fid = int(f["file_id"])
+        ch = first_animal_channel_index(store, f["session_dir"])
+        with store.connection() as conn:
+            row = conn.execute(
+                """SELECT n_peaks FROM envelope_peak_cache
+                   WHERE file_id=? AND channel=? AND cutoff=?
+                     AND min_peak_dist_sec=?""",
+                (fid, ch, float(cutoff),
+                 float(min_peak_dist_sec)),
+            ).fetchone()
+        if row is None:
+            continue  # not scanned yet
+        if int(row["n_peaks"]) > 0:
+            pool1.append(fid)
+        else:
+            pool2.append(fid)
+    return {"pool1": pool1, "pool2": pool2}
 
 
 def count_pending_for_animal(store, animal_id: str) -> int:
