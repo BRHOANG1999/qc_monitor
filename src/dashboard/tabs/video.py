@@ -940,6 +940,38 @@ def _video_mass_analyze_panel() -> html.Details:
                                 "1px solid rgba(255,255,255,0.10)",
                             "borderRadius": "4px",
                             "fontSize": "12px"}),
+                html.Label("AUC thresh:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Input(
+                    id="video-ma-auc-threshold-input",
+                    type="number", min=0, step="any",
+                    placeholder="e.g. 0.5",
+                    style={"flex": "0 0 100px",
+                            "padding": "6px 10px",
+                            "background": "#262638",
+                            "color": "#f0f0f5",
+                            "border":
+                                "1px solid rgba(255,255,255,0.10)",
+                            "borderRadius": "4px",
+                            "fontSize": "12px"}),
+                html.Label("AUC win (s):",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Input(
+                    id="video-ma-auc-window-input",
+                    type="number", min=0, step="any",
+                    value=5,
+                    style={"flex": "0 0 80px",
+                            "padding": "6px 10px",
+                            "background": "#262638",
+                            "color": "#f0f0f5",
+                            "border":
+                                "1px solid rgba(255,255,255,0.10)",
+                            "borderRadius": "4px",
+                            "fontSize": "12px"}),
                 html.Button(
                     "Scan files",
                     id="video-ma-scan-btn", n_clicks=0,
@@ -997,12 +1029,16 @@ def _video_mass_analyze_panel() -> html.Details:
                                       "marginBottom": "6px"}),
                     html.Div([
                         html.Button(
-                            "Browse peak-hits (Pool 1)",
+                            "Browse Pool 1 (envelope)",
                             id="video-ma-browse-p1", n_clicks=0,
                             style=_POOL_BTN_STYLE),
                         html.Button(
-                            "Browse peak-misses (Pool 2)",
+                            "Browse Pool 2 (AUC)",
                             id="video-ma-browse-p2", n_clicks=0,
+                            style=_POOL_BTN_STYLE),
+                        html.Button(
+                            "Browse Pool 3 (disagreement)",
+                            id="video-ma-browse-p3", n_clicks=0,
                             style=_POOL_BTN_STYLE),
                     ], style={"display": "flex", "gap": "8px",
                                "marginBottom": "6px"}),
@@ -5238,9 +5274,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-ma-modal-confirm-btn", "n_clicks"),
         State("video-queue-animal", "value"),
         State("video-ma-cutoff-input", "value"),
+        State("video-ma-auc-threshold-input", "value"),
+        State("video-ma-auc-window-input", "value"),
         prevent_initial_call=True,
     )
-    def _on_video_ma_modal_confirm(n_clicks, picker_value, cutoff):
+    def _on_video_ma_modal_confirm(n_clicks, picker_value, cutoff,
+                                     auc_threshold, auc_window):
         if not n_clicks:
             return no_update, no_update, no_update
         animal_id = _ma_animal_from_picker(picker_value)
@@ -5255,9 +5294,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return None, True, f"Invalid cutoff: {cutoff!r}"
         if cutoff <= 0:
             return None, True, "Cutoff must be > 0."
+        # AUC screen is optional: only runs if a valid threshold +
+        # window are supplied. A blank threshold scans the
+        # envelope screen alone (Pool 1 only).
+        auc_t = None
+        auc_w = None
+        try:
+            if auc_threshold not in (None, "") and float(auc_threshold) > 0:
+                auc_t = float(auc_threshold)
+                auc_w = float(auc_window) if auc_window else 5.0
+        except (TypeError, ValueError):
+            auc_t, auc_w = None, None
         try:
             job_id = _mass_analyze.create_job(
-                store, email, animal_id, cutoff)
+                store, email, animal_id, cutoff,
+                auc_threshold=auc_t, auc_window_sec=auc_w)
         except Exception as e:
             logger.exception("Mass Analyze create_job failed")
             return None, True, f"Failed to start: {e}"
@@ -5359,22 +5410,35 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                             "cursor": "pointer",
                             "fontSize": "12px"}),
             ]
-            # Build the two browsable pools off the cache the scan
-            # just populated (read-only; no recompute).
+            # Build the screen pools off the caches the scan just
+            # populated (read-only; no recompute). Pool 2/3 only
+            # exist when the AUC screen ran (threshold supplied).
+            auc_t = job.get("auc_threshold")
+            auc_w = job.get("auc_window_sec")
+            pools = {"pool1": [], "pool2": [], "pool3": []}
             try:
                 pools = _mass_analyze.pool_files(
-                    store, job["animal_id"], float(job["cutoff"]))
+                    store, job["animal_id"], float(job["cutoff"]),
+                    float(auc_t) if auc_t else None,
+                    float(auc_w) if auc_w else None)
             except Exception as e:
                 logger.warning("pool_files failed: %s", e)
-                pools = {"pool1": [], "pool2": []}
             pools_data = pools
             browse_style = {"display": "block",
                              "padding": "0 14px",
                              "marginBottom": "10px"}
-            pool_counts = (
-                f"Pool 1 (peak hits): {len(pools['pool1'])}  ·  "
-                f"Pool 2 (peak misses to rescue): "
-                f"{len(pools['pool2'])}")
+            if auc_t and auc_w:
+                pool_counts = (
+                    f"Pool 1 -- envelope screen: "
+                    f"{len(pools['pool1'])}  ·  "
+                    f"Pool 2 -- AUC screen: {len(pools['pool2'])}"
+                    f"  ·  Pool 3 -- disagreement: "
+                    f"{len(pools['pool3'])}")
+            else:
+                pool_counts = (
+                    f"Pool 1 -- envelope screen: "
+                    f"{len(pools['pool1'])}  (add an AUC threshold "
+                    "to also run the AUC screen)")
         elif status == "failed":
             err = job.get("error") or "unknown"
             summary = html.Div(f"Scan failed: {err}",
@@ -5400,22 +5464,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-ma-pool-status", "children"),
         Input("video-ma-browse-p1", "n_clicks"),
         Input("video-ma-browse-p2", "n_clicks"),
+        Input("video-ma-browse-p3", "n_clicks"),
         Input("video-ma-pool-prev", "n_clicks"),
         Input("video-ma-pool-next", "n_clicks"),
         State("video-ma-pools", "data"),
         State("video-ma-pool-cursor", "data"),
         prevent_initial_call=True,
     )
-    def _on_pool_nav(_p1, _p2, _prev, _next, pools, cursor):
-        """Walk Pool 1 / Pool 2 file-by-file in the player.
+    def _on_pool_nav(_p1, _p2, _p3, _prev, _next, pools, cursor):
+        """Walk Pool 1 / 2 / 3 file-by-file in the player.
 
-        Browse-pool-N picks a pool and jumps to its first file;
-        Prev/Next step within the active pool. Each move resolves
-        the file's session + id and drives the existing
-        session/file dropdowns (same hand-off as the queue
-        button). Pool 2 also flips the brain-feature trace to the
-        sliding-window AUC so the sustained low-amplitude humps
-        the peak detector missed are obvious.
+        Browse-pool-N picks a screen's pool and jumps to its first
+        file; Prev/Next step within the active pool. Each move
+        resolves the file's session + id and drives the existing
+        session/file dropdowns (same hand-off as the queue button).
+        The brain-feature trace follows the screen that flagged the
+        file: Pool 2 -> Hilbert AUC; Pool 3 mixes both, so it sets
+        the trace per entry's ``only`` tag (envelope-only ->
+        Hilbert, AUC-only -> Hilbert AUC).
         """
         # Real-click guard: pattern recreation / initial fires
         # carry n_clicks 0/None across all buttons.
@@ -5435,32 +5501,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             active, idx = "1", 0
         elif trig == "video-ma-browse-p2":
             active, idx = "2", 0
-            feature_out = "hilbert_auc"
+        elif trig == "video-ma-browse-p3":
+            active, idx = "3", 0
         elif trig == "video-ma-pool-prev":
             idx = max(0, idx - 1)
         elif trig == "video-ma-pool-next":
             idx = idx + 1
-        if active not in ("1", "2"):
+        if active not in ("1", "2", "3"):
             return (no_update, no_update, no_update,
                     no_update, "Pick a pool to browse.")
-        files = pools.get("pool1" if active == "1" else "pool2", [])
+        key = {"1": "pool1", "2": "pool2", "3": "pool3"}[active]
+        files = pools.get(key, [])
         n = len(files)
         if n == 0:
             return ({"active": active, "idx": 0},
-                    no_update, no_update, feature_out,
+                    no_update, no_update, no_update,
                     f"Pool {active} is empty.")
         idx = min(idx, n - 1)
-        file_id = int(files[idx])
+        entry = files[idx]
+        # pool3 entries are {file_id, only}; pool1/2 are bare ids.
+        if isinstance(entry, dict):
+            file_id = int(entry["file_id"])
+            feature_out = ("hilbert_auc" if entry.get("only") == "auc"
+                            else "hilbert")
+        else:
+            file_id = int(entry)
+            feature_out = "hilbert_auc" if active == "2" else "hilbert"
         with store.connection() as conn:
             row = conn.execute(
                 "SELECT session_dir FROM processed_files "
                 "WHERE id = ?", (file_id,)).fetchone()
         if not row:
             return ({"active": active, "idx": idx},
-                    no_update, no_update, feature_out,
+                    no_update, no_update, no_update,
                     f"Pool {active} · file {idx + 1} of {n} "
                     "(missing)")
-        status = f"Pool {active} · file {idx + 1} of {n}"
+        badge = ""
+        if isinstance(entry, dict):
+            badge = f" ({entry.get('only')}-only)"
+        status = f"Pool {active} · file {idx + 1} of {n}{badge}"
         return ({"active": active, "idx": idx},
                 row["session_dir"], file_id, feature_out, status)
 
