@@ -39,6 +39,7 @@ from src.utils import assignments as _assignments
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
+from src.utils import stim_blank as _stim_blank
 from src.utils.hilbert_envelope import (
     hilbert_envelope_20_200, windowed_auc)
 from src.utils.peakseek import peakseek
@@ -119,43 +120,15 @@ def _file_path_for_id(store: Store, file_id: int) -> str | None:
         return row["file_path"] if row else None
 
 
+# Stim-blanking lives in src/utils/stim_blank.py so the Mass Analyze
+# scan computes the envelope on the exact same blanked signal. These
+# thin wrappers keep the existing call sites.
 def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
-    """Return stim onset times (sec) detected by the MATLAB pipeline.
-
-    Reads ``evoked_features.epoch_time_sec`` — each epoch corresponds
-    to one detected stim event, so this is exactly the list of onsets.
-    Returns an empty array for files that haven't been MATLAB-processed.
-    """
-    with store.connection() as conn:
-        rows = conn.execute(
-            """SELECT DISTINCT epoch_time_sec
-               FROM evoked_features
-               WHERE file_id = ? AND epoch_time_sec IS NOT NULL
-               ORDER BY epoch_time_sec""",
-            (file_id,),
-        ).fetchall()
-    return np.asarray([r["epoch_time_sec"] for r in rows], dtype=np.float64)
+    return _stim_blank.stim_times_for_file(store, file_id)
 
 
 def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
-    """Return the set of channel indices flagged as stim-copy.
-
-    Stim-copy channels record the stimulator output itself; blanking
-    them out would erase the only signal worth seeing, so we leave
-    them as-is.
-    """
-    if not session_dir:
-        return set()
-    cfg = store.get_session_config(session_dir) or {}
-    raw = cfg.get("stim_copy_channels")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            raw = []
-    if isinstance(raw, list):
-        return {int(c) for c in raw}
-    return set()
+    return _stim_blank.stim_copy_channels(store, session_dir)
 
 
 def _animal_for_session(store: Store, session_dir: str) -> str:
@@ -467,18 +440,9 @@ def _get_blanked_series(file_path: str, channel: int,
         )
     series = sig[:, channel].astype(np.float32, copy=True)
 
-    n_blanked = 0
-    if stim_times is not None and len(stim_times) > 0:
-        pre = int(round(blank_pre_ms * 1e-3 * fs))
-        post = int(round(blank_post_ms * 1e-3 * fs))
-        n = len(series)
-        for t_sec in stim_times:
-            center = int(round(t_sec * fs))
-            lo = max(0, center + pre)
-            hi = min(n, center + post)
-            if hi > lo:
-                series[lo:hi] = np.nan
-                n_blanked += 1
+    n_blanked = (0 if stim_times is None else int(len(stim_times)))
+    series = _stim_blank.blank_series_with_stim_times(
+        series, fs, stim_times, blank_pre_ms, blank_post_ms)
 
     with _blanked_lock:
         _blanked_cache[key] = (series, fs)

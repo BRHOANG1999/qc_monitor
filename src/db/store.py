@@ -100,6 +100,22 @@ class Store:
             )
         except Exception:
             pass
+        # One-time eviction of the envelope caches. Every row written
+        # before the stim-blank fix was computed on the raw (un-blanked)
+        # signal, so it over-detects on stim artifacts. PRAGMA
+        # user_version gates this to a single run -- without the guard it
+        # would wipe the cache on every boot and force a full re-scan.
+        try:
+            ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        except Exception:
+            ver = 0
+        if (ver or 0) < 1:
+            try:
+                conn.execute("DELETE FROM envelope_peak_cache")
+                conn.execute("DELETE FROM envelope_auc_cache")
+            except Exception:
+                pass  # brand-new DB: tables may not exist yet
+            conn.execute("PRAGMA user_version = 1")
         conn.commit()
         conn.close()
 

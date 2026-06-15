@@ -55,6 +55,7 @@ from src.utils.hilbert_envelope import (
     windowed_auc,
 )
 from src.utils.peakseek import peakseek
+from src.utils import stim_blank
 
 logger = logging.getLogger("qc_monitor.utils.mass_analyze")
 
@@ -62,6 +63,28 @@ logger = logging.getLogger("qc_monitor.utils.mass_analyze")
 # BHZ minimum peak distance, in seconds. Matches the
 # behavioral_seizure_detection.m:237 hardcoded targetfs*30*5.
 DEFAULT_MIN_PEAK_DIST_SEC: float = 150.0
+
+# Stim-blank window for the scan -- captured from config at
+# start_worker so the scan blanks exactly like the Video Review trace.
+# Defaults match the dashboard's feature_analysis.* defaults.
+_BLANK_PRE_MS: float = stim_blank.BLANK_PRE_MS
+_BLANK_POST_MS: float = stim_blank.BLANK_POST_MS
+
+
+def _blank_channel_series(store, file_id: int, channel: int,
+                            series, fs: float,
+                            session_dir: str | None):
+    """Stim-blank one channel's series the same way the trace does.
+
+    Skips blanking on stim-copy channels (they record the stimulator
+    output). Reuses src/utils/stim_blank so the scan and the displayed
+    Hilbert/AUC trace operate on an identical signal.
+    """
+    if channel in stim_blank.stim_copy_channels(store, session_dir):
+        return series
+    times = stim_blank.stim_times_for_file(store, file_id)
+    return stim_blank.blank_series_with_stim_times(
+        series, fs, times, _BLANK_PRE_MS, _BLANK_POST_MS)
 
 
 @dataclass(frozen=True)
@@ -176,6 +199,9 @@ def _compute_peak_count_uncached(store, file_id: int,
             peak_times=[])
     series = chunk.signal[:, channel].astype(
         np.float32, copy=False)
+    series = _blank_channel_series(
+        store, file_id, channel, series, fs,
+        file_row.get("session_dir"))
     env = hilbert_envelope_20_200(series, fs)
     min_peak_dist = max(1, int(round(fs * min_peak_dist_sec)))
     locs, _heights = peakseek(
@@ -377,6 +403,9 @@ def _compute_auc_count_uncached(store, file_id: int, channel: int,
             channel, file_id, chunk.signal.shape)
         return empty
     series = chunk.signal[:, channel].astype(np.float32, copy=False)
+    series = _blank_channel_series(
+        store, file_id, channel, series, fs,
+        file_row.get("session_dir"))
     env = hilbert_envelope_20_200(series, fs)
     n = _count_auc_peaks(
         env, fs, window_sec, auc_threshold,
@@ -1087,6 +1116,14 @@ def start_worker(store, config: dict) -> None:
     ``assignments.start_warmer`` / ``event_clip.start_worker``."""
     assert config is None or isinstance(config, dict)
     cfg = (config or {}).get("mass_analyze", {}) or {}
+    # Capture the stim-blank window so the scan blanks exactly like the
+    # Video Review trace (which reads the same config keys).
+    fa = (config or {}).get("feature_analysis", {}) or {}
+    global _BLANK_PRE_MS, _BLANK_POST_MS
+    _BLANK_PRE_MS = float(
+        fa.get("stim_artifact_start_ms", stim_blank.BLANK_PRE_MS))
+    _BLANK_POST_MS = float(
+        fa.get("stim_artifact_end_ms", stim_blank.BLANK_POST_MS))
     if cfg.get("enabled") is False:  # explicit disable only
         logger.info("mass_analyze worker disabled in config")
         return
