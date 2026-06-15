@@ -14,6 +14,7 @@ from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
 from src.utils import mass_analyze as _mass_analyze
+from src.utils.version import qc_monitor_version
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
@@ -196,44 +197,7 @@ from src.dashboard.components import (  # noqa: E402,F401
 # src/dashboard/tabs/overview.py (their only consumer).
 
 
-def _qc_monitor_version() -> str:
-    """Short, human-readable version string for the dashboard header.
-
-    There is no setup.py / pyproject.toml here, so we derive from git:
-    ``<short-sha>[-dirty]  <YYYY-MM-DD>``. If git isn't reachable
-    (deployed without .git, no PATH entry), returns ``unknown``.
-    Computed once at import so the subprocess cost doesn't repeat on
-    every page render.
-    """
-    import subprocess
-    repo_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", ".."))
-    try:
-        sha = subprocess.check_output(
-            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL, timeout=2,
-        ).decode().strip()
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return "unknown"
-    try:
-        dirty = bool(subprocess.check_output(
-            ["git", "-C", repo_root, "status", "--porcelain"],
-            stderr=subprocess.DEVNULL, timeout=2,
-        ).decode().strip())
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        dirty = False
-    try:
-        ts = subprocess.check_output(
-            ["git", "-C", repo_root, "log", "-1", "--format=%cs"],
-            stderr=subprocess.DEVNULL, timeout=2,
-        ).decode().strip()
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        ts = ""
-    label = sha + ("-dirty" if dirty else "")
-    return f"{label}  {ts}".strip() if ts else label
-
-
-_QC_MONITOR_VERSION = _qc_monitor_version()
+_QC_MONITOR_VERSION = qc_monitor_version()
 
 
 # _parse_json_field, _get_channel_map, and _color_for_role moved to

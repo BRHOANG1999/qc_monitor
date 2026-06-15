@@ -41,11 +41,16 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
 
+from src.utils.version import qc_monitor_version
+
 logger = logging.getLogger("qc_monitor.utils.bhz_csv")
 
 
-# 44 columns, exact order verified against
-# 20260224_BCH040.csv (Plan, Data model section).
+# First 44 columns: exact order verified against
+# 20260224_BCH040.csv (Plan, Data model section). The 45th,
+# ``SoftwareVersion``, is a lab-local addition appended at the
+# END so MATLAB ``readtable`` (which reads by header name) keeps
+# working and the first-44 contract is untouched.
 COLUMNS: tuple[str, ...] = (
     "folder", "filename", "fs", "Cutoff", "Channel",
     "Peak_Index", "Peak_Stamp", "Peak_Date", "Peak_Time",
@@ -60,6 +65,7 @@ COLUMNS: tuple[str, ...] = (
     "Roomlight", "VideoQuality", "VideoComment",
     "BehaviorOnsetComment", "Comment", "Light", "Mode", "Target",
     "scorecomment",
+    "SoftwareVersion",
 )
 
 ONSET_LVF = "LVF (Low Voltage Fast Onset)"
@@ -176,6 +182,7 @@ def _event_to_row(event: dict, file_meta: dict,
     row["Light"] = event.get("light")
     row["Mode"] = "manual"
     row["Target"] = file_meta.get("Target") or "LFP"
+    row["SoftwareVersion"] = qc_monitor_version()
     return row
 
 
@@ -188,6 +195,7 @@ def _no_events_row(file_meta: dict) -> dict:
     row["Comment"] = NO_EVENTS_COMMENT
     row["Mode"] = ""
     row["Target"] = file_meta.get("Target") or "LFP"
+    row["SoftwareVersion"] = qc_monitor_version()
     return row
 
 

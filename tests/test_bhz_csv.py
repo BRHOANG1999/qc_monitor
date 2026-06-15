@@ -41,12 +41,21 @@ def _ref_header() -> list[str]:
 class CsvHeader(unittest.TestCase):
 
     def test_header_matches_reference(self):
-        """COLUMNS must be the reference header verbatim."""
+        """The first 44 columns must be the reference header
+        verbatim. ``SoftwareVersion`` is a deliberate lab-local
+        addition appended at the end (provenance per row), so it
+        is excluded from the reference comparison."""
         ref = _ref_header()
-        self.assertEqual(list(COLUMNS), ref,
+        if ref and ref[-1] == "SoftwareVersion":
+            ref = ref[:-1]  # fallback path returns our own COLUMNS
+        expected = [c for c in COLUMNS if c != "SoftwareVersion"]
+        self.assertEqual(expected, ref,
                          "BHZ CSV header drifted from the lab "
                          "reference. Update COLUMNS to match "
                          "G:\\BHZ\\BHZ_CSV_Exports.")
+        self.assertEqual(COLUMNS[-1], "SoftwareVersion",
+                         "SoftwareVersion must stay the trailing "
+                         "column so MATLAB readtable is unaffected.")
 
 
 class LvfRoundTrip(unittest.TestCase):
