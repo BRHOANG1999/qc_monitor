@@ -432,15 +432,39 @@ CREATE INDEX IF NOT EXISTS idx_envelope_peak_cache_lookup
     ON envelope_peak_cache(file_id, channel, cutoff);
 
 -- ----------------------------------------------------------------------
+-- envelope_auc_cache: sibling of envelope_peak_cache for the AUC screen.
+-- Per-(file, channel, auc_threshold, window_sec) sliding-window-AUC
+-- peakseek count, so re-sweeping the AUC threshold / window is a single
+-- indexed read instead of re-paying the FFT.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS envelope_auc_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    channel INTEGER NOT NULL,
+    auc_threshold REAL NOT NULL,
+    window_sec REAL NOT NULL,
+    min_peak_dist_sec REAL NOT NULL DEFAULT 150.0,
+    n_events INTEGER NOT NULL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(file_id, channel, auc_threshold, window_sec, min_peak_dist_sec)
+);
+CREATE INDEX IF NOT EXISTS idx_envelope_auc_cache_lookup
+    ON envelope_auc_cache(file_id, channel, auc_threshold, window_sec);
+
+-- ----------------------------------------------------------------------
 -- mass_analyze_job: background scan queue + progress for the PI's
 -- Mass Analyze panel. One row per (PI, animal, cutoff) run; the panel
 -- polls scanned_files / n_zero_peaks / n_with_peaks for live progress.
+-- auc_threshold / auc_window_sec drive the second (AUC) screen so the
+-- scan can populate both pools in one pass.
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS mass_analyze_job (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     pi_email TEXT NOT NULL,
     animal_id TEXT NOT NULL,
     cutoff REAL NOT NULL,
+    auc_threshold REAL,
+    auc_window_sec REAL,
     status TEXT NOT NULL
         CHECK(status IN ('pending', 'running',
                           'done', 'failed', 'cancelled')),
@@ -455,6 +479,45 @@ CREATE TABLE IF NOT EXISTS mass_analyze_job (
 );
 CREATE INDEX IF NOT EXISTS idx_mass_analyze_job_status
     ON mass_analyze_job(status);
+
+-- ----------------------------------------------------------------------
+-- screen_eval_job: background benchmark of the two file-screens against
+-- human labels. One row per (PI, animal, peak_cutoff, auc_threshold,
+-- window) run. The PI panel polls the per-screen confusion counters
+-- (p1_* = envelope screen, p2_* = AUC screen) + the disagreement
+-- breakdown (*_only_* = file flagged by exactly one screen).
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS screen_eval_job (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pi_email TEXT NOT NULL,
+    animal_id TEXT NOT NULL,
+    peak_cutoff REAL NOT NULL,
+    auc_threshold REAL NOT NULL,
+    auc_window_sec REAL NOT NULL,
+    status TEXT NOT NULL
+        CHECK(status IN ('pending', 'running',
+                          'done', 'failed', 'cancelled')),
+    total_files INTEGER,
+    scanned_files INTEGER DEFAULT 0,
+    p1_tp INTEGER DEFAULT 0,
+    p1_fp INTEGER DEFAULT 0,
+    p1_tn INTEGER DEFAULT 0,
+    p1_fn INTEGER DEFAULT 0,
+    p2_tp INTEGER DEFAULT 0,
+    p2_fp INTEGER DEFAULT 0,
+    p2_tn INTEGER DEFAULT 0,
+    p2_fn INTEGER DEFAULT 0,
+    env_only_true INTEGER DEFAULT 0,
+    env_only_false INTEGER DEFAULT 0,
+    auc_only_true INTEGER DEFAULT 0,
+    auc_only_false INTEGER DEFAULT 0,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_screen_eval_job_status
+    ON screen_eval_job(status);
 
 -- ----------------------------------------------------------------------
 -- event_clip_job: ffmpeg job queue + cache index. The PI tab kicks off

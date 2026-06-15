@@ -57,6 +57,19 @@ class Store:
         }
         if "user_email" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN user_email TEXT")
+        # Two-screen comparison rollout: add the AUC-screen columns to an
+        # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
+        # columns to a table already on disk, so ALTER them in.
+        existing_maj_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(mass_analyze_job)")
+        }
+        if "auc_threshold" not in existing_maj_cols:
+            conn.execute(
+                "ALTER TABLE mass_analyze_job ADD COLUMN auc_threshold REAL")
+        if "auc_window_sec" not in existing_maj_cols:
+            conn.execute(
+                "ALTER TABLE mass_analyze_job ADD COLUMN auc_window_sec REAL")
         # PI verification rollout migration: widen the review_state
         # status CHECK + promote pre-existing finalised rows to
         # 'pi_approved' (their CSV row was already written under the
@@ -76,6 +89,16 @@ class Store:
             )
         except Exception:
             # Table doesn't exist yet on a brand-new DB; fine.
+            pass
+        # Same restart-reap for the screen-comparison benchmark jobs.
+        try:
+            conn.execute(
+                """UPDATE screen_eval_job
+                   SET status='failed', error='worker restart',
+                       finished_at=datetime('now')
+                   WHERE status IN ('pending', 'running')"""
+            )
+        except Exception:
             pass
         conn.commit()
         conn.close()
