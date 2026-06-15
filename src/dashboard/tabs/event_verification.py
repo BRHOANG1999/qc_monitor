@@ -70,6 +70,9 @@ def layout(store: Store, config: dict | None = None):
         # cutoff; zero-peak files get auto-cleared to
         # pending_pi_review on Confirm.
         _mass_analyze_panel(store),
+        # Screen-comparison benchmark: run both screens over the
+        # animal's human-labeled files and compare TP/FP/TN/FN.
+        _screen_compare_panel(store),
         # Bulk-action bar.
         html.Div([
             html.Button(
@@ -319,6 +322,152 @@ def _mass_analyze_panel(store) -> html.Details:
                    "1px solid rgba(255,255,255,0.06)",
                "borderRadius": "8px",
                "marginBottom": "14px"})
+
+
+def _screen_compare_panel(store) -> html.Details:
+    """Benchmark the two file-screens against human labels.
+
+    Runs the envelope screen (peak height) and the AUC screen
+    (sliding-window area) over every file this animal has a human
+    verdict for, then reports each screen's confusion matrix +
+    sensitivity / false-positive rate so the PI can pick the
+    screen that wastes the least review time."""
+    animals = sorted(store.list_all_animals())
+    num_style = {"flex": "0 0 110px", "padding": "6px 10px",
+                  "background": "#262638", "color": "#f0f0f5",
+                  "border": "1px solid rgba(255,255,255,0.10)",
+                  "borderRadius": "4px", "fontSize": "12px"}
+    lab = {"color": "#a0a0b0", "fontSize": "12px",
+            "marginLeft": "14px", "marginRight": "6px"}
+    return html.Details([
+        html.Summary([
+            html.Span("Compare screening methods ",
+                       style={"color": "#f0f0f5",
+                               "fontWeight": "600"}),
+            html.Span("(envelope vs AUC, scored on human labels)",
+                       style={"color": "#a0a0b0",
+                               "fontSize": "11px",
+                               "marginLeft": "6px"}),
+        ], style={"cursor": "pointer", "marginBottom": "8px"}),
+        html.Div([
+            html.Div(
+                "Runs both screens over every file with a human "
+                "verdict (has-events / no-events / PI-approved) "
+                "for this animal, then compares each screen's "
+                "true/false positives. The AUC screen integrates "
+                "the envelope over a sliding window, so it should "
+                "raise fewer false positives on transient noise "
+                "while keeping the real events. Set the AUC "
+                "threshold after eyeballing the Hilbert-AUC trace "
+                "in Video Review.",
+                style={"color": "#a0a0b0", "fontSize": "11px",
+                        "padding": "8px 12px",
+                        "background": "rgba(94,124,226,0.04)",
+                        "border": "1px solid rgba(94,124,226,0.18)",
+                        "borderRadius": "6px",
+                        "marginBottom": "10px"}),
+            html.Div([
+                html.Label("Animal:",
+                            style={"color": "#a0a0b0",
+                                    "fontSize": "12px",
+                                    "marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="evtv-sc-animal-dropdown",
+                    options=[{"label": a, "value": a}
+                             for a in animals],
+                    placeholder="Pick an animal",
+                    style={"flex": "1 1 200px", "minWidth": "180px"},
+                    className="dark-dropdown",
+                ),
+                html.Label("Peak cutoff:", style=lab),
+                dcc.Input(id="evtv-sc-cutoff-input", type="number",
+                           min=0, step="any", value=0.05,
+                           style=num_style),
+                html.Label("AUC thresh:", style=lab),
+                dcc.Input(id="evtv-sc-auc-threshold-input",
+                           type="number", min=0, step="any",
+                           placeholder="e.g. 0.5", style=num_style),
+                html.Label("AUC win (s):", style=lab),
+                dcc.Input(id="evtv-sc-auc-window-input",
+                           type="number", min=0, step="any",
+                           value=5, style={**num_style,
+                                            "flex": "0 0 80px"}),
+                html.Button("Compare screens",
+                             id="evtv-sc-run-btn", n_clicks=0,
+                             style=_btn_style(accent=True)),
+                html.Button("Cancel",
+                             id="evtv-sc-cancel-btn", n_clicks=0,
+                             style=_btn_style(secondary=True)),
+            ], style={"display": "flex", "alignItems": "center",
+                       "gap": "8px", "flexWrap": "wrap",
+                       "marginBottom": "10px"}),
+            html.Div(id="evtv-sc-progress",
+                      style={"color": "#a0a0b0", "fontSize": "12px",
+                              "minHeight": "16px",
+                              "marginBottom": "8px"}),
+            html.Div(id="evtv-sc-results",
+                      style={"marginBottom": "10px"}),
+            dcc.Store(id="evtv-sc-job-id", data=None),
+            dcc.Interval(id="evtv-sc-poll", interval=1500,
+                           n_intervals=0, disabled=True),
+        ]),
+    ], open=False,
+       style={"padding": "12px 14px", "background": "#13131f",
+               "border": "1px solid rgba(255,255,255,0.06)",
+               "borderRadius": "8px", "marginBottom": "14px"})
+
+
+def _screen_compare_table(job: dict) -> html.Div:
+    """Render the two-screen confusion comparison from a done
+    screen_eval_job row."""
+    def _rate(num: int, den: int) -> str:
+        return f"{num / den:.3f}" if den else "--"
+    p1 = {k: int(job.get(f"p1_{k}") or 0)
+          for k in ("tp", "fp", "tn", "fn")}
+    p2 = {k: int(job.get(f"p2_{k}") or 0)
+          for k in ("tp", "fp", "tn", "fn")}
+    n_labeled = int(job.get("scanned_files") or 0)
+    rows = [
+        {"metric": "Files labeled", "env": n_labeled, "auc": n_labeled},
+        {"metric": "True positives (events caught)",
+         "env": p1["tp"], "auc": p2["tp"]},
+        {"metric": "False positives (event-free flagged)",
+         "env": p1["fp"], "auc": p2["fp"]},
+        {"metric": "True negatives", "env": p1["tn"], "auc": p2["tn"]},
+        {"metric": "False negatives (events missed)",
+         "env": p1["fn"], "auc": p2["fn"]},
+        {"metric": "Sensitivity TP/(TP+FN)",
+         "env": _rate(p1["tp"], p1["tp"] + p1["fn"]),
+         "auc": _rate(p2["tp"], p2["tp"] + p2["fn"])},
+        {"metric": "False-positive rate FP/(FP+TN)",
+         "env": _rate(p1["fp"], p1["fp"] + p1["tn"]),
+         "auc": _rate(p2["fp"], p2["fp"] + p2["tn"])},
+    ]
+    eot = int(job.get("env_only_true") or 0)
+    eof = int(job.get("env_only_false") or 0)
+    aot = int(job.get("auc_only_true") or 0)
+    aof = int(job.get("auc_only_false") or 0)
+    return html.Div([
+        dash_table.DataTable(
+            data=rows,
+            columns=[{"name": "Metric", "id": "metric"},
+                      {"name": "Envelope screen", "id": "env"},
+                      {"name": "AUC screen", "id": "auc"}],
+            **DARK_TABLE_STYLE,
+        ),
+        html.Div([
+            html.Div("Disagreement (flagged by exactly one screen):",
+                      style={"color": "#cfd0d6", "fontSize": "12px",
+                              "fontWeight": "600",
+                              "margin": "10px 0 4px"}),
+            html.Div(
+                f"Envelope-only: {eot + eof}  "
+                f"({eot} real events, {eof} event-free false alarms)  ·  "
+                f"AUC-only: {aot + aof}  "
+                f"({aot} real events, {aof} event-free false alarms)",
+                style={"color": "#a0a0b0", "fontSize": "12px"}),
+        ]),
+    ])
 
 
 # --------------------------------------------------------------- #
@@ -875,6 +1024,102 @@ def register_callbacks(app, store, config: dict) -> None:
             return no_update, "Not authorised.", no_update
         _mass_analyze.cancel_job(store, int(job_id))
         return no_update, "Cancel requested.", no_update
+
+    # ---- Screen comparison: start / poll / cancel ---- #
+    @app.callback(
+        Output("evtv-sc-job-id", "data"),
+        Output("evtv-sc-poll", "disabled"),
+        Output("evtv-sc-progress", "children",
+                allow_duplicate=True),
+        Input("evtv-sc-run-btn", "n_clicks"),
+        State("evtv-sc-animal-dropdown", "value"),
+        State("evtv-sc-cutoff-input", "value"),
+        State("evtv-sc-auc-threshold-input", "value"),
+        State("evtv-sc-auc-window-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_sc_run(n_clicks, animal_id, cutoff,
+                    auc_threshold, auc_window):
+        if not n_clicks:
+            return no_update, no_update, no_update
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return None, True, "Not authorised."
+        if not animal_id:
+            return None, True, "Pick an animal first."
+        try:
+            cutoff = float(cutoff)
+            auc_t = float(auc_threshold)
+            auc_w = float(auc_window) if auc_window else 5.0
+        except (TypeError, ValueError):
+            return (None, True,
+                     "Peak cutoff and AUC threshold must be numbers.")
+        if cutoff <= 0 or auc_t <= 0 or auc_w <= 0:
+            return None, True, "Cutoff, AUC threshold, window > 0."
+        try:
+            job_id = _mass_analyze.create_screen_eval_job(
+                store, email, animal_id, cutoff, auc_t, auc_w)
+        except Exception as e:
+            logger.exception("create_screen_eval_job failed")
+            return None, True, f"Failed to start: {e}"
+        return job_id, False, "Benchmark queued…"
+
+    @app.callback(
+        Output("evtv-sc-progress", "children"),
+        Output("evtv-sc-results", "children"),
+        Output("evtv-sc-poll", "disabled",
+                allow_duplicate=True),
+        Input("evtv-sc-poll", "n_intervals"),
+        Input("evtv-sc-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_sc_poll(_n, job_id):
+        if not job_id:
+            return ("", "", True)
+        job = _mass_analyze.get_screen_eval_job(store, int(job_id))
+        if not job:
+            return ("Job vanished.", "", True)
+        status = job.get("status") or "?"
+        scanned = int(job.get("scanned_files") or 0)
+        total = int(job.get("total_files") or 0)
+        progress = (
+            f"{status}  ·  scored {scanned}"
+            + (f" of {total} labeled files" if total else ""))
+        polling_disabled = status in ("done", "failed", "cancelled")
+        results = []
+        if status == "done":
+            if total == 0:
+                results = html.Div(
+                    "No human-labeled files for this animal yet "
+                    "-- nothing to score the screens against.",
+                    style={"color": "#a0a0b0", "fontSize": "12px"})
+            else:
+                results = _screen_compare_table(job)
+        elif status == "failed":
+            results = html.Div(
+                f"Benchmark failed: {job.get('error') or 'unknown'}",
+                style={"color": "#ff453a", "fontSize": "12px"})
+        elif status == "cancelled":
+            results = html.Div(
+                f"Cancelled at {scanned} of {total}.",
+                style={"color": "#ff9f0a", "fontSize": "12px"})
+        return (progress, results, polling_disabled)
+
+    @app.callback(
+        Output("evtv-sc-progress", "children",
+                allow_duplicate=True),
+        Input("evtv-sc-cancel-btn", "n_clicks"),
+        State("evtv-sc-job-id", "data"),
+        prevent_initial_call=True,
+    )
+    def _on_sc_cancel(n_clicks, job_id):
+        if not n_clicks or not job_id:
+            return no_update
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return "Not authorised."
+        _mass_analyze.cancel_screen_eval_job(store, int(job_id))
+        return "Cancel requested."
 
     @app.callback(
         Output("evtv-ma-progress", "children",
