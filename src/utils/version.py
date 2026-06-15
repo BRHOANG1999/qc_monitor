@@ -1,8 +1,8 @@
 """Single source of truth for the app version string.
 
-Derived from git -- ``<short-sha>[-dirty]  <YYYY-MM-DD>`` -- because
-there is no setup.py / pyproject.toml here. Returns ``unknown`` when
-git isn't reachable (deployed without .git, or git not on PATH).
+Derived from git -- the ``<short-sha>`` of HEAD -- because there is no
+setup.py / pyproject.toml here. Returns ``unknown`` when git isn't
+reachable (deployed without .git, or git not on PATH).
 
 Computed once and cached so the subprocess cost is paid a single time
 per process. The cached value is therefore frozen at first call, which
@@ -36,19 +36,4 @@ def _compute_version() -> str:
         ).decode().strip()
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return "unknown"
-    try:
-        dirty = bool(subprocess.check_output(
-            ["git", "-C", repo_root, "status", "--porcelain"],
-            stderr=subprocess.DEVNULL, timeout=2,
-        ).decode().strip())
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        dirty = False
-    try:
-        ts = subprocess.check_output(
-            ["git", "-C", repo_root, "log", "-1", "--format=%cs"],
-            stderr=subprocess.DEVNULL, timeout=2,
-        ).decode().strip()
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        ts = ""
-    label = sha + ("-dirty" if dirty else "")
-    return f"{label}  {ts}".strip() if ts else label
+    return sha or "unknown"
