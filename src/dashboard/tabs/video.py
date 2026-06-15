@@ -2988,14 +2988,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             "display": "flex",
             "alignItems": "center",
             "gap": "8px",
-            "padding": "6px 12px",
-            "marginBottom": "10px",
+            "padding": "8px 14px",
             "borderRadius": "999px",
-            "background": "rgba(94, 124, 226, 0.10)",
-            "border": "1px solid rgba(94, 124, 226, 0.30)",
+            "background": "rgba(19, 19, 31, 0.92)",
+            "border": "1px solid rgba(94, 124, 226, 0.45)",
             "fontSize": "12px",
             "color": "#cfd0d6",
             "width": "fit-content",
+            # Float bottom-right so it follows the reviewer as they
+            # scroll, instead of sitting inline at the top.
+            "position": "fixed",
+            "right": "20px",
+            "bottom": "20px",
+            "zIndex": "10000",
+            "boxShadow": "0 8px 24px rgba(0, 0, 0, 0.45)",
         })
         chips = []
         for key, label in legs:
@@ -4559,7 +4565,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if hi <= lo:
             return no_update
 
-        target_bins = choose_target_bins(hi - lo) or INITIAL_TARGET_BINS
+        # choose_target_bins returns 0 when the window is small enough
+        # to render RAW. The old `... or INITIAL_TARGET_BINS` turned
+        # that 0 into a decimate (0 or N == N), so zooming in never
+        # showed real samples. When raw, pass target_bins = window
+        # length so envelope() takes its decim==1 (raw) path.
+        tb = choose_target_bins(hi - lo)
+        target_bins = tb if tb else max(1, hi - lo)
         x_p, y_p, _decim = envelope(
             series[lo:hi], fs, target_bins, t_start=lo / fs,
         )
