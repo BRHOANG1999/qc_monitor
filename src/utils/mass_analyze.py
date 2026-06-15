@@ -836,11 +836,14 @@ def scan_for_animal(store, job_id: int,
         conn.commit()
     n_zero = 0
     n_with = 0
+    n_auc_pos = 0      # Pool 2 (AUC-screen positives)
+    n_disagree = 0     # Pool 3 (flagged by exactly one screen)
     done = 0
 
     def _work(f):
         channel = first_animal_channel_index(store, f["session_dir"])
         npk = None
+        auc_pos = None
         try:
             npk = get_or_compute_peak_count(
                 store, int(f["file_id"]), channel, cutoff,
@@ -850,28 +853,36 @@ def scan_for_animal(store, job_id: int,
                             f["file_id"], channel, e)
         if run_auc:
             try:
-                get_or_compute_auc_count(
+                auc_pos = get_or_compute_auc_count(
                     store, int(f["file_id"]), channel,
                     float(auc_threshold), float(auc_window),
-                    min_peak_dist_sec=min_peak_dist_sec)
+                    min_peak_dist_sec=min_peak_dist_sec).n_events > 0
             except Exception as e:
                 logger.warning("auc screen file=%s ch=%s failed: %s",
                                 f["file_id"], channel, e)
-        return npk
+        return (npk, auc_pos)
 
-    def _record(_f, npk):
-        nonlocal n_zero, n_with, done
-        # None (scan error -> safer 'with peaks') or >0 -> with; 0 -> zero.
+    def _record(_f, res):
+        nonlocal n_zero, n_with, n_auc_pos, n_disagree, done
+        npk, auc_pos = res
+        # Pool 1 (envelope): None (scan error -> safer 'with') or >0.
+        env_pos = (npk is None) or (npk > 0)
         if npk == 0:
             n_zero += 1
         else:
             n_with += 1
+        # Pool 2 (AUC) + Pool 3 (disagreement), only when AUC ran.
+        if auc_pos:
+            n_auc_pos += 1
+        if auc_pos is not None and env_pos != bool(auc_pos):
+            n_disagree += 1
         done += 1
         with store.connection() as conn:
             conn.execute(
                 """UPDATE mass_analyze_job SET scanned_files=?,
-                   n_zero_peaks=?, n_with_peaks=? WHERE id=?""",
-                (done, n_zero, n_with, job_id))
+                   n_zero_peaks=?, n_with_peaks=?,
+                   n_auc_pos=?, n_disagree=? WHERE id=?""",
+                (done, n_zero, n_with, n_auc_pos, n_disagree, job_id))
             conn.commit()
 
     cancelled = _run_file_pool(

@@ -472,6 +472,8 @@ CREATE TABLE IF NOT EXISTS mass_analyze_job (
     scanned_files INTEGER DEFAULT 0,
     n_zero_peaks INTEGER DEFAULT 0,
     n_with_peaks INTEGER DEFAULT 0,
+    n_auc_pos INTEGER DEFAULT 0,
+    n_disagree INTEGER DEFAULT 0,
     error TEXT,
     started_at TEXT,
     finished_at TEXT,

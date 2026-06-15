@@ -70,6 +70,14 @@ class Store:
         if "auc_window_sec" not in existing_maj_cols:
             conn.execute(
                 "ALTER TABLE mass_analyze_job ADD COLUMN auc_window_sec REAL")
+        # Live per-pool counters (Pool 2 = AUC positives, Pool 3 =
+        # disagreement) so the scan progress can track all three pools.
+        if "n_auc_pos" not in existing_maj_cols:
+            conn.execute("ALTER TABLE mass_analyze_job "
+                         "ADD COLUMN n_auc_pos INTEGER DEFAULT 0")
+        if "n_disagree" not in existing_maj_cols:
+            conn.execute("ALTER TABLE mass_analyze_job "
+                         "ADD COLUMN n_disagree INTEGER DEFAULT 0")
         # PI verification rollout migration: widen the review_state
         # status CHECK + promote pre-existing finalised rows to
         # 'pi_approved' (their CSV row was already written under the

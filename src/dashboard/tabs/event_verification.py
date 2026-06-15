@@ -944,11 +944,16 @@ def register_callbacks(app, store, config: dict) -> None:
         total = int(job.get("total_files") or 0)
         n_zero = int(job.get("n_zero_peaks") or 0)
         n_with = int(job.get("n_with_peaks") or 0)
+        n_auc = int(job.get("n_auc_pos") or 0)
+        n_dis = int(job.get("n_disagree") or 0)
+        ran_auc = bool(job.get("auc_threshold")) and \
+            bool(job.get("auc_window_sec"))
         progress = (
             f"{status}  ·  scanned {scanned}"
             + (f" of {total}" if total else "")
-            + f"  ·  zero-peak: {n_zero}  ·  "
-              f"≥1 peak: {n_with}"
+            + f"  ·  Pool 1 (envelope): {n_with}"
+            + (f"  ·  Pool 2 (AUC): {n_auc}  ·  "
+               f"Pool 3 (disagree): {n_dis}" if ran_auc else "")
         )
         summary = []
         confirm_row = []
