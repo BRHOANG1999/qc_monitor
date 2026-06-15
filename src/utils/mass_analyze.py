@@ -43,6 +43,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -69,6 +70,45 @@ DEFAULT_MIN_PEAK_DIST_SEC: float = 150.0
 # Defaults match the dashboard's feature_analysis.* defaults.
 _BLANK_PRE_MS: float = stim_blank.BLANK_PRE_MS
 _BLANK_POST_MS: float = stim_blank.BLANK_POST_MS
+
+# Per-file work (SMB read + FFT) is independent across files, so the
+# scan/benchmark loops run on a bounded thread pool. numpy releases the
+# GIL during the FFT/filtfilt and the SMB reads overlap, so threads give
+# real speedup without the per-process chunk-memory blowup of processes.
+# Bounded (not os.cpu_count) so we don't thrash the SMB share. Captured
+# from config at start_worker.
+_SCAN_WORKERS: int = 4
+
+
+def _run_file_pool(files: list, work_fn, cancel_fn, on_result,
+                     *, workers: int) -> bool:
+    """Map *work_fn* over *files* on a bounded thread pool.
+
+    ``on_result(file, result)`` is invoked in THIS (draining) thread as
+    each file completes, so tallies + the job-row progress write stay
+    single-threaded and race-free. ``cancel_fn() -> bool`` is checked
+    between completions; on cancel, pending futures are dropped and the
+    function returns True (running ones finish in the background -- they
+    only warm the cache). ``work_fn`` must catch its own per-file errors
+    and return a sentinel rather than raising.
+    """
+    n = len(files)
+    if n == 0:
+        return False
+    ex = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    futs = {ex.submit(work_fn, f): f for f in files}
+    cancelled = False
+    try:
+        max_iter = n + 1
+        for i, fut in enumerate(as_completed(futs)):
+            assert i < max_iter, "pool drain runaway"
+            if cancel_fn():
+                cancelled = True
+                break
+            on_result(futs[fut], fut.result())
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return cancelled
 
 
 def _blank_channel_series(store, file_id: int, channel: int,
@@ -796,60 +836,54 @@ def scan_for_animal(store, job_id: int,
         conn.commit()
     n_zero = 0
     n_with = 0
-    max_iter = total + 1
-    for i, f in enumerate(files):
-        assert i < max_iter, "scan loop runaway"
-        # Cooperative cancel check between files.
-        cur_status = _job_status(store, job_id)
-        if cur_status == "cancelled":
-            logger.info("mass_analyze job %s cancelled at "
-                         "%d/%d", job_id, i, total)
-            return {"status": "cancelled",
-                     "scanned_files": i,
-                     "total_files": total,
-                     "n_zero_peaks": n_zero,
-                     "n_with_peaks": n_with}
-        channel = first_animal_channel_index(
-            store, f["session_dir"])
+    done = 0
+
+    def _work(f):
+        channel = first_animal_channel_index(store, f["session_dir"])
+        npk = None
         try:
-            result = get_or_compute_peak_count(
+            npk = get_or_compute_peak_count(
                 store, int(f["file_id"]), channel, cutoff,
-                min_peak_dist_sec=min_peak_dist_sec,
-            )
+                min_peak_dist_sec=min_peak_dist_sec).n_peaks
         except Exception as e:
-            logger.warning(
-                "mass_analyze file=%s ch=%s failed: %s",
-                f["file_id"], channel, e)
-            # Treat scan failure as "with peaks" -- safer
-            # (file stays in queue for normal review).
-            n_with += 1
-        else:
-            if result.n_peaks == 0:
-                n_zero += 1
-            else:
-                n_with += 1
-        # Warm the AUC cache for the same file (second screen).
+            logger.warning("mass_analyze file=%s ch=%s failed: %s",
+                            f["file_id"], channel, e)
         if run_auc:
             try:
                 get_or_compute_auc_count(
                     store, int(f["file_id"]), channel,
                     float(auc_threshold), float(auc_window),
-                    min_peak_dist_sec=min_peak_dist_sec,
-                )
+                    min_peak_dist_sec=min_peak_dist_sec)
             except Exception as e:
-                logger.warning(
-                    "auc screen file=%s ch=%s failed: %s",
-                    f["file_id"], channel, e)
-        # Live progress update.
+                logger.warning("auc screen file=%s ch=%s failed: %s",
+                                f["file_id"], channel, e)
+        return npk
+
+    def _record(_f, npk):
+        nonlocal n_zero, n_with, done
+        # None (scan error -> safer 'with peaks') or >0 -> with; 0 -> zero.
+        if npk == 0:
+            n_zero += 1
+        else:
+            n_with += 1
+        done += 1
         with store.connection() as conn:
             conn.execute(
-                """UPDATE mass_analyze_job
-                   SET scanned_files=?,
-                       n_zero_peaks=?, n_with_peaks=?
-                   WHERE id=?""",
-                (i + 1, n_zero, n_with, job_id),
-            )
+                """UPDATE mass_analyze_job SET scanned_files=?,
+                   n_zero_peaks=?, n_with_peaks=? WHERE id=?""",
+                (done, n_zero, n_with, job_id))
             conn.commit()
+
+    cancelled = _run_file_pool(
+        files, _work,
+        lambda: _job_status(store, job_id) == "cancelled",
+        _record, workers=_SCAN_WORKERS)
+    if cancelled:
+        logger.info("mass_analyze job %s cancelled at %d/%d",
+                     job_id, done, total)
+        return {"status": "cancelled", "scanned_files": done,
+                 "total_files": total, "n_zero_peaks": n_zero,
+                 "n_with_peaks": n_with}
     # Done.
     with store.connection() as conn:
         conn.execute(
@@ -1044,14 +1078,10 @@ def run_screen_benchmark(store, job_id: int,
         "p2_tp", "p2_fp", "p2_tn", "p2_fn",
         "env_only_true", "env_only_false",
         "auc_only_true", "auc_only_false")}
-    max_iter = total + 1
-    for i, f in enumerate(files):
-        assert i < max_iter, "benchmark loop runaway"
-        if _screen_eval_status(store, job_id) == "cancelled":
-            return {"status": "cancelled", **c}
-        channel = first_animal_channel_index(
-            store, f["session_dir"])
-        truth_pos = (f["truth"] == "pos")
+    done = 0
+
+    def _work(f):
+        channel = first_animal_channel_index(store, f["session_dir"])
         try:
             env_pos, auc_pos = screen_file(
                 store, int(f["file_id"]), channel,
@@ -1060,13 +1090,20 @@ def run_screen_benchmark(store, job_id: int,
         except Exception as e:
             logger.warning("benchmark file=%s ch=%s failed: %s",
                             f["file_id"], channel, e)
-            continue
+            return None
+        return (env_pos, auc_pos, f["truth"] == "pos")
+
+    def _record(_f, res):
+        nonlocal done
+        if res is None:
+            return
+        env_pos, auc_pos, truth_pos = res
         _tally(c, "p1", env_pos, truth_pos)
         _tally(c, "p2", auc_pos, truth_pos)
         if env_pos != auc_pos:
             who = "env" if env_pos else "auc"
-            key = f"{who}_only_{'true' if truth_pos else 'false'}"
-            c[key] += 1
+            c[f"{who}_only_{'true' if truth_pos else 'false'}"] += 1
+        done += 1
         with store.connection() as conn:
             conn.execute(
                 """UPDATE screen_eval_job SET scanned_files=?,
@@ -1075,13 +1112,20 @@ def run_screen_benchmark(store, job_id: int,
                    env_only_true=?, env_only_false=?,
                    auc_only_true=?, auc_only_false=?
                    WHERE id=?""",
-                (i + 1, c["p1_tp"], c["p1_fp"], c["p1_tn"],
+                (done, c["p1_tp"], c["p1_fp"], c["p1_tn"],
                  c["p1_fn"], c["p2_tp"], c["p2_fp"], c["p2_tn"],
                  c["p2_fn"], c["env_only_true"],
                  c["env_only_false"], c["auc_only_true"],
                  c["auc_only_false"], job_id),
             )
             conn.commit()
+
+    cancelled = _run_file_pool(
+        files, _work,
+        lambda: _screen_eval_status(store, job_id) == "cancelled",
+        _record, workers=_SCAN_WORKERS)
+    if cancelled:
+        return {"status": "cancelled", **c}
     with store.connection() as conn:
         conn.execute(
             """UPDATE screen_eval_job
@@ -1119,11 +1163,15 @@ def start_worker(store, config: dict) -> None:
     # Capture the stim-blank window so the scan blanks exactly like the
     # Video Review trace (which reads the same config keys).
     fa = (config or {}).get("feature_analysis", {}) or {}
-    global _BLANK_PRE_MS, _BLANK_POST_MS
+    global _BLANK_PRE_MS, _BLANK_POST_MS, _SCAN_WORKERS
     _BLANK_PRE_MS = float(
         fa.get("stim_artifact_start_ms", stim_blank.BLANK_PRE_MS))
     _BLANK_POST_MS = float(
         fa.get("stim_artifact_end_ms", stim_blank.BLANK_POST_MS))
+    try:
+        _SCAN_WORKERS = max(1, int(cfg.get("scan_workers", 4)))
+    except (TypeError, ValueError):
+        _SCAN_WORKERS = 4
     if cfg.get("enabled") is False:  # explicit disable only
         logger.info("mass_analyze worker disabled in config")
         return

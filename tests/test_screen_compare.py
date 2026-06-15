@@ -175,5 +175,42 @@ def test_pool_files_two_screen_split(tmp_path, monkeypatch):
     assert p3 == {11: "envelope", 12: "auc"}
 
 
+# --------------------------------------------------------------- #
+# Thread-pool helper
+# --------------------------------------------------------------- #
+
+def test_run_file_pool_processes_all_once():
+    files = list(range(50))
+    seen = []
+
+    def work(f):
+        return f * 2
+
+    def on_result(f, r):
+        seen.append((f, r))
+
+    cancelled = ma._run_file_pool(
+        files, work, lambda: False, on_result, workers=8)
+    assert cancelled is False
+    # Order is non-deterministic; the SET of results is exact.
+    assert sorted(seen) == [(f, f * 2) for f in files]
+
+
+def test_run_file_pool_cancels():
+    files = list(range(100))
+    seen = []
+    cancelled = ma._run_file_pool(
+        files, lambda f: f, lambda: True,  # cancel immediately
+        lambda f, r: seen.append(f), workers=4)
+    assert cancelled is True
+    assert len(seen) < len(files)  # bailed early
+
+
+def test_run_file_pool_empty():
+    assert ma._run_file_pool(
+        [], lambda f: f, lambda: False,
+        lambda f, r: None, workers=4) is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
