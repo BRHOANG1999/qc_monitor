@@ -849,7 +849,7 @@ def _video_mass_analyze_panel() -> html.Details:
                                     "marginRight": "6px"}),
                 dcc.Input(
                     id="video-ma-cutoff-input",
-                    type="number", min=0, step=0.005,
+                    type="number", min=0, step="any",
                     value=0.05,
                     style={"flex": "0 0 110px",
                             "padding": "6px 10px",
@@ -1661,7 +1661,7 @@ def layout(store: Store, bridge: dict | None = None):
                                        "to move it. Lower = more sensitive."),
                     dcc.Input(
                         id="video-threshold-input",
-                        type="number", min=0, step=0.005,
+                        type="number", min=0, step="any",
                         value=0.05,
                         style={"backgroundColor": "#262638",
                                 "color": "#f0f0f5", "width": "90px"}),

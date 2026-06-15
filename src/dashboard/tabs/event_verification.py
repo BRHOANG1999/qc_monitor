@@ -273,7 +273,7 @@ def _mass_analyze_panel(store) -> html.Details:
                                     "marginRight": "6px"}),
                 dcc.Input(
                     id="evtv-ma-cutoff-input",
-                    type="number", min=0, step=0.005,
+                    type="number", min=0, step="any",
                     value=0.05,
                     style={"flex": "0 0 110px",
                             "padding": "6px 10px",
