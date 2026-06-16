@@ -327,6 +327,7 @@ def pending_files_for_animal(store, animal_id: str
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
+                         'needs_scoring',
                          'pi_approved'
                      )
                  )
@@ -653,6 +654,7 @@ def count_pending_for_animal(store, animal_id: str) -> int:
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
+                         'needs_scoring',
                          'pi_approved'
                      )
                  )

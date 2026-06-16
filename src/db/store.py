@@ -99,6 +99,8 @@ class Store:
         # pre-PI flow). SQLite can't ALTER a CHECK in place, so we
         # detect-and-rebuild only when the old constraint is on disk.
         self._migrate_review_state_pi_statuses(conn)
+        # Widen the CHECK again for the quick-flag 'needs_scoring' status.
+        self._migrate_review_state_add_needs_scoring(conn)
         # Reap mass_analyze_job rows stuck in 'running' across a
         # restart -- without this they'd never re-progress because
         # the worker that started them no longer exists. Safe to
@@ -209,6 +211,55 @@ class Store:
                    datetime('now')
               FROM review_state
               WHERE status = 'pi_approved';
+            """
+        )
+
+    def _migrate_review_state_add_needs_scoring(self, conn) -> None:
+        """Add 'needs_scoring' to the review_state CHECK constraint.
+
+        SQLite can't ALTER a CHECK in place, so detect-and-rebuild only
+        when the status isn't already allowed. Pure widening: no data
+        transform. Idempotent across boots.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='review_state'"
+        ).fetchone()
+        if not row:
+            return
+        if "needs_scoring" in (row["sql"] or ""):
+            return  # already migrated
+        conn.executescript(
+            """
+            CREATE TABLE review_state_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL
+                    REFERENCES processed_files(id),
+                user_email TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('claimed', 'no_events',
+                                      'has_events', 'abandoned',
+                                      'pending_pi_review',
+                                      'pi_approved', 'pi_flagged',
+                                      'needs_scoring')),
+                markers_json TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO review_state_new
+              (id, file_id, user_email, status, markers_json, note,
+               created_at, updated_at)
+            SELECT id, file_id, user_email, status, markers_json, note,
+                   created_at, updated_at FROM review_state;
+            DROP TABLE review_state;
+            ALTER TABLE review_state_new RENAME TO review_state;
+            CREATE INDEX IF NOT EXISTS idx_review_state_file
+                ON review_state(file_id);
+            CREATE INDEX IF NOT EXISTS idx_review_state_user
+                ON review_state(user_email);
+            CREATE INDEX IF NOT EXISTS idx_review_state_status
+                ON review_state(status);
             """
         )
 
@@ -1576,13 +1627,15 @@ class Store:
         assert user_email, "user_email required"
         assert status in ("claimed", "no_events", "has_events",
                            "abandoned", "pending_pi_review",
-                           "pi_approved", "pi_flagged"), \
+                           "pi_approved", "pi_flagged",
+                           "needs_scoring"), \
             f"bad status {status!r}"
         now = datetime.now().isoformat()
         markers_json = json.dumps(markers or [])
         log_action = ("claim" if status == "claimed"
                        else "abandon" if status == "abandoned"
                        else "pi_flag" if status == "pi_flagged"
+                       else "quick_flag" if status == "needs_scoring"
                        else "finish")
         conn = self._connect()
         try:
@@ -1840,6 +1893,56 @@ class Store:
                 })
         return out
 
+    def files_needing_scoring_for_animal(self, animal_id: str
+                                           ) -> list[dict]:
+        """Files whose LATEST review_state is 'needs_scoring' for
+        *animal_id* -- the quick-flag pool awaiting full scoring.
+
+        Mirrors the animal-match post-filter used elsewhere (the
+        channel_names LIKE is loose, so re-check with the parser).
+        Each dict: {file_id, session_dir, file_path, chunk_datetime,
+        duration_sec, markers_json}.
+        """
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        if not animal_id:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT pf.id AS file_id, pf.session_dir,
+                          pf.file_path, pf.chunk_datetime,
+                          pf.duration_sec, rs.markers_json
+                   FROM processed_files pf
+                   JOIN session_config sc
+                     ON sc.session_dir = pf.session_dir
+                   JOIN review_state rs ON rs.file_id = pf.id
+                   WHERE sc.channel_names LIKE ?
+                     AND rs.status = 'needs_scoring'
+                     AND rs.updated_at = (
+                       SELECT MAX(rs2.updated_at) FROM review_state rs2
+                       WHERE rs2.file_id = pf.id)
+                   ORDER BY pf.chunk_datetime ASC""",
+                (f'%"{animal_id}%',),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for r in rows:
+            names = self._channel_names_for_session(r["session_dir"])
+            match = False
+            for n in names:
+                if not isinstance(n, str) or not is_animal_channel(n):
+                    continue
+                a, _ = split_animal_electrode(n)
+                if a == animal_id:
+                    match = True
+                    break
+            if match:
+                out.append(dict(r))
+        return out
+
     def get_review_queue(self, animal_ids: list[str],
                           user_email: str,
                           limit: int = 100,
@@ -1914,12 +2017,15 @@ class Store:
               -- "send back for re-review" puts the file back
               -- in the undergrad's queue. The pi_flagged row's
               -- note is surfaced by the queue-card renderer.
+              -- 'needs_scoring' is a quick-flagged file parked in the
+              -- separate "Needs scoring" pool; hide it from the FIFO
+              -- queue for everyone until it's fully scored.
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs
                 WHERE rs.file_id = pf.id
                   AND rs.status IN ('no_events', 'has_events',
                                      'pending_pi_review',
-                                     'pi_approved')
+                                     'pi_approved', 'needs_scoring')
               )
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs2

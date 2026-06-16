@@ -1465,6 +1465,22 @@ def layout(store: Store, bridge: dict | None = None):
                                           "borderRadius": "6px",
                                           "padding": "4px"}),
                     ),
+                    # Quick-flag pool: files parked for full scoring.
+                    _details_card(
+                        "Needs scoring",
+                        summary_sub="quick-flagged files -- click to "
+                                     "finish scoring",
+                        open_default=False,
+                        content=html.Div(
+                            id="video-needs-scoring-list",
+                            style={"maxHeight": "220px",
+                                    "overflowY": "auto",
+                                    "background": "#13131f",
+                                    "border":
+                                        "1px solid rgba(240,180,41,0.25)",
+                                    "borderRadius": "6px",
+                                    "padding": "4px"}),
+                    ),
                     dcc.Store(id="video-queue-position", data=0),
                 ], id="video-queue-card"),
             ], style={"flex": "1", "minWidth": "320px"}),
@@ -2339,6 +2355,24 @@ def layout(store: Store, bridge: dict | None = None):
                                 "fontSize": "13px",
                                 "fontWeight": "700",
                                 "marginRight": "10px"}),
+                    html.Button(
+                        "Quick-flag (needs scoring)",
+                        id="video-review-quickflag-btn",
+                        n_clicks=0,
+                        title="Fast first pass: save the event "
+                               "timestamps you dropped (no type / "
+                               "Racine needed) and park the file in "
+                               "the 'Needs scoring' pool to finish "
+                               "later.",
+                        style={"backgroundColor": "transparent",
+                                "color": "#f0b429",
+                                "border": "1px solid #f0b429",
+                                "padding": "8px 18px",
+                                "borderRadius": "6px",
+                                "cursor": "pointer",
+                                "fontSize": "12px",
+                                "fontWeight": "700",
+                                "marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
                         type="dot",
@@ -2819,6 +2853,82 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     {"source": "queue_card_load"})
         return row["session_dir"], int(row["id"])
 
+    # The "Needs scoring" pool: quick-flagged files awaiting full
+    # scoring. Reuses the video-queue-item id type so a click loads the
+    # file through the existing _load_from_queue handler (which prefills
+    # the draft events on file change).
+    @app.callback(
+        Output("video-needs-scoring-list", "children"),
+        Input("video-queue-animal", "value"),
+        Input("refresh-trigger", "data"),
+        Input("video-file-dropdown", "value"),
+    )
+    def _render_needs_scoring(animal_value, _refresh, active_file_id):
+        animal = _ma_animal_from_picker(animal_value)
+        if not animal:
+            return html.Div(
+                "Pick an animal to see its quick-flag pool.",
+                style={"color": "#888", "fontSize": "11px",
+                        "padding": "8px"})
+        try:
+            rows = store.files_needing_scoring_for_animal(str(animal))
+        except Exception as e:
+            logger.warning("files_needing_scoring failed: %s", e)
+            rows = []
+        if not rows:
+            return html.Div(
+                "Nothing flagged for scoring.",
+                style={"color": "#888", "fontSize": "11px",
+                        "padding": "8px"})
+        from datetime import datetime as _dt
+        items = []
+        for r in rows:
+            ts_raw = r.get("chunk_datetime") or ""
+            try:
+                ts_label = _dt.strptime(
+                    ts_raw, "%Y_%m_%d__%H_%M_%S").strftime(
+                        "%Y-%m-%d  %H:%M")
+            except ValueError:
+                ts_label = ts_raw
+            try:
+                n_ev = len(json.loads(r.get("markers_json") or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                n_ev = 0
+            fname = os.path.basename(r.get("file_path") or "")
+            is_active = (active_file_id is not None
+                          and int(r["file_id"]) == int(active_file_id))
+            items.append(html.Button([
+                html.Div([
+                    html.Span(ts_label, style={
+                        "color": "#f0f0f5", "fontWeight": "600",
+                        "fontSize": "12px"}),
+                    html.Span(f"  · {n_ev} flagged", style={
+                        "color": "#f0b429", "fontSize": "11px",
+                        "marginLeft": "auto"}),
+                ], style={"display": "flex", "width": "100%"}),
+                html.Span(fname, title=fname, style={
+                    "color": "#6f7080", "fontSize": "10px",
+                    "fontFamily": "ui-monospace, monospace",
+                    "maxWidth": "100%", "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                    "whiteSpace": "nowrap"}),
+            ], id={"type": "video-queue-item",
+                    "file_id": int(r["file_id"])},
+                n_clicks=0,
+                style={"display": "flex", "flexDirection": "column",
+                        "alignItems": "flex-start", "width": "100%",
+                        "border": "none",
+                        "background": ("rgba(240,180,41,0.10)"
+                                        if is_active else "transparent"),
+                        "color": "#cfd0d6", "padding": "6px 10px",
+                        "cursor": "pointer",
+                        "borderBottom":
+                            "1px solid rgba(255,255,255,0.04)",
+                        "borderLeft": ("3px solid #f0b429" if is_active
+                                        else "3px solid transparent"),
+                        "textAlign": "left"}))
+        return items
+
     @app.callback(
         Output("video-queue-list", "children"),
         Input("video-queue-animal", "value"),
@@ -3144,15 +3254,29 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # change in video_events.py.
     _events.register_callbacks(app, store)
 
-    # Clear the events list when the file dropdown changes so
-    # the next recording starts blank.
+    # Reset the events list when the file dropdown changes -- but if
+    # the file was quick-flagged ('needs_scoring'), PREFILL its draft
+    # events so the second pass continues where pass 1 left off.
     @app.callback(
         Output("video-events-store", "data",
                 allow_duplicate=True),
         Input("video-file-dropdown", "value"),
         prevent_initial_call=True,
     )
-    def _reset_events_on_file_change(_file_id):
+    def _reset_events_on_file_change(file_id):
+        if not file_id:
+            return []
+        try:
+            latest = store.get_review_state(int(file_id))
+        except Exception:
+            latest = None
+        if latest and latest.get("status") == "needs_scoring":
+            try:
+                drafts = json.loads(latest.get("markers_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                drafts = []
+            if isinstance(drafts, list) and drafts:
+                return drafts
         return []
 
     # ---- Track D: multi-camera focus selector ---- #
@@ -3688,6 +3812,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not file_id:
             return [], None, "", ""
         email = current_user_email() or ""
+        # Quick-flagged file: resume in events mode so the draft
+        # events (prefilled by _reset_events_on_file_change) show.
+        latest = store.get_review_state(int(file_id))
+        if latest and latest.get("status") == "needs_scoring":
+            return ([], "has_events", latest.get("note") or "",
+                    "Resuming quick-flagged events -- finish "
+                    "scoring each, then Mark recording done.")
         existing = store.get_review_state_by_user(int(file_id),
                                                      email)
         if existing and existing["status"] in (
@@ -4068,6 +4199,74 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     no_update, no_update, undo_payload)
         return (badge, [], None, "",
                 next_session, next_file, undo_payload)
+
+    # ---- Quick-flag: save bare events, park in "Needs scoring" ---- #
+    # Fast first pass. Saves whatever events the reviewer dropped (even
+    # just an EO timestamp -- no type / landmarks / Racine) under the
+    # 'needs_scoring' status, bypassing the completeness gate, and
+    # advances. The file leaves the FIFO queue and shows up in the
+    # per-animal "Needs scoring" pool to finish later.
+    @app.callback(
+        Output("video-review-status", "children",
+                allow_duplicate=True),
+        Output("video-events-store", "data",
+                allow_duplicate=True),
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Input("video-review-quickflag-btn", "n_clicks"),
+        State("video-file-dropdown", "value"),
+        State("video-events-store", "data"),
+        State("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _quick_flag(n_clicks, file_id, events, animal_value):
+        if not n_clicks or not file_id:
+            return (no_update, no_update, no_update, no_update)
+        email = current_user_email()
+        if not email:
+            return ("Not signed in -- can't quick-flag.",
+                    no_update, no_update, no_update)
+        events = list(events or [])
+        # At least one dropped timestamp is required -- otherwise this
+        # is just "no events", which the normal Save handles.
+        has_any = any(
+            e.get("EO_sec") not in (None, "") for e in events)
+        if not has_any:
+            return ("Drop at least one event onset (EO) before "
+                     "quick-flagging.", no_update, no_update, no_update)
+        # Tag each as a draft so the second pass knows it's unfinished.
+        drafts = []
+        for e in events:
+            d = dict(e)
+            d["draft"] = True
+            drafts.append(d)
+        try:
+            store.mark_review(
+                int(file_id), email, "needs_scoring",
+                markers=drafts,
+                note="Quick-flagged: needs full scoring.")
+        except Exception as e:
+            logger.warning("quick-flag mark_review failed: %s", e)
+            return (f"Quick-flag failed: {e}",
+                    no_update, no_update, no_update)
+        try:
+            store.release_claim(int(file_id))
+        except Exception as e:
+            logger.warning("release_claim failed: %s", e)
+        from datetime import datetime as _dt
+        n_ev = len(drafts)
+        badge = (f"Flagged {n_ev} event"
+                  f"{'' if n_ev == 1 else 's'} for scoring at "
+                  f"{_dt.now().strftime('%H:%M')}  ·  in 'Needs "
+                  "scoring' pool.")
+        next_session, next_file = _resolve_next_in_queue(
+            store, animal_value, int(file_id), email,
+            queue_limit=queue_limit)
+        if next_file is None:
+            return (badge, [], no_update, no_update)
+        return (badge, [], next_session, next_file)
 
     # ---- file/channel options ---- #
     @app.callback(
