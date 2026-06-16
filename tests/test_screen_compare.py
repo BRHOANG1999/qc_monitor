@@ -212,7 +212,7 @@ def test_pool_files_two_screen_split(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         ma, "pending_files_for_animal",
-        lambda store, animal: [
+        lambda store, animal, include_reviewed=False: [
             {"file_id": fid, "session_dir": "s"}
             for fid in fixtures])
     monkeypatch.setattr(

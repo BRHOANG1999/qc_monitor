@@ -298,7 +298,8 @@ def _write_cache(store, result: FilePeakResult,
 # File enumeration
 # --------------------------------------------------------------- #
 
-def pending_files_for_animal(store, animal_id: str
+def pending_files_for_animal(store, animal_id: str,
+                                include_reviewed: bool = False
                                 ) -> list[dict]:
     """Queue-eligible files for *animal_id*.
 
@@ -308,19 +309,16 @@ def pending_files_for_animal(store, animal_id: str
     pending_pi_review / pi_approved / no_events / has_events /
     abandoned are excluded -- mass-analyze doesn't touch
     things that already have a state.
+
+    *include_reviewed* keeps the already-reviewed / flagged / claimed
+    files in the list. Used by the pool BROWSER (not the scan): once a
+    file is flagged for scoring its status leaves the pending set, so
+    without this it would silently drop out of the rebuilt pool and the
+    progress tracker would show it as gone instead of "flagged".
     """
     assert isinstance(animal_id, str) and animal_id, \
         "animal_id required"
-    with store.connection() as conn:
-        rows = conn.execute(
-            """SELECT DISTINCT pf.id AS file_id,
-                      pf.session_dir, pf.file_path,
-                      pf.duration_sec, pf.sampling_rate,
-                      pf.chunk_datetime
-               FROM processed_files pf
-               JOIN session_config sc
-                 ON sc.session_dir = pf.session_dir
-               WHERE sc.channel_names LIKE ?
+    review_gate = "" if include_reviewed else """
                  AND NOT EXISTS (
                    SELECT 1 FROM review_state rs
                    WHERE rs.file_id = pf.id
@@ -338,9 +336,21 @@ def pending_files_for_animal(store, animal_id: str
                    SELECT 1 FROM file_claim fc
                    WHERE fc.file_id = pf.id
                      AND fc.claimed_at >= ?
-                 )
+                 )"""
+    params = ([f'%"{animal_id}%']
+              + ([] if include_reviewed else [store.claim_cutoff_iso()]))
+    with store.connection() as conn:
+        rows = conn.execute(
+            f"""SELECT DISTINCT pf.id AS file_id,
+                      pf.session_dir, pf.file_path,
+                      pf.duration_sec, pf.sampling_rate,
+                      pf.chunk_datetime
+               FROM processed_files pf
+               JOIN session_config sc
+                 ON sc.session_dir = pf.session_dir
+               WHERE sc.channel_names LIKE ?{review_gate}
                ORDER BY pf.chunk_datetime ASC""",
-            (f'%"{animal_id}%', store.claim_cutoff_iso()),
+            params,
         ).fetchall()
     # Post-filter: the LIKE is loose ("BCH062" would also match
     # "BCH0620"); use the parser to be precise.
@@ -506,6 +516,7 @@ def pool_files(store, animal_id: str, peak_cutoff: float,
                  electrode: int = 0,
                  min_peak_dist_sec: float =
                      DEFAULT_MIN_PEAK_DIST_SEC,
+                 include_reviewed: bool = False,
                  ) -> dict:
     """Run the screen(s) over *animal_id*'s pending files.
 
@@ -529,7 +540,8 @@ def pool_files(store, animal_id: str, peak_cutoff: float,
     assert isinstance(peak_cutoff, (int, float)) and peak_cutoff > 0, \
         "peak_cutoff > 0"
     run_auc = bool(auc_threshold) and bool(window_sec)
-    files = pending_files_for_animal(store, animal_id)
+    files = pending_files_for_animal(store, animal_id,
+                                      include_reviewed=include_reviewed)
     pool1: list[int] = []
     pool2: list[int] = []
     pool3: list[dict] = []

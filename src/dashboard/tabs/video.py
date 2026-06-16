@@ -5858,7 +5858,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 store, job["animal_id"], float(job["cutoff"]),
                 float(auc_t) if auc_t else None,
                 float(auc_w) if auc_w else None,
-                electrode=int(job.get("electrode") or 0))
+                electrode=int(job.get("electrode") or 0),
+                # Keep flagged / done files in the restored browse pool
+                # so progress (flagged / done) survives a tab reopen.
+                include_reviewed=True)
         except Exception as e:
             logger.warning("restore pool_files failed: %s", e)
             return no_update, no_update, no_update, no_update
@@ -6217,7 +6220,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     store, job["animal_id"], float(job["cutoff"]),
                     float(auc_t) if auc_t else None,
                     float(auc_w) if auc_w else None,
-                    electrode=int(job.get("electrode") or 0))
+                    electrode=int(job.get("electrode") or 0),
+                    # Keep flagged / done files in the browse pool so the
+                    # progress tracker can show them (they leave the
+                    # pending set the moment they're flagged).
+                    include_reviewed=True)
             except Exception as e:
                 logger.warning("pool_files failed: %s", e)
             pools_data = pools

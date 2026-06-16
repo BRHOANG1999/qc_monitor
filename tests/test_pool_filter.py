@@ -105,6 +105,39 @@ def test_pool_meta_is_db_only(tmp_path, monkeypatch):
     assert "has_stim" not in meta["1"]
 
 
+def test_pending_files_include_reviewed_keeps_flagged(tmp_path):
+    # A flagged (needs_scoring) file is dropped from the pending set but
+    # MUST stay when include_reviewed=True, so the pool browser/tracker
+    # doesn't lose it on a tab-reopen rebuild.
+    import json as _json
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    sd = "//srv/db\\stimBaseline_BCH062SR_BCH061SLM_"
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO session_config (session_dir, channel_names, "
+            "eeg_channels, discovered_at) VALUES (?, ?, ?, '2026-01-01')",
+            (sd, _json.dumps(["stimCopy", "BCH062SR", "BCH061SLM"]),
+             _json.dumps([1, 2])))
+        for fid in (10, 11):
+            conn.execute(
+                "INSERT INTO processed_files (id, file_path, session_dir, "
+                "chunk_datetime) VALUES (?, ?, ?, ?)",
+                (fid, f"/f/{fid}.mat", sd, f"2026-01-0{fid}"))
+        # File 10 flagged for scoring; file 11 untouched.
+        conn.execute(
+            "INSERT INTO review_state (file_id, user_email, status, "
+            "created_at, updated_at) VALUES "
+            "(10,'u','needs_scoring','t','t')")
+        conn.commit()
+
+    pending = {int(f["file_id"])
+               for f in ma.pending_files_for_animal(store, "BCH062")}
+    allf = {int(f["file_id"]) for f in ma.pending_files_for_animal(
+        store, "BCH062", include_reviewed=True)}
+    assert 10 not in pending and 11 in pending      # flagged dropped
+    assert 10 in allf and 11 in allf                # kept with flag
+
+
 def test_review_statuses_for_files_batch(tmp_path):
     store = Store(str(tmp_path / "data" / "monitor.db"))
     for fid in (1, 2, 3, 4):
