@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Test-Path *)",
+      "PowerShell(python --version; python -c \"import sys; sys.path.insert\\(0, '.'\\); import main\" 2>&1 | Select-Object -First 40)",
+      "PowerShell(python -c \"import sys; sys.path.insert\\(0, '.'\\); import main; import src.dashboard.app; import src.dispatcher; import src.utils.mass_analyze; import src.utils.assignments; import src.notifications.surgery_digest; print\\('ALL IMPORTS OK'\\)\" 2>&1 | Select-Object -Last 60)",
+      "PowerShell(python -m pytest tests/ -q --tb=short 2>&1 | Select-Object -Last 80)",
+      "PowerShell(pip install *)",
+      "PowerShell(python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 100)",
+      "PowerShell(Copy-Item *)",
+      "PowerShell(New-Item *)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-Object -Last 80)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-Object -Last 40)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-Object -Last 25)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-Object -Last 15)",
+      "PowerShell(python -m pytest tests/ -q --tb=line 2>&1)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"video|FAIL|All \" | Select-Object -Last 6)",
+      "PowerShell(python -c \"import sys; sys.path.insert\\(0,'.'\\); from src.dashboard.tabs.video import _ma_animal_from_picker; from src.utils import mass_analyze as ma; from src.db.store import Store; import os; s=Store\\(os.environ['TEMP']+r'/monitor_smoke.db'\\); raw='_pool_BCH060'; resolved=_ma_animal_from_picker\\(raw\\); print\\('raw:', raw, '-> resolved:', resolved\\); print\\('count for resolved:', ma.count_pending_for_animal\\(s, resolved\\) if resolved else 'n/a'\\); print\\('count for raw \\(old buggy path\\):', ma.count_pending_for_animal\\(s, raw\\)\\)\" 2>&1 | Select-Object -Last 10)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate|loadtoken\" | Select-Object -Last 10)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]   video\" ; python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate\" | Select-Object -Last 5)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]   video\" ; python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate|in_use\" | Select-Object -Last 6)",
+      "PowerShell(python -c \"import sys; sys.path.insert\\(0,'.'\\); from src.utils import mass_analyze as ma; from src.db.store import Store; import os; s=Store\\(os.environ['TEMP']+r'/monitor_smoke.db'\\); print\\('active job for BCH060:', ma.active_job_for_animal\\(s, 'BCH060'\\)\\)\" 2>&1 | Select-Object -Last 3; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3)",
+      "PowerShell(python -m pytest tests/test_file_claim.py tests/test_store_bootstrap.py -q --tb=short 2>&1 | Select-Object -Last 30)",
+      "PowerShell(python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 4; python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]   video\"; python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback\" | Select-Object -Last 3)",
+      "PowerShell(python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]   video\"; python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate\" | Select-Object -Last 4)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate|evtv-list-sig\" | Select-Object -Last 5; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3)",
+      "PowerShell(python -m pytest tests/test_event_verification_actions.py -q --tb=short 2>&1 | Select-Object -Last 12; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3; python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback\" | Select-Object -Last 2)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate|nonexistent|selected_row_ids\" | Select-Object -Last 8)",
+      "PowerShell(python -m pytest tests/test_event_verification_actions.py -q --tb=short 2>&1 | Select-Object -Last 15)",
+      "PowerShell(python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3; python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]\" | Select-Object -Last 3)",
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback\" | Select-Object -Last 3; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3)"
+    ]
+  }
+}

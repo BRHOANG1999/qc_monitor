@@ -544,16 +544,17 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         name=label,
     ))
     # Cursor placeholder — clientside callback updates the x position.
-    # dragmode='pan' makes click-on-the-trace forgiving: a stray
-    # 1-2px drag while attempting to click no longer activates the
-    # zoom-box (which would swallow the click event before our
-    # marker-add callback sees it). Zoom moves to scrollwheel +
-    # modebar; double-click still resets the view.
+    # dragmode=False (Seek mode default): drag is inert so a click on the
+    # trace cleanly registers (clickData) and seeks the video; no stray
+    # zoom-box swallows the click. The "Mode" toggle flips this to 'zoom'
+    # (drag draws a zoom box) via a clientside enforcer that re-applies it
+    # after every rebuild. Scroll-zoom + the modebar zoom/pan buttons stay
+    # available in both modes; double-click resets.
     fig.update_layout(
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         height=220,
         margin=dict(l=60, r=20, t=10, b=40),
-        dragmode="pan",
+        dragmode=False,
         # uirevision (stable per recording) tells Plotly to preserve
         # the user's zoom/pan across figure updates -- the cursor
         # mirror + re-decimate redraws no longer snap the view back.
@@ -1708,19 +1709,17 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Span(id="video-lfp-status",
                           style={"color": "#888", "fontSize": "11px",
                                  "marginLeft": "12px"}),
-                # Decouple clicking from the zoom/pan toolbar: choose
-                # what a click on the trace DOES. The modebar (zoom,
-                # reset, pan) works independently in every mode.
-                html.Span("On click:",
+                # Mode toggle: Seek (click the trace -> the video jumps
+                # there) vs Zoom (drag a box to zoom). Default Seek.
+                html.Span("Mode:",
                           style={"color": "#a0a0b0", "fontSize": "11px",
                                  "marginLeft": "auto",
                                  "marginRight": "6px"}),
                 dcc.RadioItems(
-                    id="video-lfp-click-action",
+                    id="video-lfp-mode",
                     options=[
-                        {"label": " Seek video", "value": "seek"},
-                        {"label": " Place onset", "value": "place"},
-                        {"label": " Off (zoom only)", "value": "off"},
+                        {"label": " Seek (click)", "value": "seek"},
+                        {"label": " Zoom (drag)", "value": "zoom"},
                     ],
                     value="seek", inline=True,
                     inputStyle={"marginRight": "3px"},
@@ -1836,7 +1835,7 @@ def layout(store: Store, bridge: dict | None = None):
             dcc.Loading(
                 id="video-lfp-loading",
                 custom_spinner=_loading_icon("Re-decimating…"),
-                delay_show=120,
+                delay_show=80,
                 # Keep the trace visible (dimmed) under the spinner so a
                 # zoom re-decimate shows progress without the graph
                 # vanishing.
@@ -2126,7 +2125,7 @@ def layout(store: Store, bridge: dict | None = None):
             dcc.Loading(
                 id="video-analysis-loading",
                 custom_spinner=_loading_icon("Re-decimating…"),
-                delay_show=120,
+                delay_show=80,
                 overlay_style={"visibility": "visible",
                                 "opacity": 0.45},
                 parent_style={"minHeight": "220px"},
@@ -3990,39 +3989,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return [], None, "", badge
         return [], None, "", "Not reviewed yet."
 
-    # ---- Step 4: click LFP -> append onset marker (when in events mode) ---- #
-    @app.callback(
-        Output("video-review-marker-store", "data",
-                allow_duplicate=True),
-        Input("video-lfp-trace", "clickData"),
-        State("video-lfp-click-action", "value"),
-        State("video-review-marker-store", "data"),
-        prevent_initial_call=True,
-    )
-    def _maybe_append_marker(click_data, click_action, markers):
-        # Only drop an onset when the "On click" mode is "place" -- so
-        # seeking / zooming never leaves a stray marker.
-        if click_action != "place":
-            return no_update
-        if not click_data or not click_data.get("points"):
-            return no_update
-        try:
-            t_sec = float(click_data["points"][0]["x"])
-        except (KeyError, ValueError, TypeError):
-            return no_update
-        if t_sec < 0:
-            return no_update
-        new = list(markers or [])
-        # De-dupe within 0.5 s so a double-click doesn't spam.
-        for m in new:
-            if abs(float(m.get("peak_time_sec", -1)) - t_sec) < 0.5:
-                return no_update
-        new.append({
-            "type": "onset",
-            "peak_time_sec": round(t_sec, 3),
-        })
-        new.sort(key=lambda m: m.get("peak_time_sec", 0))
-        return new
+    # (Generic click-to-onset removed: in Seek mode a click only seeks
+    # the video. Onset placement is the structured-events flow -- the
+    # events panel + "Set on LFP" landmark drop in video_events.py.)
 
     # The reviewer sees onset markers two ways: as red verticals
     # on the LFP trace (P0-3: recognition > recall) and -- when
@@ -5109,9 +5078,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
 
     # 5. Click an epoch on the analysis trace -> seek the video.
+    #    Gated on Seek mode so zoom-dragging it doesn't also seek.
     app.clientside_callback(
         """
-        function(clickData, lfp_dur) {
+        function(clickData, lfp_dur, mode) {
+            if (mode !== 'seek') { return ''; }
             if (!clickData || !clickData.points || !clickData.points.length) {
                 return '';
             }
@@ -5134,6 +5105,33 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-seek-sink", "children", allow_duplicate=True),
         Input("video-analysis-trace", "clickData"),
         State("video-lfp-duration", "data"),
+        State("video-lfp-mode", "value"),
+        prevent_initial_call=True,
+    )
+
+    # Enforce dragmode on both traces to match the Mode toggle, re-applied
+    # after every figure rebuild so it survives channel/feature/zoom
+    # redraws. Only relayouts when the live dragmode differs -> cheap, no
+    # loop (a dragmode-only relayout changes no axis range, so it can't
+    # re-trigger the zoom re-decimate).
+    app.clientside_callback(
+        """
+        function(mode, _figA, _figB) {
+            var want = (mode === 'zoom') ? 'zoom' : false;
+            ['video-lfp-trace', 'video-analysis-trace'].forEach(function(id) {
+                var gd = document.getElementById(id);
+                if (!gd || !gd._fullLayout) { return; }
+                if (gd._fullLayout.dragmode !== want) {
+                    try { Plotly.relayout(gd, {dragmode: want}); } catch (e) {}
+                }
+            });
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-fs-sink", "children", allow_duplicate=True),
+        Input("video-lfp-mode", "value"),
+        Input("video-lfp-trace", "figure"),
+        Input("video-analysis-trace", "figure"),
         prevent_initial_call=True,
     )
 
@@ -5443,7 +5441,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-seek-sink", "children"),
         Input("video-lfp-trace", "clickData"),
         State("video-lfp-duration", "data"),
-        State("video-lfp-click-action", "value"),
+        State("video-lfp-mode", "value"),
     )
 
     # =================================================================== #
