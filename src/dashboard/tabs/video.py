@@ -1014,8 +1014,8 @@ def _video_mass_analyze_panel() -> html.Details:
                               style={"fontSize": "12px",
                                       "color": "#cfd0d6",
                                       "marginBottom": "6px"}),
-                    # Filters: narrow the pools to one session and/or
-                    # stim-vs-baseline files before browsing.
+                    # Filter: narrow the pools to one session before
+                    # browsing. (Stim is implicit in the session.)
                     html.Div([
                         html.Label("Session:",
                                     style={"color": "#a0a0b0",
@@ -1026,24 +1026,8 @@ def _video_mass_analyze_panel() -> html.Details:
                             options=[{"label": "All sessions",
                                        "value": "__all__"}],
                             value="__all__", clearable=False,
-                            style={"flex": "1 1 220px",
+                            style={"flex": "1 1 260px",
                                     "minWidth": "180px"},
-                            className="dark-dropdown"),
-                        html.Label("Stim:",
-                                    style={"color": "#a0a0b0",
-                                            "fontSize": "11px",
-                                            "margin": "0 6px 0 10px"}),
-                        dcc.Dropdown(
-                            id="video-ma-filter-stim",
-                            options=[
-                                {"label": "All", "value": "all"},
-                                {"label": "Stim files",
-                                 "value": "stim"},
-                                {"label": "Baseline files",
-                                 "value": "baseline"}],
-                            value="all", clearable=False,
-                            style={"flex": "0 0 150px",
-                                    "minWidth": "130px"},
                             className="dark-dropdown"),
                     ], style={"display": "flex",
                                "alignItems": "center",
@@ -5383,6 +5367,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-ma-pool-cursor", "data",
                 allow_duplicate=True),
+        Output("video-ma-filter-session", "value",
+                allow_duplicate=True),
         Input("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
@@ -5391,15 +5377,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                    "marginBottom": "10px"}
         animal = _ma_animal_from_picker(picker_value)
         if not animal:
-            return None, hidden, "", None
+            return None, hidden, "", None, "__all__"
         try:
             job = _mass_analyze.last_done_job_for_animal(
                 store, str(animal))
         except Exception as e:
             logger.warning("last_done_job_for_animal failed: %s", e)
-            return no_update, no_update, no_update, no_update
+            return (no_update, no_update, no_update, no_update,
+                    "__all__")
         if not job:
-            return None, hidden, "", None
+            return None, hidden, "", None, "__all__"
         auc_t = job.get("auc_threshold")
         auc_w = job.get("auc_window_sec")
         try:
@@ -5427,7 +5414,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             counts = f"{prefix})  ·  Pool 1 -- envelope: {n1}"
         browse = {"display": "block", "padding": "0 14px",
                    "marginBottom": "10px"}
-        return pools, browse, counts, None
+        return pools, browse, counts, None, "__all__"
 
     @app.callback(
         Output("video-ma-confirm-modal", "style"),
@@ -5856,8 +5843,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("pool_meta failed: %s", e)
             return None
 
-    # Apply the session + stim filters -> the view _on_pool_nav browses.
-    # Also populates the session dropdown options + the filtered counts.
+    # Apply the session filter -> the view _on_pool_nav browses. Also
+    # populates the session dropdown options + the filtered counts.
     @app.callback(
         Output("video-ma-pools-view", "data"),
         Output("video-ma-filter-session", "options"),
@@ -5866,10 +5853,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-ma-pools", "data"),
         Input("video-ma-pool-meta", "data"),
         Input("video-ma-filter-session", "value"),
-        Input("video-ma-filter-stim", "value"),
         prevent_initial_call=True,
     )
-    def _on_video_ma_filter(pools, meta, sess_val, stim_val):
+    def _on_video_ma_filter(pools, meta, sess_val):
         pools = pools or {"pool1": [], "pool2": [], "pool3": []}
         meta = meta or {}
         # Session dropdown options from the meta map (stable order).
@@ -5881,19 +5867,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         opts = [{"label": "All sessions", "value": "__all__"}]
         opts += [{"label": name, "value": sd}
                   for sd, name in seen.items()]
+        # Defensive: a session value left over from a previously-viewed
+        # animal isn't in THIS animal's options -- treat it as "all" so
+        # it never nukes the whole view (the Pool-2-empty bug).
+        valid_sessions = set(seen.keys())
+        if sess_val not in (None, "__all__") \
+                and sess_val not in valid_sessions:
+            sess_val = "__all__"
 
         def _keep(fid: int) -> bool:
+            if sess_val in (None, "__all__"):
+                return True
             m = meta.get(str(fid))
             if m is None:
                 return True  # meta not built yet -> don't hide
-            if sess_val and sess_val != "__all__" \
-                    and m.get("session_dir") != sess_val:
-                return False
-            if stim_val == "stim" and not m.get("has_stim"):
-                return False
-            if stim_val == "baseline" and m.get("has_stim"):
-                return False
-            return True
+            return m.get("session_dir") == sess_val
 
         def _fid(entry):
             return int(entry["file_id"]) if isinstance(entry, dict) \
@@ -5907,9 +5895,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             "pool3": [f for f in pools.get("pool3", [])
                        if _keep(_fid(f))],
         }
-        active = (sess_val not in (None, "__all__")) \
-            or (stim_val and stim_val != "all")
-        if active:
+        if sess_val not in (None, "__all__"):
             counts = (f"Filtered  ·  Pool 1: {len(view['pool1'])}  ·  "
                        f"Pool 2: {len(view['pool2'])}  ·  Pool 3: "
                        f"{len(view['pool3'])}")

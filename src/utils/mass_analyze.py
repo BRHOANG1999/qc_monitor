@@ -605,10 +605,12 @@ def has_stim_for_file(store, file_id: int,
 
 
 def pool_meta(store, animal_id: str) -> dict:
-    """Per-file display/filter metadata for the pool browser:
-    ``{file_id: {"session_dir","session_name","has_stim"}}`` over the
-    same files ``pool_files`` covers. Built once when pools are built so
-    the session + stim filters need no re-query."""
+    """Per-file metadata for the pool browser's session filter:
+    ``{file_id: {"session_dir","session_name"}}`` over the same files
+    ``pool_files`` covers. DB-only (no signal load) so building it for a
+    large pending set is instant -- the per-file stim check used to live
+    here and caused a multi-second SMB/FFT stall; stim is now implicit in
+    the session, surfaced by ``session_review_stats`` instead."""
     out: dict = {}
     files = pending_files_for_animal(store, animal_id)
     max_iter = len(files) + 1
@@ -617,11 +619,7 @@ def pool_meta(store, animal_id: str) -> dict:
         fid = int(f["file_id"])
         sd = f.get("session_dir")
         name = sd.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] if sd else ""
-        out[str(fid)] = {
-            "session_dir": sd,
-            "session_name": name,
-            "has_stim": has_stim_for_file(store, fid, sd),
-        }
+        out[str(fid)] = {"session_dir": sd, "session_name": name}
     return out
 
 
