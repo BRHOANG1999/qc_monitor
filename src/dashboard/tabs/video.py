@@ -193,6 +193,37 @@ def _session_dir_for_file(store: Store, file_id: int) -> str | None:
         return row["session_dir"] if row else None
 
 
+def _next_in_pool(store: Store, view, cursor,
+                    current_file_id: int):
+    """If the reviewer is browsing a pool AND the loaded file is the
+    pool's current entry, return the next step ``(session_dir, file_id,
+    new_cursor)``; else None. Lets Save / Quick-flag advance WITHIN the
+    pool (the primary source once pool navigation is in use) instead of
+    falling back to the FIFO queue."""
+    if not view or not cursor:
+        return None
+    active = cursor.get("active")
+    if active not in ("1", "2", "3"):
+        return None
+    key = {"1": "pool1", "2": "pool2", "3": "pool3"}[active]
+    files = view.get(key) or []
+    idx = int(cursor.get("idx") or 0)
+
+    def _fid(e):
+        return int(e["file_id"]) if isinstance(e, dict) else int(e)
+
+    # The loaded file must BE the pool's current entry -- otherwise the
+    # reviewer got here some other way and the pool isn't primary.
+    if idx >= len(files) or _fid(files[idx]) != int(current_file_id):
+        return None
+    nxt = idx + 1
+    if nxt >= len(files):
+        return None  # end of the pool
+    fid = _fid(files[nxt])
+    return _session_dir_for_file(store, fid), fid, \
+        {"active": active, "idx": nxt}
+
+
 def _animal_ids_from_picker(animal_value: str | None
                               ) -> list[str]:
     """Resolve the Step-1 animal picker value into the
@@ -4179,6 +4210,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-file-dropdown", "value",
                 allow_duplicate=True),
         Output("kbd-undo", "data", allow_duplicate=True),
+        Output("video-ma-pool-cursor", "data",
+                allow_duplicate=True),
         Input("video-review-save-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-review-decision", "value"),
@@ -4187,26 +4220,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-queue-animal", "value"),
         State("video-events-store", "data"),
         State("video-channel-dropdown", "value"),
+        State("video-ma-pools-view", "data"),
+        State("video-ma-pool-cursor", "data"),
         prevent_initial_call=True,
     )
     def _save_review(n_clicks, file_id, decision, markers, note,
-                      animal_value, events, channel):
-        nop7 = (no_update,) * 7
+                      animal_value, events, channel,
+                      pools_view, pool_cursor):
+        nop = (no_update,) * 8
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
-                    else no_update,
-                    no_update, no_update, no_update,
-                    no_update, no_update, no_update)
+                    else no_update, *nop[1:])
         if decision not in ("no_events", "has_events"):
             return ("Pick \"No events seen\" or \"Events seen\" "
                      "before saving.",
-                    *nop7[1:])
+                    *nop[1:])
         events = list(events or [])
         if decision == "has_events":
             if not events:
                 return ("Add at least one event with + Add event "
                          "before saving.",
-                        *nop7[1:])
+                        *nop[1:])
             # Gating: every event must be complete (type +
             # required landmarks + Racine 1-8).
             incomplete = [i + 1 for i, e in enumerate(events)
@@ -4216,12 +4250,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 return (f"Event{'s' if len(incomplete) > 1 else ''} "
                          f"{idxs} still need landmarks + Racine "
                          "before saving.",
-                        *nop7[1:])
+                        *nop[1:])
         email = current_user_email()
         if not email:
             return ("Not signed in — can't record who reviewed "
                      "this.",
-                    *nop7[1:])
+                    *nop[1:])
         # PI verification pipeline (the BHZ event taxonomy plan):
         # every undergrad save lands in 'pending_pi_review'.
         # markers_json stores the canonical event list -- empty
@@ -4239,7 +4273,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             )
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
-            return (f"Save failed: {e}", *nop7[1:])
+            return (f"Save failed: {e}", *nop[1:])
         # Submitted -> drop the soft-claim so the row doesn't linger
         # (the file is now excluded from queues by its pending_pi_review
         # status anyway; this just keeps file_claim tidy).
@@ -4256,11 +4290,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                   f"{_dt.now().strftime('%H:%M')}  ·  "
                   f"{decision_label}.  "
                   f"The PI will verify before final CSV export.")
-        # Resolve the next file in the queue so we can auto-advance.
-        next_session, next_file = _resolve_next_in_queue(
-            store, animal_value, int(file_id), email,
-            queue_limit=queue_limit,
-        )
         # Undo toast payload: the JS reads label + deadline_ms and
         # the U-hotkey / Undo-button callback reads file_id.
         import time as _time
@@ -4272,14 +4301,28 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                              + UNDO_WINDOW_MS,
             "status": decision,
         }
+        # Auto-advance: if the reviewer is stepping through a pool, the
+        # pool is the primary source -- advance to the next POOL file and
+        # keep the pool cursor in sync. Otherwise fall back to the FIFO
+        # queue.
+        pooled = _next_in_pool(store, pools_view, pool_cursor,
+                                 int(file_id))
+        if pooled is not None:
+            p_session, p_file, new_cursor = pooled
+            return (badge, [], None, "",
+                    p_session, p_file, undo_payload, new_cursor)
+        next_session, next_file = _resolve_next_in_queue(
+            store, animal_value, int(file_id), email,
+            queue_limit=queue_limit,
+        )
         # If we found a next file, push it; otherwise leave the
         # dropdowns alone so the reviewer sees the queue empty
         # state via _render_queue.
         if next_file is None:
             return (badge, [], None, "",
-                    no_update, no_update, undo_payload)
+                    no_update, no_update, undo_payload, no_update)
         return (badge, [], None, "",
-                next_session, next_file, undo_payload)
+                next_session, next_file, undo_payload, no_update)
 
     # ---- Quick-flag: save bare events, park in "Needs scoring" ---- #
     # Fast first pass. Saves whatever events the reviewer dropped (even
@@ -4296,19 +4339,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-file-dropdown", "value",
                 allow_duplicate=True),
+        Output("video-ma-pool-cursor", "data",
+                allow_duplicate=True),
         Input("video-review-quickflag-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-events-store", "data"),
         State("video-queue-animal", "value"),
+        State("video-ma-pools-view", "data"),
+        State("video-ma-pool-cursor", "data"),
         prevent_initial_call=True,
     )
-    def _quick_flag(n_clicks, file_id, events, animal_value):
+    def _quick_flag(n_clicks, file_id, events, animal_value,
+                     pools_view, pool_cursor):
         if not n_clicks or not file_id:
-            return (no_update, no_update, no_update, no_update)
+            return (no_update,) * 5
         email = current_user_email()
         if not email:
             return ("Not signed in -- can't quick-flag.",
-                    no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update)
         events = list(events or [])
         # At least one dropped timestamp is required -- otherwise this
         # is just "no events", which the normal Save handles.
@@ -4316,7 +4364,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             e.get("EO_sec") not in (None, "") for e in events)
         if not has_any:
             return ("Drop at least one event onset (EO) before "
-                     "quick-flagging.", no_update, no_update, no_update)
+                     "quick-flagging.", no_update, no_update,
+                    no_update, no_update)
         # Tag each as a draft so the second pass knows it's unfinished.
         drafts = []
         for e in events:
@@ -4331,7 +4380,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("quick-flag mark_review failed: %s", e)
             return (f"Quick-flag failed: {e}",
-                    no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update)
         try:
             store.release_claim(int(file_id))
         except Exception as e:
@@ -4342,12 +4391,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                   f"{'' if n_ev == 1 else 's'} for scoring at "
                   f"{_dt.now().strftime('%H:%M')}  ·  in 'Needs "
                   "scoring' pool.")
+        # Pool is primary when browsing it: advance to the next POOL
+        # file; else fall back to the FIFO queue.
+        pooled = _next_in_pool(store, pools_view, pool_cursor,
+                                 int(file_id))
+        if pooled is not None:
+            p_session, p_file, new_cursor = pooled
+            return (badge, [], p_session, p_file, new_cursor)
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
             queue_limit=queue_limit)
         if next_file is None:
-            return (badge, [], no_update, no_update)
-        return (badge, [], next_session, next_file)
+            return (badge, [], no_update, no_update, no_update)
+        return (badge, [], next_session, next_file, no_update)
 
     # ---- file/channel options ---- #
     @app.callback(
