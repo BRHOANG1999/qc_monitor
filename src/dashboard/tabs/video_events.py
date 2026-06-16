@@ -297,10 +297,27 @@ def _racine_picker(event: dict, idx: int) -> html.Div:
                 "minWidth": "28px",
             },
         ))
+    # Once a stage is picked, spell its meaning out on the card (to the
+    # right of the chips) instead of hiding it behind the hover tooltip
+    # -- a constant reminder of what the chosen score means.
+    desc = dict(RACINE_STAGES).get(current)
+    if desc:
+        chips.append(html.Span(
+            f"Stage {current}: {desc}",
+            style={"color": COLOR_TEXT_SECONDARY,
+                   "fontSize": FONT_SIZE_CAPTION,
+                   "fontStyle": "italic",
+                   "lineHeight": "1.35",
+                   "marginLeft": SPACE_3,
+                   "paddingLeft": SPACE_3,
+                   "borderLeft": f"2px solid {COLOR_ACCENT}",
+                   "flex": "1 1 220px", "minWidth": "180px"},
+        ))
     return html.Div(
         chips,
         style={"display": "flex", "alignItems": "center",
-               "padding": f"{SPACE_2} 0", "flexWrap": "wrap"},
+               "padding": f"{SPACE_2} 0", "flexWrap": "wrap",
+               "gap": f"{SPACE_1} 0"},
     )
 
 
