@@ -47,6 +47,19 @@ logger = logging.getLogger("qc_monitor.video_events")
 # LAS is LVF-only; the renderer hides its row for HYP events.
 EVENT_FIELDS: tuple[str, ...] = ("EO", "LAS", "BO", "PID", "BB")
 
+# Per-landmark colors -- the SINGLE source of truth. The plot renderer
+# (video.py `_render_marker_shapes`) paints the verticals with these,
+# and `landmark_legend()` below shows the same swatches so the reviewer
+# can read the colored lines on the LFP / Hilbert by hue. Distinct +
+# semantic (Apple system hues).
+LANDMARK_COLORS: dict[str, str] = {
+    "EO":  "#ff453a",  # red    -- electrographic onset
+    "LAS": "#ff9f0a",  # orange -- large-amplitude spiking
+    "BO":  "#bf5af2",  # violet -- behavioral onset
+    "PID": "#5e7ce2",  # blue   -- post-ictal depression
+    "BB":  "#30d158",  # green  -- back to baseline
+}
+
 # Extended Racine scale (1-8). Stages verbatim from the user.
 # Tooltip shown on hover so the reviewer never has to leave the
 # screen to look up a stage description.
@@ -145,6 +158,36 @@ def _field_label(field: str) -> str:
         "PID": "PID -- Post-Ictal Depression",
         "BB":  "BB -- Back to Baseline",
     }.get(field, field)
+
+
+def landmark_legend() -> html.Div:
+    """Color key for the onset landmarks, so the reviewer can read the
+    colored verticals the plot draws (same hues as LANDMARK_COLORS).
+    One swatch + abbreviation per field; full name on hover."""
+    swatches: list = [
+        html.Span("Onset colors:", style={
+            "color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+            "fontWeight": "600", "marginRight": SPACE_1}),
+    ]
+    for field in EVENT_FIELDS:
+        swatches.append(html.Span([
+            html.Span(style={
+                "display": "inline-block", "width": "10px",
+                "height": "10px", "borderRadius": "50%",
+                "backgroundColor": LANDMARK_COLORS.get(field, "#888"),
+                "marginRight": SPACE_1, "verticalAlign": "middle"}),
+            html.Span(field, style={
+                "color": COLOR_TEXT_SECONDARY,
+                "fontSize": FONT_SIZE_CAPTION}),
+        ], title=_field_label(field).replace(" -- ", " — "),
+           style={"display": "inline-flex", "alignItems": "center",
+                   "marginRight": SPACE_3}))
+    return html.Div(swatches, style={
+        "display": "flex", "alignItems": "center", "flexWrap": "wrap",
+        "gap": f"{SPACE_1} 0", "padding": f"{SPACE_2} {SPACE_3}",
+        "marginBottom": SPACE_2, "background": COLOR_SURFACE_1,
+        "border": f"1px solid {COLOR_DIVIDER}",
+        "borderRadius": RADIUS_SM})
 
 
 def _field_row(event: dict, idx: int, field: str) -> html.Div:
@@ -431,6 +474,8 @@ def render_events_panel() -> html.Div:
                           "border": f"1px solid {COLOR_DIVIDER}",
                           "borderRadius": RADIUS_SM,
                           "fontSize": FONT_SIZE_BODY}),
+        # Color key for the onset verticals drawn on the LFP / Hilbert.
+        landmark_legend(),
         # Armed-landmark banner: when a "Set on LFP" button is armed,
         # the next click on the LFP trace drops that landmark.
         html.Div(id="video-armed-banner",

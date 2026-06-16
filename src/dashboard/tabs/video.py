@@ -4100,15 +4100,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
 
-    # Per-field landmark colors. Distinct + semantic so the
-    # reviewer can read EO / LAS / BO / PID / BB by hue alone.
-    LANDMARK_COLORS: dict = {
-        "EO":  "#ff453a",  # red    -- electrographic onset
-        "LAS": "#ff9f0a",  # orange -- large-amp spiking
-        "BO":  "#bf5af2",  # violet -- behavioral onset
-        "PID": "#5e7ce2",  # blue   -- post-ictal depression
-        "BB":  "#30d158",  # green  -- back to baseline
-    }
+    # Per-field landmark colors -- the single source of truth lives in
+    # video_events.py so the plot verticals and the on-screen color
+    # legend (events panel) can never drift apart.
+    LANDMARK_COLORS: dict = _events.LANDMARK_COLORS
 
     @app.callback(
         Output("video-lfp-trace", "figure", allow_duplicate=True),
