@@ -351,6 +351,33 @@ def _comment_box(event: dict, idx: int, field: str,
     ], style={"marginTop": SPACE_2})
 
 
+def apply_event_types(events: list,
+                       idx_value_pairs) -> tuple[list, bool]:
+    """Apply per-event type selections, keyed by event index.
+
+    *idx_value_pairs* is an iterable of ``(idx, value)`` -- one per
+    type radio. Only entries whose value actually differs from the
+    stored type are rewritten, so re-rendering the list (which recreates
+    every radio and re-fires the ALL-pattern callback) is a no-op rather
+    than clobbering a sibling event's type. Switching to HYP drops a
+    now-orphaned LAS landmark. Returns ``(events, changed)``.
+    """
+    events = list(events or [])
+    changed = False
+    for idx, value in idx_value_pairs:
+        if idx is None or idx < 0 or idx >= len(events):
+            continue
+        new_val = value or ""
+        if new_val == (events[idx].get("type") or ""):
+            continue
+        events[idx] = dict(events[idx])
+        events[idx]["type"] = new_val
+        if new_val == "HYP":
+            events[idx]["LAS_sec"] = None
+        changed = True
+    return events, changed
+
+
 def _type_radio(event: dict, idx: int) -> html.Div:
     """HYP / LVF radio."""
     return html.Div([
@@ -698,25 +725,19 @@ def register_callbacks(app, store) -> None:
         prevent_initial_call=True,
     )
     def _set_type(values, events):
-        trig = callback_context.triggered_id
-        if not isinstance(trig, dict):
-            return no_update
-        idx = trig.get("idx")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
-            return no_update
-        # The values list is in DOM order; pull the latest by idx.
-        new_val = None
-        triggered = callback_context.triggered or []
-        for t in triggered:
-            new_val = t.get("value")
-        events[idx] = dict(events[idx])
-        events[idx]["type"] = new_val or ""
-        # Clearing type clears LAS (HYP doesn't have it; if the
-        # user flips LVF->HYP a stale LAS would orphan).
-        if events[idx]["type"] == "HYP":
-            events[idx]["LAS_sec"] = None
-        return events
+        # Sync each event's type from ITS OWN radio (keyed by idx), not
+        # "the last triggered value applied to the first triggered
+        # idx" -- that cross-assigned one event's value onto another's
+        # index, so picking a type for event 2 cleared event 1's type.
+        # Re-rendering recreates every radio and re-fires this
+        # ALL-pattern callback; apply_event_types only rewrites entries
+        # that differ, so recreation is a no-op. See apply_event_types.
+        inputs = (callback_context.inputs_list[0]
+                  if callback_context.inputs_list else [])
+        pairs = [((item.get("id") or {}).get("idx"), item.get("value"))
+                 for item in inputs]
+        new_events, changed = apply_event_types(events, pairs)
+        return new_events if changed else no_update
 
     @app.callback(
         Output("video-events-store", "data",
