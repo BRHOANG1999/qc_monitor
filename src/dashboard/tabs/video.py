@@ -1009,7 +1009,10 @@ def _video_mass_analyze_panel() -> html.Details:
                 style={"display": "none",
                         "padding": "0 14px",
                         "marginBottom": "10px"},
-                children=[
+                children=dcc.Loading(
+                  id="video-ma-browse-loading",
+                  type="circle", color="#5e7ce2", delay_show=180,
+                  children=[
                     html.Div(id="video-ma-pool-counts",
                               style={"fontSize": "12px",
                                       "color": "#cfd0d6",
@@ -1070,7 +1073,7 @@ def _video_mass_analyze_panel() -> html.Details:
                             n_clicks=0, style=_POOL_NAV_STYLE),
                     ], style={"display": "flex", "gap": "8px",
                                "alignItems": "center"}),
-                ]),
+                  ])),
             # State stores + polling.
             dcc.Store(id="video-ma-pools", data=None),
             # Per-file meta {file_id: {session_dir, session_name,
@@ -5902,6 +5905,36 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         else:
             counts = ""
         return view, opts, counts, None
+
+    # Loading feedback: grey out the Browse / Prev / Next controls until
+    # the filtered view is ready, so the reviewer never clicks into a
+    # half-built pool (and gets a clear "not yet" signal).
+    @app.callback(
+        Output("video-ma-browse-p1", "disabled"),
+        Output("video-ma-browse-p2", "disabled"),
+        Output("video-ma-browse-p3", "disabled"),
+        Output("video-ma-pool-prev", "disabled"),
+        Output("video-ma-pool-next", "disabled"),
+        Input("video-ma-pools-view", "data"),
+    )
+    def _toggle_browse_enabled(view):
+        ready = bool(view) and any(
+            view.get(k) for k in ("pool1", "pool2", "pool3"))
+        d = not ready
+        return d, d, d, d, d
+
+    # Scan button reflects the job state: disabled + "Scanning..." while
+    # a scan is running, so it's obvious work is in progress.
+    @app.callback(
+        Output("video-ma-scan-btn", "disabled"),
+        Output("video-ma-scan-btn", "children"),
+        Input("video-ma-job-id", "data"),
+        Input("video-ma-poll", "disabled"),
+    )
+    def _scan_btn_state(job_id, poll_disabled):
+        if bool(job_id) and not poll_disabled:
+            return True, "Scanning..."
+        return False, "Scan files"
 
     @app.callback(
         Output("video-ma-pool-cursor", "data"),
