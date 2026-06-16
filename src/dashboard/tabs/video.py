@@ -1592,6 +1592,13 @@ def layout(store: Store, bridge: dict | None = None):
                          n_clicks=0, className="video-layout-btn"),
             html.Button("Big LFP", id="video-layout-biglfp",
                          n_clicks=0, className="video-layout-btn"),
+            html.Button("⛶ Fullscreen", id="video-fullscreen-btn",
+                         n_clicks=0, className="video-layout-btn",
+                         title="Fill the screen with the video; the "
+                               "LFP/Hilbert stays as a card bottom-right "
+                               "(Esc to exit)."),
+            html.Div(id="video-fs-sink",
+                      style={"display": "none"}),
         ], style={"display": "flex", "alignItems": "center",
                    "gap": "6px", "marginBottom": "8px"}),
 
@@ -1610,6 +1617,7 @@ def layout(store: Store, bridge: dict | None = None):
                 # (where the reviewer needs the feedback) tip
                 # over the threshold and show clearly.
                 delay_show=180,
+                parent_className="video-player-col",
                 parent_style={"gridArea": "video",
                                "minHeight": "360px"},
                 children=html.Div(
@@ -2056,7 +2064,8 @@ def layout(store: Store, bridge: dict | None = None):
                     },
                 ),
             ),
-        ], style={"marginTop": "0", "gridArea": "lfp",
+        ], className="video-lfp-col",
+           style={"marginTop": "0", "gridArea": "lfp",
                    "minWidth": "0"}),
             # In-PiP "Dock" button. Hidden in normal grid view
             # via the CSS rule on .qc-pip-dock-btn; only appears
@@ -3665,6 +3674,38 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-layout-bigvideo", "n_clicks"),
         Input("video-layout-5050", "n_clicks"),
         Input("video-layout-biglfp", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    # Fullscreen: fill the screen with the Step-2 grid (video). CSS in
+    # theme.css (#video-step2-grid:fullscreen) makes the video fill the
+    # viewport and floats the LFP/Hilbert column as a bottom-right card.
+    # A one-time fullscreenchange listener dispatches a window resize so
+    # the Plotly traces redraw at the card size (and on exit).
+    app.clientside_callback(
+        """
+        function(n) {
+            if (!window.__qcFsInit) {
+                window.__qcFsInit = true;
+                document.addEventListener('fullscreenchange', function() {
+                    setTimeout(function() {
+                        window.dispatchEvent(new Event('resize'));
+                    }, 220);
+                });
+            }
+            if (!n) return window.dash_clientside.no_update;
+            var el = document.getElementById('video-step2-grid');
+            if (!el) return window.dash_clientside.no_update;
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else if (el.requestFullscreen) {
+                el.requestFullscreen();
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-fs-sink", "children"),
+        Input("video-fullscreen-btn", "n_clicks"),
         prevent_initial_call=True,
     )
 
