@@ -33,6 +33,31 @@ SUPPORTED_NOTCH: tuple[int | None, ...] = (None, 50, 60)
 DEFAULT_BUTTER_ORDER = 4
 DEFAULT_NOTCH_Q = 30.0
 
+# Slow gamma band (Hz). A 30-50 sub-slice of the lab's wide 30-100 "gamma".
+SLOW_GAMMA_BAND: tuple[float, float] = (30.0, 50.0)
+
+# np.trapz was deprecated in NumPy 2.0 / removed in 2.2 -- prefer the new
+# name, fall back for older NumPy (mirrors src/analyzers/spectral.py).
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
+
+def band_power(freqs: np.ndarray, psd: np.ndarray,
+                lo: float, hi: float) -> float:
+    """Integrated power in ``[lo, hi]`` Hz from a PSD (V**2).
+
+    Trapezoidal integral of *psd* over the ``lo <= f <= hi`` mask, matching
+    the linear-power convention the batch spectral analyzer uses. Pair with
+    ``compute_psd``. Returns 0.0 when the band is empty / inputs are bad.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    psd = np.asarray(psd, dtype=np.float64)
+    if freqs.size == 0 or psd.size != freqs.size or hi <= lo:
+        return 0.0
+    mask = (freqs >= lo) & (freqs <= hi) & np.isfinite(psd)
+    if mask.sum() < 2:
+        return float(psd[mask].sum()) if mask.any() else 0.0
+    return float(_trapezoid(psd[mask], freqs[mask]))
+
 # ----- LRU cache --------------------------------------------------- #
 # Key shape: (file_path, hp, lp, notch, smooth_ms) -- per chunk + per
 # settings combination. Capping at 4 keeps RAM bounded under typical

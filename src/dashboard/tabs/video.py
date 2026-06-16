@@ -41,7 +41,7 @@ from src.dashboard.auth import current_user_email
 from src.utils.chunk_cache import get_chunk
 from src.utils import stim_blank as _stim_blank
 from src.utils.hilbert_envelope import (
-    hilbert_envelope_20_200, windowed_auc)
+    hilbert_envelope_20_200, windowed_auc, band_envelope)
 from src.utils.peakseek import peakseek
 from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
@@ -57,7 +57,8 @@ from src.utils import mass_analyze as _mass_analyze
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
 )
-from src.utils.filters import apply_filter
+from src.utils.filters import (
+    apply_filter, compute_psd, band_power, SLOW_GAMMA_BAND)
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
@@ -726,6 +727,127 @@ def _render_hilbert_trace(store, file_id: int,
         f"{int(min_peak_dist_sec)} s from any larger peak) · "
         f"{len(env)/fs:.1f} s @ {int(fs)} Hz"
     )
+    return (fig, status)
+
+
+# Evoked per-stim window for the slow-gamma band-power feature. 200 ms
+# post-stim resolves the 30-50 Hz band (>= ~6 cycles of 30 Hz).
+_EVOKED_GAMMA_WIN_SEC: float = 0.200
+
+
+def _render_band_power_trace(store, file_id: int, channel: int | None,
+                              lo: float, hi: float,
+                              blank_pre_ms: float = -5.0,
+                              blank_post_ms: float = 15.0,
+                              show_raw: bool = False) -> tuple:
+    """(figure, status) for continuous band power vs time.
+
+    The lab's band-limited analytic envelope (``band_envelope``, the same
+    FFT-zero-mask as the 20-200 Hz default) over ``[lo, hi]`` Hz, squared to
+    instantaneous power, then decimated for display. Stim-blanked like the
+    LFP by default. Used for the slow-gamma (30-50 Hz) "LFP analysis" trace.
+    """
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig(
+            "Pick a brain channel (Step 1) to see band power."), "")
+    session_dir = _session_dir_for_file(store, file_id)
+    stim_copy = _stim_copy_channels(store, session_dir)
+    do_blank = (int(channel) not in stim_copy) and (not show_raw)
+    stim_times = (_stim_times_for_file(store, file_id)
+                   if do_blank else np.asarray([], dtype=np.float64))
+    try:
+        series, fs, _ = _get_blanked_series(
+            file_path, int(channel), stim_times,
+            blank_pre_ms, blank_post_ms)
+    except Exception as e:
+        logger.warning("Band-power load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    env = band_envelope(np.asarray(series, dtype=np.float64), fs, lo, hi)
+    power = env * env  # instantaneous band power
+    target_bins = choose_target_bins(len(power)) or 4000
+    t, display, _decim = envelope(power, fs, target_bins, t_start=0.0)
+    fig = _build_lfp_figure(
+        t, display, f"Slow gamma power ({lo:g}-{hi:g} Hz)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].line.color = "#bf5af2"
+    fig.data[0].hovertemplate = (
+        "t=%{x:.2f}s<br>power=%{y:.3g}<extra></extra>")
+    fig.layout.yaxis.title = "band power (μV²)"
+    status = (f"Slow gamma {lo:g}-{hi:g} Hz · continuous band power · "
+              f"{len(power) / fs:.1f} s @ {int(fs)} Hz")
+    return (fig, status)
+
+
+def _render_evoked_band_power(store, file_id: int, channel: int | None,
+                               lo: float, hi: float,
+                               win_sec: float = _EVOKED_GAMMA_WIN_SEC
+                               ) -> tuple:
+    """(figure, status) for per-stim-epoch slow-gamma power.
+
+    For each stim onset, integrate the PSD over ``[lo, hi]`` Hz across a
+    short post-stim window -- the stim-locked ("evoked") band power. One
+    point per epoch, plotted vs stim time (same shape as the DB-backed
+    per-epoch features). Computed live, so no pipeline reprocess is needed.
+    """
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig(
+            "Pick a brain channel (Step 1) first."), "")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return (_empty_lfp_fig(
+            "No stim epochs on this file — evoked band power needs "
+            "stimulation onsets."), "")
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Evoked band-power load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    win = max(1, int(round(win_sec * fs)))
+    n = len(sig)
+    times: list[float] = []
+    vals: list[float] = []
+    # NASA Rule 3: bound the per-render epoch count.
+    for s in np.asarray(stim_times, dtype=np.float64)[:5000]:
+        i0 = int(round(float(s) * fs))
+        i1 = i0 + win
+        if i0 < 0 or i1 > n:
+            continue
+        seg = sig[i0:i1]
+        if not np.all(np.isfinite(seg)):
+            seg = np.nan_to_num(seg)
+        freqs, psd = compute_psd(seg, fs)
+        if freqs.size == 0:
+            continue
+        times.append(float(s))
+        vals.append(band_power(freqs, psd, lo, hi))
+    if not times:
+        return (_empty_lfp_fig(
+            "No usable stim epochs (windows fell off the recording)."),
+                "")
+    fig = _build_lfp_figure(
+        np.asarray(times), np.asarray(vals),
+        f"Slow gamma power ({lo:g}-{hi:g} Hz, per stim)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].mode = "markers+lines"
+    fig.data[0].line.color = "#bf5af2"
+    fig.data[0].marker = dict(size=5, color="#bf5af2")
+    fig.data[0].hovertemplate = (
+        "stim @ t=%{x:.2f}s<br>power=%{y:.3g}<extra></extra>")
+    fig.layout.yaxis.title = "evoked band power (μV²)"
+    status = (f"Slow gamma {lo:g}-{hi:g} Hz · per stim epoch "
+              f"({win_sec * 1000:.0f} ms window) · {len(times)} epochs")
     return (fig, status)
 
 
@@ -1889,6 +2011,15 @@ def layout(store: Store, bridge: dict | None = None):
                             {"label": "Hilbert AUC (sliding window) "
                                        "-- catches sustained events",
                                 "value": "hilbert_auc"},
+                            # Slow gamma (30-50 Hz) band power -- live,
+                            # no pipeline reprocess. Continuous (LFP) +
+                            # per-stim (evoked) views.
+                            {"label": "Slow gamma power "
+                                       "(30-50 Hz, continuous)",
+                                "value": "slow_gamma_power"},
+                            {"label": "Slow gamma power "
+                                       "(30-50 Hz, per stim)",
+                                "value": "slow_gamma_evoked"},
                             {"label": "Line length (per-event)",
                                 "value": "line_length"},
                             {"label": "Log(AUC) — area under the curve",
@@ -4831,6 +4962,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 blank_pre_ms=blank_pre_ms,
                 blank_post_ms=blank_post_ms,
                 show_raw="raw" in (blank_raw or []))
+        # Slow gamma (30-50 Hz) band power -- computed live, no DB column.
+        if feature == "slow_gamma_power":
+            lo, hi = SLOW_GAMMA_BAND
+            return _render_band_power_trace(
+                store, int(file_id), channel, lo, hi,
+                blank_pre_ms=blank_pre_ms,
+                blank_post_ms=blank_post_ms,
+                show_raw="raw" in (blank_raw or []))
+        if feature == "slow_gamma_evoked":
+            lo, hi = SLOW_GAMMA_BAND
+            return _render_evoked_band_power(
+                store, int(file_id), channel, lo, hi)
         # Hilbert envelope (BHZ default). Continuous-time trace
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":

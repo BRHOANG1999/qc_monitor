@@ -45,18 +45,25 @@ _SMOOTH_NORM_CUTOFF: float = 0.1 / 500.0  # tay_preprocess.m:15
 _SMOOTH_ORDER: int = 2
 
 
-def hilbert_envelope_20_200(signal: np.ndarray,
-                              fs: float) -> np.ndarray:
-    """Return the smoothed 20-200 Hz instantaneous amplitude.
+def band_envelope(signal: np.ndarray, fs: float,
+                   hp_hz: float, lp_hz: float,
+                   smooth: bool = True) -> np.ndarray:
+    """Smoothed instantaneous amplitude of *signal* in ``[hp_hz, lp_hz]``.
 
-    Drops NaNs in the input to 0 before the FFT (the lab's
-    stim-blank fills produce NaN runs; transforming them
-    propagates NaN everywhere). The returned array has the
-    same shape and dtype-family (float64) as the input.
+    The generalised core of ``hilbert_envelope_20_200``: an FFT zero-mask
+    that keeps a single positive sub-band, so ``abs(ifft(masked))`` is the
+    magnitude of the analytic (Hilbert) signal in that band. Works for any
+    band (20-200 for the BHZ default, 30-50 for slow gamma, ...).
+
+    NaNs/inf (stim-blank fills) are zeroed before the FFT so it stays
+    finite. With *smooth* (default), the same fixed Butterworth low-pass as
+    ``tay_preprocess.m`` is applied; pass ``smooth=False`` for the raw
+    band-limited amplitude. Returns float64, same length as the input.
     """
     assert isinstance(signal, np.ndarray), "signal must be ndarray"
     assert signal.ndim == 1, "signal must be 1-D"
     assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
+    assert 0 <= hp_hz < lp_hz, "need 0 <= hp_hz < lp_hz"
 
     n = signal.shape[0]
     if n < 4:
@@ -70,8 +77,8 @@ def hilbert_envelope_20_200(signal: np.ndarray,
     x[~np.isfinite(x)] = 0.0
 
     fdata = np.fft.fft(x)
-    hp_bin = int(np.floor(n * _HPASS_HZ / fs))
-    lp_bin = int(np.floor(n * _LPASS_HZ / fs))
+    hp_bin = int(np.floor(n * hp_hz / fs))
+    lp_bin = int(np.floor(n * lp_hz / fs))
     # MATLAB indexing: fdata(1:floor(N*HP/fs))=0 zeros bins
     # 1..hp_bin inclusive. Python equivalent is [:hp_bin].
     fdata[:hp_bin] = 0
@@ -79,6 +86,8 @@ def hilbert_envelope_20_200(signal: np.ndarray,
         fdata[lp_bin:] = 0
 
     envelope_data = np.abs(np.fft.ifft(fdata))
+    if not smooth:
+        return envelope_data
 
     b, a = butter(_SMOOTH_ORDER, _SMOOTH_NORM_CUTOFF, btype="low")
     # filtfilt requires len(x) > 3 * max(len(a), len(b)); we
@@ -86,6 +95,14 @@ def hilbert_envelope_20_200(signal: np.ndarray,
     # default padlen can still exceed; clamp.
     pad = min(3 * max(len(a), len(b)), n - 1)
     return filtfilt(b, a, envelope_data, padlen=pad)
+
+
+def hilbert_envelope_20_200(signal: np.ndarray,
+                              fs: float) -> np.ndarray:
+    """Return the smoothed 20-200 Hz instantaneous amplitude -- the lab's
+    BHZ default (1:1 with ``tay_preprocess.m``). Thin wrapper over
+    ``band_envelope`` so the band is the single source of truth."""
+    return band_envelope(signal, fs, _HPASS_HZ, _LPASS_HZ, smooth=True)
 
 
 def windowed_auc(env: np.ndarray, fs: float,

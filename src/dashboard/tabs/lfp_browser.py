@@ -50,7 +50,8 @@ from src.utils.chunk_cache import get_chunk
 from src.utils.decimate import (
     choose_target_bins, envelope_channel, parse_relayout, window_slice,
 )
-from src.utils.filters import compute_psd, get_filtered
+from src.utils.filters import (
+    compute_psd, get_filtered, band_power, SLOW_GAMMA_BAND)
 
 logger = logging.getLogger("qc_monitor.dashboard.lfp_browser")
 
@@ -62,6 +63,7 @@ _LFP_PRESETS = {
     "theta": (4, 8),
     "alpha": (8, 13),
     "beta":  (13, 30),
+    "slow_gamma": (30, 50),
     "gamma": (30, 100),
     "spike": (300, 3000),
 }
@@ -72,6 +74,7 @@ _PRESET_OPTIONS = [
     {"label": "Theta (4-8 Hz)", "value": "theta"},
     {"label": "Alpha (8-13 Hz)", "value": "alpha"},
     {"label": "Beta (13-30 Hz)", "value": "beta"},
+    {"label": "Slow gamma (30-50 Hz)", "value": "slow_gamma"},
     {"label": "Gamma (30-100 Hz)", "value": "gamma"},
     {"label": "Spike band (300-3000 Hz)", "value": "spike"},
     {"label": "Custom", "value": "custom"},
@@ -587,6 +590,19 @@ def _build_psd_figure(signal, fs, n_ch, info_for, filt_label):
                               row=ch_idx + 1, col=1,
                               title_font=dict(size=9, color="#aaa"),
                               tickfont=dict(size=8))
+        # Slow gamma (30-50 Hz): shade the band + print its integrated
+        # power per channel. Reuses the (freqs, psd) already computed.
+        _sg_lo, _sg_hi = SLOW_GAMMA_BAND
+        if _sg_lo < x_cap:
+            _sg_pow = band_power(freqs, psd, _sg_lo, _sg_hi)
+            psd_fig.add_vrect(
+                x0=_sg_lo, x1=min(_sg_hi, x_cap),
+                row=ch_idx + 1, col=1,
+                fillcolor="#bf5af2", opacity=0.12, line_width=0,
+                annotation_text=f"slow γ: {_sg_pow:.2g} μV²",
+                annotation_position="top left",
+                annotation_font_size=9,
+                annotation_font_color="#bf5af2")
         for line_hz in (50, 60, 120, 180):
             if line_hz < x_cap:
                 psd_fig.add_vline(
