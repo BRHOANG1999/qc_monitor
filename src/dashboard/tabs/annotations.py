@@ -16,6 +16,7 @@ Lifted out of ``src/dashboard/app.py`` following the per-tab pattern.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 
 from dash import Input, Output, State, dash_table, dcc, html, no_update
@@ -25,8 +26,41 @@ from src.dashboard.components import (
     DARK_TABLE_STYLE, DROPDOWN_STYLE, INPUT_STYLE, LABEL_STYLE,
     SECTION_STYLE, ZEBRA_STRIPE,
 )
+from src.dashboard.design import COLOR_ACCENT
 from src.dashboard.data_helpers import session_dropdown_options
 from src.db.store import Store
+from src.utils.animal import is_animal_channel
+
+# Video Review prefixes its notes with the playback time, e.g.
+# "[t=12.34s] grooming". Pull that out so a note can deep-link back to
+# the exact moment.
+_TS_RE = re.compile(r"\[t=([0-9]+(?:\.[0-9]+)?)s\]")
+
+
+def _start_sec_from_note(note: str) -> float:
+    """Parse the ``[t=..s]`` playback-time prefix Video Review writes;
+    0.0 when the note has none."""
+    m = _TS_RE.search(note or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_animal_channel_index(store: Store, session_dir: str) -> int:
+    """First animal-bearing channel for the LFP stitch -- notes don't
+    record a channel, so default to the same heuristic Video Review
+    uses. Falls back to channel 0."""
+    try:
+        names = store._channel_names_for_session(session_dir)
+    except Exception:
+        return 0
+    for i, n in enumerate(names or []):
+        if isinstance(n, str) and is_animal_channel(n):
+            return i
+    return 0
 
 _CATEGORY_OPTIONS = [
     {"label": "Electrode", "value": "electrode"},
@@ -36,6 +70,10 @@ _CATEGORY_OPTIONS = [
 ]
 
 _COLUMNS = [
+    # Clickable only for notes tied to a recording (file_id present):
+    # the active_cell callback deep-links into Video Review at the
+    # note's moment. Blank for free-form notes.
+    {"name": "", "id": "open"},
     {"name": "ID", "id": "id"},
     {"name": "Timestamp", "id": "timestamp"},
     {"name": "Category", "id": "category"},
@@ -52,6 +90,9 @@ def _table_data(annotations: list[dict]) -> list[dict]:
     return [
         {
             "id": a.get("id", ""),
+            # "▶ Open" only when the note is tied to a recording; the
+            # deep-link callback reads file_id off the annotation id.
+            "open": "▶ Open" if a.get("file_id") else "",
             "timestamp": (a.get("timestamp") or "")[:19],
             "category": a.get("category", ""),
             "note": a.get("note", ""),
@@ -73,8 +114,13 @@ def layout(store: Store):
         all_annotations = []
 
     return html.Div([
-        html.H3("Annotations",
-                style={"color": "white", "marginBottom": "12px"}),
+        html.H3("Notes",
+                style={"color": "white", "marginBottom": "4px"}),
+        html.Div("Notes you save while reviewing video / LFP show up "
+                 "here. Click ▶ Open on one to jump straight back "
+                 "into Video Review at that recording and moment.",
+                 style={"color": "#a0a0b0", "fontSize": "12px",
+                        "marginBottom": "12px"}),
 
         dash_table.DataTable(
             id="annotation-table",
@@ -82,6 +128,10 @@ def layout(store: Store):
             columns=_COLUMNS,
             **DARK_TABLE_STYLE,
             style_data_conditional=[ZEBRA_STRIPE,
+                # The Open affordance reads as an interactive link.
+                {"if": {"column_id": "open"},
+                 "color": COLOR_ACCENT, "fontWeight": "600",
+                 "cursor": "pointer"},
                 {"if": {"filter_query": "{category} = electrode"},
                  "color": "#FFA15A"},
                 {"if": {"filter_query": "{category} = injection"},
@@ -90,6 +140,8 @@ def layout(store: Store):
                  "color": "#636EFA"},
                 {"if": {"filter_query": "{category} = observation"},
                  "color": "#00CC96"},
+                {"if": {"filter_query": "{category} = video_review"},
+                 "color": COLOR_ACCENT},
             ],
             page_size=20,
             filter_action="native",
@@ -199,3 +251,64 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return (html.Div(f"Error: {e}",
                              style={"color": "#EF553B"}),
                     no_update)
+
+    # Click a note's "▶ Open" cell -> hand the recording to Video
+    # Review and seek to the note's moment, reusing the same
+    # lfp-to-video-bridge + pending-seek path the LFP Browser uses
+    # (video.py consumes both, then the clientside seek loop jumps the
+    # player to start_sec). Only notes with a file_id are openable.
+    @app.callback(
+        Output("lfp-to-video-bridge", "data", allow_duplicate=True),
+        Output("pending-seek", "data", allow_duplicate=True),
+        Output("group-tabs", "value", allow_duplicate=True),
+        Output("tabs", "value", allow_duplicate=True),
+        Output("annotation-table", "active_cell"),
+        Input("annotation-table", "active_cell"),
+        prevent_initial_call=True,
+    )
+    def open_note_in_video(active_cell):
+        nop = (no_update, no_update, no_update, no_update, no_update)
+        # Clear active_cell on a handled open so re-entering the tab
+        # doesn't re-navigate; ignore clicks on any other column.
+        if not active_cell or active_cell.get("column_id") != "open":
+            return nop
+        ann_id = active_cell.get("row_id")
+        cleared = (no_update, no_update, no_update, no_update, None)
+        if ann_id is None:
+            return cleared
+        try:
+            ann = next((a for a in store.get_annotations()
+                        if a.get("id") == ann_id), None)
+        except Exception:
+            return cleared
+        if not ann or not ann.get("file_id"):
+            return cleared
+        file_id = int(ann["file_id"])
+        session_dir = ann.get("session_dir")
+        duration = 0.0
+        try:
+            with store.connection() as conn:
+                row = conn.execute(
+                    "SELECT session_dir, duration_sec "
+                    "FROM processed_files WHERE id = ?",
+                    (file_id,),
+                ).fetchone()
+            if row:
+                session_dir = session_dir or row["session_dir"]
+                duration = float(row["duration_sec"] or 0.0)
+        except Exception:
+            pass
+        if not session_dir:
+            return cleared
+        start_sec = _start_sec_from_note(ann.get("note") or "")
+        channel = _first_animal_channel_index(store, session_dir)
+        seq = int(datetime.now().timestamp() * 1000)
+        bridge = {
+            "session_dir": session_dir, "file_id": file_id,
+            "channel": int(channel),
+            "hp": 0, "lp": 0, "notch": 0, "smooth": 0,
+            "start_sec": float(start_sec),
+            "lfp_dur": duration, "seq": seq,
+        }
+        seek = {"start_sec": float(start_sec), "lfp_dur": duration}
+        return bridge, seek, "analysis", "video", None
