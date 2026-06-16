@@ -544,17 +544,21 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         name=label,
     ))
     # Cursor placeholder — clientside callback updates the x position.
-    # dragmode=False (Seek mode default): drag is inert so a click on the
-    # trace cleanly registers (clickData) and seeks the video; no stray
-    # zoom-box swallows the click. The "Mode" toggle flips this to 'zoom'
-    # (drag draws a zoom box) via a clientside enforcer that re-applies it
-    # after every rebuild. Scroll-zoom + the modebar zoom/pan buttons stay
-    # available in both modes; double-click resets.
+    # dragmode='pan' (Seek mode default): a brief click still registers as
+    # a click (clickData) and seeks the video, while a slightly-longer
+    # press-drag PANS a hair instead of drawing a zoom box. We deliberately
+    # avoid dragmode=False here: Plotly.js does not reliably honor it (it
+    # silently falls back to 'zoom', so a tiny drag would zoom -- the exact
+    # bug reviewers hit). 'pan' is a positively-supported value, so the
+    # gesture can never zoom by accident. The "Mode" toggle flips this to
+    # 'zoom' (drag draws a zoom box) via a clientside enforcer that
+    # re-applies it after every rebuild. Scroll-zoom + the modebar zoom/pan
+    # buttons stay available in both modes; double-click resets.
     fig.update_layout(
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         height=220,
         margin=dict(l=60, r=20, t=10, b=40),
-        dragmode=False,
+        dragmode="pan",
         # uirevision (stable per recording) tells Plotly to preserve
         # the user's zoom/pan across figure updates -- the cursor
         # mirror + re-decimate redraws no longer snap the view back.
@@ -5169,7 +5173,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     app.clientside_callback(
         """
         function(mode, _figA, _figB) {
-            var want = (mode === 'zoom') ? 'zoom' : false;
+            // 'pan' (not false) for Seek: a drag pans a hair instead of
+            // zooming, because Plotly.js doesn't reliably honor false.
+            var want = (mode === 'zoom') ? 'zoom' : 'pan';
             ['video-lfp-trace', 'video-analysis-trace'].forEach(function(id) {
                 var gd = document.getElementById(id);
                 if (!gd || !gd._fullLayout) { return; }
@@ -5184,6 +5190,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-lfp-mode", "value"),
         Input("video-lfp-trace", "figure"),
         Input("video-analysis-trace", "figure"),
+        prevent_initial_call=True,
+    )
+
+    # Armed-landmark cursor: when a "Set on plot" landmark is armed, mark
+    # the Step-2 grid so CSS swaps the plot cursor to a crosshair -- a
+    # visible "click the trace to place this onset" affordance that
+    # reinforces the armed banner. Cleared the moment the landmark drops
+    # or is disarmed (video-armed-landmark -> null).
+    app.clientside_callback(
+        """
+        function(armed) {
+            var grid = document.getElementById('video-step2-grid');
+            if (grid) {
+                if (armed) { grid.classList.add('qc-armed'); }
+                else { grid.classList.remove('qc-armed'); }
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-fs-sink", "children", allow_duplicate=True),
+        Input("video-armed-landmark", "data"),
         prevent_initial_call=True,
     )
 

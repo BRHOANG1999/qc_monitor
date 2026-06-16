@@ -527,6 +527,20 @@ details.qc-expandable:hover {
     border-color: rgba(94, 124, 226, 0.35) !important;
 }
 
+/* --- Armed-landmark cursor: crosshair over both plots --- */
+/* video.py toggles .qc-armed on #video-step2-grid while a "Set on plot"
+   landmark is armed. Plotly sets the drag-layer cursor inline (move / pan),
+   so !important is required to override it. Covers the LFP + Hilbert traces
+   and their drag layers. */
+#video-step2-grid.qc-armed #video-lfp-trace,
+#video-step2-grid.qc-armed #video-analysis-trace,
+#video-step2-grid.qc-armed #video-lfp-trace .nsewdrag,
+#video-step2-grid.qc-armed #video-analysis-trace .nsewdrag,
+#video-step2-grid.qc-armed #video-lfp-trace .drag,
+#video-step2-grid.qc-armed #video-analysis-trace .drag {
+    cursor: crosshair !important;
+}
+
 /* --- Video Review Step-2 layout presets --- */
 #video-step2-grid { transition: grid-template-columns 0.15s ease; }
 #video-step2-grid.layout-bigvideo {
