@@ -82,14 +82,19 @@ SECTION_STYLE = {
 VIDEO_DOM_ID = "lfp-video"
 
 
-def _loading_icon(text: str = "Loading…"):
+def _loading_icon(text: str = "Loading…", small: bool = False):
     """Animated EEG-bar loading icon for dcc.Loading(custom_spinner=...).
     Renders a row of pulsing bars (like a live trace) over the card while
-    it loads, with an optional caption. Styled by .qc-load-* in
+    it loads, with an optional caption. ``small`` gives a compact inline
+    variant (no caption) for status lines. Styled by .qc-load-* in
     theme.css."""
+    bars = html.Div([html.Span() for _ in range(5)],
+                     className="qc-load-bars qc-load-bars-sm"
+                              if small else "qc-load-bars")
+    if small:
+        return html.Div(bars, className="qc-load-overlay")
     return html.Div([
-        html.Div([html.Span() for _ in range(5)],
-                  className="qc-load-bars"),
+        bars,
         html.Div(text, className="qc-load-text"),
     ], className="qc-load-overlay")
 
@@ -1703,11 +1708,29 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Span(id="video-lfp-status",
                           style={"color": "#888", "fontSize": "11px",
                                  "marginLeft": "12px"}),
-                html.Span("💡  Click on the trace to jump the video here.",
-                          style={"color": "#5e7ce2", "fontSize": "11px",
+                # Decouple clicking from the zoom/pan toolbar: choose
+                # what a click on the trace DOES. The modebar (zoom,
+                # reset, pan) works independently in every mode.
+                html.Span("On click:",
+                          style={"color": "#a0a0b0", "fontSize": "11px",
                                  "marginLeft": "auto",
-                                 "fontStyle": "italic"}),
-            ], style={"display": "flex", "alignItems": "baseline",
+                                 "marginRight": "6px"}),
+                dcc.RadioItems(
+                    id="video-lfp-click-action",
+                    options=[
+                        {"label": " Seek video", "value": "seek"},
+                        {"label": " Place onset", "value": "place"},
+                        {"label": " Off (zoom only)", "value": "off"},
+                    ],
+                    value="seek", inline=True,
+                    inputStyle={"marginRight": "3px"},
+                    labelStyle={"marginRight": "10px",
+                                 "color": "#cfd0d6",
+                                 "fontSize": "11px",
+                                 "cursor": "pointer"},
+                ),
+            ], style={"display": "flex", "alignItems": "center",
+                      "flexWrap": "wrap",
                       "marginBottom": "8px"}),
             # --- Filter strip (hidden by default, click to expand) ---
             _details_card(
@@ -1812,8 +1835,13 @@ def layout(store: Store, bridge: dict | None = None):
                       data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
             dcc.Loading(
                 id="video-lfp-loading",
-                custom_spinner=_loading_icon("Loading LFP…"),
-                delay_show=180,
+                custom_spinner=_loading_icon("Re-decimating…"),
+                delay_show=120,
+                # Keep the trace visible (dimmed) under the spinner so a
+                # zoom re-decimate shows progress without the graph
+                # vanishing.
+                overlay_style={"visibility": "visible",
+                                "opacity": 0.45},
                 parent_style={"minHeight": "220px"},
                 children=dcc.Graph(
                     id="video-lfp-trace",
@@ -2097,8 +2125,10 @@ def layout(store: Store, bridge: dict | None = None):
             ),
             dcc.Loading(
                 id="video-analysis-loading",
-                custom_spinner=_loading_icon("Loading feature…"),
-                delay_show=180,
+                custom_spinner=_loading_icon("Re-decimating…"),
+                delay_show=120,
+                overlay_style={"visibility": "visible",
+                                "opacity": 0.45},
                 parent_style={"minHeight": "220px"},
                 children=dcc.Graph(
                     id="video-analysis-trace",
@@ -2435,8 +2465,7 @@ def layout(store: Store, bridge: dict | None = None):
                                 "marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
-                        type="dot",
-                        color="#5e7ce2",
+                        custom_spinner=_loading_icon(small=True),
                         # 250 ms delay so a cache-hit save
                         # doesn't flash; the SQLite write +
                         # CSV append (the slow leg) tip the
@@ -3966,14 +3995,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-review-marker-store", "data",
                 allow_duplicate=True),
         Input("video-lfp-trace", "clickData"),
-        State("video-review-decision", "value"),
+        State("video-lfp-click-action", "value"),
         State("video-review-marker-store", "data"),
         prevent_initial_call=True,
     )
-    def _maybe_append_marker(click_data, decision, markers):
-        # We don't want every click-to-seek to also drop a marker;
-        # gate on the radio being in events mode.
-        if decision != "has_events":
+    def _maybe_append_marker(click_data, click_action, markers):
+        # Only drop an onset when the "On click" mode is "place" -- so
+        # seeking / zooming never leaves a stray marker.
+        if click_action != "place":
             return no_update
         if not click_data or not click_data.get("points"):
             return no_update
@@ -5385,9 +5414,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     # 3. Click on the LFP trace -> seek the video to that x value.
     #    Inverse mapping: video_t = x * (video_duration / lfp_duration).
+    #    Gated on the "On click" mode so zoom/place-onset don't also seek.
     app.clientside_callback(
         """
-        function(clickData, lfp_dur) {
+        function(clickData, lfp_dur, mode) {
+            if (mode !== 'seek') { return ''; }
             if (!clickData || !clickData.points || !clickData.points.length) {
                 return '';
             }
@@ -5412,6 +5443,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-seek-sink", "children"),
         Input("video-lfp-trace", "clickData"),
         State("video-lfp-duration", "data"),
+        State("video-lfp-click-action", "value"),
     )
 
     # =================================================================== #

@@ -315,8 +315,23 @@ button:focus-visible {
     font-size: 11px;
     letter-spacing: 0.3px;
 }
+/* Compact inline variant for status lines (e.g. Save). */
+.qc-load-bars-sm {
+    height: 16px;
+    gap: 2px;
+}
+.qc-load-bars-sm > span {
+    width: 3px;
+    height: 4px;
+}
+.qc-load-bars-sm > span { animation-name: qc-eeg-sm; }
+@keyframes qc-eeg-sm {
+    0%, 100% { height: 4px;  opacity: 0.55; }
+    50%      { height: 14px; opacity: 1; }
+}
 @media (prefers-reduced-motion: reduce) {
     .qc-load-bars > span { animation: none; height: 18px; }
+    .qc-load-bars-sm > span { animation: none; height: 10px; }
 }
 
 /* --- "+ Add event" pulse when the events list is empty --- */
