@@ -803,6 +803,25 @@ def active_job_for_animal(store, animal_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def last_done_job_for_animal(store, animal_id: str) -> dict | None:
+    """Most-recent COMPLETED scan for *animal_id*, or None.
+
+    Lets the UI restore the pool browser after a tab reload: the scan's
+    cache rows persist, so re-running ``pool_files`` at this job's
+    thresholds rebuilds the exact same pools with no recompute.
+    """
+    assert isinstance(animal_id, str) and animal_id, \
+        "animal_id required"
+    with store.connection() as conn:
+        row = conn.execute(
+            """SELECT * FROM mass_analyze_job
+               WHERE animal_id = ? AND status = 'done'
+               ORDER BY finished_at DESC, created_at DESC LIMIT 1""",
+            (animal_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def cancel_job(store, job_id: int) -> bool:
     """Flip a pending/running job to 'cancelled'. The worker
     checks this between files and bails cleanly."""

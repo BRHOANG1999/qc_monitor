@@ -52,6 +52,31 @@ def test_animal_channel_index_picks_the_scanned_animal(tmp_path):
         ma.animal_channel_index(store, "s1", "ZZZ999", 0), int)
 
 
+def test_last_done_job_for_animal(tmp_path):
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO mass_analyze_job
+               (pi_email, animal_id, cutoff, status, created_at,
+                finished_at)
+               VALUES ('pi','BCH1',0.05,'done','2026-01-01','2026-01-01')""")
+        conn.execute(
+            """INSERT INTO mass_analyze_job
+               (pi_email, animal_id, cutoff, status, created_at,
+                finished_at)
+               VALUES ('pi','BCH1',0.05,'done','2026-02-01','2026-02-01')""")
+        conn.execute(
+            """INSERT INTO mass_analyze_job
+               (pi_email, animal_id, cutoff, status, created_at)
+               VALUES ('pi','BCH1',0.05,'running','2026-03-01')""")
+        conn.commit()
+    job = ma.last_done_job_for_animal(store, "BCH1")
+    assert job is not None
+    assert job["finished_at"] == "2026-02-01"  # newest DONE, not running
+    assert ma.last_done_job_for_animal(store, "BCH2") is None
+
+
 def test_file_ground_truth_mapping():
     g = ma.file_ground_truth
     assert g("has_events", None) == "pos"

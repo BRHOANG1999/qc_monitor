@@ -5125,6 +5125,64 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "Progress will update below.",
                     style={"color": "#5e7ce2"}))
 
+    # Restore the pool browser from this animal's most recent COMPLETED
+    # scan when the animal is (re)selected -- so the pools survive a tab
+    # close. The scan's cache rows persist, so pool_files rebuilds the
+    # same pools with no recompute. To re-analyze at new thresholds, the
+    # PI just runs a fresh scan.
+    @app.callback(
+        Output("video-ma-pools", "data", allow_duplicate=True),
+        Output("video-ma-browse", "style", allow_duplicate=True),
+        Output("video-ma-pool-counts", "children",
+                allow_duplicate=True),
+        Output("video-ma-pool-cursor", "data",
+                allow_duplicate=True),
+        Input("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_restore_pools(picker_value):
+        hidden = {"display": "none", "padding": "0 14px",
+                   "marginBottom": "10px"}
+        animal = _ma_animal_from_picker(picker_value)
+        if not animal:
+            return None, hidden, "", None
+        try:
+            job = _mass_analyze.last_done_job_for_animal(
+                store, str(animal))
+        except Exception as e:
+            logger.warning("last_done_job_for_animal failed: %s", e)
+            return no_update, no_update, no_update, no_update
+        if not job:
+            return None, hidden, "", None
+        auc_t = job.get("auc_threshold")
+        auc_w = job.get("auc_window_sec")
+        try:
+            pools = _mass_analyze.pool_files(
+                store, job["animal_id"], float(job["cutoff"]),
+                float(auc_t) if auc_t else None,
+                float(auc_w) if auc_w else None,
+                electrode=int(job.get("electrode") or 0))
+        except Exception as e:
+            logger.warning("restore pool_files failed: %s", e)
+            return no_update, no_update, no_update, no_update
+        n1, n2, n3 = (len(pools["pool1"]), len(pools["pool2"]),
+                       len(pools["pool3"]))
+        if n1 + n2 + n3 == 0:
+            return None, hidden, "", None
+        prefix = (f"Restored from last scan (cutoff "
+                   f"{float(job['cutoff']):g}")
+        if auc_t and auc_w:
+            prefix += (f", AUC {float(auc_t):g}, win "
+                        f"{float(auc_w):g}s)")
+            counts = (f"{prefix}  ·  Pool 1 -- envelope: {n1}  ·  "
+                       f"Pool 2 -- AUC: {n2}  ·  Pool 3 -- "
+                       f"disagreement: {n3}")
+        else:
+            counts = f"{prefix})  ·  Pool 1 -- envelope: {n1}"
+        browse = {"display": "block", "padding": "0 14px",
+                   "marginBottom": "10px"}
+        return pools, browse, counts, None
+
     @app.callback(
         Output("video-ma-confirm-modal", "style"),
         Output("video-ma-modal-body", "children"),
