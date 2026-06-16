@@ -332,25 +332,26 @@ def create_app(config: dict, store: Store) -> Dash:
             # compares it to the live HEAD on disk; when the deployment
             # has moved ahead, the update banner appears.
             dcc.Store(id="page-version", data=_QC_MONITOR_VERSION),
-            dcc.Store(id="version-reload-sink"),
             # Update-available banner. Hidden until a newer version is
             # detected; click reloads the page to pick it up.
+            # Passive, non-clickable info chip (a browser reload can't
+            # restart the backend, so we don't pretend it can). A calm
+            # accent blue -- amber would read as a warning.
             html.Span(
-                "↻ New version available — click to reload",
-                id="header-update-msg", n_clicks=0,
-                title="The app has been updated since you opened this "
-                       "page. Click to reload and get the latest "
-                       "version.",
+                "New version available",
+                id="header-update-msg",
+                title="A newer version has been deployed. It takes "
+                       "effect after the QC Monitor service restarts.",
                 style={
                     "display": "none",
                     "marginLeft": SPACE_4,
                     "padding": "3px 10px",
                     "borderRadius": "10px",
-                    "background": COLOR_WARNING,
-                    "color": "#1a1205",
+                    "background": "rgba(94, 124, 226, 0.15)",
+                    "color": COLOR_ACCENT,
+                    "border": "1px solid rgba(94, 124, 226, 0.35)",
                     "fontSize": FONT_SIZE_CAPTION,
-                    "fontWeight": "700",
-                    "cursor": "pointer",
+                    "fontWeight": "600",
                     "verticalAlign": "middle",
                     "letterSpacing": "0.2px",
                 },
@@ -926,14 +927,6 @@ def create_app(config: dict, store: Store) -> Dash:
                             if newer_version_available(page_version)
                             else "none")
         return base
-
-    # Click the banner -> hard reload to pick up the new version.
-    app.clientside_callback(
-        "function(n){ if(n){ window.location.reload(); } return null; }",
-        Output("version-reload-sink", "data"),
-        Input("header-update-msg", "n_clicks"),
-        prevent_initial_call=True,
-    )
 
     @app.callback(
         Output("last-refresh-label", "children"),
