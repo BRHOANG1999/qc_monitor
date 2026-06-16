@@ -6259,6 +6259,35 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return ({"active": active, "idx": idx},
                 row["session_dir"], file_id, feature_out, status)
 
+    # Keep the "Pool N · file x of y" counter in sync with the cursor on
+    # EVERY move -- including the auto-advance after Mark-done / Flag for
+    # scoring, which bump the cursor but not the status text. Without
+    # this the counter only refreshed on the Prev/Next/Browse buttons,
+    # so progress through a pool looked frozen while auto-advancing.
+    @app.callback(
+        Output("video-ma-pool-status", "children",
+                allow_duplicate=True),
+        Input("video-ma-pool-cursor", "data"),
+        State("video-ma-pools-view", "data"),
+        prevent_initial_call=True,
+    )
+    def _render_pool_status(cursor, pools):
+        if not cursor or not isinstance(cursor, dict):
+            return no_update
+        active = cursor.get("active")
+        if active not in ("1", "2", "3"):
+            return no_update
+        key = {"1": "pool1", "2": "pool2", "3": "pool3"}[active]
+        files = (pools or {}).get(key, []) or []
+        n = len(files)
+        if n == 0:
+            return no_update
+        idx = min(int(cursor.get("idx") or 0), n - 1)
+        entry = files[idx]
+        badge = (f" ({entry.get('only')}-only)"
+                 if isinstance(entry, dict) else "")
+        return f"Pool {active} · file {idx + 1} of {n}{badge}"
+
     @app.callback(
         Output("video-ma-job-id", "data",
                 allow_duplicate=True),
