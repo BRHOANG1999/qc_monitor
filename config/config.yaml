@@ -247,6 +247,20 @@ review_queue:
     weekday: 4   # 0=Mon ... 4=Fri
     hour: 17
 
+# Training tab: students blind-re-score PI-approved recordings and get an
+# agreement score vs the validated answer. Reuses review_queue.pi_emails
+# for the PI roster / advance gate.
+training:
+  # Rolling pass bar: a student is flagged "ready to advance" when the
+  # mean agreement over their last `window` graded attempts in the
+  # current stage is >= pass_pct. The PI still confirms the advance.
+  pass_pct: 85
+  window: 10
+  # Strictness of agreement (Stages 2-3): how close a student's onset must
+  # be to count as the same event / landmark, and the Racine slack.
+  onset_tol_s: 10
+  racine_tol: 1
+
 # Event-clip extractor (ffmpeg) for the PI verification flow.
 # Builds a stitched 10+ min clip (5 min before EO to 5 min
 # after BB) for every event the PI opens for detail review.

@@ -33,6 +33,7 @@ from src.dashboard.tabs import sessions as tabs_sessions
 from src.dashboard.tabs import settings as tabs_settings
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
+from src.dashboard.tabs import training as tabs_training
 from src.dashboard.tabs import waveforms as tabs_waveforms
 from src.dashboard.components import (
     card as _card, pill as _pill, section_header as _section_header,
@@ -109,6 +110,7 @@ NAV_GROUPS = [
         {"id": "criticality", "label": "Criticality"},
         {"id": "lfp", "label": "LFP browser"},
         {"id": "video", "label": "Video review"},
+        {"id": "training", "label": "Training"},
     ]},
     {"id": "quality", "label": "Quality", "subs": [
         {"id": "signal", "label": "Signal quality"},
@@ -1090,6 +1092,9 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_activity_log.layout(store))
             elif tab == "annotations":
                 return _enable_persistence(tabs_annotations.layout(store))
+            elif tab == "training":
+                return _enable_persistence(
+                    tabs_training.layout(store, config))
             elif tab == "alerts":
                 return _enable_persistence(tabs_alerts.layout(store))
             elif tab == "sessions":
@@ -1163,6 +1168,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_session_compare.register_callbacks(app, store, config)
     tabs_activity_log.register_callbacks(app, store, config)
     tabs_annotations.register_callbacks(app, store, config)
+    tabs_training.register_callbacks(app, store, config)
     tabs_sessions.register_callbacks(app, store, config)
     tabs_electrode_health.register_callbacks(app, store, config)
     tabs_waveforms.register_callbacks(app, store, config)

@@ -550,4 +550,32 @@ CREATE INDEX IF NOT EXISTS idx_event_clip_job_status
     ON event_clip_job(status);
 CREATE INDEX IF NOT EXISTS idx_event_clip_job_hash
     ON event_clip_job(spec_hash);
+
+-- ----------------------------------------------------------------------
+-- Training: a student blind-re-scores PI-validated recordings and gets an
+-- agreement score. Each graded submission is one training_attempt row;
+-- training_progress tracks which stage (1-3) each student has unlocked
+-- (advancement is PI-confirmed) and when they were certified.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS training_attempt (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_email TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    file_id INTEGER REFERENCES processed_files(id),
+    submitted_json TEXT,
+    agreement REAL,
+    breakdown_json TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_training_attempt_student
+    ON training_attempt(student_email, stage);
+CREATE INDEX IF NOT EXISTS idx_training_attempt_file
+    ON training_attempt(student_email, file_id);
+
+CREATE TABLE IF NOT EXISTS training_progress (
+    student_email TEXT PRIMARY KEY,
+    unlocked_stage INTEGER NOT NULL DEFAULT 1,
+    certified_at TEXT,
+    updated_at TEXT NOT NULL
+);
 """

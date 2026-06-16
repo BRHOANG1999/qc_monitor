@@ -2362,6 +2362,157 @@ class Store:
         finally:
             conn.close()
 
+    # ------------------------------------------------------------------ #
+    #  Training tab -- staged blind re-score vs PI-validated answers
+    # ------------------------------------------------------------------ #
+
+    def add_training_attempt(self, student_email: str, stage: int,
+                              file_id: int, submitted_json: str,
+                              agreement: float,
+                              breakdown_json: str | None = None) -> int:
+        """Record one graded training submission; returns its id."""
+        assert isinstance(student_email, str) and student_email, \
+            "student_email required"
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """INSERT INTO training_attempt
+                   (student_email, stage, file_id, submitted_json,
+                    agreement, breakdown_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (student_email.lower(), int(stage), file_id,
+                 submitted_json, float(agreement), breakdown_json,
+                 datetime.now().isoformat()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    def recent_training_scores(self, student_email: str, stage: int,
+                                limit: int = 50) -> list[float]:
+        """Agreement scores for (student, stage), CHRONOLOGICAL (oldest
+        first) so ``rolling_ready`` can take the last *window*."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT agreement FROM training_attempt
+                   WHERE student_email=? AND stage=?
+                   ORDER BY id DESC LIMIT ?""",
+                (student_email.lower(), int(stage), int(limit)),
+            ).fetchall()
+            # Fetched newest-first; reverse to chronological.
+            return [float(r["agreement"]) for r in rows][::-1]
+        finally:
+            conn.close()
+
+    def get_training_progress(self, student_email: str) -> dict:
+        """Return ``{unlocked_stage, certified_at}`` for a student,
+        defaulting to stage 1 / not certified when no row exists yet."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT unlocked_stage, certified_at FROM "
+                "training_progress WHERE student_email=?",
+                (student_email.lower(),),
+            ).fetchone()
+            if not row:
+                return {"unlocked_stage": 1, "certified_at": None}
+            return {"unlocked_stage": int(row["unlocked_stage"]),
+                    "certified_at": row["certified_at"]}
+        finally:
+            conn.close()
+
+    def advance_student(self, student_email: str,
+                         new_stage: int) -> None:
+        """PI action: unlock *new_stage* for a student (upsert). Past
+        stage 3 (new_stage>=4) sets certified_at instead."""
+        assert new_stage >= 1, "new_stage must be >= 1"
+        now = datetime.now().isoformat()
+        email = student_email.lower()
+        unlocked = min(int(new_stage), 3)
+        certify = now if int(new_stage) >= 4 else None
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO training_progress
+                   (student_email, unlocked_stage, certified_at,
+                    updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(student_email) DO UPDATE SET
+                     unlocked_stage=MAX(unlocked_stage, excluded.
+                       unlocked_stage),
+                     certified_at=COALESCE(excluded.certified_at,
+                       certified_at),
+                     updated_at=excluded.updated_at""",
+                (email, unlocked, certify, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def all_training_progress(self) -> list[dict]:
+        """Roster for the PI: every student who has a progress row OR
+        any attempt, with their unlocked stage + certified status."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT student_email,
+                          MAX(unlocked_stage) AS unlocked_stage,
+                          MAX(certified_at) AS certified_at
+                   FROM (
+                     SELECT student_email, unlocked_stage, certified_at
+                       FROM training_progress
+                     UNION ALL
+                     SELECT DISTINCT student_email, 1 AS unlocked_stage,
+                            NULL AS certified_at
+                       FROM training_attempt
+                   )
+                   GROUP BY student_email
+                   ORDER BY student_email""",
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def next_training_file(self, student_email: str) -> dict | None:
+        """Pick the next pi_approved recording for a student: unseen
+        first, then the oldest-seen (recycle). Returns the file row +
+        its validated event list, or None when no approved files exist.
+        """
+        email = student_email.lower()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT rs.file_id, rs.markers_json,
+                          pf.file_path, pf.session_dir,
+                          pf.chunk_datetime, pf.sampling_rate,
+                          pf.duration_sec,
+                          (SELECT MAX(ta.id) FROM training_attempt ta
+                            WHERE ta.student_email=?
+                              AND ta.file_id=rs.file_id) AS last_seen
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   WHERE rs.status='pi_approved'
+                   GROUP BY rs.file_id
+                   ORDER BY (last_seen IS NOT NULL), last_seen ASC,
+                            rs.updated_at ASC
+                   LIMIT 1""",
+                (email,),
+            ).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            try:
+                d["events"] = json.loads(d.get("markers_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                d["events"] = []
+            return d
+        finally:
+            conn.close()
+
     def pi_flag(self, file_id: int, pi_email: str,
                   *, note: str,
                   event_indices: list[int] | None = None) -> int:
