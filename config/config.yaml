@@ -149,12 +149,12 @@ auth:
   enabled: true
   # Identity method: 'cf_access' (Cloudflare Access, default) or
   # 'google_oauth' (the app runs Google sign-in itself).
-  method: cf_access
+  method: google_oauth
   cf_team_domain: ''
   cf_audience: ''
   # dev_bypass short-circuits BOTH methods for local development.
   # Set to false before exposing the dashboard.
-  dev_bypass: true
+  dev_bypass: false
   dev_bypass_email: hoang392@umn.edu
   # --- app-level Google OAuth (used when method: google_oauth) ---
   # 1. Google Cloud Console -> APIs & Services -> Credentials ->
@@ -162,7 +162,7 @@ auth:
   # 2. Authorized redirect URI: <oauth_redirect_base>/auth/google/callback
   # 3. Put the client ID below; keep the SECRET out of git -- set env
   #    QC_GOOGLE_CLIENT_SECRET or write it to secrets/google_client_secret.
-  google_client_id: ''
+  google_client_id: 833184028975-eg8co485fvt6gqcr9fkibhoviilsju9q.apps.googleusercontent.com
   allowed_domain: umn.edu
   oauth_redirect_base: http://localhost:8050
 maintenance:
@@ -268,6 +268,23 @@ bhz_csv:
   base_dir: "G:\\BHZ\\BHZ_CSV_Exports"
   filename_template: "{date}_{animal}.csv"
   append: true
+
+# Daily Google-Sheet sync: on CSV finalize, upsert one row per
+# (animal, day) into the lab sheet, matching its existing column header.
+# PRECONDITION: share the spreadsheet (Editor) with the service-account
+# email in service_account_file, and enable the Sheets API for its
+# project. Disabled by default until that's done.
+google_sheets:
+  enabled: false
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  spreadsheet_id: 1HwQlqGPERHCOVUcJDzv8yMm-vZzjqfsh25ud7rfWes8
+  # gid 256001691 -> set this to that tab's TITLE (the API needs the
+  # title, not the gid).
+  tab_name: "Sheet1"
+  key_columns: [Date, Animal]
+  # Optional explicit header->stat-key overrides if auto-match misses,
+  # e.g. {"# Seizures": "n_events", "Stim?": "n_during_stim_events"}.
+  column_map: {}
 
 surgery_digest:
   enabled: true

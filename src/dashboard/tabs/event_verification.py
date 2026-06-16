@@ -1303,7 +1303,9 @@ def _finalize_approved_to_csv(store, config: dict,
             continue
         bucket.setdefault((animal, chunk_dt.date()), []).append(r)
     parts: list[str] = []
+    day_stat_rows: list[dict] = []
     for (animal, day), items in sorted(bucket.items()):
+        day_stat_rows.append(_day_stats(store, animal, day, items))
         csv_path = _bhz_csv.resolve_csv_path(
             bhz_cfg.get("base_dir", ""),
             bhz_cfg.get("filename_template",
@@ -1344,7 +1346,69 @@ def _finalize_approved_to_csv(store, config: dict,
             parts.append(
                 f"{animal} {day}: {n_total} row"
                 f"{'' if n_total == 1 else 's'} appended")
-    return "  •  ".join(parts)
+    # Daily Google-Sheet upsert (non-fatal): one row per (animal, day).
+    summary = "  •  ".join(parts)
+    gs = (config or {}).get("google_sheets", {}) or {}
+    if gs.get("enabled") and day_stat_rows:
+        try:
+            from src.utils import sheets_write
+            res = sheets_write.upsert_day_rows(
+                gs["service_account_file"], gs["spreadsheet_id"],
+                gs["tab_name"],
+                gs.get("key_columns", ["Date", "Animal"]),
+                day_stat_rows, gs.get("column_map"))
+            summary += (f"  •  Sheet: {res['updated']} updated, "
+                         f"{res['appended']} appended")
+        except Exception as e:
+            logger.warning("Google Sheet upsert failed: %s", e)
+            summary += f"  •  Sheet sync FAILED: {e}"
+    return summary
+
+
+def _day_stats(store, animal: str, day, items: list[dict]) -> dict:
+    """Canonical one-row-per-(animal, day) summary for the Sheet.
+
+    *items* are the pi_approved rows for this (animal, day); each has a
+    decoded ``events`` list + ``file_id`` / ``session_dir``.
+    """
+    from datetime import datetime as _dt
+    from src.utils import mass_analyze as _ma
+    n_files = len(items)
+    n_with = n_events = max_racine = n_no_event = 0
+    n_stim_files = n_during = 0
+    for r in items:
+        evs = r.get("events") or []
+        n_ev = len(evs) if isinstance(evs, list) else 0
+        if n_ev > 0:
+            n_with += 1
+            n_events += n_ev
+            for e in evs:
+                try:
+                    max_racine = max(max_racine,
+                                      int((e or {}).get("racine") or 0))
+                except (TypeError, ValueError):
+                    pass
+        else:
+            n_no_event += 1
+        try:
+            if _ma.has_stim_for_file(store, int(r["file_id"]),
+                                       r.get("session_dir")):
+                n_stim_files += 1
+                n_during += n_ev
+        except Exception:
+            pass
+    return {
+        "date": day.isoformat() if hasattr(day, "isoformat")
+                 else str(day),
+        "animal": animal,
+        "n_files": n_files,
+        "n_files_with_events": n_with,
+        "n_events": n_events,
+        "max_racine": max_racine,
+        "n_during_stim_events": n_during,
+        "n_no_event_files": n_no_event,
+        "exported_at": _dt.now().isoformat(timespec="seconds"),
+    }
 
 
 def _fetch_approved_rows(store) -> list[dict]:
