@@ -1835,7 +1835,11 @@ def layout(store: Store, bridge: dict | None = None):
             dcc.Loading(
                 id="video-lfp-loading",
                 custom_spinner=_loading_icon("Re-decimating…"),
-                delay_show=80,
+                # 0 ms: show the loading overlay the instant a re-decimate
+                # starts. Fast zoom-ins (few points in the window) used to
+                # finish under the old 80 ms threshold and never showed the
+                # spinner, so a zoom felt like it had no loading feedback.
+                delay_show=0,
                 # Keep the trace visible (dimmed) under the spinner so a
                 # zoom re-decimate shows progress without the graph
                 # vanishing.
@@ -2125,7 +2129,9 @@ def layout(store: Store, bridge: dict | None = None):
             dcc.Loading(
                 id="video-analysis-loading",
                 custom_spinner=_loading_icon("Re-decimating…"),
-                delay_show=80,
+                # 0 ms: immediate loading overlay on zoom / feature redraws
+                # (matches video-lfp-loading above).
+                delay_show=0,
                 overlay_style={"visibility": "visible",
                                 "opacity": 0.45},
                 parent_style={"minHeight": "220px"},
@@ -3440,6 +3446,49 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         next_state["lfp"] = "loading"
         next_state["hilbert"] = "loading"
         return next_state
+
+    # ---- Instant blank-on-load (clientside) ---- #
+    # The moment the reviewer prompts a new file, wipe BOTH plot figures
+    # to a "Loading…" placeholder straight from the browser -- before the
+    # server even starts. Previously the stale trace from the PREVIOUS
+    # recording lingered: all three render callbacks share the file
+    # dropdown as their Input, but the heavy video render runs first, so
+    # the LFP/Hilbert dcc.Loading overlays (and their real figures) only
+    # arrived AFTER the video finished. A clientside callback runs in the
+    # browser the instant the value changes, so the transition to a
+    # loading state is immediate and unmistakable. The server
+    # _update_lfp / _update_analysis overwrite this placeholder with the
+    # real trace when they finish; the dcc.Loading spinner animates on top
+    # meanwhile.
+    app.clientside_callback(
+        """
+        function(file_id) {
+            var NU = window.dash_clientside.no_update;
+            if (!file_id) { return [NU, NU]; }
+            function mk() {
+                return {
+                    data: [],
+                    layout: {
+                        height: 220,
+                        plot_bgcolor: '#13131f', paper_bgcolor: '#13131f',
+                        xaxis: {visible: false}, yaxis: {visible: false},
+                        margin: {l: 20, r: 20, t: 20, b: 20},
+                        annotations: [{
+                            text: 'Loading…', showarrow: false,
+                            x: 0.5, y: 0.5, xref: 'paper', yref: 'paper',
+                            font: {size: 12, color: '#a0a0b0'}
+                        }]
+                    }
+                };
+            }
+            return [mk(), mk()];
+        }
+        """,
+        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        Output("video-analysis-trace", "figure", allow_duplicate=True),
+        Input("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
 
     @app.callback(
         Output("video-load-pill", "children"),
