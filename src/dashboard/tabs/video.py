@@ -2347,9 +2347,11 @@ def layout(store: Store, bridge: dict | None = None):
                 ),
                 html.Div([
                     html.Div(
-                        "Click the brain trace above to drop onset "
-                        "markers. Each click becomes a red dotted "
-                        "vertical on the LFP at that time.",
+                        "To record an onset that saves, use an event "
+                        "card above: \"+ Add event\", then \"Set on "
+                        "plot\" and click the LFP or Hilbert trace. "
+                        "(The quick marks below are a scratch aid only "
+                        "-- they are not saved.)",
                         style={"color": "#a0a0b0",
                                 "fontSize": "12px",
                                 "marginBottom": "6px"}),
@@ -4005,8 +4007,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _render_markers(markers):
         if not markers:
             return (
-                "Click on the brain trace above to add an onset "
-                "marker here.")
+                "No quick marks. To record an onset that saves, use "
+                "an event card above: \"+ Add event\" -> \"Set on "
+                "plot\", then click the LFP or Hilbert trace.")
         return ", ".join(
             f"{m['peak_time_sec']:.2f}s" for m in markers)
 

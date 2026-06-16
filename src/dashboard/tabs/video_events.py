@@ -184,12 +184,12 @@ def _field_row(event: dict, idx: int, field: str) -> html.Div:
                 },
             ),
             html.Button(
-                "Set on LFP",
+                "Set on plot",
                 id={"type": "event-field-lfp", "idx": idx,
                      "field": field},
                 n_clicks=0,
-                title="Arm this landmark, then click the LFP trace at "
-                       "the moment you see it -- no video needed.",
+                title="Arm this landmark, then click the LFP or Hilbert "
+                       "trace at the moment you see it -- no video needed.",
                 style={
                     "background": "transparent",
                     "color": COLOR_ACCENT,
@@ -522,7 +522,7 @@ def register_callbacks(app, store) -> None:
         if not armed:
             return ""
         return html.Div(
-            f"Armed: click the LFP trace to set "
+            f"Armed: click the LFP or Hilbert trace to set "
             f"{_field_label(armed.get('field', ''))} "
             f"for event {int(armed.get('idx', 0)) + 1}.",
             style={"padding": f"{SPACE_2} {SPACE_3}",
@@ -539,15 +539,27 @@ def register_callbacks(app, store) -> None:
         Output("video-armed-landmark", "data",
                 allow_duplicate=True),
         Input("video-lfp-trace", "clickData"),
+        Input("video-analysis-trace", "clickData"),
         State("video-armed-landmark", "data"),
         State("video-events-store", "data"),
         prevent_initial_call=True,
     )
-    def _drop_landmark_from_lfp(click_data, armed, events):
-        # Only act when a landmark is armed; otherwise the LFP click
+    def _drop_landmark_from_lfp(lfp_click, hilbert_click, armed, events):
+        # Only act when a landmark is armed; otherwise a plot click
         # just seeks the video (handled clientside in video.py).
         if not armed or not isinstance(armed, dict):
             return no_update, no_update
+        # Either plot can set the onset (LFP or the Hilbert/feature
+        # trace below it) -- both share the same x-axis (seconds since
+        # chunk start), so the clicked x maps to the identical time.
+        # Read x from whichever trace fired this callback.
+        trig = callback_context.triggered_id
+        if trig == "video-analysis-trace":
+            click_data = hilbert_click
+        elif trig == "video-lfp-trace":
+            click_data = lfp_click
+        else:
+            click_data = lfp_click or hilbert_click
         if (not click_data or not click_data.get("points")):
             return no_update, no_update
         x = click_data["points"][0].get("x")
