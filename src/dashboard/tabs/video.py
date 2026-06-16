@@ -58,7 +58,8 @@ from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
 )
 from src.utils.filters import (
-    apply_filter, compute_psd, band_power, SLOW_GAMMA_BAND)
+    apply_filter, compute_psd, band_power, SLOW_GAMMA_BAND,
+    epoch_band_power, epoch_band_ratio_db)
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
@@ -814,25 +815,9 @@ def _render_evoked_band_power(store, file_id: int, channel: int | None,
         logger.warning("Evoked band-power load failed file=%s ch=%s: %s",
                         file_id, channel, e)
         return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
-    win = max(1, int(round(win_sec * fs)))
-    n = len(sig)
-    times: list[float] = []
-    vals: list[float] = []
-    # NASA Rule 3: bound the per-render epoch count.
-    for s in np.asarray(stim_times, dtype=np.float64)[:5000]:
-        i0 = int(round(float(s) * fs))
-        i1 = i0 + win
-        if i0 < 0 or i1 > n:
-            continue
-        seg = sig[i0:i1]
-        if not np.all(np.isfinite(seg)):
-            seg = np.nan_to_num(seg)
-        freqs, psd = compute_psd(seg, fs)
-        if freqs.size == 0:
-            continue
-        times.append(float(s))
-        vals.append(band_power(freqs, psd, lo, hi))
-    if not times:
+    times, vals = epoch_band_power(
+        sig, fs, stim_times, lo, hi, (0.0, float(win_sec)))
+    if len(times) == 0:
         return (_empty_lfp_fig(
             "No usable stim epochs (windows fell off the recording)."),
                 "")
@@ -848,6 +833,69 @@ def _render_evoked_band_power(store, file_id: int, channel: int | None,
     fig.layout.yaxis.title = "evoked band power (μV²)"
     status = (f"Slow gamma {lo:g}-{hi:g} Hz · per stim epoch "
               f"({win_sec * 1000:.0f} ms window) · {len(times)} epochs")
+    return (fig, status)
+
+
+def _render_evoked_band_ratio(store, file_id: int, channel: int | None,
+                               lo: float, hi: float,
+                               pre_win: tuple[float, float],
+                               post_win: tuple[float, float]) -> tuple:
+    """(figure, status) for baseline-normalized ("induced") slow gamma:
+    per stim, ``10*log10(post/pre)`` band power in dB.
+
+    Post window starts after the evoked transient (default 50-200 ms) so
+    it reflects an oscillation rather than the spectral leakage of the
+    evoked deflection; the pre window is the ongoing pre-stim baseline. A
+    point above 0 dB means the stim *increased* slow gamma. Live -- no
+    pipeline reprocess.
+    """
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig("Pick a brain channel (Step 1) first."), "")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return (_empty_lfp_fig(
+            "No stim epochs on this file — induced slow gamma needs "
+            "stimulation onsets."), "")
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Induced band-power load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    times, db = epoch_band_ratio_db(
+        sig, fs, stim_times, lo, hi, pre_win, post_win)
+    if len(times) == 0:
+        return (_empty_lfp_fig(
+            "No usable stim epochs (a baseline or post window fell off "
+            "the recording)."), "")
+    fig = _build_lfp_figure(
+        np.asarray(times), np.asarray(db),
+        f"Induced slow gamma ({lo:g}-{hi:g} Hz, dB)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].mode = "markers+lines"
+    fig.data[0].line.color = "#bf5af2"
+    fig.data[0].marker = dict(size=5, color="#bf5af2")
+    fig.data[0].hovertemplate = (
+        "stim @ t=%{x:.2f}s<br>%{y:+.1f} dB vs baseline<extra></extra>")
+    fig.layout.yaxis.title = "post / pre slow gamma (dB)"
+    # 0 dB reference (no change). Cursor lives in shapes[0]; this takes [1].
+    fig.layout.shapes = list(fig.layout.shapes or []) + [dict(
+        type="line", xref="paper", yref="y", x0=0, x1=1, y0=0, y1=0,
+        line=dict(color="#888", width=1, dash="dash"), opacity=0.8)]
+    mean_db = float(np.mean(db))
+    frac_up = float(np.mean(np.asarray(db) > 0))
+    status = (
+        f"Induced slow gamma {lo:g}-{hi:g} Hz · post "
+        f"[{post_win[0] * 1000:.0f},{post_win[1] * 1000:.0f}] ms vs pre "
+        f"[{pre_win[0] * 1000:.0f},{pre_win[1] * 1000:.0f}] ms · "
+        f"mean {mean_db:+.1f} dB · {frac_up * 100:.0f}% of "
+        f"{len(times)} epochs increased")
     return (fig, status)
 
 
@@ -2020,6 +2068,9 @@ def layout(store: Store, bridge: dict | None = None):
                             {"label": "Slow gamma power "
                                        "(30-50 Hz, per stim)",
                                 "value": "slow_gamma_evoked"},
+                            {"label": "Slow gamma induced "
+                                       "(30-50 Hz, post vs baseline dB)",
+                                "value": "slow_gamma_induced"},
                             {"label": "Line length (per-event)",
                                 "value": "line_length"},
                             {"label": "Log(AUC) — area under the curve",
@@ -4974,6 +5025,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             lo, hi = SLOW_GAMMA_BAND
             return _render_evoked_band_power(
                 store, int(file_id), channel, lo, hi)
+        if feature == "slow_gamma_induced":
+            lo, hi = SLOW_GAMMA_BAND
+            sg = (config or {}).get("slow_gamma", {}) or {}
+            pre_ms = sg.get("pre_ms", [-200, -2])
+            post_ms = sg.get("post_ms", [50, 200])
+            pre_win = (float(pre_ms[0]) / 1000.0,
+                       float(pre_ms[1]) / 1000.0)
+            post_win = (float(post_ms[0]) / 1000.0,
+                        float(post_ms[1]) / 1000.0)
+            return _render_evoked_band_ratio(
+                store, int(file_id), channel, lo, hi, pre_win, post_win)
         # Hilbert envelope (BHZ default). Continuous-time trace
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":

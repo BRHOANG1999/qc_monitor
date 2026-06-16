@@ -261,6 +261,14 @@ training:
   onset_tol_s: 10
   racine_tol: 1
 
+# Slow-gamma (30-50 Hz) induced-power feature in Video Review. Windows are
+# milliseconds relative to each stim onset. The post window starts AFTER the
+# evoked transient (~first tens of ms) so it measures an oscillation, not the
+# spectral leakage of the evoked deflection; pre is the ongoing baseline.
+slow_gamma:
+  pre_ms: [-200, -2]
+  post_ms: [50, 200]
+
 # Event-clip extractor (ffmpeg) for the PI verification flow.
 # Builds a stitched 10+ min clip (5 min before EO to 5 min
 # after BB) for every event the PI opens for detail review.

@@ -17,7 +17,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.utils.filters import (  # noqa: E402
-    band_power, compute_psd, SLOW_GAMMA_BAND)
+    band_power, compute_psd, SLOW_GAMMA_BAND,
+    epoch_band_power, epoch_band_ratio_db)
 from src.utils.hilbert_envelope import (  # noqa: E402
     band_envelope, hilbert_envelope_20_200)
 
@@ -88,6 +89,59 @@ def test_20_200_wrapper_matches_direct_band_call():
     a = hilbert_envelope_20_200(sig, _FS)
     b = band_envelope(sig, _FS, 20.0, 200.0, smooth=True)
     assert np.allclose(a, b)
+
+
+# ---- epoch band power / ratio ------------------------------------ #
+
+def _signal_with_post_burst(stims, fs=_FS, dur_s=30.0, burst_amp=3.0):
+    """Quiet pink-ish noise everywhere; a 40 Hz burst only in the
+    50-200 ms window after each stim. Slow gamma should jump post vs pre.
+    """
+    rng = np.random.default_rng(0)
+    n = int(dur_s * fs)
+    x = 0.05 * rng.standard_normal(n)
+    t = np.arange(n) / fs
+    for s in stims:
+        i0, i1 = int((s + 0.050) * fs), int((s + 0.200) * fs)
+        seg_t = t[i0:i1]
+        x[i0:i1] += burst_amp * np.sin(2 * np.pi * 40.0 * seg_t)
+    return x
+
+
+def test_epoch_band_power_counts_inbounds_epochs():
+    stims = [1.0, 2.0, 3.0]
+    x = _signal_with_post_burst(stims)
+    times, powers = epoch_band_power(x, _FS, stims, _LO, _HI,
+                                      (0.050, 0.200))
+    assert len(times) == 3 and len(powers) == 3
+    # Out-of-bounds windows (pre-roll before t=0) are dropped.
+    times2, _ = epoch_band_power(x, _FS, [0.0], _LO, _HI, (-0.5, -0.1))
+    assert len(times2) == 0  # window starts before the recording
+
+
+def test_induced_ratio_positive_when_post_burst():
+    stims = [1.0, 2.0, 3.0, 4.0, 5.0]
+    x = _signal_with_post_burst(stims)
+    times, db = epoch_band_ratio_db(
+        x, _FS, stims, _LO, _HI,
+        pre_win=(-0.200, -0.002), post_win=(0.050, 0.200))
+    assert len(db) == len(stims)
+    # A 40 Hz burst only post-stim -> strong positive dB on every epoch.
+    assert np.all(db > 6.0)
+
+
+def test_induced_ratio_near_zero_for_stationary_noise():
+    # Stationary noise -> no stim-locked change. Per-epoch ratios are
+    # noisy with short windows, so average enough epochs for the mean to
+    # converge toward 0 dB (and stay well below the burst case's >6 dB).
+    stims = [float(i) for i in range(1, 26)]   # 25 epochs
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal(int(30 * _FS))     # same stats pre & post
+    _t, db = epoch_band_ratio_db(
+        x, _FS, stims, _LO, _HI,
+        pre_win=(-0.200, -0.002), post_win=(0.050, 0.200))
+    assert len(db) == len(stims)
+    assert abs(float(np.mean(db))) < 3.0
 
 
 if __name__ == "__main__":

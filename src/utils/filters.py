@@ -58,6 +58,75 @@ def band_power(freqs: np.ndarray, psd: np.ndarray,
         return float(psd[mask].sum()) if mask.any() else 0.0
     return float(_trapezoid(psd[mask], freqs[mask]))
 
+
+def _window_band_power(signal: np.ndarray, fs: float, n: int,
+                        center_sec: float, win: tuple[float, float],
+                        lo: float, hi: float) -> float | None:
+    """Band power in ``[lo,hi]`` over the window ``[center+win0,
+    center+win1]`` seconds (``win0`` may be negative). None when the
+    window falls outside the signal or is too short for a PSD."""
+    i0 = int(round((center_sec + win[0]) * fs))
+    i1 = int(round((center_sec + win[1]) * fs))
+    if i0 < 0 or i1 > n or (i1 - i0) < 4:
+        return None
+    seg = signal[i0:i1]
+    if not np.all(np.isfinite(seg)):
+        seg = np.nan_to_num(seg)
+    freqs, psd = compute_psd(seg, fs)
+    if freqs.size == 0:
+        return None
+    return band_power(freqs, psd, lo, hi)
+
+
+def epoch_band_power(signal: np.ndarray, fs: float, stim_times,
+                      lo: float, hi: float,
+                      win: tuple[float, float],
+                      max_epochs: int = 5000):
+    """Per-stim band power: for each stim onset integrate the PSD over
+    ``[lo,hi]`` Hz across ``[onset+win0, onset+win1]`` s (win0 may be
+    negative for a pre-stim baseline). Returns ``(times, powers)`` numpy
+    arrays for the epochs whose window is fully in-bounds.
+    """
+    assert win[1] > win[0], "win end must exceed start"
+    signal = np.asarray(signal, dtype=np.float64)
+    n = signal.shape[0]
+    times: list[float] = []
+    powers: list[float] = []
+    for s in np.asarray(stim_times, dtype=np.float64)[:max_epochs]:
+        p = _window_band_power(signal, fs, n, float(s), win, lo, hi)
+        if p is None:
+            continue
+        times.append(float(s))
+        powers.append(p)
+    return np.asarray(times), np.asarray(powers)
+
+
+def epoch_band_ratio_db(signal: np.ndarray, fs: float, stim_times,
+                         lo: float, hi: float,
+                         pre_win: tuple[float, float],
+                         post_win: tuple[float, float],
+                         max_epochs: int = 5000):
+    """Per-stim post/pre band-power ratio in dB (``10*log10(post/pre)``).
+
+    The "induced slow gamma" readout: how much the ``[lo,hi]`` band power
+    changes from a pre-stim baseline window to a post-stim window. Only
+    epochs with BOTH windows in-bounds and strictly positive power are
+    kept. Returns ``(times, ratios_db)`` numpy arrays.
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    n = signal.shape[0]
+    times: list[float] = []
+    ratios: list[float] = []
+    for s in np.asarray(stim_times, dtype=np.float64)[:max_epochs]:
+        pre = _window_band_power(signal, fs, n, float(s), pre_win, lo, hi)
+        post = _window_band_power(signal, fs, n, float(s), post_win,
+                                   lo, hi)
+        if pre is None or post is None or pre <= 0 or post <= 0:
+            continue
+        times.append(float(s))
+        ratios.append(10.0 * float(np.log10(post / pre)))
+    return np.asarray(times), np.asarray(ratios)
+
 # ----- LRU cache --------------------------------------------------- #
 # Key shape: (file_path, hp, lp, notch, smooth_ms) -- per chunk + per
 # settings combination. Capping at 4 keeps RAM bounded under typical
