@@ -48,6 +48,28 @@ def test_blank_nans_the_window_and_suppresses_envelope():
         windowed_auc(hilbert_envelope_20_200(s, fs), fs, 5.0).max() / 10
 
 
+def test_detect_stim_onsets_finds_pulses():
+    from src.utils.stim_blank import detect_stim_onsets
+    fs, n = 1000.0, 10000
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(n) * 0.5  # baseline noise
+    for t in np.arange(0.5, 10.0, 0.5):  # 19 pulses
+        c = int(t * fs)
+        x[c:c + 3] = 120.0
+    onsets = detect_stim_onsets(x, fs)
+    assert len(onsets) == 19
+    # Onsets land near the injected times.
+    assert abs(onsets[0] - 0.5) < 0.01
+
+
+def test_detect_stim_onsets_baseline_is_empty():
+    from src.utils.stim_blank import detect_stim_onsets
+    rng = np.random.default_rng(1)
+    assert detect_stim_onsets(rng.standard_normal(10000) * 0.5,
+                               1000.0).size == 0
+    assert detect_stim_onsets(np.zeros(0), 1000.0).size == 0
+
+
 def test_blank_no_stim_times_is_passthrough():
     fs = 2000.0
     s = _artifact_series(fs, 2.0, 1.0)
@@ -147,8 +169,8 @@ def _user_version(db) -> int:
 
 def test_one_time_cache_eviction(tmp_path):
     db = str(tmp_path / "data" / "monitor.db")
-    Store(db)  # first boot stamps user_version = 1
-    assert _user_version(db) == 1
+    Store(db)  # first boot stamps the current cache-schema version
+    assert _user_version(db) == 2
 
     # Simulate a legacy DB: stale row + version reset to 0.
     _insert_cache_row(db)
@@ -161,7 +183,7 @@ def test_one_time_cache_eviction(tmp_path):
     # Re-boot: the guard fires once, clears the stale cache.
     Store(db)
     assert _peak_cache_count(db) == 0
-    assert _user_version(db) == 1
+    assert _user_version(db) == 2
 
     # A fresh row must survive a subsequent boot (guard already spent).
     conn = sqlite3.connect(db)

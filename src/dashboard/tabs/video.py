@@ -2817,17 +2817,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             ], style={"padding": "14px", "textAlign": "center"})
         from datetime import datetime as _dt
         now = _dt.now()
-        items = []
+        # Two-level grouping: day (expandable) -> hours within it.
+        day_groups: "OrderedDict[str, dict]" = OrderedDict()
         for r in rows:
             ts_raw = r.get("chunk_datetime") or ""
             try:
                 ts = _dt.strptime(ts_raw,
                                     "%Y_%m_%d__%H_%M_%S")
                 age_days = (now - ts).total_seconds() / 86400
-                ts_label = ts.strftime("%Y-%m-%d  %H:%M")
+                day_key = ts.strftime("%Y-%m-%d")
+                hour_label = ts.strftime("%H:%M")
             except ValueError:
                 age_days = 0
-                ts_label = ts_raw
+                day_key = "undated"
+                hour_label = ts_raw
             warn = age_days >= warn_age_days
             dur = r.get("duration_sec") or 0
             dur_h = dur / 3600.0 if dur else 0
@@ -2850,9 +2853,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     else "3px solid transparent"),
                 "textAlign": "left",
             }
-            items.append(html.Button([
+            btn = html.Button([
                 html.Div([
-                    html.Span(ts_label, style={
+                    html.Span(hour_label, style={
                         "color": "#f0f0f5", "fontWeight": "600",
                         "fontSize": "12px"}),
                     html.Span(f"  ({dur_h:.1f} h)", style={
@@ -2880,8 +2883,34 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                             "whiteSpace": "nowrap"}),
             ], id={"type": "video-queue-item",
                     "file_id": int(r["id"])},
-                n_clicks=0, style=btn_style))
-        return items
+                n_clicks=0, style=btn_style)
+            g = day_groups.setdefault(
+                day_key, {"items": [], "active": False})
+            g["items"].append(btn)
+            if is_active:
+                g["active"] = True
+
+        # One collapsible section per day; auto-open the day holding
+        # the loaded recording, collapse the rest.
+        out = []
+        for day_key, g in day_groups.items():
+            n_rec = len(g["items"])
+            out.append(html.Details([
+                html.Summary([
+                    html.Span(day_key, style={
+                        "color": "#f0f0f5", "fontWeight": "600",
+                        "fontSize": "12px"}),
+                    html.Span(
+                        f"  ·  {n_rec} recording"
+                        f"{'' if n_rec == 1 else 's'}",
+                        style={"color": "#888", "fontSize": "11px"}),
+                ], style={"cursor": "pointer", "padding": "6px 8px",
+                           "userSelect": "none"}),
+                html.Div(g["items"]),
+            ], open=g["active"],
+               style={"borderBottom":
+                          "1px solid rgba(255,255,255,0.06)"}))
+        return out
 
     @app.callback(
         Output("video-session-dropdown", "value",
