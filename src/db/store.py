@@ -1562,6 +1562,38 @@ class Store:
         finally:
             conn.close()
 
+    def review_statuses_for_files(self, file_ids) -> dict:
+        """Latest review status per file_id -> ``{file_id: status}``.
+
+        Files with no review_state row are absent from the map. Used by
+        the Mass Analyze pool browser to show flagged / done / untouched
+        progress without a query per file.
+        """
+        ids = [int(f) for f in (file_ids or [])]
+        if not ids:
+            return {}
+        out: dict[int, str] = {}
+        conn = self._connect()
+        try:
+            # Chunk to stay under SQLite's variable limit on big pools.
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                ph = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"""SELECT rs.file_id AS fid, rs.status AS status
+                        FROM review_state rs
+                        WHERE rs.file_id IN ({ph})
+                          AND rs.id = (SELECT MAX(r2.id)
+                                       FROM review_state r2
+                                       WHERE r2.file_id = rs.file_id)""",
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    out[int(r["fid"])] = r["status"]
+            return out
+        finally:
+            conn.close()
+
     def get_review_state_by_user(self, file_id: int,
                                    user_email: str) -> dict | None:
         """Latest row for this (file, user) pair. Used by the UI to

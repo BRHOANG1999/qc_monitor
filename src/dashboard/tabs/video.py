@@ -244,6 +244,13 @@ def _next_in_pool(store: Store, view, cursor,
         {"active": active, "idx": nxt}
 
 
+# review_state statuses for the pool-progress readout: "done" = the file
+# was submitted and left the pool; "needs_scoring" = flagged for later;
+# anything else (claimed / abandoned / none) = not started.
+_POOL_DONE_STATUSES = {"pending_pi_review", "pi_approved", "pi_flagged",
+                        "no_events", "has_events"}
+
+
 def _animal_ids_from_picker(animal_value: str | None
                               ) -> list[str]:
     """Resolve the Step-1 animal picker value into the
@@ -6328,13 +6335,25 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return int(entry["file_id"]) if isinstance(entry, dict) \
                 else int(entry)
 
+        def _sess_key(entry):
+            m = meta.get(str(_fid(entry))) or {}
+            return m.get("session_dir") or ""
+
+        def _filtered_sorted(pool_list):
+            # Keep the session filter, then GROUP BY SESSION. The scan
+            # orders pools by time, so an unfiltered pool interleaves
+            # sessions -- browsing / Flag / Save would then flip the
+            # session on every step. A stable sort by session_dir keeps
+            # each session's files contiguous (and the original order
+            # within a session), so you finish one session's pool before
+            # the next instead of the session changing "randomly".
+            kept = [f for f in (pool_list or []) if _keep(_fid(f))]
+            return sorted(kept, key=_sess_key)
+
         view = {
-            "pool1": [f for f in pools.get("pool1", [])
-                       if _keep(_fid(f))],
-            "pool2": [f for f in pools.get("pool2", [])
-                       if _keep(_fid(f))],
-            "pool3": [f for f in pools.get("pool3", [])
-                       if _keep(_fid(f))],
+            "pool1": _filtered_sorted(pools.get("pool1", [])),
+            "pool2": _filtered_sorted(pools.get("pool2", [])),
+            "pool3": _filtered_sorted(pools.get("pool3", [])),
         }
         if sess_val not in (None, "__all__"):
             counts = (f"Filtered  ·  Pool 1: {len(view['pool1'])}  ·  "
@@ -6488,10 +6507,44 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if n == 0:
             return no_update
         idx = min(int(cursor.get("idx") or 0), n - 1)
+
+        def _fid(e):
+            return int(e["file_id"]) if isinstance(e, dict) else int(e)
+
+        file_ids = [_fid(e) for e in files]
+        try:
+            statuses = store.review_statuses_for_files(file_ids)
+        except Exception:
+            statuses = {}
+        flagged = sum(1 for f in file_ids
+                      if statuses.get(f) == "needs_scoring")
+        done = sum(1 for f in file_ids
+                   if statuses.get(f) in _POOL_DONE_STATUSES)
+        todo = n - flagged - done
         entry = files[idx]
         badge = (f" ({entry.get('only')}-only)"
                  if isinstance(entry, dict) else "")
-        return f"Pool {active} · file {idx + 1} of {n}{badge}"
+        cur_st = statuses.get(file_ids[idx])
+        if cur_st == "needs_scoring":
+            cur_lbl, cur_col = "⚑ flagged", "#f0b429"
+        elif cur_st in _POOL_DONE_STATUSES:
+            cur_lbl, cur_col = "✓ done", "#30d158"
+        else:
+            cur_lbl, cur_col = "• not started", "#a0a0b0"
+        # The list is grouped by session, so when a session is selected in
+        # the filter this tally IS that (session, pool)'s completion -- the
+        # answer to "did I finish this session's pool?" (to-start = 0).
+        return [
+            html.Span(f"Pool {active} · file {idx + 1} of {n}{badge} · "),
+            html.Span(cur_lbl, style={"color": cur_col,
+                                       "fontWeight": "600"}),
+            html.Span("   |   ", style={"color": "#555"}),
+            html.Span(f"✓ {done} done", style={"color": "#30d158"}),
+            html.Span(" · "),
+            html.Span(f"⚑ {flagged} flagged", style={"color": "#f0b429"}),
+            html.Span(" · "),
+            html.Span(f"{todo} to start", style={"color": "#a0a0b0"}),
+        ]
 
     @app.callback(
         Output("video-ma-job-id", "data",

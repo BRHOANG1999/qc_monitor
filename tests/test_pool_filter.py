@@ -105,5 +105,30 @@ def test_pool_meta_is_db_only(tmp_path, monkeypatch):
     assert "has_stim" not in meta["1"]
 
 
+def test_review_statuses_for_files_batch(tmp_path):
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    for fid in (1, 2, 3, 4):
+        _seed(store, fid, "sessA")
+    with store.connection() as conn:
+        # File 1 flagged; file 2 done (pending PI); file 3 just claimed;
+        # file 4 has two rows -> latest (needs_scoring) wins.
+        conn.execute(
+            "INSERT INTO review_state (file_id, user_email, status, "
+            "created_at, updated_at) VALUES "
+            "(1,'u','needs_scoring','t','t'),"
+            "(2,'u','pending_pi_review','t','t'),"
+            "(3,'u','claimed','t','t'),"
+            "(4,'u','pending_pi_review','t','t'),"
+            "(4,'u','needs_scoring','t','t')")
+        conn.commit()
+    m = store.review_statuses_for_files([1, 2, 3, 4, 999])
+    assert m[1] == "needs_scoring"
+    assert m[2] == "pending_pi_review"
+    assert m[3] == "claimed"
+    assert m[4] == "needs_scoring"   # latest row by id wins
+    assert 999 not in m              # no row -> absent
+    assert store.review_statuses_for_files([]) == {}
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
