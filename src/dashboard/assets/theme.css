@@ -527,6 +527,39 @@ details.qc-expandable:hover {
     border-color: rgba(94, 124, 226, 0.35) !important;
 }
 
+/* --- Button system (components.button): one loud action per screen --- */
+/* Base transition; per-variant hover/active polish below. The inline
+   styles set color/fill/border; these classes own the motion + states. */
+.qc-btn {
+    transition: filter 0.15s ease, transform 0.04s ease,
+                background-color 0.15s ease, border-color 0.15s ease,
+                box-shadow 0.15s ease;
+}
+.qc-btn:active { transform: translateY(1px); }
+.qc-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+/* Primary: solid fill (accent/success/danger set inline). A subtle lift
+   on hover makes the dominant action feel tactile, not painted-on. */
+.qc-btn-primary { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); }
+.qc-btn-primary:hover {
+    filter: brightness(1.08);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    transform: translateY(-1px);
+}
+.qc-btn-primary:active { transform: translateY(0); }
+/* Secondary: surface outline; border warms to accent on hover. */
+.qc-btn-secondary:hover {
+    border-color: var(--accent) !important;
+    background-color: var(--surface-2) !important;
+}
+/* Ghost: text only; faint wash on hover so it reads as interactive. */
+.qc-btn-ghost:hover {
+    background-color: rgba(94, 124, 226, 0.12) !important;
+    color: var(--text-primary) !important;
+}
+
 /* --- Armed-landmark cursor: crosshair over both plots --- */
 /* video.py toggles .qc-armed on #video-step2-grid while a "Set on plot"
    landmark is armed. Plotly sets the drag-layer cursor inline (move / pan),

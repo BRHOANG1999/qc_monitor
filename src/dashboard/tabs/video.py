@@ -46,6 +46,13 @@ from src.utils.peakseek import peakseek
 from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.dashboard.tabs import video_events as _events
+from src.dashboard.components import (
+    button, empty_state, DROPDOWN_STYLE, LABEL_STYLE)
+from src.dashboard.icons import icon
+from src.dashboard.design import (
+    COLOR_ACCENT, COLOR_SUCCESS, COLOR_SURFACE_1, COLOR_DIVIDER,
+    COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
+    RADIUS_MD, SPACE_2, SPACE_3, SPACE_4)
 from src.utils import mass_analyze as _mass_analyze
 from src.utils.decimate import (
     envelope, window_slice, choose_target_bins, parse_relayout,
@@ -66,17 +73,11 @@ _BLANKED_MAX = 8
 _blanked_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
 _blanked_lock = RLock()
 
-LABEL_STYLE = {
-    "color": "#6c6c80", "fontSize": "11px", "marginBottom": "8px",
-    "display": "block", "letterSpacing": "0.4px",
-    "textTransform": "uppercase", "fontWeight": "600",
-}
-DROPDOWN_STYLE = {"backgroundColor": "#262638", "color": "#f0f0f5"}
-SECTION_STYLE = {
-    "background": "#13131f", "padding": "24px",
-    "borderRadius": "10px", "border": "1px solid rgba(255,255,255,0.07)",
-    "marginBottom": "16px",
-}
+# LABEL_STYLE / DROPDOWN_STYLE now come from src.dashboard.components
+# (the shared design system) -- imported above. The local copies used to
+# duplicate those token values inline and drifted (the old LABEL_STYLE
+# failed WCAG AA); consuming the shared ones keeps this tab consistent
+# with the rest of the dashboard.
 
 # DOM id assigned to the <video> element so clientside JS can find it.
 VIDEO_DOM_ID = "lfp-video"
@@ -848,8 +849,8 @@ def _details_card(summary_text: str, content,
     controls behind a click. Keeps the default view friendly.
     """
     summary_children: list = [
-        html.Span("⚙  ", style={"color": "#888",
-                                 "fontSize": "11px"}),
+        icon("sliders", size=12, color=COLOR_TEXT_TERTIARY,
+             style={"marginRight": SPACE_2}),
         html.Span(summary_text, style={
             "color": "#cfd0d6", "fontSize": "12px",
             "fontWeight": "600",
@@ -982,28 +983,12 @@ def _video_mass_analyze_panel() -> html.Details:
                                 "1px solid rgba(255,255,255,0.10)",
                             "borderRadius": "4px",
                             "fontSize": "12px"}),
-                html.Button(
-                    "Scan files",
-                    id="video-ma-scan-btn", n_clicks=0,
-                    style={"background": "#5e7ce2",
-                            "color": "white",
-                            "border": "none",
-                            "padding": "6px 14px",
-                            "borderRadius": "5px",
-                            "cursor": "pointer",
-                            "fontSize": "12px",
-                            "fontWeight": "600"}),
-                html.Button(
+                button(
+                    "Scan for events",
+                    "video-ma-scan-btn", variant="primary"),
+                button(
                     "Cancel scan",
-                    id="video-ma-cancel-btn", n_clicks=0,
-                    style={"background": "transparent",
-                            "color": "#cfd0d6",
-                            "border":
-                                "1px solid rgba(255,255,255,0.15)",
-                            "padding": "6px 14px",
-                            "borderRadius": "5px",
-                            "cursor": "pointer",
-                            "fontSize": "12px"}),
+                    "video-ma-cancel-btn", variant="ghost"),
             ], style={"display": "flex",
                        "alignItems": "center",
                        "gap": "8px",
@@ -1293,7 +1278,9 @@ def layout(store: Store, bridge: dict | None = None):
         # open so undergrads see the orientation on first visit.
         html.Details([
             html.Summary([
-                html.Span("👋  Quick start", style={
+                icon("info", size=14, color=COLOR_ACCENT,
+                     style={"marginRight": SPACE_2}),
+                html.Span("Quick start", style={
                     "color": "#f0f0f5", "fontSize": "13px",
                     "fontWeight": "600",
                 }),
@@ -1304,6 +1291,7 @@ def layout(store: Store, bridge: dict | None = None):
             ], style={
                 "cursor": "pointer", "userSelect": "none",
                 "padding": "10px 14px", "listStyle": "none",
+                "display": "flex", "alignItems": "center",
             }),
             html.Div([
                 html.Div(
@@ -1349,9 +1337,12 @@ def layout(store: Store, bridge: dict | None = None):
                 ),
             ], style={"padding": "0 14px 14px 14px"}),
         ], open=False, className="qc-expandable", style={
-            "background": "rgba(94, 124, 226, 0.08)",
-            "border": "1px solid rgba(94, 124, 226, 0.25)",
-            "borderRadius": "8px",
+            # Quiet chrome: neutral card surface + hairline, with a thin
+            # accent left edge for identity (no saturated blue wash).
+            "background": COLOR_SURFACE_1,
+            "border": f"1px solid {COLOR_DIVIDER}",
+            "borderLeft": f"3px solid {COLOR_ACCENT}",
+            "borderRadius": RADIUS_MD,
             "marginBottom": "16px",
         }),
 
@@ -1496,19 +1487,11 @@ def layout(store: Store, bridge: dict | None = None):
                                    "1px solid rgba(255,255,255,0.06)",
                                "borderRadius": "6px"}),
                     html.Div([
-                        html.Button(
+                        button(
                             "Load this recording",
-                            id="video-queue-load-btn",
-                            n_clicks=0,
-                            style={"background": "#5e7ce2",
-                                    "color": "white",
-                                    "border": "none",
-                                    "padding": "6px 16px",
-                                    "borderRadius": "5px",
-                                    "cursor": "pointer",
-                                    "fontSize": "12px",
-                                    "fontWeight": "600",
-                                    "marginRight": "10px"}),
+                            "video-queue-load-btn",
+                            variant="primary", icon_name="video",
+                            style={"marginRight": "10px"}),
                         html.Span(id="video-queue-card-position",
                                    style={"color": "#a0a0b0",
                                            "fontSize": "11px"}),
@@ -1642,9 +1625,11 @@ def layout(store: Store, bridge: dict | None = None):
         ], style={"display": "flex", "alignItems": "center",
                    "gap": "8px", "flexWrap": "wrap",
                    "padding": "8px 12px", "marginBottom": "10px",
-                   "background": "rgba(94,124,226,0.06)",
-                   "border": "1px solid rgba(94,124,226,0.18)",
-                   "borderRadius": "8px"}),
+                   # Quiet chrome: neutral surface + accent left edge.
+                   "background": COLOR_SURFACE_1,
+                   "border": f"1px solid {COLOR_DIVIDER}",
+                   "borderLeft": f"3px solid {COLOR_ACCENT}",
+                   "borderRadius": RADIUS_MD}),
 
         # --- Layout presets: resize the video / LFP split ---------- #
         html.Div([
@@ -1657,7 +1642,11 @@ def layout(store: Store, bridge: dict | None = None):
                          n_clicks=0, className="video-layout-btn"),
             html.Button("Big LFP", id="video-layout-biglfp",
                          n_clicks=0, className="video-layout-btn"),
-            html.Button("⛶ Fullscreen", id="video-fullscreen-btn",
+            html.Button([icon("maximize", size=12,
+                               color=COLOR_TEXT_SECONDARY,
+                               style={"marginRight": "5px"}),
+                         "Fullscreen"],
+                         id="video-fullscreen-btn",
                          n_clicks=0, className="video-layout-btn",
                          title="Fill the screen with the video; the "
                                "LFP/Hilbert stays as a card bottom-right "
@@ -1686,14 +1675,11 @@ def layout(store: Store, bridge: dict | None = None):
                                "minHeight": "360px"},
                 children=html.Div(
                     id="video-player-container",
-                    children=html.Div([
-                        html.Div("📹", style={"fontSize": "32px",
-                                              "marginBottom": "6px"}),
-                        html.Div("Pick a recording above to load "
-                                  "the video here.",
-                                  style={"color": "#a0a0b0",
-                                          "fontSize": "13px"}),
-                    ], style={"textAlign": "center"}),
+                    children=empty_state(
+                        "No recording loaded",
+                        hint="Pick a recording above to load the video "
+                             "here.",
+                        icon_name="video"),
                     style={"backgroundColor": "#000",
                             "borderRadius": "10px",
                             "minHeight": "360px",
@@ -1815,18 +1801,10 @@ def layout(store: Store, bridge: dict | None = None):
                 ], style={"flex": "0 0 120px"}),
                 html.Div([
                     html.Label(" ", style=LABEL_STYLE),
-                    html.Button("Apply",
-                                 id="video-apply-filter-btn", n_clicks=0,
-                                 title="Apply the filter settings above.",
-                                 style={"backgroundColor": "#5e7ce2",
-                                        "color": "white",
-                                        "border": "none",
-                                        "padding": "7px 18px",
-                                        "borderRadius": "6px",
-                                        "cursor": "pointer",
-                                        "fontSize": "12px",
-                                        "fontWeight": "600"}),
-                ], style={"flex": "0 0 100px",
+                    button("Apply filters",
+                           "video-apply-filter-btn", variant="secondary",
+                           title="Apply the filter settings above."),
+                ], style={"flex": "0 0 120px",
                           "display": "flex", "alignItems": "flex-end"}),
             ], style={"display": "flex", "gap": "12px",
                       "marginBottom": "4px", "flexWrap": "wrap",
@@ -2104,21 +2082,13 @@ def layout(store: Store, bridge: dict | None = None):
                     ], style={"flex": "1 1 auto"}),
                     html.Div([
                         html.Label(" ", style=LABEL_STYLE),
-                        html.Button(
-                            "Apply",
-                            id="video-analysis-apply-btn",
-                            n_clicks=0,
+                        button(
+                            "Update plot",
+                            "video-analysis-apply-btn",
+                            variant="secondary",
                             title="Apply smoothing / detrend / "
-                                   "normalize / clean-up choices.",
-                            style={"backgroundColor": "#5e7ce2",
-                                    "color": "white",
-                                    "border": "none",
-                                    "padding": "7px 18px",
-                                    "borderRadius": "6px",
-                                    "cursor": "pointer",
-                                    "fontSize": "12px",
-                                    "fontWeight": "600"}),
-                    ], style={"flex": "0 0 100px",
+                                  "normalize / clean-up choices."),
+                    ], style={"flex": "0 0 120px",
                                "display": "flex",
                                "alignItems": "flex-end"}),
                 ], style={"display": "flex", "gap": "12px",
@@ -2197,8 +2167,10 @@ def layout(store: Store, bridge: dict | None = None):
                     "border": "1px solid rgba(255,159,10,0.25)",
                     "borderRadius": "6px"},
             children=[
-                html.Div(
-                    "🛠️  Advanced: video quality threshold (PI)",
+                html.Div([
+                    icon("alert-triangle", size=13, color="#ff9f0a",
+                         style={"marginRight": "6px"}),
+                    "Advanced: video quality threshold (PI)"],
                     style={"color": "#ff9f0a", "fontSize": "12px",
                             "fontWeight": "600",
                             "marginBottom": "8px"}),
@@ -2366,19 +2338,11 @@ def layout(store: Store, bridge: dict | None = None):
                                 "fontSize": "12px",
                                 "marginBottom": "6px"}),
                     html.Div([
-                        html.Button(
-                            "Clear markers",
-                            id="video-review-clear-markers-btn",
-                            n_clicks=0,
-                            style={"backgroundColor": "transparent",
-                                    "color": "#a0a0b0",
-                                    "border": "1px solid "
-                                               "rgba(255,255,255,0.15)",
-                                    "padding": "4px 10px",
-                                    "borderRadius": "5px",
-                                    "cursor": "pointer",
-                                    "fontSize": "11px",
-                                    "marginRight": "8px"}),
+                        button("Clear quick marks",
+                               "video-review-clear-markers-btn",
+                               variant="ghost",
+                               style={"fontSize": "11px",
+                                      "padding": "4px 10px"}),
                     ], style={"marginTop": "4px"}),
                     _details_card(
                         "Show timestamps as list",
@@ -2440,40 +2404,28 @@ def layout(store: Store, bridge: dict | None = None):
                                       "1px solid rgba(255,255,255,0.04)",
                                   "borderRadius": "6px"}),
                 html.Div([
-                    html.Button(
+                    # The single loud action on this step: solid success
+                    # fill + larger footprint so it's unmistakably the
+                    # next thing to do. Quick-flag recedes to secondary.
+                    button(
                         "Mark recording done",
-                        id="video-review-save-btn",
-                        n_clicks=0,
-                        title="Saves your decision + any onset "
-                               "markers. Removes the recording from "
-                               "your queue.",
-                        style={"backgroundColor": "#00CC96",
-                                "color": "white",
-                                "border": "none",
-                                "padding": "8px 22px",
-                                "borderRadius": "6px",
-                                "cursor": "pointer",
-                                "fontSize": "13px",
-                                "fontWeight": "700",
-                                "marginRight": "10px"}),
-                    html.Button(
-                        "Quick-flag (needs scoring)",
-                        id="video-review-quickflag-btn",
-                        n_clicks=0,
+                        "video-review-save-btn",
+                        variant="primary", tone="success",
+                        icon_name="check-circle",
+                        title="Saves your decision + any onset markers. "
+                              "Removes the recording from your queue.",
+                        style={"padding": "10px 26px",
+                               "fontSize": "14px", "fontWeight": "700",
+                               "marginRight": "10px"}),
+                    button(
+                        "Flag for scoring",
+                        "video-review-quickflag-btn",
+                        variant="secondary",
                         title="Fast first pass: save the event "
-                               "timestamps you dropped (no type / "
-                               "Racine needed) and park the file in "
-                               "the 'Needs scoring' pool to finish "
-                               "later.",
-                        style={"backgroundColor": "transparent",
-                                "color": "#f0b429",
-                                "border": "1px solid #f0b429",
-                                "padding": "8px 18px",
-                                "borderRadius": "6px",
-                                "cursor": "pointer",
-                                "fontSize": "12px",
-                                "fontWeight": "700",
-                                "marginRight": "10px"}),
+                              "timestamps you dropped (no type / Racine "
+                              "needed) and park the file in the 'Needs "
+                              "scoring' pool to finish later.",
+                        style={"marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
                         custom_spinner=_loading_icon(small=True),
@@ -2500,9 +2452,13 @@ def layout(store: Store, bridge: dict | None = None):
                            data=[]),
             ], style={"marginTop": "12px",
                        "padding": "12px 14px",
-                       "background": "rgba(0, 204, 150, 0.05)",
-                       "border": "1px solid rgba(0, 204, 150, 0.2)",
-                       "borderRadius": "8px"}),
+                       # Quiet chrome: neutral surface + success left edge
+                       # for step identity. The saturated green now lives
+                       # only on the "Mark recording done" primary button.
+                       "background": COLOR_SURFACE_1,
+                       "border": f"1px solid {COLOR_DIVIDER}",
+                       "borderLeft": f"3px solid {COLOR_SUCCESS}",
+                       "borderRadius": RADIUS_MD}),
 
         # --- Existing video-review notes for this file ------------------ #
         html.Div([

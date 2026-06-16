@@ -202,6 +202,58 @@ def refresh_button(id_: str, label: str = "Refresh") -> html.Button:
     })
 
 
+def button(label: str, id_: str, variant: str = "primary",
+            tone: str = "accent", icon_name: str | None = None,
+            **btn_kwargs: Any) -> html.Button:
+    """Canonical action button -- one source of truth so every screen has
+    exactly one visually dominant action.
+
+    *variant*: ``primary`` (solid *tone* fill), ``secondary`` (surface
+    outline), ``ghost`` (text only). *tone* (primary only): ``accent`` /
+    ``success`` / ``danger`` -- the solid fill color. *icon_name* adds a
+    leading SVG icon. Extra kwargs (``style``, ``title``, ``className``,
+    ``n_clicks`` ...) pass through to ``html.Button``; ``style`` merges on
+    top of the variant base. Hover/active polish lives in the
+    ``.qc-btn-*`` CSS classes.
+    """
+    tone_color = {"accent": COLOR_ACCENT, "success": COLOR_SUCCESS,
+                  "danger": COLOR_DANGER}.get(tone, COLOR_ACCENT)
+    base: dict = {
+        "fontFamily": FONT_STACK, "fontSize": FONT_SIZE_BODY,
+        "fontWeight": "600", "borderRadius": RADIUS_SM, "cursor": "pointer",
+        "padding": f"{SPACE_2} {SPACE_4}", "display": "inline-flex",
+        "alignItems": "center", "justifyContent": "center", "gap": SPACE_2,
+        "lineHeight": "1.2", "whiteSpace": "nowrap",
+    }
+    if variant == "primary":
+        base.update({"backgroundColor": tone_color, "color": "white",
+                     "border": "1px solid transparent"})
+        ic_color = "white"
+    elif variant == "secondary":
+        base.update({"backgroundColor": COLOR_SURFACE_3,
+                     "color": COLOR_TEXT_PRIMARY,
+                     "border": f"1px solid {COLOR_DIVIDER}"})
+        ic_color = COLOR_TEXT_SECONDARY
+    else:  # ghost
+        base.update({"backgroundColor": "transparent",
+                     "color": COLOR_TEXT_SECONDARY,
+                     "border": "1px solid transparent"})
+        ic_color = COLOR_TEXT_SECONDARY
+    extra_style = btn_kwargs.pop("style", None)
+    if extra_style:
+        base.update(extra_style)
+    children: list = []
+    if icon_name:
+        children.append(icon(icon_name, size=14, color=ic_color))
+    children.append(html.Span(label))
+    classes = f"qc-btn qc-btn-{variant}"
+    if "className" in btn_kwargs:
+        classes = f"{classes} {btn_kwargs.pop('className')}"
+    n_clicks = btn_kwargs.pop("n_clicks", 0)
+    return html.Button(children, id=id_, n_clicks=n_clicks,
+                        className=classes, style=base, **btn_kwargs)
+
+
 def refresh_bar(refresh_btn_id: str) -> html.Div:
     """Right-aligned bar with a Refresh button. Used at the top of
     every Sheets-backed tab so layout is consistent."""
@@ -364,7 +416,10 @@ ZEBRA_STRIPE: dict = {
 # --------------------------------------------------------------------- #
 
 LABEL_STYLE: dict = {
-    "color": COLOR_TEXT_TERTIARY,
+    # Secondary (not tertiary) so form labels clear WCAG AA: tertiary
+    # #6c6c80 on the dark surface is ~3.9:1 (fails); secondary #a0a0b0
+    # is ~5.8:1 (passes). Applies app-wide -- every tab imports this.
+    "color": COLOR_TEXT_SECONDARY,
     "fontSize": FONT_SIZE_CAPTION,
     "marginBottom": SPACE_2,
     "display": "block",
