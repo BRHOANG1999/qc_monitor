@@ -82,6 +82,18 @@ SECTION_STYLE = {
 VIDEO_DOM_ID = "lfp-video"
 
 
+def _loading_icon(text: str = "Loading…"):
+    """Animated EEG-bar loading icon for dcc.Loading(custom_spinner=...).
+    Renders a row of pulsing bars (like a live trace) over the card while
+    it loads, with an optional caption. Styled by .qc-load-* in
+    theme.css."""
+    return html.Div([
+        html.Div([html.Span() for _ in range(5)],
+                  className="qc-load-bars"),
+        html.Div(text, className="qc-load-text"),
+    ], className="qc-load-overlay")
+
+
 # ===================================================================== #
 #  Data helpers
 # ===================================================================== #
@@ -1065,7 +1077,8 @@ def _video_mass_analyze_panel() -> html.Details:
                         "marginBottom": "10px"},
                 children=dcc.Loading(
                   id="video-ma-browse-loading",
-                  type="circle", color="#5e7ce2", delay_show=180,
+                  custom_spinner=_loading_icon("Building pools…"),
+                  delay_show=180,
                   children=[
                     html.Div(id="video-ma-pool-counts",
                               style={"fontSize": "12px",
@@ -1652,8 +1665,7 @@ def layout(store: Store, bridge: dict | None = None):
         html.Div([
             dcc.Loading(
                 id="video-player-loading",
-                type="circle",
-                color="#5e7ce2",
+                custom_spinner=_loading_icon("Loading video…"),
                 # 180 ms before showing the spinner means warm-
                 # cache renders don't flash; cold-cache reads
                 # (where the reviewer needs the feedback) tip
@@ -1800,8 +1812,7 @@ def layout(store: Store, bridge: dict | None = None):
                       data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
             dcc.Loading(
                 id="video-lfp-loading",
-                type="circle",
-                color="#5e7ce2",
+                custom_spinner=_loading_icon("Loading LFP…"),
                 delay_show=180,
                 parent_style={"minHeight": "220px"},
                 children=dcc.Graph(
@@ -2086,8 +2097,7 @@ def layout(store: Store, bridge: dict | None = None):
             ),
             dcc.Loading(
                 id="video-analysis-loading",
-                type="circle",
-                color="#5e7ce2",
+                custom_spinner=_loading_icon("Loading feature…"),
                 delay_show=180,
                 parent_style={"minHeight": "220px"},
                 children=dcc.Graph(
