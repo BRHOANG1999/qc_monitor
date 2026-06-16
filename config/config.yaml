@@ -281,7 +281,7 @@ bhz_csv:
 #   Analysis), max_racine, n_during_stim_events, n_files, ...
 # Tabs that don't exist are skipped (we never create a tab).
 google_sheets:
-  enabled: false
+  enabled: true
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   spreadsheet_id: 1HwQlqGPERHCOVUcJDzv8yMm-vZzjqfsh25ud7rfWes8
   key_columns: [Date]   # one row per day within each animal's tab
