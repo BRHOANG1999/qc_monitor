@@ -14,7 +14,7 @@ from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
 from src.utils import mass_analyze as _mass_analyze
-from src.utils.version import qc_monitor_version
+from src.utils.version import qc_monitor_version, newer_version_available
 from src.dashboard.media_routes import register_media_routes
 from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
@@ -326,6 +326,33 @@ def create_app(config: dict, store: Store) -> Dash:
                              "color": COLOR_TEXT_TERTIARY,
                              "fontSize": FONT_SIZE_CAPTION,
                              "letterSpacing": "0.2px"}),
+            # The version this page was served with. A timer callback
+            # compares it to the live HEAD on disk; when the deployment
+            # has moved ahead, the update banner appears.
+            dcc.Store(id="page-version", data=_QC_MONITOR_VERSION),
+            dcc.Store(id="version-reload-sink"),
+            # Update-available banner. Hidden until a newer version is
+            # detected; click reloads the page to pick it up.
+            html.Span(
+                "↻ New version available — click to reload",
+                id="header-update-msg", n_clicks=0,
+                title="The app has been updated since you opened this "
+                       "page. Click to reload and get the latest "
+                       "version.",
+                style={
+                    "display": "none",
+                    "marginLeft": SPACE_4,
+                    "padding": "3px 10px",
+                    "borderRadius": "10px",
+                    "background": COLOR_WARNING,
+                    "color": "#1a1205",
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "fontWeight": "700",
+                    "cursor": "pointer",
+                    "verticalAlign": "middle",
+                    "letterSpacing": "0.2px",
+                },
+            ),
         ], id="app-header",
            style={"padding": f"{SPACE_4} {SPACE_6}",
                   "background": COLOR_SURFACE_0,
@@ -879,6 +906,32 @@ def create_app(config: dict, store: Store) -> Dash:
             "verticalAlign": "middle",
         }
         return style, title, cls
+
+    # Update-available banner. On each refresh cycle, compare the
+    # version this page was served with against the live HEAD on disk;
+    # show the banner only when the deployment has moved strictly ahead
+    # (newer_version_available does an ancestor check so a diverged
+    # branch or an identical SHA never nags).
+    @app.callback(
+        Output("header-update-msg", "style"),
+        Input("refresh-trigger", "data"),
+        State("page-version", "data"),
+        State("header-update-msg", "style"),
+    )
+    def _check_for_update(_n, page_version, cur_style):
+        base = dict(cur_style or {})
+        base["display"] = ("inline-block"
+                            if newer_version_available(page_version)
+                            else "none")
+        return base
+
+    # Click the banner -> hard reload to pick up the new version.
+    app.clientside_callback(
+        "function(n){ if(n){ window.location.reload(); } return null; }",
+        Output("version-reload-sink", "data"),
+        Input("header-update-msg", "n_clicks"),
+        prevent_initial_call=True,
+    )
 
     @app.callback(
         Output("last-refresh-label", "children"),
