@@ -269,21 +269,24 @@ bhz_csv:
   filename_template: "{date}_{animal}.csv"
   append: true
 
-# Daily Google-Sheet sync: on CSV finalize, upsert one row per
-# (animal, day) into the lab sheet, matching its existing column header.
-# PRECONDITION: share the spreadsheet (Editor) with the service-account
-# email in service_account_file, and enable the Sheets API for its
-# project. Disabled by default until that's done.
+# Daily Google-Sheet sync: on CSV finalize, upsert one row PER DAY into
+# the animal's own tab (each MouseID is a tab in "BHZ Analysis Log").
+# Update is a MERGE -- only the columns we compute are written; the
+# lab's hand-filled columns (Recording Location, etc.) are left intact.
+# PRECONDITION: the spreadsheet is shared (Editor) with the
+# service-account email + the Sheets API is enabled for its project.
+# Auto-maps these stat keys onto the tab header by name:
+#   date, animal (MouseID), csv_filename (CSV File Name),
+#   n_events (Number of Behavioral Events), reviewers (Who Completed
+#   Analysis), max_racine, n_during_stim_events, n_files, ...
+# Tabs that don't exist are skipped (we never create a tab).
 google_sheets:
   enabled: false
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   spreadsheet_id: 1HwQlqGPERHCOVUcJDzv8yMm-vZzjqfsh25ud7rfWes8
-  # gid 256001691 -> set this to that tab's TITLE (the API needs the
-  # title, not the gid).
-  tab_name: "Sheet1"
-  key_columns: [Date, Animal]
-  # Optional explicit header->stat-key overrides if auto-match misses,
-  # e.g. {"# Seizures": "n_events", "Stim?": "n_during_stim_events"}.
+  key_columns: [Date]   # one row per day within each animal's tab
+  # Optional explicit header->stat-key overrides, e.g.
+  #   {"Channel(s)": "channels", "Type of Recording": "n_during_stim_events"}
   column_map: {}
 
 surgery_digest:

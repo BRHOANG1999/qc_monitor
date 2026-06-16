@@ -1303,15 +1303,17 @@ def _finalize_approved_to_csv(store, config: dict,
             continue
         bucket.setdefault((animal, chunk_dt.date()), []).append(r)
     parts: list[str] = []
-    day_stat_rows: list[dict] = []
+    # One day-row per animal tab: {animal_tab: [day_stat_dict, ...]}.
+    rows_by_tab: dict[str, list[dict]] = {}
     for (animal, day), items in sorted(bucket.items()):
-        day_stat_rows.append(_day_stats(store, animal, day, items))
         csv_path = _bhz_csv.resolve_csv_path(
             bhz_cfg.get("base_dir", ""),
             bhz_cfg.get("filename_template",
                          "{date}_{animal}.csv"),
             day, animal,
         )
+        rows_by_tab.setdefault(animal, []).append(
+            _day_stats(store, animal, day, items, csv_path.name))
         events_by_fn: dict[str, list[dict]] = {}
         meta_by_fn: dict[str, dict] = {}
         for r in items:
@@ -1346,37 +1348,53 @@ def _finalize_approved_to_csv(store, config: dict,
             parts.append(
                 f"{animal} {day}: {n_total} row"
                 f"{'' if n_total == 1 else 's'} appended")
-    # Daily Google-Sheet upsert (non-fatal): one row per (animal, day).
+    # Daily Google-Sheet upsert (non-fatal): one row per day in each
+    # animal's own tab (MouseID). Merge-update never blanks the lab's
+    # hand-filled columns.
     summary = "  •  ".join(parts)
     gs = (config or {}).get("google_sheets", {}) or {}
-    if gs.get("enabled") and day_stat_rows:
+    if gs.get("enabled") and rows_by_tab:
         try:
             from src.utils import sheets_write
             res = sheets_write.upsert_day_rows(
                 gs["service_account_file"], gs["spreadsheet_id"],
-                gs["tab_name"],
-                gs.get("key_columns", ["Date", "Animal"]),
-                day_stat_rows, gs.get("column_map"))
-            summary += (f"  •  Sheet: {res['updated']} updated, "
-                         f"{res['appended']} appended")
+                rows_by_tab,
+                gs.get("key_columns", ["Date"]),
+                gs.get("column_map"))
+            note = (f"  •  Sheet: {res['updated']} updated, "
+                     f"{res['appended']} appended")
+            if res.get("skipped_tabs"):
+                note += (f" (no tab for: "
+                          f"{', '.join(res['skipped_tabs'])})")
+            summary += note
         except Exception as e:
             logger.warning("Google Sheet upsert failed: %s", e)
             summary += f"  •  Sheet sync FAILED: {e}"
     return summary
 
 
-def _day_stats(store, animal: str, day, items: list[dict]) -> dict:
+def _day_stats(store, animal: str, day, items: list[dict],
+                 csv_name: str = "") -> dict:
     """Canonical one-row-per-(animal, day) summary for the Sheet.
 
     *items* are the pi_approved rows for this (animal, day); each has a
-    decoded ``events`` list + ``file_id`` / ``session_dir``.
+    decoded ``events`` list + ``file_id`` / ``session_dir`` /
+    ``user_email``.
     """
     from datetime import datetime as _dt
     from src.utils import mass_analyze as _ma
     n_files = len(items)
     n_with = n_events = max_racine = n_no_event = 0
     n_stim_files = n_during = 0
+    reviewers: list[str] = []
+    sessions: list[str] = []
     for r in items:
+        ue = (r.get("user_email") or "").strip()
+        if ue and ue not in reviewers:
+            reviewers.append(ue)
+        sd = r.get("session_dir")
+        if sd and sd not in sessions:
+            sessions.append(sd)
         evs = r.get("events") or []
         n_ev = len(evs) if isinstance(evs, list) else 0
         if n_ev > 0:
@@ -1397,16 +1415,57 @@ def _day_stats(store, animal: str, day, items: list[dict]) -> dict:
                 n_during += n_ev
         except Exception:
             pass
+
+    # Per-animal recording metadata from the session config(s):
+    #  Recording Location = electrode suffix(es) (SR / SLM / ...)
+    #  Channel(s)         = the animal's electrode channel index(es)
+    #  More Settings      = the stim parameters
+    locations: list[str] = []
+    channels: list[str] = []
+    stim_settings = ""
+    for sd in sessions:
+        try:
+            for e in store.electrodes_for_animal_in_session(sd, animal):
+                loc = e.get("location")
+                if loc and loc not in locations:
+                    locations.append(loc)
+                ch = str(e.get("channel_index"))
+                if ch not in channels:
+                    channels.append(ch)
+            if not stim_settings:
+                cfg = store.get_session_config(sd) or {}
+                bits = []
+                if cfg.get("stim_charge_nC"):
+                    bits.append(f"{float(cfg['stim_charge_nC']):g}nC")
+                if cfg.get("stim_pulse_width_us"):
+                    bits.append(
+                        f"{float(cfg['stim_pulse_width_us']):g}us")
+                if cfg.get("stim_frequency_hz"):
+                    bits.append(
+                        f"{float(cfg['stim_frequency_hz']):g}Hz")
+                stim_settings = ", ".join(bits)
+        except Exception:
+            pass
+
+    is_stim = n_stim_files > 0
     return {
         "date": day.isoformat() if hasattr(day, "isoformat")
                  else str(day),
         "animal": animal,
+        "csv_filename": csv_name,
         "n_files": n_files,
         "n_files_with_events": n_with,
         "n_events": n_events,
         "max_racine": max_racine,
         "n_during_stim_events": n_during,
         "n_no_event_files": n_no_event,
+        "reviewers": ", ".join(reviewers),
+        "recording_location": ", ".join(locations),
+        "channels": ", ".join(
+            sorted(channels,
+                    key=lambda x: int(x) if x.isdigit() else 0)),
+        "type_of_recording": "stim" if is_stim else "baseline",
+        "more_settings": stim_settings if is_stim else "",
         "exported_at": _dt.now().isoformat(timespec="seconds"),
     }
 
