@@ -574,6 +574,56 @@ def pool_files(store, animal_id: str, peak_cutoff: float,
     return {"pool1": pool1, "pool2": pool2, "pool3": pool3}
 
 
+def has_stim_for_file(store, file_id: int,
+                        session_dir: str | None = None) -> bool:
+    """True if *file_id* had stimulation at all (whole-file).
+
+    Three independent signals, any of which is sufficient: the
+    ``processed_files.has_stim_report`` flag, a catalogued evoked
+    response (``evoked_features`` row), or a stimCopy pulse detected by
+    ``stim_blank.stim_times_for_file``. Cheap checks first; the stimCopy
+    fallback only runs when the catalogue is empty (and it's itself
+    cached per file)."""
+    assert isinstance(file_id, int), "file_id must be int"
+    with store.connection() as conn:
+        row = conn.execute(
+            "SELECT has_stim_report FROM processed_files WHERE id=?",
+            (file_id,)).fetchone()
+        if row and int(row["has_stim_report"] or 0) > 0:
+            return True
+        ef = conn.execute(
+            """SELECT 1 FROM evoked_features
+               WHERE file_id=? AND epoch_time_sec IS NOT NULL
+               LIMIT 1""", (file_id,)).fetchone()
+    if ef is not None:
+        return True
+    try:
+        return bool(stim_blank.stim_times_for_file(store, file_id).size)
+    except Exception:
+        return False
+
+
+def pool_meta(store, animal_id: str) -> dict:
+    """Per-file display/filter metadata for the pool browser:
+    ``{file_id: {"session_dir","session_name","has_stim"}}`` over the
+    same files ``pool_files`` covers. Built once when pools are built so
+    the session + stim filters need no re-query."""
+    out: dict = {}
+    files = pending_files_for_animal(store, animal_id)
+    max_iter = len(files) + 1
+    for i, f in enumerate(files):
+        assert i < max_iter, "pool meta runaway"
+        fid = int(f["file_id"])
+        sd = f.get("session_dir")
+        name = sd.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] if sd else ""
+        out[str(fid)] = {
+            "session_dir": sd,
+            "session_name": name,
+            "has_stim": has_stim_for_file(store, fid, sd),
+        }
+    return out
+
+
 def count_pending_for_animal(store, animal_id: str) -> int:
     """Cheap count of queue-eligible files for *animal_id*.
 

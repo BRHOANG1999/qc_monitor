@@ -1014,6 +1014,48 @@ def _video_mass_analyze_panel() -> html.Details:
                               style={"fontSize": "12px",
                                       "color": "#cfd0d6",
                                       "marginBottom": "6px"}),
+                    # Filters: narrow the pools to one session and/or
+                    # stim-vs-baseline files before browsing.
+                    html.Div([
+                        html.Label("Session:",
+                                    style={"color": "#a0a0b0",
+                                            "fontSize": "11px",
+                                            "marginRight": "6px"}),
+                        dcc.Dropdown(
+                            id="video-ma-filter-session",
+                            options=[{"label": "All sessions",
+                                       "value": "__all__"}],
+                            value="__all__", clearable=False,
+                            style={"flex": "1 1 220px",
+                                    "minWidth": "180px"},
+                            className="dark-dropdown"),
+                        html.Label("Stim:",
+                                    style={"color": "#a0a0b0",
+                                            "fontSize": "11px",
+                                            "margin": "0 6px 0 10px"}),
+                        dcc.Dropdown(
+                            id="video-ma-filter-stim",
+                            options=[
+                                {"label": "All", "value": "all"},
+                                {"label": "Stim files",
+                                 "value": "stim"},
+                                {"label": "Baseline files",
+                                 "value": "baseline"}],
+                            value="all", clearable=False,
+                            style={"flex": "0 0 150px",
+                                    "minWidth": "130px"},
+                            className="dark-dropdown"),
+                    ], style={"display": "flex",
+                               "alignItems": "center",
+                               "gap": "4px", "marginBottom": "4px"}),
+                    html.Div(id="video-ma-filter-counts",
+                              style={"fontSize": "11px",
+                                      "color": "#a0a0b0",
+                                      "marginBottom": "6px"}),
+                    # Per-session statistics (Phase 3); filled when a
+                    # specific session is selected above.
+                    html.Div(id="video-ma-session-stats",
+                              style={"marginBottom": "8px"}),
                     html.Div([
                         html.Button(
                             "Browse Pool 1 (envelope)",
@@ -1047,6 +1089,11 @@ def _video_mass_analyze_panel() -> html.Details:
                 ]),
             # State stores + polling.
             dcc.Store(id="video-ma-pools", data=None),
+            # Per-file meta {file_id: {session_dir, session_name,
+            # has_stim}} so the filters work without re-querying.
+            dcc.Store(id="video-ma-pool-meta", data=None),
+            # The filtered view _on_pool_nav actually browses.
+            dcc.Store(id="video-ma-pools-view", data=None),
             dcc.Store(id="video-ma-pool-cursor", data=None),
             dcc.Store(id="video-ma-job-id", data=None),
             dcc.Interval(id="video-ma-poll",
@@ -5553,6 +5600,85 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 polling_disabled, pools_data, browse_style,
                 pool_counts)
 
+    # Build the per-file meta map whenever the pools change, so the
+    # session + stim filters resolve without re-querying.
+    @app.callback(
+        Output("video-ma-pool-meta", "data"),
+        Input("video-ma-pools", "data"),
+        State("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_build_meta(pools, picker_value):
+        animal = _ma_animal_from_picker(picker_value)
+        if not pools or not animal:
+            return None
+        try:
+            return _mass_analyze.pool_meta(store, str(animal))
+        except Exception as e:
+            logger.warning("pool_meta failed: %s", e)
+            return None
+
+    # Apply the session + stim filters -> the view _on_pool_nav browses.
+    # Also populates the session dropdown options + the filtered counts.
+    @app.callback(
+        Output("video-ma-pools-view", "data"),
+        Output("video-ma-filter-session", "options"),
+        Output("video-ma-filter-counts", "children"),
+        Output("video-ma-pool-cursor", "data", allow_duplicate=True),
+        Input("video-ma-pools", "data"),
+        Input("video-ma-pool-meta", "data"),
+        Input("video-ma-filter-session", "value"),
+        Input("video-ma-filter-stim", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_filter(pools, meta, sess_val, stim_val):
+        pools = pools or {"pool1": [], "pool2": [], "pool3": []}
+        meta = meta or {}
+        # Session dropdown options from the meta map (stable order).
+        seen: "OrderedDict[str, str]" = OrderedDict()
+        for m in meta.values():
+            sd = m.get("session_dir")
+            if sd and sd not in seen:
+                seen[sd] = m.get("session_name") or sd
+        opts = [{"label": "All sessions", "value": "__all__"}]
+        opts += [{"label": name, "value": sd}
+                  for sd, name in seen.items()]
+
+        def _keep(fid: int) -> bool:
+            m = meta.get(str(fid))
+            if m is None:
+                return True  # meta not built yet -> don't hide
+            if sess_val and sess_val != "__all__" \
+                    and m.get("session_dir") != sess_val:
+                return False
+            if stim_val == "stim" and not m.get("has_stim"):
+                return False
+            if stim_val == "baseline" and m.get("has_stim"):
+                return False
+            return True
+
+        def _fid(entry):
+            return int(entry["file_id"]) if isinstance(entry, dict) \
+                else int(entry)
+
+        view = {
+            "pool1": [f for f in pools.get("pool1", [])
+                       if _keep(_fid(f))],
+            "pool2": [f for f in pools.get("pool2", [])
+                       if _keep(_fid(f))],
+            "pool3": [f for f in pools.get("pool3", [])
+                       if _keep(_fid(f))],
+        }
+        active = (sess_val not in (None, "__all__")) \
+            or (stim_val and stim_val != "all")
+        if active:
+            counts = (f"Filtered  ·  Pool 1: {len(view['pool1'])}  ·  "
+                       f"Pool 2: {len(view['pool2'])}  ·  Pool 3: "
+                       f"{len(view['pool3'])}")
+        else:
+            counts = ""
+        return view, opts, counts, None
+
     @app.callback(
         Output("video-ma-pool-cursor", "data"),
         Output("video-session-dropdown", "value",
@@ -5567,7 +5693,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-ma-browse-p3", "n_clicks"),
         Input("video-ma-pool-prev", "n_clicks"),
         Input("video-ma-pool-next", "n_clicks"),
-        State("video-ma-pools", "data"),
+        State("video-ma-pools-view", "data"),
         State("video-ma-pool-cursor", "data"),
         prevent_initial_call=True,
     )
