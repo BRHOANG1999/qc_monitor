@@ -1893,6 +1893,92 @@ class Store:
                 })
         return out
 
+    def session_review_stats(self, session_dir: str) -> dict:
+        """One review/stim summary for *session_dir*.
+
+        Counts over the session's files + their latest review_state,
+        decoding ``markers_json`` for event-level figures. During-stim
+        counts events in files that had stimulation (whole-file, via
+        ``mass_analyze.has_stim_for_file``).
+        """
+        from src.utils import mass_analyze as _ma
+        out = {
+            "session_dir": session_dir,
+            "n_files": 0, "n_reviewed": 0, "n_pending_pi": 0,
+            "n_approved": 0, "n_needs_scoring": 0,
+            "n_files_with_events": 0, "n_events": 0,
+            "max_racine": 0, "n_no_event_files": 0,
+            "n_stim_files": 0, "n_during_stim_events": 0,
+        }
+        if not session_dir:
+            return out
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT pf.id AS file_id,
+                          (SELECT status FROM review_state rs
+                           WHERE rs.file_id = pf.id
+                           ORDER BY rs.updated_at DESC LIMIT 1)
+                              AS status,
+                          (SELECT markers_json FROM review_state rs
+                           WHERE rs.file_id = pf.id
+                           ORDER BY rs.updated_at DESC LIMIT 1)
+                              AS markers_json
+                   FROM processed_files pf
+                   WHERE pf.session_dir = ?""",
+                (session_dir,),
+            ).fetchall()
+        finally:
+            conn.close()
+        out["n_files"] = len(rows)
+        max_iter = len(rows) + 1
+        for i, r in enumerate(rows):
+            assert i < max_iter, "session stats runaway"
+            status = r["status"]
+            if status in ("no_events", "has_events",
+                          "pending_pi_review", "pi_approved"):
+                out["n_reviewed"] += 1
+            if status == "pending_pi_review":
+                out["n_pending_pi"] += 1
+            elif status == "pi_approved":
+                out["n_approved"] += 1
+            elif status == "needs_scoring":
+                out["n_needs_scoring"] += 1
+            # Only finalised reviews contribute scored events;
+            # needs_scoring drafts are provisional (counted separately).
+            finalised = status in ("has_events", "pending_pi_review",
+                                     "pi_approved")
+            if finalised:
+                try:
+                    evs = json.loads(r["markers_json"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    evs = []
+            else:
+                evs = []
+            n_ev = len(evs) if isinstance(evs, list) else 0
+            # 'No events' submissions store [] under a finalised status.
+            if status == "no_events" or (finalised and n_ev == 0):
+                out["n_no_event_files"] += 1
+            if n_ev > 0:
+                out["n_files_with_events"] += 1
+                out["n_events"] += n_ev
+                for e in evs:
+                    r_val = e.get("racine") if isinstance(e, dict) \
+                        else None
+                    try:
+                        out["max_racine"] = max(
+                            out["max_racine"], int(r_val or 0))
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                if _ma.has_stim_for_file(
+                        self, int(r["file_id"]), session_dir):
+                    out["n_stim_files"] += 1
+                    out["n_during_stim_events"] += n_ev
+            except Exception:
+                pass
+        return out
+
     def files_needing_scoring_for_animal(self, animal_id: str
                                            ) -> list[dict]:
         """Files whose LATEST review_state is 'needs_scoring' for

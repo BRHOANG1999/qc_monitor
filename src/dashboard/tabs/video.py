@@ -5799,6 +5799,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 polling_disabled, pools_data, browse_style,
                 pool_counts)
 
+    # Per-session statistics: shown when a specific session is picked
+    # in the pool-filter dropdown.
+    @app.callback(
+        Output("video-ma-session-stats", "children"),
+        Input("video-ma-filter-session", "value"),
+        prevent_initial_call=True,
+    )
+    def _on_video_ma_session_stats(session_dir):
+        if not session_dir or session_dir == "__all__":
+            return ""
+        try:
+            s = store.session_review_stats(session_dir)
+        except Exception as e:
+            logger.warning("session_review_stats failed: %s", e)
+            return ""
+
+        def _cell(label, val):
+            return html.Div([
+                html.Div(str(val), style={"color": "#f0f0f5",
+                                           "fontWeight": "700",
+                                           "fontSize": "14px"}),
+                html.Div(label, style={"color": "#a0a0b0",
+                                        "fontSize": "10px"}),
+            ], style={"padding": "4px 10px",
+                       "borderRight": "1px solid rgba(255,255,255,0.06)"})
+        return html.Div([
+            _cell("files", s["n_files"]),
+            _cell("reviewed", s["n_reviewed"]),
+            _cell("with events", s["n_files_with_events"]),
+            _cell("events", s["n_events"]),
+            _cell("max Racine", s["max_racine"]),
+            _cell("needs scoring", s["n_needs_scoring"]),
+            _cell("stim files", s["n_stim_files"]),
+            _cell("during-stim events", s["n_during_stim_events"]),
+        ], style={"display": "flex", "flexWrap": "wrap",
+                   "background": "#13131f",
+                   "border": "1px solid rgba(94,124,226,0.18)",
+                   "borderRadius": "6px", "padding": "4px"})
+
     # Build the per-file meta map whenever the pools change, so the
     # session + stim filters resolve without re-querying.
     @app.callback(
