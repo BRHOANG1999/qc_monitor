@@ -131,22 +131,33 @@ def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
     return _stim_blank.stim_copy_channels(store, session_dir)
 
 
-def _animal_for_session(store: Store, session_dir: str) -> str:
-    """First animal id in the session's channel naming, or '?'."""
+def _animal_for_session(store: Store, session_dir: str,
+                          prefer: str | None = None) -> str:
+    """Animal id to label a session by. Sessions can hold several
+    animals (e.g. BCH062SR + BCH061SLM in one cage); when *prefer* (the
+    animal the reviewer selected) is one of them, use it, so the banner
+    matches who they're reviewing. Otherwise the first animal, or '?'."""
     if not session_dir:
         return "?"
     names = store._channel_names_for_session(session_dir)
+    animals: list[str] = []
     for n in names:
         if isinstance(n, str) and is_animal_channel(n):
             a, _ = split_animal_electrode(n)
-            return a
-    return "?"
+            if a and a not in animals:
+                animals.append(a)
+    if prefer and prefer in animals:
+        return prefer
+    return animals[0] if animals else "?"
 
 
-def _now_viewing_info(store: Store, file_id: int) -> dict | None:
+def _now_viewing_info(store: Store, file_id: int,
+                        prefer_animal: str | None = None) -> dict | None:
     """Orientation for the loaded recording: animal, date/time, its
     position among the session's hour-chunks, and the neighbouring
-    file ids for prev/next-hour stepping. None if not resolvable."""
+    file ids for prev/next-hour stepping. None if not resolvable.
+    *prefer_animal* (the reviewer's selected animal) wins the label in
+    multi-animal sessions."""
     session_dir = _session_dir_for_file(store, file_id)
     if not session_dir:
         return None
@@ -164,7 +175,7 @@ def _now_viewing_info(store: Store, file_id: int) -> dict | None:
     except ValueError:
         date_label, time_label = cdt, ""
     return {
-        "animal": _animal_for_session(store, session_dir),
+        "animal": _animal_for_session(store, session_dir, prefer_animal),
         "date": date_label,
         "time": time_label,
         "index": i + 1,
@@ -3514,12 +3525,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-prev-hour-btn", "disabled"),
         Output("video-next-hour-btn", "disabled"),
         Input("video-file-dropdown", "value"),
+        Input("video-queue-animal", "value"),
     )
-    def _render_now_viewing(file_id):
+    def _render_now_viewing(file_id, picker_value):
         if not file_id:
             return ("No recording loaded -- pick one above.",
                     True, True)
-        info = _now_viewing_info(store, int(file_id))
+        prefer = _ma_animal_from_picker(picker_value)
+        info = _now_viewing_info(store, int(file_id), prefer)
         if not info:
             return ("Recording loaded.", True, True)
         label = html.Span([
@@ -3537,6 +3550,34 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         ])
         return (label, info["prev_id"] is None,
                 info["next_id"] is None)
+
+    # Multi-animal sessions: switching the reviewed animal on an
+    # already-loaded file re-targets the LFP/Hilbert to THAT animal's
+    # electrode (the per-file channel default only re-runs on a file
+    # change, so without this the trace stayed on the prior animal).
+    @app.callback(
+        Output("video-channel-dropdown", "value",
+                allow_duplicate=True),
+        Input("video-queue-animal", "value"),
+        State("video-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _retarget_channel_on_animal(picker_value, file_id):
+        if not file_id:
+            return no_update
+        animal = _ma_animal_from_picker(picker_value)
+        if not animal:
+            return no_update
+        sd = _session_dir_for_file(store, int(file_id))
+        if not sd:
+            return no_update
+        try:
+            elecs = store.electrodes_for_animal_in_session(sd, animal)
+        except Exception:
+            return no_update
+        if elecs:
+            return int(elecs[0]["channel_index"])
+        return no_update
 
     @app.callback(
         Output("video-file-dropdown", "value",
