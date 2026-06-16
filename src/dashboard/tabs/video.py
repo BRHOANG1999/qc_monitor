@@ -2162,18 +2162,28 @@ def layout(store: Store, bridge: dict | None = None):
             id="video-pi-quality-panel",
             style={"display": "none",
                     "marginTop": "8px",
-                    "padding": "10px 14px",
                     "background": "rgba(255,159,10,0.05)",
                     "border": "1px solid rgba(255,159,10,0.25)",
                     "borderRadius": "6px"},
             children=[
-                html.Div([
+              # Collapsible (collapsed by default): even PIs only open it
+              # when they're actually re-tuning the quality threshold.
+              html.Details([
+                html.Summary([
                     icon("alert-triangle", size=13, color="#ff9f0a",
                          style={"marginRight": "6px"}),
-                    "Advanced: video quality threshold (PI)"],
-                    style={"color": "#ff9f0a", "fontSize": "12px",
-                            "fontWeight": "600",
-                            "marginBottom": "8px"}),
+                    html.Span("Advanced: video quality threshold (PI)"),
+                    html.Span("  (click to expand)",
+                              style={"color": "#a0a0b0",
+                                      "fontSize": "11px",
+                                      "marginLeft": "6px",
+                                      "fontWeight": "400"}),
+                ], style={"color": "#ff9f0a", "fontSize": "12px",
+                           "fontWeight": "600", "cursor": "pointer",
+                           "userSelect": "none", "listStyle": "none",
+                           "display": "flex", "alignItems": "center",
+                           "padding": "10px 14px"}),
+                html.Div([
                 html.Div([
                     html.Button(
                         "Sample current frame",
@@ -2239,6 +2249,9 @@ def layout(store: Store, bridge: dict | None = None):
                           style={"color": "#a0a0b0",
                                   "fontSize": "11px",
                                   "marginTop": "6px"}),
+                ], style={"padding": "0 14px 12px"}),
+              ], open=False, style={"background": "transparent",
+                                     "border": "none"}),
                 dcc.Store(id="video-pi-variance-store", data=None),
             ],
         ),
