@@ -1993,7 +1993,7 @@ def layout(store: Store, bridge: dict | None = None):
                       data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0}),
             dcc.Loading(
                 id="video-lfp-loading",
-                custom_spinner=_loading_icon("Re-decimating…"),
+                custom_spinner=_loading_icon("Filtering & re-decimating…"),
                 # 0 ms: show the loading overlay the instant a re-decimate
                 # starts. Fast zoom-ins (few points in the window) used to
                 # finish under the old 80 ms threshold and never showed the
@@ -2291,7 +2291,7 @@ def layout(store: Store, bridge: dict | None = None):
             ),
             dcc.Loading(
                 id="video-analysis-loading",
-                custom_spinner=_loading_icon("Re-decimating…"),
+                custom_spinner=_loading_icon("Filtering & re-decimating…"),
                 # 0 ms: immediate loading overlay on zoom / feature redraws
                 # (matches video-lfp-loading above).
                 delay_show=0,
@@ -5439,21 +5439,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                            file_id, channel, e)
             return no_update
 
-        # Apply the same filter the time-domain plot used. Filtering
-        # is on the full-resolution series here (zoom needs raw fs
-        # not the display rate) -- still cheap because get_chunk +
-        # _get_blanked_series caches keep this hot.
-        st = filter_state or {}
-        try:
-            series = apply_filter(
-                np.asarray(series, dtype=np.float32), fs,
-                highpass=st.get("hp"), lowpass=st.get("lp"),
-                notch=st.get("notch"),
-                smoothing_ms=st.get("smooth"),
-            )
-        except Exception as e:
-            logger.debug("zoom filter skipped: %s", e)
-
+        series = np.asarray(series, dtype=np.float32)
         n = len(series)
         if is_reset:
             lo, hi = 0, n
@@ -5461,6 +5447,36 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             lo, hi = window_slice(n, fs, x0, x1)
         if hi <= lo:
             return no_update
+
+        # Apply the same filter the time-domain plot used -- but only on
+        # the VISIBLE window plus a settling margin, not the whole
+        # recording. The old code filtfilt'd the entire full-rate chunk
+        # on every zoom (millions of samples), which is the lingering
+        # post-decimate wait the reviewer noticed. The margin keeps
+        # filtfilt's edge transients out of the displayed window; it
+        # scales with the high-pass cutoff (low cutoffs settle slowly).
+        # No filter set -> skip the pass entirely.
+        st = filter_state or {}
+        has_filter = any(st.get(k) for k in ("hp", "lp", "notch",
+                                               "smooth"))
+        if has_filter:
+            hp = float(st.get("hp") or 0)
+            margin = int(min(n, max(2.0, 5.0 / max(hp, 0.5)) * fs))
+            a = max(0, lo - margin)
+            b = min(n, hi + margin)
+            try:
+                filt = apply_filter(
+                    series[a:b], fs,
+                    highpass=st.get("hp"), lowpass=st.get("lp"),
+                    notch=st.get("notch"),
+                    smoothing_ms=st.get("smooth"),
+                )
+                seg = filt[lo - a:hi - a]
+            except Exception as e:
+                logger.debug("zoom filter skipped: %s", e)
+                seg = series[lo:hi]
+        else:
+            seg = series[lo:hi]
 
         # choose_target_bins returns 0 when the window is small enough
         # to render RAW. The old `... or INITIAL_TARGET_BINS` turned
@@ -5470,7 +5486,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         tb = choose_target_bins(hi - lo)
         target_bins = tb if tb else max(1, hi - lo)
         x_p, y_p, _decim = envelope(
-            series[lo:hi], fs, target_bins, t_start=lo / fs,
+            seg, fs, target_bins, t_start=lo / fs,
         )
 
         p = Patch()
