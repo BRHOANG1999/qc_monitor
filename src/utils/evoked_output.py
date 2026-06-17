@@ -31,6 +31,7 @@ import glob
 import os
 import re
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 
 from src.utils.animal import split_animal_electrode, is_animal_channel
@@ -50,6 +51,12 @@ _DT_RX = re.compile(
 _ANIMAL_RX = re.compile(r"(BCH\d+)")
 
 _MAX_FILES = 100000          # NASA Rule 2: explicit loop bound.
+
+# Serialize cache builds: the dashboard fires the chronic callback from
+# multiple worker threads (page auto-refresh), and two concurrent builds
+# would race on the file_meta INSERT. One builder at a time; the others
+# wait, then find the work already done.
+_BUILD_LOCK = threading.Lock()
 
 
 def parse_recording_dt(filename: str) -> datetime | None:
@@ -224,18 +231,21 @@ class ChronicEvokedCache:
         assert isinstance(animal, str) and animal, "animal required"
         files = self.files_for_animal(animal)
         built = 0
-        conn = self._conn()
-        try:
-            for i, path in enumerate(files):
-                assert i < _MAX_FILES, "file loop exceeds bound"
-                if self._needs_build(conn, path):
-                    self._build_one(conn, path)
-                    conn.commit()   # release the write lock per file so
-                    built += 1       # the dashboard can read mid-warm.
-                if progress is not None:
-                    progress(i + 1, len(files), path)
-        finally:
-            conn.close()
+        # One builder at a time across threads (see _BUILD_LOCK). A second
+        # caller waits, then re-checks _needs_build and finds nothing to do.
+        with _BUILD_LOCK:
+            conn = self._conn()
+            try:
+                for i, path in enumerate(files):
+                    assert i < _MAX_FILES, "file loop exceeds bound"
+                    if self._needs_build(conn, path):
+                        self._build_one(conn, path)
+                        conn.commit()   # release the write lock per file so
+                        built += 1       # the dashboard can read mid-warm.
+                    if progress is not None:
+                        progress(i + 1, len(files), path)
+            finally:
+                conn.close()
         return {"files": len(files), "built": built}
 
     def _build_one(self, conn, path: str) -> None:
@@ -263,18 +273,23 @@ class ChronicEvokedCache:
 
     @staticmethod
     def _upsert_file(conn, path, mtime, rec_iso) -> int:
-        """Insert/refresh the file_meta row, returning its integer id."""
+        """Insert/refresh the file_meta row, returning its integer id.
+
+        Idempotent: ``INSERT OR IGNORE`` never collides on the file_path
+        UNIQUE, then we set the fresh values and read the id back -- safe
+        even if two builders touch the same path.
+        """
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT OR IGNORE INTO file_meta (file_path, mtime, rec_dt, "
+            "built_at) VALUES (?,?,?,?)", (path, mtime, rec_iso, now))
+        conn.execute(
+            "UPDATE file_meta SET mtime=?, rec_dt=?, built_at=? "
+            "WHERE file_path=?", (mtime, rec_iso, now, path))
         row = conn.execute("SELECT id FROM file_meta WHERE file_path = ?",
                            (path,)).fetchone()
-        now = datetime.now().isoformat()
-        if row is not None:
-            conn.execute("UPDATE file_meta SET mtime=?, rec_dt=?, built_at=? "
-                         "WHERE id=?", (mtime, rec_iso, now, row["id"]))
-            return int(row["id"])
-        cur = conn.execute(
-            "INSERT INTO file_meta (file_path, mtime, rec_dt, built_at) "
-            "VALUES (?,?,?,?)", (path, mtime, rec_iso, now))
-        return int(cur.lastrowid)
+        assert row is not None, "file_meta upsert lost its row"
+        return int(row["id"])
 
     @staticmethod
     def _epoch_rows(file_id, animal, electrode, ch, arr):
