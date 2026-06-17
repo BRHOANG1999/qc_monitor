@@ -336,9 +336,14 @@ class ChronicEvokedCache:
                 for i, path in enumerate(files):
                     assert i < _MAX_FILES, "file loop exceeds bound"
                     if self._needs_build(conn, path, force):
-                        self._build_one(conn, path)
-                        conn.commit()   # release the write lock per file so
-                        built += 1       # the dashboard can read mid-warm.
+                        try:
+                            self._build_one(conn, path)
+                            conn.commit()   # release the lock per file so
+                            built += 1       # the dashboard reads mid-warm.
+                        except sqlite3.OperationalError:
+                            # Transient lock contention: skip this file (a
+                            # later run rebuilds it) rather than abort.
+                            conn.rollback()
                     if progress is not None:
                         progress(i + 1, len(files), path)
             finally:
