@@ -17,12 +17,13 @@ with ``--expensive``.
 from __future__ import annotations
 
 import statistics
+import threading
 from collections import OrderedDict
 from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Input, Output, dash_table, dcc, html
+from dash import Input, Output, callback_context, dash_table, dcc, html
 
 from src.dashboard.components import (
     DARK_TABLE_STYLE, DROPDOWN_STYLE, LABEL_STYLE, ZEBRA_STRIPE)
@@ -59,6 +60,42 @@ def _cache() -> ChronicEvokedCache:
         _cache_singleton = ChronicEvokedCache(
             _EVOKED_DIR, _CACHE_DB, compute_expensive=_EXPENSIVE_ENABLED)
     return _cache_singleton
+
+
+# Background warm: building an animal's cache (reading + feature-extracting
+# hundreds of files) must NEVER run inside the render callback -- it would
+# hang the UI. The render path is query-only; the Refresh button kicks an
+# off-thread warm so the page stays responsive and the cache fills in.
+_warm_threads: dict = {}
+_warm_lock = threading.Lock()
+
+
+def _kick_warm(animal: str) -> bool:
+    """Start a background warm for *animal* unless one is already running."""
+    if not animal:
+        return False
+    with _warm_lock:
+        t = _warm_threads.get(animal)
+        if t is not None and t.is_alive():
+            return False
+        th = threading.Thread(target=_warm_worker, args=(animal,),
+                              daemon=True, name=f"chronic-warm-{animal}")
+        _warm_threads[animal] = th
+        th.start()
+        return True
+
+
+def _warm_worker(animal: str) -> None:
+    try:
+        _cache().ensure_animal(animal)
+    except Exception:  # noqa: BLE001 -- lock contention is non-fatal here
+        pass
+
+
+def _is_warming(animal: str) -> bool:
+    with _warm_lock:
+        t = _warm_threads.get(animal)
+        return t is not None and t.is_alive()
 
 
 def _feature_options() -> list[dict]:
@@ -105,21 +142,26 @@ def layout(store):
                     value=0, style=DROPDOWN_STYLE, className="dark-dropdown"),
             ], style={"flex": "0 0 160px"}),
             html.Div([
-                html.Label("Trend", style=LABEL_STYLE),
+                html.Label("Trend fit", style=LABEL_STYLE),
                 dcc.Checklist(
                     id="chronic-trend-toggles",
-                    options=[{"label": " Linear", "value": "lin"},
-                             {"label": " Quad", "value": "quad"},
-                             {"label": " Moving avg", "value": "ma"}],
+                    options=[{"label": "Linear", "value": "lin"},
+                             {"label": "Quad", "value": "quad"},
+                             {"label": "Moving avg", "value": "ma"}],
                     value=["lin"], inline=True,
-                    style={"color": "#cfd0d6", "fontSize": "12px"},
-                    inputStyle={"marginRight": "3px", "marginLeft": "8px"}),
-            ], style={"flex": "0 0 240px"}),
+                    style={"fontSize": "12px"},
+                    labelStyle={"color": "#cfd0d6", "marginRight": "14px",
+                                "display": "inline-flex",
+                                "alignItems": "center"},
+                    inputStyle={"marginRight": "5px"}),
+            ], style={"flex": "0 0 260px"}),
             html.Div([
-                html.Label(" ", style=LABEL_STYLE),
-                html.Button("↻ Refresh", id="chronic-refresh-btn",
-                            n_clicks=0, style=_BTN_STYLE),
-            ], style={"flex": "0 0 110px"}),
+                html.Label("Cache", style=LABEL_STYLE),
+                html.Button("↻ Refresh / warm", id="chronic-refresh-btn",
+                            n_clicks=0, style=_BTN_STYLE,
+                            title="Re-query the cache and warm this animal "
+                                  "in the background if it isn't cached yet."),
+            ], style={"flex": "0 0 140px"}),
         ], style={"display": "flex", "gap": "14px", "marginBottom": "10px",
                   "flexWrap": "wrap"}),
 
@@ -229,25 +271,31 @@ def register_callbacks(app, store, config: dict) -> None:
             return (empty_fig("Select an animal"), blank, blank, blank,
                     blank, [], "", "")
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
+        # Query-only render. The heavy cache build runs off-thread; the
+        # Refresh button is the only thing that kicks/refreshes a warm.
+        if callback_context.triggered_id == "chronic-refresh-btn":
+            _kick_warm(animal)
         try:
             cache = _cache()
-            stats = cache.ensure_animal(animal)
             rows = cache.query(animal, hours=(hours or None))
             means = cache.query_recording_means(animal, hours=(hours or None))
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
-            err = empty_fig("Couldn't read evokedOutput", hint=str(e))
+            err = empty_fig("Couldn't read the cache", hint=str(e))
             return err, blank, blank, blank, blank, [], "", f"Error: {e}"
         rows, means, win_lbl = _apply_window(rows, means, win_hours, scroll)
         pts = _feature_points(rows, feature)
-        status = (f"{stats['files']} recordings cached "
-                  f"({stats['built']} (re)built) · {len(rows)} responses "
-                  f"· {len(pts[0])} with {_label(feature)}{win_lbl}.")
+        warming = " · ⏳ warming in background…" if _is_warming(animal) else ""
+        status = (f"{len(rows)} cached responses · {len(pts[0])} with "
+                  f"{_label(feature)}{win_lbl}{warming}.")
         table = _stats_table_rows(rows, feature)
         if not pts[0]:
-            msg = f"No {_label(feature)} for {animal} in range"
+            hint = ("" if rows else
+                    f" — not cached yet; click ↻ Refresh to warm {animal} "
+                    "in the background, then Refresh again.")
+            msg = f"No {_label(feature)} for {animal}{hint}"
             return (empty_fig(msg), blank, blank,
                     _build_waveform_overlay(means, animal),
-                    _build_stim_corr(rows, corr_mode), table, "", status)
+                    _build_stim_corr(rows, corr_mode), table, "", status + hint)
         return (_build_feature_scatter(pts, feature, animal, overlays or []),
                 _build_recording_trend(rows, feature),
                 _build_circadian(rows, feature),
