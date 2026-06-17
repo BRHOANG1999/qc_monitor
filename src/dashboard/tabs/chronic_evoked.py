@@ -23,7 +23,8 @@ from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Input, Output, callback_context, dash_table, dcc, html
+from dash import (
+    Input, Output, State, callback_context, dash_table, dcc, html)
 
 from src.dashboard.components import (
     DARK_TABLE_STYLE, DROPDOWN_STYLE, LABEL_STYLE, ZEBRA_STRIPE)
@@ -179,11 +180,19 @@ def layout(store):
                     inputStyle={"marginRight": "5px"}),
             ], style={"flex": "0 0 260px"}),
             html.Div([
-                html.Label("Cache", style=LABEL_STYLE),
+                html.Label(" ", style=LABEL_STYLE),
+                html.Button("▶ Plot", id="chronic-load-btn", n_clicks=0,
+                            style=_PLOT_BTN_STYLE,
+                            title="Build the plots for the current animal / "
+                                  "session(s) / feature. Nothing renders "
+                                  "until you click this."),
+            ], style={"flex": "0 0 110px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
                 html.Button("↻ Refresh / warm", id="chronic-refresh-btn",
                             n_clicks=0, style=_BTN_STYLE,
-                            title="Re-query the cache and warm this animal "
-                                  "in the background if it isn't cached yet."),
+                            title="Warm this animal in the background if it "
+                                  "isn't cached yet, then re-plot."),
             ], style={"flex": "0 0 140px"}),
         ], style={"display": "flex", "gap": "14px", "marginBottom": "10px",
                   "flexWrap": "wrap"}),
@@ -232,7 +241,9 @@ def layout(store):
                  style={"color": "#cfd0d6", "fontSize": "12px",
                         "minHeight": "16px", "marginBottom": "6px"}),
         dcc.Loading(type="default", color="#5e7ce2", children=[
-            dcc.Graph(id="chronic-feature-plot"),
+            dcc.Graph(id="chronic-feature-plot",
+                      figure=empty_fig("Pick animal / session(s) / feature, "
+                                       "then click ▶ Plot")),
             dcc.Graph(id="chronic-recording-plot"),
             dcc.Graph(id="chronic-circadian-plot"),
             dcc.Graph(id="chronic-waveform-plot"),
@@ -277,6 +288,9 @@ _MAX_WAVEFORMS = 40
 _BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#2a2d3a",
               "color": "#cfd0d6", "border": "1px solid #3a3d4a",
               "borderRadius": "6px", "cursor": "pointer"}
+_PLOT_BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#5e7ce2",
+                   "color": "white", "border": "none", "fontWeight": "700",
+                   "borderRadius": "6px", "cursor": "pointer"}
 
 
 def register_callbacks(app, store, config: dict) -> None:
@@ -295,7 +309,11 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("chronic-refresh-btn", "n_clicks"),
     )
     def _sessions(animal, _clicks):
-        return _session_options(animal), []
+        # Refresh updates the options (new warmed sessions) but keeps the
+        # current selection; an animal change clears it.
+        from dash import no_update
+        clear = callback_context.triggered_id == "chronic-animal-dropdown"
+        return _session_options(animal), ([] if clear else no_update)
 
     @app.callback(
         Output("chronic-feature-plot", "figure"),
@@ -306,24 +324,26 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("chronic-stats-table", "data"),
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
-        Input("chronic-animal-dropdown", "value"),
-        Input("chronic-session-dropdown", "value"),
-        Input("chronic-feature-dropdown", "value"),
-        Input("chronic-hours-dropdown", "value"),
-        Input("chronic-trend-toggles", "value"),
-        Input("chronic-corr-mode", "value"),
-        Input("chronic-window-hours", "value"),
-        Input("chronic-window-scroll", "value"),
-        Input("chronic-panels", "value"),
-        Input("chronic-roll-window", "value"),
+        Input("chronic-load-btn", "n_clicks"),
         Input("chronic-refresh-btn", "n_clicks"),
+        State("chronic-animal-dropdown", "value"),
+        State("chronic-session-dropdown", "value"),
+        State("chronic-feature-dropdown", "value"),
+        State("chronic-hours-dropdown", "value"),
+        State("chronic-trend-toggles", "value"),
+        State("chronic-corr-mode", "value"),
+        State("chronic-window-hours", "value"),
+        State("chronic-window-scroll", "value"),
+        State("chronic-panels", "value"),
+        State("chronic-roll-window", "value"),
+        prevent_initial_call=True,
     )
-    def _update(animal, sessions, feature, hours, overlays, corr_mode,
-                win_hours, scroll, panels, roll_window, _clicks):
+    def _update(_load, _refresh, animal, sessions, feature, hours, overlays,
+                corr_mode, win_hours, scroll, panels, roll_window):
         blank = empty_fig("(enable in 'Extra panels')")
         off = empty_fig("")
         if not animal:
-            return (empty_fig("Select an animal"), off, off, off,
+            return (empty_fig("Select an animal, then ▶ Plot"), off, off, off,
                     off, [], "", "")
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
         panels = panels or []
