@@ -22,9 +22,10 @@ from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Input, Output, dcc, html
+from dash import Input, Output, dash_table, dcc, html
 
-from src.dashboard.components import DROPDOWN_STYLE, LABEL_STYLE
+from src.dashboard.components import (
+    DARK_TABLE_STYLE, DROPDOWN_STYLE, LABEL_STYLE, ZEBRA_STRIPE)
 from src.dashboard.data_helpers import (
     EVOKED_FEATURE_LABELS, TIME_RANGE_OPTIONS, empty_fig)
 from src.utils import evoked_features as ef
@@ -122,6 +123,24 @@ def layout(store):
         ], style={"display": "flex", "gap": "14px", "marginBottom": "10px",
                   "flexWrap": "wrap"}),
 
+        html.Div([
+            html.Div([
+                html.Label("Window (h, 0=all)", style=LABEL_STYLE),
+                dcc.Input(id="chronic-window-hours", type="number",
+                          value=0, min=0, step=12,
+                          style={"width": "100%", "padding": "6px",
+                                 "background": "#1f2230", "color": "#cfd0d6",
+                                 "border": "1px solid #3a3d4a",
+                                 "borderRadius": "6px"}),
+            ], style={"flex": "0 0 150px"}),
+            html.Div([
+                html.Label("Scroll", style=LABEL_STYLE),
+                dcc.Slider(id="chronic-window-scroll", min=0, max=1,
+                           step=0.01, value=0, marks=None,
+                           tooltip={"placement": "bottom"}),
+            ], style={"flex": "1", "minWidth": "200px"}),
+        ], style={"display": "flex", "gap": "14px", "alignItems": "center",
+                  "marginBottom": "8px"}),
         html.Div(id="chronic-status",
                  style={"color": "#8a8d99", "fontSize": "11px",
                         "minHeight": "14px"}),
@@ -131,6 +150,7 @@ def layout(store):
         dcc.Loading(type="default", color="#5e7ce2", children=[
             dcc.Graph(id="chronic-feature-plot"),
             dcc.Graph(id="chronic-recording-plot"),
+            dcc.Graph(id="chronic-circadian-plot"),
             dcc.Graph(id="chronic-waveform-plot"),
             html.Div([
                 html.Label("Correlation", style=LABEL_STYLE),
@@ -143,6 +163,15 @@ def layout(store):
                     className="dark-dropdown"),
             ], style={"marginTop": "6px"}),
             dcc.Graph(id="chronic-corr-plot"),
+            html.Div("Per-recording summary", style={**LABEL_STYLE,
+                     "marginTop": "10px"}),
+            dash_table.DataTable(
+                id="chronic-stats-table", page_size=15,
+                sort_action="native",
+                columns=[{"name": c, "id": c} for c in
+                         ["Recording", "N", "Mean", "SD"]],
+                style_data_conditional=[ZEBRA_STRIPE],
+                **DARK_TABLE_STYLE),
         ]),
     ])
 
@@ -178,8 +207,10 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("chronic-feature-plot", "figure"),
         Output("chronic-recording-plot", "figure"),
+        Output("chronic-circadian-plot", "figure"),
         Output("chronic-waveform-plot", "figure"),
         Output("chronic-corr-plot", "figure"),
+        Output("chronic-stats-table", "data"),
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
         Input("chronic-animal-dropdown", "value"),
@@ -187,12 +218,16 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("chronic-hours-dropdown", "value"),
         Input("chronic-trend-toggles", "value"),
         Input("chronic-corr-mode", "value"),
+        Input("chronic-window-hours", "value"),
+        Input("chronic-window-scroll", "value"),
         Input("chronic-refresh-btn", "n_clicks"),
     )
-    def _update(animal, feature, hours, overlays, corr_mode, _clicks):
+    def _update(animal, feature, hours, overlays, corr_mode,
+                win_hours, scroll, _clicks):
         blank = empty_fig("")
         if not animal:
-            return (empty_fig("Select an animal"), blank, blank, blank, "", "")
+            return (empty_fig("Select an animal"), blank, blank, blank,
+                    blank, [], "", "")
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
         try:
             cache = _cache()
@@ -201,20 +236,23 @@ def register_callbacks(app, store, config: dict) -> None:
             means = cache.query_recording_means(animal, hours=(hours or None))
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             err = empty_fig("Couldn't read evokedOutput", hint=str(e))
-            return err, blank, blank, blank, "", f"Error: {e}"
+            return err, blank, blank, blank, blank, [], "", f"Error: {e}"
+        rows, means, win_lbl = _apply_window(rows, means, win_hours, scroll)
         pts = _feature_points(rows, feature)
         status = (f"{stats['files']} recordings cached "
                   f"({stats['built']} (re)built) · {len(rows)} responses "
-                  f"· {len(pts[0])} with {_label(feature)}.")
+                  f"· {len(pts[0])} with {_label(feature)}{win_lbl}.")
+        table = _stats_table_rows(rows, feature)
         if not pts[0]:
             msg = f"No {_label(feature)} for {animal} in range"
-            return (empty_fig(msg), blank,
+            return (empty_fig(msg), blank, blank,
                     _build_waveform_overlay(means, animal),
-                    _build_stim_corr(rows, corr_mode), "", status)
+                    _build_stim_corr(rows, corr_mode), table, "", status)
         return (_build_feature_scatter(pts, feature, animal, overlays or []),
                 _build_recording_trend(rows, feature),
+                _build_circadian(rows, feature),
                 _build_waveform_overlay(means, animal),
-                _build_stim_corr(rows, corr_mode),
+                _build_stim_corr(rows, corr_mode), table,
                 _trend_stats(pts, feature), status)
 
 
@@ -400,6 +438,111 @@ def _add_regression(fig, xa, ya) -> None:
         line=dict(color="#ff453a", width=2),
         name=f"r={lr.rvalue:.2f} r²={lr.rvalue**2:.2f} "
              f"p={lr.pvalue:.1e} n={xa.size}"))
+
+
+def _apply_window(rows, means, win_hours, scroll):
+    """Filter to a scrollable [start, start+window) slice of wall time."""
+    if not win_hours or win_hours <= 0 or not rows:
+        return rows, means, ""
+    times = [_parse_iso(r.get("abs_dt")) for r in rows]
+    valid = [t for t in times if t is not None]
+    if not valid:
+        return rows, means, ""
+    t0, t1 = min(valid), max(valid)
+    span = (t1 - t0).total_seconds() / 3600.0
+    if span <= win_hours:
+        return rows, means, ""
+    start_h = float(scroll or 0) * (span - win_hours)
+    start = t0.timestamp() + start_h * 3600.0
+    end = start + win_hours * 3600.0
+    rw = [r for r, t in zip(rows, times)
+          if t is not None and start <= t.timestamp() < end]
+    mw = [m for m in means
+          if _in_window(m.get("rec_dt"), start, end)]
+    lbl = f" · window {win_hours:g}h @ +{start_h:.0f}h"
+    return rw, mw, lbl
+
+
+def _in_window(rec_dt, start, end) -> bool:
+    t = _parse_iso(rec_dt)
+    return t is not None and start <= t.timestamp() < end
+
+
+def _build_circadian(rows, feature) -> go.Figure:
+    """Polar: theta = time-of-day, rho = feature; 24-bin mean + Rayleigh."""
+    label = _label(feature)
+    theta, rho = [], []
+    for r in rows:
+        v = r.get(feature)
+        dt = _parse_iso(r.get("abs_dt"))
+        if v is None or dt is None:
+            continue
+        hod = dt.hour + dt.minute / 60.0
+        theta.append(hod / 24.0 * 360.0)
+        rho.append(float(v))
+    if len(theta) < 3:
+        return empty_fig("Not enough points for a circadian view")
+    th = np.asarray(theta)
+    rh = np.asarray(rho)
+    shift = -min(0.0, float(rh.min()))         # keep rho >= 0 for polar
+    fig = go.Figure(go.Scatterpolargl(
+        theta=th, r=rh + shift, mode="markers",
+        marker=dict(size=4, color=th, colorscale="Turbo", opacity=0.5),
+        name="responses"))
+    _add_hourly_mean(fig, th, rh + shift)
+    R, p = _rayleigh(np.deg2rad(th))
+    fig.update_layout(
+        title=f"{label} by time of day — Rayleigh R={R:.2f} p={p:.1e}",
+        height=420, polar=dict(angularaxis=dict(
+            rotation=90, direction="clockwise",
+            tickmode="array", tickvals=[0, 90, 180, 270],
+            ticktext=["0h", "6h", "12h", "18h"])))
+    return fig
+
+
+def _add_hourly_mean(fig, th, rho) -> None:
+    bins = np.floor(th / 15.0).astype(int) % 24     # 24 bins of 15 deg
+    cx, cy = [], []
+    for b in range(24):
+        m = bins == b
+        if np.any(m):
+            cx.append((b + 0.5) * 15.0)
+            cy.append(float(np.mean(rho[m])))
+    if cx:
+        cx.append(cx[0])
+        cy.append(cy[0])
+        fig.add_trace(go.Scatterpolar(theta=cx, r=cy, mode="lines",
+                      line=dict(color="#ff453a", width=2),
+                      name="hourly mean"))
+
+
+def _rayleigh(angles):
+    """Rayleigh mean resultant length R and p-value for circular data."""
+    n = angles.size
+    if n == 0:
+        return 0.0, 1.0
+    c = np.mean(np.cos(angles))
+    s = np.mean(np.sin(angles))
+    R = float(np.hypot(c, s))
+    z = n * R * R
+    p = float(np.exp(-z) * (1 + (2 * z - z * z) / (4 * n)))
+    return R, min(1.0, max(0.0, p))
+
+
+def _stats_table_rows(rows, feature) -> list:
+    """Per-recording N / mean / SD of the selected feature."""
+    grouped: "OrderedDict[str, list]" = OrderedDict()
+    for r in rows:
+        v = r.get(feature)
+        if v is not None and r.get("rec_dt"):
+            grouped.setdefault(r["rec_dt"], []).append(float(v))
+    out = []
+    for rec, vals in grouped.items():
+        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        out.append({"Recording": str(rec)[:19], "N": len(vals),
+                    "Mean": f"{statistics.mean(vals):.4g}",
+                    "SD": f"{sd:.4g}"})
+    return out
 
 
 def _time_colors(n) -> list:
