@@ -128,6 +128,20 @@ def _round(arr) -> list:
     return [round(float(v), 4) for v in np.asarray(arr).ravel()]
 
 
+def _add_time_session(sql: str, params: list, hours, sessions):
+    """Append the optional ``rec_dt > cutoff`` and ``session IN (...)``
+    clauses (both join on file_meta alias ``m``)."""
+    if hours:
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        sql += " AND m.rec_dt > ?"
+        params.append(cutoff)
+    if sessions:
+        marks = ",".join("?" * len(sessions))
+        sql += f" AND m.session IN ({marks})"
+        params.extend(sessions)
+    return sql, params
+
+
 def _mean_row_to_dict(r) -> dict:
     d = dict(r)
     for k in ("time_axis", "mean_trace", "std_trace"):
@@ -143,6 +157,15 @@ def animals_in_filename(filename: str) -> set[str]:
     if not filename:
         return set()
     return set(_ANIMAL_RX.findall(os.path.basename(filename)))
+
+
+def parse_session(filename: str) -> str:
+    """Session/protocol label = the filename prefix before the channel
+    list (the first ``__``). E.g. ``20251210_stimBaseline__stimCopy_...``
+    -> ``20251210_stimBaseline``; ``stimTest-40nC__...`` -> ``stimTest-40nC``.
+    """
+    b = os.path.basename(filename or "")
+    return b.split("__", 1)[0] if b else ""
 
 
 def list_evoked_files(evoked_dir: str) -> list[str]:
@@ -223,6 +246,7 @@ class ChronicEvokedCache:
         self.evoked_dir = evoked_dir or DEFAULT_EVOKED_DIR
         self.cache_db = cache_db or DEFAULT_CACHE_DB
         self.compute_expensive = bool(compute_expensive)
+        self._has_session = False   # set by _init_schema (may be locked out)
         assert isinstance(self.evoked_dir, str), "evoked_dir must be str"
         assert isinstance(self.cache_db, str), "cache_db must be str"
         d = os.path.dirname(self.cache_db)
@@ -256,6 +280,7 @@ class ChronicEvokedCache:
             ).fetchone()
             if row is None or row["value"] != SCHEMA_VERSION:
                 self._reset_schema(conn)
+            self._has_session = self._ensure_session_column(conn)
             conn.commit()
         finally:
             conn.close()
@@ -273,7 +298,7 @@ class ChronicEvokedCache:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT UNIQUE NOT NULL,
                 mtime REAL NOT NULL, rec_dt TEXT, built_at TEXT,
-                n_epochs INTEGER, fs REAL
+                n_epochs INTEGER, fs REAL, session TEXT
             );
             CREATE TABLE epoch (
                 file_id INTEGER NOT NULL, animal TEXT NOT NULL,
@@ -289,11 +314,38 @@ class ChronicEvokedCache:
             CREATE INDEX idx_epoch_animal ON epoch(animal);
             CREATE INDEX idx_epoch_file ON epoch(file_id);
             CREATE INDEX idx_recmean_animal ON recording_mean(animal);
+            CREATE INDEX idx_fm_session ON file_meta(session);
             """
         )
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('schema_version', ?)", (SCHEMA_VERSION,))
+
+    def _ensure_session_column(self, conn) -> bool:
+        """Add + backfill file_meta.session without re-warming (parses the
+        path string only). Returns True when the column is available.
+
+        Resilient: if the ALTER/backfill can't get the write lock (a warm is
+        running), return False -- queries fall back to no-session mode and a
+        later cache open retries. Avoids breaking the tab under contention.
+        """
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(file_meta)")]
+        try:
+            if "session" not in cols:
+                conn.execute("ALTER TABLE file_meta ADD COLUMN session TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_fm_session "
+                             "ON file_meta(session)")
+            rows = conn.execute(
+                "SELECT id, file_path FROM file_meta "
+                "WHERE session IS NULL").fetchall()
+            for i, r in enumerate(rows):
+                assert i < _MAX_FILES, "session backfill exceeds bound"
+                conn.execute("UPDATE file_meta SET session=? WHERE id=?",
+                             (parse_session(r["file_path"]), r["id"]))
+            return True
+        except sqlite3.OperationalError:
+            conn.rollback()
+            return "session" in cols
 
     def files_for_animal(self, animal: str) -> list[str]:
         """Evoked files whose filename names *animal* (sorted by time)."""
@@ -444,40 +496,58 @@ class ChronicEvokedCache:
         even if two builders touch the same path.
         """
         now = datetime.now().isoformat()
+        session = parse_session(path)
         conn.execute(
             "INSERT OR IGNORE INTO file_meta (file_path, mtime, rec_dt, "
-            "built_at) VALUES (?,?,?,?)", (path, mtime, rec_iso, now))
+            "built_at, session) VALUES (?,?,?,?,?)",
+            (path, mtime, rec_iso, now, session))
         conn.execute(
-            "UPDATE file_meta SET mtime=?, rec_dt=?, built_at=? "
-            "WHERE file_path=?", (mtime, rec_iso, now, path))
+            "UPDATE file_meta SET mtime=?, rec_dt=?, built_at=?, session=? "
+            "WHERE file_path=?", (mtime, rec_iso, now, session, path))
         row = conn.execute("SELECT id FROM file_meta WHERE file_path = ?",
                            (path,)).fetchone()
         assert row is not None, "file_meta upsert lost its row"
         return int(row["id"])
 
-    def query(self, animal: str, hours: int | None = None) -> list[dict]:
+    def list_sessions(self, animal: str) -> list[str]:
+        """Distinct session labels for *animal* (sorted)."""
+        if not animal or not self._has_session:
+            return []
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT m.session FROM epoch e "
+                "JOIN file_meta m ON e.file_id = m.id "
+                "WHERE e.animal = ? AND m.session IS NOT NULL "
+                "ORDER BY m.session", (animal,)).fetchall()
+        finally:
+            conn.close()
+        return [r["session"] for r in rows if r["session"]]
+
+    def query(self, animal: str, hours: int | None = None,
+              sessions: list | None = None) -> list[dict]:
         """Per-epoch rows for *animal*, oldest first (optionally last N h).
 
         ``abs_dt`` (recording time + stim offset) is computed here from the
-        joined ``rec_dt``; ``hours`` filters on recording datetime. Each
-        dict carries channel/electrode/rec_dt/abs_dt/stim_time_sec, the raw
-        stim ``peak``/``trough``, and every computed evoked feature column.
+        joined ``rec_dt``; ``hours`` filters on recording datetime;
+        ``sessions`` (a list of session labels) restricts to those sessions
+        (combining several when more than one is given). Each dict carries
+        channel/electrode/rec_dt/abs_dt/stim_time_sec/session, the raw stim
+        ``peak``/``trough``, and every computed evoked feature column.
         """
         if not animal:
             return []
         feat_sel = ", ".join("e." + c for c in ef.ALL_COLUMNS)
+        sess_sel = "m.session" if self._has_session else "NULL AS session"
+        use_sessions = sessions if self._has_session else None
         conn = self._conn()
         try:
-            sql = ("SELECT e.channel, e.electrode, m.rec_dt, "
-                   "e.stim_time_sec, e.peak, e.trough, " + feat_sel +
+            sql = ("SELECT e.channel, e.electrode, m.rec_dt, " + sess_sel +
+                   ", e.stim_time_sec, e.peak, e.trough, " + feat_sel +
                    " FROM epoch e JOIN file_meta m ON e.file_id = m.id "
                    "WHERE e.animal = ?")
             params: list = [animal]
-            if hours:
-                cutoff = (datetime.now()
-                          - timedelta(hours=hours)).isoformat()
-                sql += " AND m.rec_dt > ?"
-                params.append(cutoff)
+            sql, params = _add_time_session(sql, params, hours, use_sessions)
             sql += " ORDER BY m.rec_dt ASC, e.stim_time_sec ASC"
             rows = conn.execute(sql, params).fetchall()
         finally:
@@ -485,11 +555,13 @@ class ChronicEvokedCache:
         return [self._row_to_dict(r) for r in rows]
 
     def query_recording_means(self, animal: str,
-                              hours: int | None = None) -> list[dict]:
+                              hours: int | None = None,
+                              sessions: list | None = None) -> list[dict]:
         """Per-recording mean/std evoked waveforms for *animal*, oldest first.
 
         Each dict: channel, rec_dt, n_epochs, and ``time_axis``/``mean_trace``/
-        ``std_trace`` decoded back to Python float lists.
+        ``std_trace`` decoded back to Python float lists. ``sessions`` filters
+        to the given session labels.
         """
         if not animal:
             return []
@@ -501,11 +573,8 @@ class ChronicEvokedCache:
                    "JOIN file_meta m ON rm.file_id = m.id "
                    "WHERE rm.animal = ?")
             params: list = [animal]
-            if hours:
-                cutoff = (datetime.now()
-                          - timedelta(hours=hours)).isoformat()
-                sql += " AND m.rec_dt > ?"
-                params.append(cutoff)
+            use_sessions = sessions if self._has_session else None
+            sql, params = _add_time_session(sql, params, hours, use_sessions)
             sql += " ORDER BY m.rec_dt ASC"
             rows = conn.execute(sql, params).fetchall()
         finally:

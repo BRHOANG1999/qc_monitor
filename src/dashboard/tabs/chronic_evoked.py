@@ -98,6 +98,11 @@ def _is_warming(animal: str) -> bool:
         return t is not None and t.is_alive()
 
 
+_INPUT_STYLE = {"width": "100%", "padding": "6px", "background": "#1f2230",
+                "color": "#cfd0d6", "border": "1px solid #3a3d4a",
+                "borderRadius": "6px"}
+
+
 def _feature_options() -> list[dict]:
     opts = []
     for col in _FEATURE_COLS:
@@ -106,6 +111,16 @@ def _feature_options() -> list[dict]:
         opts.append({"label": _label(col) + suffix, "value": col,
                      "disabled": disabled})
     return opts
+
+
+def _session_options(animal) -> list[dict]:
+    """Session labels for *animal*, or [] (best-effort; never raises)."""
+    if not animal:
+        return []
+    try:
+        return [{"label": s, "value": s} for s in _cache().list_sessions(animal)]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def layout(store):
@@ -127,7 +142,15 @@ def layout(store):
                     options=[{"label": a, "value": a} for a in animals],
                     value=default_animal, style=DROPDOWN_STYLE,
                     className="dark-dropdown"),
-            ], style={"flex": "1", "minWidth": "170px"}),
+            ], style={"flex": "1", "minWidth": "150px"}),
+            html.Div([
+                html.Label("Session(s) — blank = all", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="chronic-session-dropdown",
+                    options=_session_options(default_animal), value=[],
+                    multi=True, placeholder="All sessions",
+                    style=DROPDOWN_STYLE, className="dark-dropdown"),
+            ], style={"flex": "1.4", "minWidth": "220px"}),
             html.Div([
                 html.Label("Feature", style=LABEL_STYLE),
                 dcc.Dropdown(
@@ -167,13 +190,32 @@ def layout(store):
 
         html.Div([
             html.Div([
+                html.Label("Rolling window (responses)", style=LABEL_STYLE),
+                dcc.Input(id="chronic-roll-window", type="number",
+                          value=301, min=11, step=20, style=_INPUT_STYLE),
+            ], style={"flex": "0 0 190px"}),
+            html.Div([
+                html.Label("Extra panels (off = faster)", style=LABEL_STYLE),
+                dcc.Checklist(
+                    id="chronic-panels",
+                    options=[{"label": "Per-recording trend", "value": "rec"},
+                             {"label": "Mean waveform", "value": "wave"},
+                             {"label": "Stim↔evoked corr", "value": "corr"},
+                             {"label": "Circadian", "value": "circ"},
+                             {"label": "Table", "value": "table"}],
+                    value=[], inline=True, style={"fontSize": "12px"},
+                    labelStyle={"color": "#cfd0d6", "marginRight": "12px",
+                                "display": "inline-flex",
+                                "alignItems": "center"},
+                    inputStyle={"marginRight": "5px"}),
+            ], style={"flex": "1", "minWidth": "320px"}),
+        ], style={"display": "flex", "gap": "14px", "alignItems": "center",
+                  "marginBottom": "8px", "flexWrap": "wrap"}),
+        html.Div([
+            html.Div([
                 html.Label("Window (h, 0=all)", style=LABEL_STYLE),
                 dcc.Input(id="chronic-window-hours", type="number",
-                          value=0, min=0, step=12,
-                          style={"width": "100%", "padding": "6px",
-                                 "background": "#1f2230", "color": "#cfd0d6",
-                                 "border": "1px solid #3a3d4a",
-                                 "borderRadius": "6px"}),
+                          value=0, min=0, step=12, style=_INPUT_STYLE),
             ], style={"flex": "0 0 150px"}),
             html.Div([
                 html.Label("Scroll", style=LABEL_STYLE),
@@ -247,6 +289,15 @@ def register_callbacks(app, store, config: dict) -> None:
     _EXPENSIVE_ENABLED = bool(ce.get("compute_expensive", False))
 
     @app.callback(
+        Output("chronic-session-dropdown", "options"),
+        Output("chronic-session-dropdown", "value"),
+        Input("chronic-animal-dropdown", "value"),
+        Input("chronic-refresh-btn", "n_clicks"),
+    )
+    def _sessions(animal, _clicks):
+        return _session_options(animal), []
+
+    @app.callback(
         Output("chronic-feature-plot", "figure"),
         Output("chronic-recording-plot", "figure"),
         Output("chronic-circadian-plot", "figure"),
@@ -256,51 +307,63 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
         Input("chronic-animal-dropdown", "value"),
+        Input("chronic-session-dropdown", "value"),
         Input("chronic-feature-dropdown", "value"),
         Input("chronic-hours-dropdown", "value"),
         Input("chronic-trend-toggles", "value"),
         Input("chronic-corr-mode", "value"),
         Input("chronic-window-hours", "value"),
         Input("chronic-window-scroll", "value"),
+        Input("chronic-panels", "value"),
+        Input("chronic-roll-window", "value"),
         Input("chronic-refresh-btn", "n_clicks"),
     )
-    def _update(animal, feature, hours, overlays, corr_mode,
-                win_hours, scroll, _clicks):
-        blank = empty_fig("")
+    def _update(animal, sessions, feature, hours, overlays, corr_mode,
+                win_hours, scroll, panels, roll_window, _clicks):
+        blank = empty_fig("(enable in 'Extra panels')")
+        off = empty_fig("")
         if not animal:
-            return (empty_fig("Select an animal"), blank, blank, blank,
-                    blank, [], "", "")
+            return (empty_fig("Select an animal"), off, off, off,
+                    off, [], "", "")
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
-        # Query-only render. The heavy cache build runs off-thread; the
-        # Refresh button is the only thing that kicks/refreshes a warm.
+        panels = panels or []
+        # Query-only render; the heavy build runs off-thread on Refresh.
         if callback_context.triggered_id == "chronic-refresh-btn":
             _kick_warm(animal)
+        sess = sessions or None
         try:
             cache = _cache()
-            rows = cache.query(animal, hours=(hours or None))
-            means = cache.query_recording_means(animal, hours=(hours or None))
+            rows = cache.query(animal, hours=(hours or None), sessions=sess)
+            need_wave = "wave" in panels
+            means = (cache.query_recording_means(
+                animal, hours=(hours or None), sessions=sess)
+                if need_wave else [])
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             err = empty_fig("Couldn't read the cache", hint=str(e))
-            return err, blank, blank, blank, blank, [], "", f"Error: {e}"
+            return err, off, off, off, off, [], "", f"Error: {e}"
         rows, means, win_lbl = _apply_window(rows, means, win_hours, scroll)
         pts = _feature_points(rows, feature)
-        warming = " · ⏳ warming in background…" if _is_warming(animal) else ""
-        status = (f"{len(rows)} cached responses · {len(pts[0])} with "
-                  f"{_label(feature)}{win_lbl}{warming}.")
-        table = _stats_table_rows(rows, feature)
+        warming = " · ⏳ warming…" if _is_warming(animal) else ""
+        sess_lbl = f" · {len(sess)} session(s)" if sess else ""
+        status = (f"{len(rows)} responses · {len(pts[0])} with "
+                  f"{_label(feature)}{sess_lbl}{win_lbl}{warming}.")
         if not pts[0]:
             hint = ("" if rows else
-                    f" — not cached yet; click ↻ Refresh to warm {animal} "
-                    "in the background, then Refresh again.")
-            msg = f"No {_label(feature)} for {animal}{hint}"
-            return (empty_fig(msg), blank, blank,
-                    _build_waveform_overlay(means, animal),
-                    _build_stim_corr(rows, corr_mode), table, "", status + hint)
-        return (_build_feature_scatter(pts, feature, animal, overlays or []),
-                _build_recording_trend(rows, feature),
-                _build_circadian(rows, feature),
-                _build_waveform_overlay(means, animal),
-                _build_stim_corr(rows, corr_mode), table,
+                    f" — not cached yet; click ↻ Refresh / warm to build "
+                    f"{animal}, then refresh.")
+            return (empty_fig(f"No {_label(feature)} for {animal}{hint}"),
+                    off, off, off, off, [], "", status + hint)
+        # Optional panels: only compute the ones that are enabled.
+        rec = _build_recording_trend(rows, feature) if "rec" in panels else blank
+        circ = _build_circadian(rows, feature) if "circ" in panels else blank
+        wave = (_build_waveform_overlay(means, animal)
+                if "wave" in panels else blank)
+        corr = (_build_stim_corr(rows, corr_mode)
+                if "corr" in panels else blank)
+        table = _stats_table_rows(rows, feature) if "table" in panels else []
+        return (_build_feature_scatter(pts, feature, animal, overlays or [],
+                                       roll_window),
+                rec, circ, wave, corr, table,
                 _trend_stats(pts, feature), status)
 
 
@@ -328,42 +391,96 @@ def _stride(n, cap):
     return (n // cap) + 1
 
 
-def _build_feature_scatter(pts, feature, animal, overlays) -> go.Figure:
+def _build_feature_scatter(pts, feature, animal, overlays,
+                            roll_window) -> go.Figure:
+    """Every evoked response (faded markers) + a sliding-window rolling
+    median line with two percentile ribbons: 10-90 (light) and 25-75
+    (darker). Optional linear/quad trend overlays."""
     iso, secs, vals = pts
     label = _label(feature)
-    step = _stride(len(secs), _MAX_POINTS)
-    color = _norm(secs)
+    order = np.argsort(secs)            # time-ascending for the ribbon
+    iso_s = np.asarray(iso)[order]
+    secs_s = secs[order]
+    vals_s = vals[order]
+    step = _stride(len(secs_s), _MAX_POINTS)
     fig = go.Figure()
+    # Faded raw responses so the ribbon reads on top.
     fig.add_trace(go.Scattergl(
-        x=iso[::step], y=vals[::step], mode="markers",
-        marker=dict(size=4, color=color[::step], colorscale="Turbo",
-                    opacity=0.6, colorbar=dict(title="time", thickness=10)),
+        x=iso_s[::step], y=vals_s[::step], mode="markers",
+        marker=dict(size=3, color="#8a8d99", opacity=0.25),
         name="responses", hoverinfo="x+y"))
-    _add_trend_overlays(fig, iso, secs, vals, overlays)
-    note = " (stride-sampled)" if step > 1 else ""
+    _add_ribbon(fig, secs_s, vals_s, roll_window)
+    _add_trend_overlays(fig, iso_s, secs_s, vals_s, overlays)
+    note = " (markers stride-sampled)" if step > 1 else ""
     fig.update_layout(
         title=f"{label} per evoked response — {animal}{note}",
         xaxis_title="Recording time", yaxis_title=label,
-        height=430, hovermode="closest", showlegend=True,
-        legend=dict(font=dict(size=10)))
+        height=460, hovermode="closest", showlegend=True,
+        legend=dict(font=dict(size=10), orientation="h", y=1.02,
+                    yanchor="bottom"))
     return fig
+
+
+def _add_ribbon(fig, secs_sorted, vals_sorted, roll_window) -> None:
+    """Rolling 10/25/50/75/90 percentiles over a sliding count window."""
+    try:
+        win = int(roll_window)
+    except (TypeError, ValueError):
+        win = 301
+    win = max(11, win)
+    res = _rolling_percentiles(secs_sorted, vals_sorted, win)
+    if res is None:
+        return
+    t_iso, p10, p25, p50, p75, p90 = res
+    # 10-90 band (light), then 25-75 (darker), then the median line.
+    _band(fig, t_iso, p10, p90, "rgba(94,124,226,0.13)", "10–90%")
+    _band(fig, t_iso, p25, p75, "rgba(94,124,226,0.30)", "25–75%")
+    fig.add_trace(go.Scatter(
+        x=t_iso, y=p50, mode="lines", line=dict(color="#5e7ce2", width=2.5),
+        name=f"rolling median (win {win})"))
+
+
+def _band(fig, t_iso, lo, hi, color, name) -> None:
+    fig.add_trace(go.Scatter(
+        x=list(t_iso) + list(t_iso[::-1]),
+        y=list(hi) + list(lo[::-1]), fill="toself", fillcolor=color,
+        line=dict(width=0), name=name, hoverinfo="skip"))
+
+
+def _rolling_percentiles(secs_sorted, vals_sorted, win, n_eval=400):
+    """Evaluate 10/25/50/75/90 percentiles in a centered count window at
+    up to *n_eval* evenly-spaced positions. Returns (iso_times, p10, p25,
+    p50, p75, p90) or None when there aren't enough points."""
+    n = vals_sorted.size
+    if n < max(11, win // 2):
+        return None
+    half = win // 2
+    lo_i, hi_i = half, n - half - 1
+    if hi_i <= lo_i:
+        lo_i, hi_i = 0, n - 1
+    idxs = np.unique(np.linspace(lo_i, hi_i,
+                                 min(n_eval, hi_i - lo_i + 1)).astype(int))
+    qs = np.array([10, 25, 50, 75, 90])
+    out = np.empty((idxs.size, 5))
+    for k, i in enumerate(idxs):
+        seg = vals_sorted[max(0, i - half):min(n, i + half + 1)]
+        out[k] = np.percentile(seg, qs)
+    t_iso = [datetime.fromtimestamp(s).isoformat() for s in secs_sorted[idxs]]
+    return (t_iso, out[:, 0], out[:, 1], out[:, 2], out[:, 3], out[:, 4])
 
 
 def _add_trend_overlays(fig, iso, secs, vals, overlays) -> None:
     if secs.size < 3:
         return
-    order = np.argsort(secs)
-    xs = np.asarray(iso)[order]
-    t = secs[order] - secs[order][0]
-    y = vals[order]
+    t = secs - secs[0]
     if "lin" in overlays:
-        _add_polyline(fig, xs, t, y, 1, "#ffffff", "linear")
+        _add_polyline(fig, iso, t, vals, 1, "#ffffff", "linear")
     if "quad" in overlays and t.size >= 3:
-        _add_polyline(fig, xs, t, y, 2, "#ffd60a", "quadratic")
+        _add_polyline(fig, iso, t, vals, 2, "#ffd60a", "quadratic")
     if "ma" in overlays:
-        ma = ef.rolling_centered(y, _MA_WINDOW, "mean")
-        fig.add_trace(go.Scattergl(x=xs, y=ma, mode="lines",
-                                   line=dict(color="#30d158", width=2),
+        ma = ef.rolling_centered(vals, _MA_WINDOW, "mean")
+        fig.add_trace(go.Scattergl(x=iso, y=ma, mode="lines",
+                                   line=dict(color="#30d158", width=1.5),
                                    name=f"moving avg ({_MA_WINDOW})"))
 
 

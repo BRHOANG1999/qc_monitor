@@ -89,6 +89,33 @@ def test_expensive_columns_filled_when_enabled(tmp_path):
     assert any(rows[-1][c] is not None for c in ef.EXPENSIVE_COLUMNS)
 
 
+def test_session_filtering(tmp_path):
+    ed = tmp_path / "eo"
+    ed.mkdir(exist_ok=True)
+    n = 6
+    sp = np.linspace(1, 2, n)
+    st = np.linspace(-1, -0.5, n)
+    # Two sessions (distinct filename prefixes) for the same animal.
+    _write(str(ed / "20251210_stimBaseline__BCH062SR___"
+               "2025_12_10__06_00_00_evoked.mat"), {"BCH062SR": (n, sp, st)})
+    _write(str(ed / "stimTest-40nC__BCH062SR___"
+               "2026_05_10__06_00_00_evoked.mat"), {"BCH062SR": (n, sp, st)})
+    cache = ChronicEvokedCache(str(ed), str(tmp_path / "c.db"))
+    cache.ensure_animal("BCH062")
+    assert cache._has_session
+    sessions = cache.list_sessions("BCH062")
+    assert sessions == ["20251210_stimBaseline", "stimTest-40nC"]
+    # All sessions vs one session (combine = pass a list).
+    assert len(cache.query("BCH062")) == 12
+    one = cache.query("BCH062", sessions=["stimTest-40nC"])
+    assert len(one) == 6
+    assert all(r["session"] == "stimTest-40nC" for r in one)
+    both = cache.query("BCH062", sessions=sessions)
+    assert len(both) == 12
+    assert cache.query_recording_means(
+        "BCH062", sessions=["20251210_stimBaseline"]) != []
+
+
 def test_incremental_and_schema_rebuild(tmp_path):
     cache, ed = _cache(tmp_path)
     cache.ensure_animal("BCH062")
