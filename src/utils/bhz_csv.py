@@ -38,7 +38,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 from src.utils.version import qc_monitor_version
@@ -65,6 +65,11 @@ COLUMNS: tuple[str, ...] = (
     "Roomlight", "VideoQuality", "VideoComment",
     "BehaviorOnsetComment", "Comment", "Light", "Mode", "Target",
     "scorecomment",
+    # Lab-local trailing additions (after the 44-col reference). Both are
+    # appended at the END so MATLAB readtable + the first-44 contract are
+    # untouched. EventEO_WallClock = the EEG/electrographic onset (EventEO)
+    # rendered as an absolute wall-clock datetime, for chronic alignment.
+    "EventEO_WallClock",
     "SoftwareVersion",
 )
 
@@ -103,6 +108,42 @@ def _to_sample_index(t_sec: float | None,
         return None
     assert fs > 0, "fs must be > 0"
     return int(round(tf * fs))
+
+
+def _wall_clock_eo(eo_sec, file_meta: dict, fs: float) -> str:
+    """Absolute wall-clock datetime of the EEG onset (EventEO).
+
+    ``EventEO`` is a sample index from the recording start. The recording
+    start = ``Peak_Date Peak_Time`` minus ``Peak_Index/fs`` (when a peak
+    index is present; the app's review flows set Peak_* to the recording
+    chunk start with no peak index, so the offset is 0). Returns "" when
+    the onset or the peak timestamp is missing.
+    """
+    if eo_sec is None or eo_sec == "":
+        return ""
+    try:
+        eo = float(eo_sec)
+    except (TypeError, ValueError):
+        return ""
+    if eo != eo:  # NaN
+        return ""
+    pdate = (file_meta.get("Peak_Date") or "").strip()
+    ptime = (file_meta.get("Peak_Time") or "00:00:00").strip()
+    if not pdate:
+        return ""
+    peak_dt = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            peak_dt = datetime.strptime(f"{pdate} {ptime}", fmt)
+            break
+        except ValueError:
+            continue
+    if peak_dt is None:
+        return ""
+    pidx = file_meta.get("Peak_Index")
+    offset = (float(pidx) / fs) if (pidx not in (None, "") and fs > 0) else 0.0
+    wall = peak_dt - timedelta(seconds=offset) + timedelta(seconds=eo)
+    return wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def _fmt_cell(col: str, val) -> str:
@@ -168,6 +209,8 @@ def _event_to_row(event: dict, file_meta: dict,
     row.update(file_meta)
     # Sample-index conversions
     row["EventEO"] = _to_sample_index(event.get("EO_sec"), fs)
+    row["EventEO_WallClock"] = _wall_clock_eo(
+        event.get("EO_sec"), file_meta, fs)
     row["EventLAS"] = _to_sample_index(event.get("LAS_sec"), fs)
     row["EventBO"] = _to_sample_index(event.get("BO_sec"), fs)
     row["EventPID"] = _to_sample_index(event.get("PID_sec"), fs)

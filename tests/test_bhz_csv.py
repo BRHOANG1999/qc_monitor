@@ -16,7 +16,7 @@ import math
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.utils.bhz_csv import (
@@ -42,13 +42,15 @@ class CsvHeader(unittest.TestCase):
 
     def test_header_matches_reference(self):
         """The first 44 columns must be the reference header
-        verbatim. ``SoftwareVersion`` is a deliberate lab-local
-        addition appended at the end (provenance per row), so it
-        is excluded from the reference comparison."""
+        verbatim. ``EventEO_WallClock`` and ``SoftwareVersion`` are
+        lab-local additions appended at the end, so they're excluded
+        from the reference comparison."""
+        lab_local = ("EventEO_WallClock", "SoftwareVersion")
         ref = _ref_header()
-        if ref and ref[-1] == "SoftwareVersion":
-            ref = ref[:-1]  # fallback path returns our own COLUMNS
-        expected = [c for c in COLUMNS if c != "SoftwareVersion"]
+        # Fallback path returns our own COLUMNS; strip trailing additions.
+        while ref and ref[-1] in lab_local:
+            ref = ref[:-1]
+        expected = [c for c in COLUMNS if c not in lab_local]
         self.assertEqual(expected, ref,
                          "BHZ CSV header drifted from the lab "
                          "reference. Update COLUMNS to match "
@@ -173,7 +175,8 @@ class NoEventsFile(unittest.TestCase):
             # cells, not NaN) -- they aren't real sample-index
             # fields. The bhz_csv module's _NUMERIC_COLS mirrors
             # this distinction.
-            string_event_cols = {"Eventstart", "Eventstop"}
+            string_event_cols = {"Eventstart", "Eventstop",
+                                  "EventEO_WallClock"}
             for c in COLUMNS:
                 if not c.startswith("Event"):
                     continue
@@ -245,6 +248,13 @@ class PartialEegOnlyEvent(unittest.TestCase):
                 self.assertEqual(r[c], "NaN", f"{c} should be NaN")
             # No Racine score on a preliminary row.
             self.assertEqual(r["Score"], "NaN")
+            # Wall-clock EO: no Peak_Index here, so recording start =
+            # Peak_Date/Peak_Time (2026-02-24 00:00:00) + EO seconds.
+            eo_sec = 28429513 / 20000.0
+            want = (datetime(2026, 2, 24)
+                    + timedelta(seconds=eo_sec)).strftime(
+                        "%Y-%m-%d %H:%M:%S.%f")[:-3]
+            self.assertEqual(r["EventEO_WallClock"], want)
 
 
 class FilenameResolver(unittest.TestCase):
