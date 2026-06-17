@@ -53,7 +53,12 @@ DEFAULT_CACHE_DB = os.path.join("data", "evoked_chronic_cache.db")
 
 # Bump when the cache layout changes; a mismatch wipes + rebuilds (the DB
 # is a throwaway cache, gitignored).
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+# Per-recording mean waveforms are stored downsampled to this many points;
+# the overlay never needs the raw ~20k-sample resolution, and full traces
+# as JSON would bloat the cache (~16 MB/file).
+_MEAN_TRACE_POINTS = 1000
 
 # epoch columns = stim scalars (raw) + the computed evoked feature set.
 _BASE_EPOCH_COLS = ["file_id", "animal", "electrode", "channel",
@@ -107,6 +112,20 @@ def _num(v):
         return None
     f = float(v)
     return f if np.isfinite(f) else None
+
+
+def _downsample(time_ms, mean_tr, std_tr, target):
+    """Stride-decimate the three aligned arrays to <= *target* points."""
+    n = len(time_ms)
+    if n <= target or target <= 0:
+        return time_ms, mean_tr, std_tr
+    step = (n // target) + 1
+    return time_ms[::step], mean_tr[::step], std_tr[::step]
+
+
+def _round(arr) -> list:
+    """Compact JSON: round to 4 sig-ish figures to keep the cache small."""
+    return [round(float(v), 4) for v in np.asarray(arr).ravel()]
 
 
 def _mean_row_to_dict(r) -> dict:
@@ -392,8 +411,9 @@ class ChronicEvokedCache:
     def _mean_row(file_id, animal, ch, traces, time_ms):
         mean_tr = np.nanmean(traces, axis=0)
         std_tr = np.nanstd(traces, axis=0)
-        return (file_id, animal, ch, json.dumps(time_ms.tolist()),
-                json.dumps(mean_tr.tolist()), json.dumps(std_tr.tolist()),
+        t, m, s = _downsample(time_ms, mean_tr, std_tr, _MEAN_TRACE_POINTS)
+        return (file_id, animal, ch, json.dumps(_round(t)),
+                json.dumps(_round(m)), json.dumps(_round(s)),
                 int(traces.shape[0]))
 
     @staticmethod

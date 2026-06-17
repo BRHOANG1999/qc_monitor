@@ -131,8 +131,34 @@ def layout(store):
         dcc.Loading(type="default", color="#5e7ce2", children=[
             dcc.Graph(id="chronic-feature-plot"),
             dcc.Graph(id="chronic-recording-plot"),
+            dcc.Graph(id="chronic-waveform-plot"),
+            html.Div([
+                html.Label("Correlation", style=LABEL_STYLE),
+                dcc.Dropdown(
+                    id="chronic-corr-mode",
+                    options=[{"label": lbl, "value": v}
+                             for v, lbl, _x, _y in _CORR_MODES],
+                    value=_CORR_MODES[0][0], clearable=False,
+                    style={**DROPDOWN_STYLE, "maxWidth": "320px"},
+                    className="dark-dropdown"),
+            ], style={"marginTop": "6px"}),
+            dcc.Graph(id="chronic-corr-plot"),
         ]),
     ])
+
+
+# (value, label, stim-amplitude source, evoked-feature column).
+# stim source: 'peak'/'trough' raw columns, 'p2p' = peak-trough.
+_CORR_MODES = [
+    ("peak_peak", "Stim Peak vs Evoked Peak", "peak", "peak_amplitude"),
+    ("trough_trough", "Stim Trough vs Evoked Trough", "trough",
+     "trough_amplitude"),
+    ("p2p_p2p", "Stim P2P vs Evoked P2P", "p2p", "peak_to_trough"),
+    ("peak_p2p", "Stim Peak vs Evoked P2P", "peak", "peak_to_trough"),
+]
+_CORR_MAP = {m[0]: m for m in _CORR_MODES}
+# How many per-recording mean waveforms to overlay (evenly sampled).
+_MAX_WAVEFORMS = 40
 
 
 _BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#2a2d3a",
@@ -152,34 +178,43 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("chronic-feature-plot", "figure"),
         Output("chronic-recording-plot", "figure"),
+        Output("chronic-waveform-plot", "figure"),
+        Output("chronic-corr-plot", "figure"),
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
         Input("chronic-animal-dropdown", "value"),
         Input("chronic-feature-dropdown", "value"),
         Input("chronic-hours-dropdown", "value"),
         Input("chronic-trend-toggles", "value"),
+        Input("chronic-corr-mode", "value"),
         Input("chronic-refresh-btn", "n_clicks"),
     )
-    def _update(animal, feature, hours, overlays, _clicks):
+    def _update(animal, feature, hours, overlays, corr_mode, _clicks):
+        blank = empty_fig("")
         if not animal:
-            return empty_fig("Select an animal"), empty_fig(""), "", ""
+            return (empty_fig("Select an animal"), blank, blank, blank, "", "")
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
         try:
             cache = _cache()
             stats = cache.ensure_animal(animal)
             rows = cache.query(animal, hours=(hours or None))
+            means = cache.query_recording_means(animal, hours=(hours or None))
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
-            return (empty_fig("Couldn't read evokedOutput", hint=str(e)),
-                    empty_fig(""), "", f"Error: {e}")
+            err = empty_fig("Couldn't read evokedOutput", hint=str(e))
+            return err, blank, blank, blank, "", f"Error: {e}"
         pts = _feature_points(rows, feature)
         status = (f"{stats['files']} recordings cached "
                   f"({stats['built']} (re)built) · {len(rows)} responses "
                   f"· {len(pts[0])} with {_label(feature)}.")
         if not pts[0]:
             msg = f"No {_label(feature)} for {animal} in range"
-            return empty_fig(msg), empty_fig(""), "", status
+            return (empty_fig(msg), blank,
+                    _build_waveform_overlay(means, animal),
+                    _build_stim_corr(rows, corr_mode), "", status)
         return (_build_feature_scatter(pts, feature, animal, overlays or []),
                 _build_recording_trend(rows, feature),
+                _build_waveform_overlay(means, animal),
+                _build_stim_corr(rows, corr_mode),
                 _trend_stats(pts, feature), status)
 
 
@@ -292,6 +327,86 @@ def _trend_stats(pts, feature) -> str:
     return (f"slope {lr.slope:.3g}/day · r {lr.rvalue:.2f} · p {lr.pvalue:.1e}"
             f"  |  mean {mean:.3g} · SD {std:.3g} · CV {cv:.2f} · "
             f"range {rng:.3g} · n {vals.size}")
+
+
+def _build_waveform_overlay(means, animal) -> go.Figure:
+    """Per-recording mean evoked waveform, rainbow-colored early->late."""
+    if not means:
+        return empty_fig("No mean waveforms (warm the cache)")
+    step = _stride(len(means), _MAX_WAVEFORMS)
+    shown = means[::step]
+    colors = _time_colors(len(shown))
+    fig = go.Figure()
+    for i, m in enumerate(shown):
+        t = m.get("time_axis") or []
+        y = m.get("mean_trace") or []
+        if not t or not y:
+            continue
+        fig.add_trace(go.Scattergl(
+            x=t, y=y, mode="lines", line=dict(color=colors[i], width=1),
+            name=str(m.get("rec_dt", ""))[:16], showlegend=False,
+            hoverinfo="skip"))
+    fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"))
+    note = f" ({len(shown)} of {len(means)})" if step > 1 else ""
+    fig.update_layout(
+        title=f"Mean evoked waveform per recording — {animal}{note}",
+        xaxis_title="Time (ms)", yaxis_title="Amplitude", height=380)
+    return fig
+
+
+def _build_stim_corr(rows, mode) -> go.Figure:
+    """Stim amplitude vs evoked amplitude scatter + regression."""
+    m = _CORR_MAP.get(mode) or _CORR_MODES[0]
+    _, label, x_src, y_col = m
+    xs, ys, secs = [], [], []
+    for r in rows:
+        x = _stim_amp(r, x_src)
+        y = r.get(y_col)
+        dt = _parse_iso(r.get("abs_dt"))
+        if x is None or y is None or dt is None:
+            continue
+        xs.append(float(x))
+        ys.append(float(y))
+        secs.append(dt.timestamp())
+    if len(xs) < 3:
+        return empty_fig("Not enough paired points for correlation")
+    xa, ya = np.asarray(xs), np.asarray(ys)
+    step = _stride(len(xa), _MAX_POINTS)
+    fig = go.Figure(go.Scattergl(
+        x=xa[::step], y=ya[::step], mode="markers",
+        marker=dict(size=4, color=_norm(np.asarray(secs))[::step],
+                    colorscale="Turbo", opacity=0.6),
+        hoverinfo="x+y", name="epochs"))
+    _add_regression(fig, xa, ya)
+    fig.update_layout(title=f"{label}", xaxis_title="Stimulus amplitude",
+                      yaxis_title="Evoked amplitude", height=380,
+                      showlegend=True)
+    return fig
+
+
+def _stim_amp(r, src):
+    if src == "p2p":
+        pk, tr = r.get("peak"), r.get("trough")
+        return (pk - tr) if (pk is not None and tr is not None) else None
+    return r.get(src)
+
+
+def _add_regression(fig, xa, ya) -> None:
+    from scipy.stats import linregress
+    lr = linregress(xa, ya)
+    xline = np.array([xa.min(), xa.max()])
+    fig.add_trace(go.Scattergl(
+        x=xline, y=lr.slope * xline + lr.intercept, mode="lines",
+        line=dict(color="#ff453a", width=2),
+        name=f"r={lr.rvalue:.2f} r²={lr.rvalue**2:.2f} "
+             f"p={lr.pvalue:.1e} n={xa.size}"))
+
+
+def _time_colors(n) -> list:
+    from plotly.colors import sample_colorscale
+    if n <= 1:
+        return ["#5e7ce2"] * max(1, n)
+    return sample_colorscale("Turbo", [i / (n - 1) for i in range(n)])
 
 
 def _norm(x):

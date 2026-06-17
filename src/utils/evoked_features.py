@@ -155,7 +155,12 @@ def spectral(traces, fs: float) -> dict:
     a = _check(traces)
     assert fs > 0, "fs must be positive"
     from scipy.signal import periodogram
-    f, pxx = periodogram(a, fs=fs, axis=1)
+    from scipy.fft import next_fast_len
+    # The raw traces are ~20001 samples -- a bad composite length whose FFT
+    # is very slow. Pad to the next fast length (negligible effect on the
+    # integrated band powers; this is the dominant warm cost).
+    nfft = next_fast_len(a.shape[1])
+    f, pxx = periodogram(a, fs=fs, nfft=nfft, axis=1)
     return {
         "sum_power_low": _band_sum(f, pxx, _LOW_BAND),
         "sum_power_high": _band_sum(f, pxx, _HIGH_SUM_BAND),
