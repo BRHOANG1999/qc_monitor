@@ -69,8 +69,12 @@ def test_cache_build_query_and_guards(tmp_path):
     # Oldest first; abs_dt = recording time + stim_time_sec.
     assert rows[0]["abs_dt"] == datetime(2026, 5, 10, 6, 0, 10).isoformat()
     assert rows[-1]["abs_dt"] == datetime(2026, 5, 12, 6, 0, 5).isoformat()
-    # Derived peak_to_trough.
-    assert rows[0]["peak_to_trough"] == pytest.approx(1.5)
+    # Raw stim scalars are kept on peak/trough (the correlation X axis).
+    assert rows[0]["peak"] == pytest.approx(1.0)
+    assert rows[0]["trough"] == pytest.approx(-0.5)
+    # No evokedData in these files -> computed evoked features stay NULL.
+    assert rows[0]["peak_to_trough"] is None
+    assert rows[0]["line_length"] is None
 
     # The other animal is isolated to its own channel.
     other = cache.query("BCH061")

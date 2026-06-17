@@ -281,6 +281,11 @@ slow_gamma:
 chronic_evoked:
   evoked_output_dir: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/evokedOutput
   cache_db: data/evoked_chronic_cache.db
+  # Compute the heavy per-epoch features (recovery tau/slope, template
+  # correlation, PCA recon error, AC width, exp-fit A). Off = fast warm with
+  # the cheap vectorized features only. To enable: set true AND re-warm with
+  # `python tools/warm_evoked_cache.py --expensive`.
+  compute_expensive: false
 
 # Event-clip extractor (ffmpeg) for the PI verification flow.
 # Builds a stitched 10+ min clip (5 min before EO to 5 min
