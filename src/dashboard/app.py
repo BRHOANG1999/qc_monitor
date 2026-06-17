@@ -26,6 +26,7 @@ from src.dashboard.tabs import annotations as tabs_annotations
 from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import electrode_health as tabs_electrode_health
 from src.dashboard.tabs import evoked as tabs_evoked
+from src.dashboard.tabs import chronic_evoked as tabs_chronic_evoked
 from src.dashboard.tabs import lfp_browser as tabs_lfp_browser
 from src.dashboard.tabs import overview as tabs_overview
 from src.dashboard.tabs import session_compare as tabs_session_compare
@@ -107,6 +108,7 @@ NAV_GROUPS = [
     {"id": "analysis", "label": "Analysis", "subs": [
         {"id": "waveforms", "label": "Evoked waveforms"},
         {"id": "evoked", "label": "Evoked features"},
+        {"id": "chronic_evoked", "label": "Chronic Evoked Analyzer"},
         {"id": "criticality", "label": "Criticality"},
         {"id": "lfp", "label": "LFP browser"},
         {"id": "video", "label": "Video review"},
@@ -1057,6 +1059,9 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_signal_quality.layout(store))
             elif tab == "evoked":
                 return _enable_persistence(tabs_evoked.layout(store))
+            elif tab == "chronic_evoked":
+                return _enable_persistence(
+                    tabs_chronic_evoked.layout(store))
             elif tab == "criticality":
                 return _enable_persistence(tabs_criticality.layout(store))
             elif tab == "lfp":
@@ -1166,6 +1171,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_electrode_health.register_callbacks(app, store, config)
     tabs_waveforms.register_callbacks(app, store, config)
     tabs_evoked.register_callbacks(app, store, config)
+    tabs_chronic_evoked.register_callbacks(app, store, config)
     tabs_settings.register_callbacks(app, store, config)
     tabs_lfp_browser.register_callbacks(app, store, config)
     tabs_overview.register_callbacks(app, store, config)
@@ -1223,7 +1229,8 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_session_compare.layout, tabs_activity_log.layout,
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
-        tabs_evoked.layout, tabs_settings.layout,
+        tabs_evoked.layout, tabs_chronic_evoked.layout,
+        tabs_settings.layout,
         tabs_video.layout, tabs_surgeries.layout,
         tabs_maintenance.layout, tabs_data_log_xref.layout,
         tabs_lfp_browser.layout, tabs_overview.layout,

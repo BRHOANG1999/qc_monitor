@@ -797,6 +797,68 @@ class Store:
         finally:
             conn.close()
 
+    def query_evoked_summary_for_animal(self, animal_id: str,
+                                         version_id: int | None = None,
+                                         hours: int | None = None
+                                         ) -> list[dict]:
+        """Per-file evoked_summary rows for *animal_id* across ALL its
+        sessions, oldest first -- the chronic (longitudinal) view that
+        the Chronic Evoked Analyzer tab plots.
+
+        Mirrors the animal-match post-filter idiom used elsewhere (the
+        channel_names LIKE is loose -- 'BCH062' would also match
+        'BCH0620' -- so re-check each session with the parser). Each dict
+        carries every evoked_summary column + chunk_datetime, session_dir,
+        session_name.
+        """
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        if not animal_id:
+            return []
+        conn = self._connect()
+        try:
+            conditions = ["sc.channel_names LIKE ?"]
+            params: list = [f'%"{animal_id}%']
+            if version_id is not None:
+                conditions.append("es.version_id = ?")
+                params.append(version_id)
+            if hours:
+                cutoff = (datetime.now()
+                          - timedelta(hours=hours)).isoformat()
+                conditions.append("pf.chunk_datetime > ?")
+                params.append(cutoff)
+            where = " AND ".join(conditions)
+            rows = conn.execute(
+                f"""SELECT pf.chunk_datetime, pf.session_dir, es.*
+                    FROM evoked_summary es
+                    JOIN processed_files pf ON es.file_id = pf.id
+                    JOIN session_config sc
+                      ON sc.session_dir = pf.session_dir
+                    WHERE {where}
+                    ORDER BY pf.chunk_datetime ASC""",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for r in rows:
+            names = self._channel_names_for_session(r["session_dir"])
+            match = False
+            for n in names:
+                if not isinstance(n, str) or not is_animal_channel(n):
+                    continue
+                a, _ = split_animal_electrode(n)
+                if a == animal_id:
+                    match = True
+                    break
+            if match:
+                d = dict(r)
+                d["session_name"] = os.path.basename(
+                    r["session_dir"] or "")
+                out.append(d)
+        return out
+
     # ------------------------------------------------------------------ #
     #  criticality
     # ------------------------------------------------------------------ #
