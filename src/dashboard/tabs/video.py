@@ -374,6 +374,33 @@ def _build_csv_file_meta(store, file_id: int, channel: int
     return meta, fs, animal, chunk_date
 
 
+def _export_partial_csv(store, config: dict, file_id: int,
+                          channel, events: list) -> tuple[int, str]:
+    """Append the dropped onsets to the official BHZ day CSV right now.
+
+    ``bhz_csv.write_event_rows`` tolerates partial events (unset landmarks
+    render as ``NaN``), so an EEG-onset-only event writes its ``EventEO``
+    and leaves the rest blank -- usable immediately. Returns
+    ``(n_rows, csv_name)``; raises ``ValueError`` on misconfig / missing
+    data so the caller can surface a clean message. A later full score is
+    replaced when the PI finalizes the day CSV in overwrite mode.
+    """
+    assert events, "events required for partial export"
+    bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
+    if not bhz_cfg.get("enabled"):
+        raise ValueError("BHZ CSV export is disabled in config.")
+    if channel is None or channel == "":
+        raise ValueError("Pick a channel before exporting.")
+    meta, fs, animal, chunk_date = _build_csv_file_meta(
+        store, int(file_id), int(channel))
+    csv_path = _bhz_csv.resolve_csv_path(
+        bhz_cfg.get("base_dir", ""),
+        bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
+        chunk_date, animal)
+    n = _bhz_csv.write_event_rows(csv_path, meta, events, fs)
+    return n, csv_path.name
+
+
 def _resolve_next_in_queue(store: Store,
                              animal_value: str | None,
                              current_file_id: int,
@@ -2628,6 +2655,19 @@ def layout(store: Store, bridge: dict | None = None):
                               "needed) and park the file in the 'Needs "
                               "scoring' pool to finish later.",
                         style={"marginRight": "10px"}),
+                    button(
+                        "EEG onset → CSV + flag",
+                        "video-review-partial-btn",
+                        variant="secondary",
+                        icon_name="file-text",
+                        title="Write the onsets you've dropped to the "
+                              "BHZ day CSV right now (EEG/EO onset only is "
+                              "fine -- other landmarks save as NaN) so you "
+                              "can use it immediately, AND keep the file in "
+                              "the 'Needs scoring' pool for full scoring "
+                              "later. The PI's finalize (overwrite) replaces "
+                              "these preliminary rows.",
+                        style={"marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
                         custom_spinner=_loading_icon(small=True),
@@ -4612,6 +4652,78 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # file; else fall back to the FIFO queue.
         pooled = _next_in_pool(store, pools_view, pool_cursor,
                                  int(file_id))
+        if pooled is not None:
+            p_session, p_file, new_cursor = pooled
+            return (badge, [], p_session, p_file, new_cursor)
+        next_session, next_file = _resolve_next_in_queue(
+            store, animal_value, int(file_id), email,
+            queue_limit=queue_limit)
+        if next_file is None:
+            return (badge, [], no_update, no_update, no_update)
+        return (badge, [], next_session, next_file, no_update)
+
+    # "EEG onset -> CSV + flag": write a preliminary CSV row now (partial
+    # events tolerated) AND keep the file in the Needs-scoring pool, so an
+    # early EEG-onset read is usable immediately without shelving the file
+    # as complete.
+    @app.callback(
+        Output("video-review-status", "children",
+                allow_duplicate=True),
+        Output("video-events-store", "data",
+                allow_duplicate=True),
+        Output("video-session-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-file-dropdown", "value",
+                allow_duplicate=True),
+        Output("video-ma-pool-cursor", "data",
+                allow_duplicate=True),
+        Input("video-review-partial-btn", "n_clicks"),
+        State("video-file-dropdown", "value"),
+        State("video-events-store", "data"),
+        State("video-channel-dropdown", "value"),
+        State("video-queue-animal", "value"),
+        State("video-ma-pools-view", "data"),
+        State("video-ma-pool-cursor", "data"),
+        prevent_initial_call=True,
+    )
+    def _partial_export(n_clicks, file_id, events, channel,
+                         animal_value, pools_view, pool_cursor):
+        if not n_clicks or not file_id:
+            return (no_update,) * 5
+        email = current_user_email()
+        if not email:
+            return ("Not signed in -- can't export.",
+                    no_update, no_update, no_update, no_update)
+        events = list(events or [])
+        has_eo = any(e.get("EO_sec") not in (None, "") for e in events)
+        if not has_eo:
+            return ("Drop at least one EEG onset (EO) before exporting.",
+                    no_update, no_update, no_update, no_update)
+        try:
+            n_rows, csv_name = _export_partial_csv(
+                store, config, int(file_id), channel, events)
+        except Exception as e:  # noqa: BLE001 -- surface, never crash UI
+            logger.warning("partial CSV export failed: %s", e)
+            return (f"Partial export failed: {e}",
+                    no_update, no_update, no_update, no_update)
+        # Keep the file flagged: drafts + needs_scoring (same pool as the
+        # quick-flag path), with a note recording the preliminary export.
+        drafts = [{**e, "draft": True} for e in events]
+        try:
+            store.mark_review(
+                int(file_id), email, "needs_scoring", markers=drafts,
+                note=f"Partial CSV exported (EEG onset) to {csv_name}; "
+                     "needs full scoring.")
+            store.release_claim(int(file_id))
+        except Exception as e:
+            logger.warning("partial-export mark_review failed: %s", e)
+            return (f"Exported to {csv_name} but flagging failed: {e}",
+                    no_update, no_update, no_update, no_update)
+        from datetime import datetime as _dt
+        badge = (f"Exported {n_rows} row{'' if n_rows == 1 else 's'} to "
+                 f"{csv_name} at {_dt.now().strftime('%H:%M')}  ·  kept in "
+                 "'Needs scoring' for full scoring.")
+        pooled = _next_in_pool(store, pools_view, pool_cursor, int(file_id))
         if pooled is not None:
             p_session, p_file, new_cursor = pooled
             return (badge, [], p_session, p_file, new_cursor)

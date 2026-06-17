@@ -220,6 +220,33 @@ class Idempotency(unittest.TestCase):
             self.assertEqual(len(rows), 1)
 
 
+class PartialEegOnlyEvent(unittest.TestCase):
+    """The 'EEG onset -> CSV + flag' path: an event with only EO set must
+    write EventEO and leave the other landmark columns as NaN, so a
+    preliminary CSV is usable immediately."""
+
+    def test_eeg_only_event_writes_partial_row(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "20260224_BCH040.csv"
+            fm = build_file_meta(
+                folder=r"U:\f", filename="partial.mat",
+                fs=20000.0, cutoff=0.05, channel=2,
+                peak_index=None, peak_stamp=None,
+                peak_dt=datetime(2026, 2, 24),
+            )
+            # EEG onset only -- no type/Racine/other landmarks.
+            ev = [{"EO_sec": 28429513 / 20000.0}]
+            n = write_event_rows(p, fm, ev, 20000.0)
+            self.assertEqual(n, 1)
+            with p.open("r", encoding="utf-8") as f:
+                r = list(csv.DictReader(f))[0]
+            self.assertEqual(r["EventEO"], "28429513")
+            for c in ("EventLAS", "EventBO", "EventPID", "EventBB"):
+                self.assertEqual(r[c], "NaN", f"{c} should be NaN")
+            # No Racine score on a preliminary row.
+            self.assertEqual(r["Score"], "NaN")
+
+
 class FilenameResolver(unittest.TestCase):
 
     def test_resolve_csv_path(self):
