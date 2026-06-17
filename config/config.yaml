@@ -164,7 +164,12 @@ auth:
   #    QC_GOOGLE_CLIENT_SECRET or write it to secrets/google_client_secret.
   google_client_id: 833184028975-eg8co485fvt6gqcr9fkibhoviilsju9q.apps.googleusercontent.com
   allowed_domain: umn.edu
-  oauth_redirect_base: http://localhost:8050
+  # Served over Tailscale HTTPS (`tailscale serve --bg 8050`) so Google
+  # OAuth accepts the redirect (it rejects raw-IP / http for non-localhost).
+  # Everyone reaches the app at this MagicDNS https host (port 443), and the
+  # callback https://<host>/auth/google/callback must be registered in the
+  # Google OAuth client's Authorized redirect URIs.
+  oauth_redirect_base: https://desktop-omq8vr5.tail7d348d.ts.net
 maintenance:
   enabled: true
   refresh_minutes: 10
