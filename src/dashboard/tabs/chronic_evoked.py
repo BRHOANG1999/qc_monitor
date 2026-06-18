@@ -68,6 +68,7 @@ def _cache() -> ChronicEvokedCache:
 # hang the UI. The render path is query-only; the Refresh button kicks an
 # off-thread warm so the page stays responsive and the cache fills in.
 _warm_threads: dict = {}
+_warm_progress: dict = {}        # animal -> {"done": int, "total": int}
 _warm_lock = threading.Lock()
 
 
@@ -79,6 +80,7 @@ def _kick_warm(animal: str) -> bool:
         t = _warm_threads.get(animal)
         if t is not None and t.is_alive():
             return False
+        _warm_progress[animal] = {"done": 0, "total": 0}
         th = threading.Thread(target=_warm_worker, args=(animal,),
                               daemon=True, name=f"chronic-warm-{animal}")
         _warm_threads[animal] = th
@@ -86,9 +88,16 @@ def _kick_warm(animal: str) -> bool:
         return True
 
 
+def _set_warm_progress(animal: str, done: int, total: int) -> None:
+    with _warm_lock:
+        _warm_progress[animal] = {"done": int(done), "total": int(total)}
+
+
 def _warm_worker(animal: str) -> None:
     try:
-        _cache().ensure_animal(animal)
+        _cache().ensure_animal(
+            animal,
+            progress=lambda d, t, _p: _set_warm_progress(animal, d, t))
     except Exception:  # noqa: BLE001 -- lock contention is non-fatal here
         pass
 
@@ -97,6 +106,21 @@ def _is_warming(animal: str) -> bool:
     with _warm_lock:
         t = _warm_threads.get(animal)
         return t is not None and t.is_alive()
+
+
+def list_warming() -> list[str]:
+    """Animals whose background warm thread is currently alive (for the
+    Jobs monitor). Runs in parallel -- one thread per animal."""
+    with _warm_lock:
+        return [a for a, t in list(_warm_threads.items())
+                if t is not None and t.is_alive()]
+
+
+def warm_progress(animal: str) -> dict | None:
+    """``{"done","total"}`` for an in-flight warm, or None."""
+    with _warm_lock:
+        p = _warm_progress.get(animal)
+        return dict(p) if p else None
 
 
 _INPUT_STYLE = {"width": "100%", "padding": "6px", "background": "#1f2230",

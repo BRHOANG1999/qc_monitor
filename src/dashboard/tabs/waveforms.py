@@ -27,7 +27,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, dcc, html
 from plotly.subplots import make_subplots
 
-from src.dashboard.components import DROPDOWN_STYLE, LABEL_STYLE
+from src.dashboard.components import DROPDOWN_STYLE, LABEL_STYLE, loading_icon
 from src.dashboard.data_helpers import (
     channel_map, default_session, empty_fig, load_config,
     processed_files_for_session, session_dropdown_options,
@@ -93,7 +93,12 @@ def layout(store: Store, default: str | None = None):
         ], style={"display": "flex", "gap": "16px",
                   "marginBottom": "16px", "flexWrap": "wrap"}),
 
-        dcc.Graph(id="waveform-plot"),
+        dcc.Loading(
+            custom_spinner=loading_icon("Building waveforms…"),
+            delay_show=150,
+            overlay_style={"visibility": "visible", "opacity": 0.45},
+            children=dcc.Graph(id="waveform-plot"),
+        ),
     ])
 
 

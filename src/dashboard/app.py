@@ -27,6 +27,7 @@ from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import electrode_health as tabs_electrode_health
 from src.dashboard.tabs import evoked as tabs_evoked
 from src.dashboard.tabs import chronic_evoked as tabs_chronic_evoked
+from src.dashboard.tabs import jobs_monitor as tabs_jobs_monitor
 from src.dashboard.tabs import lfp_browser as tabs_lfp_browser
 from src.dashboard.tabs import overview as tabs_overview
 from src.dashboard.tabs import session_compare as tabs_session_compare
@@ -125,6 +126,7 @@ NAV_GROUPS = [
         {"id": "data_log_xref", "label": "Data log diff"},
     ]},
     {"id": "system", "label": "System", "subs": [
+        {"id": "jobs_monitor", "label": "Jobs"},
         {"id": "annotations", "label": "Notes"},
         {"id": "review_status", "label": "Review status"},
         {"id": "event_verification",
@@ -1062,6 +1064,8 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "chronic_evoked":
                 return _enable_persistence(
                     tabs_chronic_evoked.layout(store))
+            elif tab == "jobs_monitor":
+                return _enable_persistence(tabs_jobs_monitor.layout(store))
             elif tab == "criticality":
                 return _enable_persistence(tabs_criticality.layout(store))
             elif tab == "lfp":
@@ -1172,6 +1176,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_waveforms.register_callbacks(app, store, config)
     tabs_evoked.register_callbacks(app, store, config)
     tabs_chronic_evoked.register_callbacks(app, store, config)
+    tabs_jobs_monitor.register_callbacks(app, store, config)
     tabs_settings.register_callbacks(app, store, config)
     tabs_lfp_browser.register_callbacks(app, store, config)
     tabs_overview.register_callbacks(app, store, config)
@@ -1230,6 +1235,7 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
         tabs_evoked.layout, tabs_chronic_evoked.layout,
+        tabs_jobs_monitor.layout,
         tabs_settings.layout,
         tabs_video.layout, tabs_surgeries.layout,
         tabs_maintenance.layout, tabs_data_log_xref.layout,

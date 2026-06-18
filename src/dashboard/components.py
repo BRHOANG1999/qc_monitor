@@ -468,3 +468,26 @@ def row(*children: Any, gap: str | None = None,
     if padding:
         style["padding"] = padding
     return html.Div(list(children), style=style)
+
+
+# --------------------------------------------------------------------- #
+#  Loading icon -- animated EEG-bar spinner for dcc.Loading(custom_spinner)
+#  Shared across tabs (Video Review, Evoked Waveforms, Chronic Evoked,
+#  Jobs). Styled by the generic .qc-load-* CSS in assets/theme.css.
+# --------------------------------------------------------------------- #
+
+def loading_icon(text: str = "Loading…", small: bool = False) -> html.Div:
+    """Animated EEG-bar loading icon for ``dcc.Loading(custom_spinner=...)``.
+
+    Renders a row of pulsing bars (like a live trace) over the card while it
+    loads, with an optional caption. ``small`` gives a compact inline variant
+    (no caption) for status lines."""
+    bars = html.Div([html.Span() for _ in range(5)],
+                     className="qc-load-bars qc-load-bars-sm"
+                              if small else "qc-load-bars")
+    if small:
+        return html.Div(bars, className="qc-load-overlay")
+    return html.Div([
+        bars,
+        html.Div(text, className="qc-load-text"),
+    ], className="qc-load-overlay")

@@ -47,7 +47,7 @@ from src.utils import bhz_csv as _bhz_csv
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.dashboard.tabs import video_events as _events
 from src.dashboard.components import (
-    button, empty_state, DROPDOWN_STYLE, LABEL_STYLE)
+    button, empty_state, loading_icon, DROPDOWN_STYLE, LABEL_STYLE)
 from src.dashboard.icons import icon
 from src.dashboard.design import (
     COLOR_ACCENT, COLOR_SUCCESS, COLOR_SURFACE_1, COLOR_DIVIDER,
@@ -85,21 +85,9 @@ _blanked_lock = RLock()
 VIDEO_DOM_ID = "lfp-video"
 
 
-def _loading_icon(text: str = "Loading…", small: bool = False):
-    """Animated EEG-bar loading icon for dcc.Loading(custom_spinner=...).
-    Renders a row of pulsing bars (like a live trace) over the card while
-    it loads, with an optional caption. ``small`` gives a compact inline
-    variant (no caption) for status lines. Styled by .qc-load-* in
-    theme.css."""
-    bars = html.Div([html.Span() for _ in range(5)],
-                     className="qc-load-bars qc-load-bars-sm"
-                              if small else "qc-load-bars")
-    if small:
-        return html.Div(bars, className="qc-load-overlay")
-    return html.Div([
-        bars,
-        html.Div(text, className="qc-load-text"),
-    ], className="qc-load-overlay")
+# The EEG-bar spinner now lives in components.loading_icon (shared across
+# tabs). Keep the private alias so existing video.py call sites are untouched.
+_loading_icon = loading_icon
 
 
 # ===================================================================== #

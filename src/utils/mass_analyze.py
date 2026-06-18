@@ -884,6 +884,90 @@ def last_done_job_for_animal(store, animal_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def list_active_jobs(store, recent_limit: int = 20) -> list[dict]:
+    """Every active + recent background job across the worker tables,
+    normalized for the Jobs monitor. Newest activity first; each pending
+    job carries a ``queue_pos`` that mirrors the worker's FIFO drain order
+    (mass_analyze scans drain before screening; event-clips have their own
+    worker). Pure read -- safe to poll every couple of seconds."""
+    assert store is not None, "store required"
+    assert isinstance(recent_limit, int) and recent_limit >= 0, \
+        "recent_limit >= 0"
+    entries: list[dict] = []
+    with store.connection() as conn:
+        entries += _fetch_worker_jobs(conn, "mass_analyze_job",
+                                       "mass_analyze", recent_limit)
+        entries += _fetch_worker_jobs(conn, "screen_eval_job",
+                                       "screen_eval", recent_limit)
+        entries += _fetch_clip_jobs(conn, recent_limit)
+    _assign_queue_positions(entries)
+    entries.sort(key=lambda e: (e.get("created_at") or ""), reverse=True)
+    return entries
+
+
+def _fetch_worker_jobs(conn, table: str, kind: str,
+                        recent_limit: int) -> list[dict]:
+    cols = ("id, animal_id, status, total_files, scanned_files, "
+            "created_at, started_at, finished_at")
+    rows = conn.execute(
+        f"SELECT {cols} FROM {table} WHERE status IN ('pending','running') "
+        "ORDER BY created_at ASC").fetchall()
+    out = [_normalize_worker_row(r, kind) for r in rows]
+    if recent_limit > 0:
+        rec = conn.execute(
+            f"SELECT {cols} FROM {table} "
+            "WHERE status NOT IN ('pending','running') "
+            "ORDER BY created_at DESC LIMIT ?", (recent_limit,)).fetchall()
+        out += [_normalize_worker_row(r, kind) for r in rec]
+    return out
+
+
+def _normalize_worker_row(r, kind: str) -> dict:
+    return {"kind": kind, "id": int(r["id"]),
+            "scope": r["animal_id"] or "?", "status": r["status"],
+            "scanned": r["scanned_files"], "total": r["total_files"],
+            "created_at": r["created_at"], "started_at": r["started_at"],
+            "finished_at": r["finished_at"], "queue_pos": None}
+
+
+def _fetch_clip_jobs(conn, recent_limit: int) -> list[dict]:
+    cols = "id, file_id, status, created_at, started_at, finished_at"
+    rows = list(conn.execute(
+        f"SELECT {cols} FROM event_clip_job "
+        "WHERE status IN ('pending','running') ORDER BY created_at ASC"))
+    if recent_limit > 0:
+        rows += conn.execute(
+            f"SELECT {cols} FROM event_clip_job "
+            "WHERE status NOT IN ('pending','running') "
+            "ORDER BY created_at DESC LIMIT ?", (recent_limit,)).fetchall()
+    return [{"kind": "event_clip", "id": int(r["id"]),
+             "scope": f"file #{r['file_id']}", "status": r["status"],
+             "scanned": None, "total": None,
+             "created_at": r["created_at"], "started_at": r["started_at"],
+             "finished_at": r["finished_at"], "queue_pos": None}
+            for r in rows]
+
+
+def _assign_queue_positions(entries: list[dict]) -> None:
+    """running -> 0; pending mass_analyze ranked by created_at, then pending
+    screen_eval (the shared worker drains scans before benchmarks); event
+    clips have an independent worker so they get their own FIFO ranks."""
+    for e in entries:
+        if e["status"] == "running":
+            e["queue_pos"] = 0
+    shared = [e for e in entries if e["status"] == "pending"
+              and e["kind"] in ("mass_analyze", "screen_eval")]
+    shared.sort(key=lambda e: (e["kind"] != "mass_analyze",
+                               e.get("created_at") or ""))
+    for i, e in enumerate(shared, start=1):
+        e["queue_pos"] = i
+    clips = sorted((e for e in entries if e["status"] == "pending"
+                    and e["kind"] == "event_clip"),
+                   key=lambda e: e.get("created_at") or "")
+    for i, e in enumerate(clips, start=1):
+        e["queue_pos"] = i
+
+
 def cancel_job(store, job_id: int) -> bool:
     """Flip a pending/running job to 'cancelled'. The worker
     checks this between files and bails cleanly."""
