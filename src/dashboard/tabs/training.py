@@ -275,6 +275,8 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     file_id = int(rnd["files"][idx])
     # Locate the EEG on disk now, only for this one file (lazy, cached).
     _resolve_for_load(store, config or {}, file_id)
+    mat_path = _file_path_for_id(store, file_id)
+    fname = os.path.basename(mat_path) if mat_path else f"file #{file_id}"
     session_dir = _session_dir_for_file(store, file_id)
     channel = _first_animal_channel(store, session_dir)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
@@ -284,10 +286,10 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
         store.set_file_duration(file_id, lfp_dur)
     cur = {"file_id": file_id, "channel": channel,
            "validated": store.validated_events_for_file(file_id),
-           "session_dir": session_dir, "lfp_dur": lfp_dur}
-    now = (f"Now scoring: example {idx + 1} of {rnd['examples']} "
-           f"(file #{file_id})")
-    return "loaded", (cur, _vid_player(file_id), lfp, hil, now,
+           "session_dir": session_dir, "lfp_dur": lfp_dur,
+           "filename": fname}
+    now = (f"Example {idx + 1} of {rnd['examples']}  ·  {fname}")
+    return "loaded", (cur, _vid_player(file_id, mat_path), lfp, hil, now,
                       _history_text(store, email, stage, rnd))
 
 
@@ -1265,13 +1267,25 @@ def _vid_placeholder(text: str) -> html.Div:
     return empty_state("No recording loaded", hint=text, icon_name="video")
 
 
-def _vid_player(file_id: int) -> html.Video:
-    return html.Video(
-        id=TRAINING_VIDEO_DOM_ID,
-        src=f"/media/video/{file_id}",
-        controls=True, preload="metadata",
-        style={"width": "100%", "maxHeight": "360px",
-               "borderRadius": RADIUS_MD, "background": "#000"})
+def _vid_player(file_id: int, mat_path: str | None = None):
+    """The <video> for this example, or a placeholder when no browser-
+    playable companion video exists next to the recording (common for older
+    historical files -- they may have no video, or only a .avi). Score from
+    the EEG in that case."""
+    from src.utils.video import video_path_for_mat, avi_companion_exists
+    if mat_path and video_path_for_mat(mat_path):
+        return html.Video(
+            id=TRAINING_VIDEO_DOM_ID,
+            src=f"/media/video/{file_id}",
+            controls=True, preload="metadata",
+            style={"width": "100%", "maxHeight": "360px",
+                   "borderRadius": RADIUS_MD, "background": "#000"})
+    if mat_path and avi_companion_exists(mat_path):
+        return _vid_placeholder(
+            "This recording's video is .avi, which browsers can't play — "
+            "score from the EEG below.")
+    return _vid_placeholder("No companion video for this recording — "
+                            "score from the EEG below.")
 
 
 def _event_row(event: dict, idx: int, stage: int) -> html.Div:

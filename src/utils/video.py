@@ -6,18 +6,34 @@ import re
 
 
 def video_path_for_mat(mat_path: str) -> str | None:
-    """Derive the companion video path from a .mat file path.
+    """Derive the companion (browser-playable) video path from a .mat file
+    path.
 
-    Convention: ``<basename>_v1.mp4`` co-located with the .mat. Returns the
-    path if the file exists on disk, ``None`` otherwise.
+    Convention: ``<basename>_v1.mp4`` co-located with the .mat; older / lab
+    recordings sometimes drop a plain ``<basename>.mp4`` instead. Tries both
+    and returns the first that exists on disk, ``None`` otherwise. (Only
+    ``.mp4`` is returned -- ``.avi`` isn't playable in an HTML5 <video>.)
     """
     assert isinstance(mat_path, str) and mat_path, "mat_path must be a non-empty string"
     if "." not in os.path.basename(mat_path):
         return None
-    candidate = mat_path.rsplit(".", 1)[0] + "_v1.mp4"
-    if os.path.isfile(candidate):
-        return candidate
+    base = mat_path.rsplit(".", 1)[0]
+    for candidate in (base + "_v1.mp4", base + ".mp4"):
+        if os.path.isfile(candidate):
+            return candidate
     return None
+
+
+def avi_companion_exists(mat_path: str) -> bool:
+    """True when a co-located ``.avi`` companion exists (``<base>_vN.avi`` or
+    ``<base>.avi``). Browsers can't play .avi in <video>, so callers use this
+    to explain *why* there's no playback rather than show a broken player."""
+    if not isinstance(mat_path, str) or not mat_path:
+        return False
+    if "." not in os.path.basename(mat_path):
+        return False
+    base = mat_path.rsplit(".", 1)[0]
+    return bool(glob.glob(base + "_v*.avi") or glob.glob(base + ".avi"))
 
 
 _V_SUFFIX_RE = re.compile(r"_v(\d+)\.mp4$", re.IGNORECASE)
