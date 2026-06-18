@@ -140,6 +140,46 @@ def _file_path_for_id(store: Store, file_id: int) -> str | None:
         return row["file_path"] if row else None
 
 
+def _landmark_shapes(events) -> list[dict]:
+    """Colored vertical lines for every filled BHZ onset/landmark in
+    *events* (EO/LAS/BO/PID/BB), so they can be drawn on the LFP and
+    Hilbert. Bounded per NASA Rule 3. Shared by the build-time injection
+    (always-on, survives figure rebuilds) and the events-store painters."""
+    shapes: list[dict] = []
+    for i, e in enumerate(events or []):
+        if i >= 16:  # bound events per file
+            break
+        for field, color in _events.LANDMARK_COLORS.items():
+            t_sec = (e or {}).get(f"{field}_sec")
+            if t_sec is None:
+                continue
+            try:
+                t = float(t_sec)
+            except (TypeError, ValueError):
+                continue
+            shapes.append({
+                "type": "line", "xref": "x", "yref": "paper",
+                "x0": t, "x1": t, "y0": 0, "y1": 1,
+                "line": {"color": color, "width": 2}, "opacity": 0.85,
+            })
+    return shapes
+
+
+def _inject_landmarks(fig, events):
+    """Append landmark verticals to a freshly-built figure so flagged
+    onsets are visible the moment the LFP/Hilbert renders -- not only
+    after the events-store changes. No-op when there are no onsets."""
+    lm = _landmark_shapes(events)
+    if not lm or fig is None:
+        return fig
+    try:
+        existing = list(fig.layout.shapes or ())
+        fig.update_layout(shapes=existing + lm)
+    except Exception:  # noqa: BLE001 -- never block the plot on shape merge
+        pass
+    return fig
+
+
 # Stim-blanking lives in src/utils/stim_blank.py so the Mass Analyze
 # scan computes the envelope on the exact same blanked signal. These
 # thin wrappers keep the existing call sites.
@@ -4985,10 +5025,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-filter-notch", "value"),
         State("video-filter-smooth", "value"),
         Input("video-blank-raw", "value"),
+        State("video-events-store", "data"),
         prevent_initial_call="initial_duplicate",
     )
     def _update_lfp(file_id, channel, _n_apply,
-                     hp, lp, notch, smooth_ms, blank_raw):
+                     hp, lp, notch, smooth_ms, blank_raw, events):
         # Fresh token each fire so the load-pill done-watcher
         # triggers even when the human-readable status string is
         # identical to the previous recording (fixed-length rig).
@@ -5051,6 +5092,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}",
                                  uirevision=f"{file_id}:{channel}")
+        # Always draw any flagged onsets so they survive this rebuild
+        # (channel/filter/blank changes), not just events-store updates.
+        _inject_landmarks(fig, events)
         filt_bits = []
         if hp and hp > 0: filt_bits.append(f"HP={hp:g}")
         if lp and lp > 0: filt_bits.append(f"LP={lp:g}")
@@ -5100,11 +5144,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
+        State("video-events-store", "data"),
     )
     def _update_analysis(file_id, feature, _n_apply,
                           channel, ma_cutoff, blank_raw, _rej_ver,
                           auc_window,
-                          smooth_sec, rollwin, postproc):
+                          smooth_sec, rollwin, postproc, events):
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
         # repeats (0-candidate fixed-length recordings all render
@@ -5112,6 +5157,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         fig, status = _compute_analysis(
             file_id, feature, channel, ma_cutoff, blank_raw,
             auc_window, smooth_sec, rollwin, postproc)
+        # Draw flagged onsets on every Hilbert rebuild, not only on
+        # events-store changes.
+        _inject_landmarks(fig, events)
         return fig, status, datetime.now().timestamp()
 
     def _compute_analysis(file_id, feature,
