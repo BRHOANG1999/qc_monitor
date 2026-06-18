@@ -384,30 +384,17 @@ def _past_enabled(config: dict) -> bool:
 
 
 def _import_card(config: dict) -> html.Div:
-    """The 'build practice library from past scored events' panel: a button
-    + a live status line polled by training-import-tick."""
-    enabled = _past_enabled(config)
-    btn_kw = {} if enabled else {"disabled": True}
+    """A slim status strip for the auto-built past-events practice library.
+    No button -- the catalog runs automatically (training-import-tick kicks
+    it once) and each EEG is located on disk only when its example loads."""
     return card(
-        html.Div("Practice library — past scored events",
-                  style={**LABEL_STYLE, "marginBottom": "2px"}),
-        html.Div("The lab's historical BHZ scorings are imported automatically "
-                  "as extra training examples; each event's EEG is located on "
-                  "disk by recursive search across the share roots and mounted "
-                  "drives. Re-scan to pick up newly scored files or drives that "
-                  "just came online.",
-                  style={"color": COLOR_TEXT_TERTIARY,
-                          "fontSize": FONT_SIZE_CAPTION,
-                          "marginBottom": SPACE_3}),
         html.Div([
-            button("Re-scan past events", "training-import-btn",
-                   variant="secondary", icon_name="inbox", **btn_kw),
+            html.Span("Practice library — past scored events:  ",
+                      style={"fontWeight": "600",
+                              "color": COLOR_TEXT_SECONDARY}),
             html.Span(id="training-import-status",
-                      style={"marginLeft": SPACE_3,
-                              "color": COLOR_TEXT_SECONDARY,
-                              "fontSize": FONT_SIZE_CAPTION}),
-        ], style={"display": "flex", "alignItems": "center",
-                   "flexWrap": "wrap", "gap": SPACE_2}),
+                      style={"color": COLOR_TEXT_TERTIARY}),
+        ], style={"fontSize": FONT_SIZE_CAPTION}),
         dcc.Interval(id="training-import-tick", interval=1500, n_intervals=0),
         style={"marginBottom": SPACE_4},
     )
@@ -985,23 +972,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         store.advance_student(email, int(prog.get("unlocked_stage", 1)) + 1)
         return int(refresh or 0) + 1
 
-    # ---- Practice library: build from past scored events ---- #
+    # ---- Practice library: auto-catalog past scored events ---- #
     @app.callback(
-        Output("training-import-status", "children", allow_duplicate=True),
-        Input("training-import-btn", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def _start_import(n):
-        if not n:
-            return no_update
-        if not _past_enabled(config):
-            return _import_status_text(False)
-        started = _kick_import(store, config)
-        return ("Starting import…" if started
-                else "An import is already running…")
-
-    @app.callback(
-        Output("training-import-status", "children", allow_duplicate=True),
+        Output("training-import-status", "children"),
         Input("training-import-tick", "n_intervals"),
         prevent_initial_call=True,
     )
