@@ -270,6 +270,25 @@ training:
   # animals. After each round the student gets a confidence prompt.
   examples_per_round: 10
 
+# Historical scored-event practice library for the Training tab. Reads the
+# lab's BHZ CSV exports (bhz_csv.base_dir) -- the same files the MATLAB BHZ
+# Review Workstation browses -- keeps the confirmed seizures (Peak_Index set,
+# Score > 0), dedupes, and resolves each event's EEG recording on disk via
+# the same cascade the toolkit uses (folder/filename -> +.mat -> recursive
+# search), extended to walk the share roots + every mounted drive. Resolved
+# files become extra Training examples whose validated answer is the lab's
+# own score. See src/utils/past_events.py. Triggered from a button in the
+# Training tab (never auto-scans on tab open).
+past_events:
+  enabled: true
+  # Recursive-search roots used when a recording isn't at its CSV folder
+  # path. Empty -> falls back to watch.paths. auto_drives additionally walks
+  # every mounted fixed drive (D:, G:, I:, U: ...) for files moved to a
+  # local HDD; system folders are skipped and a per-drive dir cap bounds it.
+  search_roots: []
+  auto_drives: true
+  max_search_dirs: 200000
+
 # Slow-gamma (30-50 Hz) induced-power feature in Video Review. Windows are
 # milliseconds relative to each stim onset. The post window starts AFTER the
 # evoked transient (~first tens of ms) so it measures an oscillation, not the

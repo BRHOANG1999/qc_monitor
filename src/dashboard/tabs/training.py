@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import random
+import threading
 
 from dash import (Input, Output, State, dcc, html, no_update, ALL,
                    callback_context)
@@ -37,6 +38,7 @@ from src.dashboard.design import (
 from src.db.store import Store
 from src.utils.animal import is_animal_channel
 from src.utils import training as _grade
+from src.utils import past_events as _past
 
 # Reused from the Video Review tab -- the LFP/Hilbert figure builders and
 # the file-path lookup. video.py never imports this module, so no cycle.
@@ -55,6 +57,79 @@ _AUC_WINDOW_SEC = 5.0          # sliding-window AUC width for the LFP toggle
 # Review tab does with VIDEO_DOM_ID -- a distinct id so the two tabs never
 # collide if both are ever in the DOM.
 TRAINING_VIDEO_DOM_ID = "training-lfp-video"
+
+
+# ===================================================================== #
+#  Historical practice-library import (background, with live progress)
+# ===================================================================== #
+#
+# Resolving past scored events across the share roots + every mounted drive
+# can take a while, so it runs off-thread; the UI polls _IMPORT_STATE. One
+# import at a time (shared library) -- concurrent clicks coalesce.
+_IMPORT_LOCK = threading.Lock()
+_IMPORT_STATE: dict = {
+    "running": False, "done": 0, "total": 0, "imported": 0,
+    "phase": "", "error": "", "finished": False,
+}
+
+
+def _import_progress(done: int, total: int, filename: str) -> None:
+    _IMPORT_STATE["done"] = int(done)
+    _IMPORT_STATE["total"] = int(total)
+    _IMPORT_STATE["phase"] = (f"Resolving {filename}" if filename
+                              else "Finishing up")
+
+
+def _import_worker(store: Store, config: dict) -> None:
+    try:
+        _IMPORT_STATE.update({"running": True, "finished": False,
+                              "error": "", "phase": "Reading scored CSVs",
+                              "done": 0, "total": 0})
+        n = _past.import_into_training(store, config,
+                                        progress=_import_progress)
+        _IMPORT_STATE["imported"] = int(n)
+    except Exception as e:  # noqa: BLE001 -- background import must not crash
+        logger.exception("historical practice import failed")
+        _IMPORT_STATE["error"] = str(e)
+    finally:
+        _IMPORT_STATE["running"] = False
+        _IMPORT_STATE["finished"] = True
+        _IMPORT_STATE["phase"] = ""
+
+
+def _kick_import(store: Store, config: dict) -> bool:
+    """Start the import in a daemon thread if one isn't already running.
+    The non-blocking lock makes concurrent clicks coalesce. Returns True if
+    this call started it."""
+    if not _IMPORT_LOCK.acquire(blocking=False):
+        return False
+    t = threading.Thread(target=_run_import_then_release,
+                          args=(store, config), daemon=True)
+    t.start()
+    return True
+
+
+def _run_import_then_release(store: Store, config: dict) -> None:
+    try:
+        _import_worker(store, config)
+    finally:
+        _IMPORT_LOCK.release()
+
+
+def _import_status_text(cfg_enabled: bool) -> str:
+    if not cfg_enabled:
+        return "Disabled in config (past_events.enabled)."
+    s = _IMPORT_STATE
+    if s["running"]:
+        tot = s["total"] or "?"
+        return f"Importing… {s['done']}/{tot} recordings.  {s['phase']}"
+    if s["finished"]:
+        if s["error"]:
+            return f"Import failed: {s['error']}"
+        return (f"Imported {s['imported']} past-scored recordings into the "
+                f"practice pool. Load an example to see them.")
+    return ("Pulls confirmed seizures from the lab's past scored CSVs and "
+            "finds their EEG on disk. Click to build the practice library.")
 
 
 # ===================================================================== #
@@ -284,6 +359,39 @@ def _events_table(events: list, title: str, color: str) -> html.Div:
               "borderRadius": RADIUS_SM})
 
 
+def _past_enabled(config: dict) -> bool:
+    return bool(((config or {}).get("past_events", {}) or {})
+                .get("enabled", False))
+
+
+def _import_card(config: dict) -> html.Div:
+    """The 'build practice library from past scored events' panel: a button
+    + a live status line polled by training-import-tick."""
+    enabled = _past_enabled(config)
+    btn_kw = {} if enabled else {"disabled": True}
+    return card(
+        html.Div("Practice library — past scored events",
+                  style={**LABEL_STYLE, "marginBottom": "2px"}),
+        html.Div("Import the lab's historical BHZ scorings as extra training "
+                  "examples; each event's EEG is located on disk by recursive "
+                  "search across the share roots and mounted drives.",
+                  style={"color": COLOR_TEXT_TERTIARY,
+                          "fontSize": FONT_SIZE_CAPTION,
+                          "marginBottom": SPACE_3}),
+        html.Div([
+            button("Build / refresh from past events", "training-import-btn",
+                   variant="secondary", icon_name="inbox", **btn_kw),
+            html.Span(id="training-import-status",
+                      style={"marginLeft": SPACE_3,
+                              "color": COLOR_TEXT_SECONDARY,
+                              "fontSize": FONT_SIZE_CAPTION}),
+        ], style={"display": "flex", "alignItems": "center",
+                   "flexWrap": "wrap", "gap": SPACE_2}),
+        dcc.Interval(id="training-import-tick", interval=1500, n_intervals=0),
+        style={"marginBottom": SPACE_4},
+    )
+
+
 # ===================================================================== #
 #  Layout
 # ===================================================================== #
@@ -328,6 +436,9 @@ def layout(store: Store, config: dict | None = None):
                               "fontSize": FONT_SIZE_CAPTION,
                               "marginTop": SPACE_2}),
         ),
+
+        # Practice library: import past scored events on demand.
+        _import_card(config or {}),
 
         # Viewer: video | LFP + Hilbert.
         html.Div([
@@ -852,6 +963,29 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prog = store.get_training_progress(email)
         store.advance_student(email, int(prog.get("unlocked_stage", 1)) + 1)
         return int(refresh or 0) + 1
+
+    # ---- Practice library: build from past scored events ---- #
+    @app.callback(
+        Output("training-import-status", "children", allow_duplicate=True),
+        Input("training-import-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _start_import(n):
+        if not n:
+            return no_update
+        if not _past_enabled(config):
+            return _import_status_text(False)
+        started = _kick_import(store, config)
+        return ("Starting import…" if started
+                else "An import is already running…")
+
+    @app.callback(
+        Output("training-import-status", "children", allow_duplicate=True),
+        Input("training-import-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _poll_import(_n):
+        return _import_status_text(_past_enabled(config))
 
     _register_cursor_sync(app)
 

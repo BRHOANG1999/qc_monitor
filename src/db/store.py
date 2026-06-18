@@ -2634,6 +2634,46 @@ class Store:
         for i, r in enumerate(rows):
             assert i < 1_000_000, "candidate pool scan exceeds bound"
             out.append(self._pool_row_labels(r, _real_events))
+        # Historical scored events imported from the BHZ CSV exports
+        # (src/utils/past_events.py) add practice candidates without going
+        # through the live review pipeline. A real pi_approved row for the
+        # same file wins, so dedupe by file_id.
+        seen = {d["file_id"] for d in out}
+        for r in self._external_candidate_rows(email):
+            if r["file_id"] in seen:
+                continue
+            out.append(r)
+            seen.add(r["file_id"])
+        return out
+
+    def _external_candidate_rows(self, email: str) -> list[dict]:
+        """training_external_example rows shaped like _pool_row_labels: the
+        stored animal/labels/markers, with this student's last_seen."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT e.file_id, e.has_seizure, e.rep_type, e.rep_racine,
+                          e.animal, pf.session_dir,
+                          (SELECT MAX(ta.id) FROM training_attempt ta
+                            WHERE ta.student_email=? AND ta.file_id=e.file_id)
+                            AS last_seen
+                   FROM training_external_example e
+                   JOIN processed_files pf ON pf.id = e.file_id""",
+                (email,)).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for i, r in enumerate(rows):
+            assert i < 1_000_000, "external pool scan exceeds bound"
+            animals = ([r["animal"]] if r["animal"]
+                       else self._animals_for_session(r["session_dir"]))
+            ls = r["last_seen"]
+            out.append({"file_id": int(r["file_id"]),
+                        "has_seizure": bool(r["has_seizure"]),
+                        "rep_type": r["rep_type"],
+                        "rep_racine": r["rep_racine"],
+                        "animals": animals,
+                        "last_seen": (int(ls) if ls is not None else None)})
         return out
 
     def _pool_row_labels(self, r, real_events_fn) -> dict:
@@ -2789,12 +2829,153 @@ class Store:
                 (int(file_id),)).fetchone()
         finally:
             conn.close()
-        if not row:
+        if row:
+            try:
+                return json.loads(row["markers_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                return []
+        # Fallback: a historical scored example carries the lab's answer.
+        return self._external_markers_for_file(file_id)
+
+    def _external_markers_for_file(self, file_id: int) -> list:
+        conn = self._connect()
+        try:
+            r = conn.execute(
+                "SELECT markers_json FROM training_external_example "
+                "WHERE file_id=?", (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        if not r:
             return []
         try:
-            return json.loads(row["markers_json"] or "[]")
+            return json.loads(r["markers_json"] or "[]")
         except (json.JSONDecodeError, TypeError):
             return []
+
+    # ---- Historical scored-event import (src/utils/past_events.py) ---- #
+
+    # Re-walk a not-found recording at most once a day; a positive hit is
+    # kept until the path stops resolving.
+    EEG_NEG_TTL_HOURS = 24
+
+    def import_historical_examples(self, examples: list[dict]) -> int:
+        """Ingest resolved historical recordings as Training practice
+        examples: a lean processed_files row + session_config (so animals
+        resolve) + a training_external_example holding the lab's markers.
+        Idempotent -- upserts by file path. Returns recordings ingested."""
+        assert isinstance(examples, list), "examples must be a list"
+        if not examples:
+            return 0
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        n = 0
+        try:
+            for i, ex in enumerate(examples):
+                assert i < 1_000_000, "historical import runaway"
+                fid = self._upsert_historical_file(conn, ex, now)
+                if fid is None:
+                    continue
+                self._upsert_historical_session(conn, ex, now)
+                self._upsert_external_example(conn, fid, ex, now)
+                n += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return n
+
+    @staticmethod
+    def _upsert_historical_file(conn, ex: dict, now: str) -> int | None:
+        path = ex.get("resolved_path")
+        if not path:
+            return None
+        conn.execute(
+            """INSERT OR IGNORE INTO processed_files
+               (file_path, session_dir, session_name, chunk_datetime,
+                num_channels, sampling_rate, processed_at, status)
+               VALUES (?,?,?,?,?,?,?,'processed')""",
+            (path, ex.get("session_dir"), ex.get("session_name"),
+             ex.get("chunk_datetime"), len(ex.get("channel_names") or []),
+             ex.get("fs") or None, now))
+        row = conn.execute(
+            "SELECT id FROM processed_files WHERE file_path=?",
+            (path,)).fetchone()
+        return int(row["id"]) if row else None
+
+    @staticmethod
+    def _upsert_historical_session(conn, ex: dict, now: str) -> None:
+        sd = ex.get("session_dir")
+        names = ex.get("channel_names") or []
+        if not sd or not names:
+            return
+        # INSERT OR IGNORE: never clobber a real discovered session_config.
+        conn.execute(
+            """INSERT OR IGNORE INTO session_config
+               (session_dir, channel_names, sampling_rate, num_channels,
+                discovered_at)
+               VALUES (?,?,?,?,?)""",
+            (sd, json.dumps(names), int(ex.get("fs") or 0) or None,
+             len(names), now))
+
+    @staticmethod
+    def _upsert_external_example(conn, fid: int, ex: dict,
+                                  now: str) -> None:
+        conn.execute(
+            """INSERT INTO training_external_example
+               (file_id, animal, fs, has_seizure, rep_type, rep_racine,
+                markers_json, source_csv, peak_stamp, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(file_id) DO UPDATE SET
+                 animal=excluded.animal, fs=excluded.fs,
+                 rep_type=excluded.rep_type, rep_racine=excluded.rep_racine,
+                 markers_json=excluded.markers_json,
+                 source_csv=excluded.source_csv,
+                 peak_stamp=excluded.peak_stamp""",
+            (int(fid), ex.get("animal"), ex.get("fs") or None, 1,
+             ex.get("rep_type"), ex.get("rep_racine"),
+             json.dumps(ex.get("markers") or []), ex.get("source_csv"),
+             ex.get("peak_stamp"), now))
+
+    def eeg_location_get(self, filename: str) -> str | None:
+        """Cached recording location for the EEGLocator. Returns the path
+        for a positive hit, "" for a known-missing file still inside the
+        negative-cache TTL (skip the re-walk), or None = unknown, search."""
+        assert filename, "filename required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT path, checked_at FROM eeg_file_location "
+                "WHERE filename=?", (filename,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        if row["path"]:
+            return row["path"]
+        # Negative entry: honor it only within the TTL, else re-search.
+        try:
+            age = datetime.now() - datetime.fromisoformat(row["checked_at"])
+            if age.total_seconds() < self.EEG_NEG_TTL_HOURS * 3600:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def eeg_location_put(self, filename: str, path: str | None) -> None:
+        """Remember (or forget) where a recording resolved. path=None
+        records a negative result with the current timestamp."""
+        assert filename, "filename required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO eeg_file_location (filename, path, checked_at)
+                   VALUES (?,?,?)
+                   ON CONFLICT(filename) DO UPDATE SET
+                     path=excluded.path, checked_at=excluded.checked_at""",
+                (filename, path, now))
+            conn.commit()
+        finally:
+            conn.close()
 
     def pi_flag(self, file_id: int, pi_email: str,
                   *, note: str,

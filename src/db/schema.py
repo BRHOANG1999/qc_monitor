@@ -600,4 +600,38 @@ CREATE TABLE IF NOT EXISTS training_round (
 );
 CREATE INDEX IF NOT EXISTS idx_training_round_student
     ON training_round(student_email, stage, id);
+
+-- ----------------------------------------------------------------------
+-- training_external_example: historical scored seizures imported from the
+-- lab's BHZ CSV exports (src/utils/past_events.py). Each row collapses one
+-- recording's scored events into the Training marker schema so the file
+-- becomes an extra practice candidate WITHOUT polluting the live
+-- review_state pipeline. Keyed 1:1 to the processed_files row created for
+-- the resolved .mat; training_candidate_pool UNIONs these in and
+-- validated_events_for_file falls back to their markers.
+CREATE TABLE IF NOT EXISTS training_external_example (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL UNIQUE REFERENCES processed_files(id),
+    animal TEXT,
+    fs REAL,
+    has_seizure INTEGER NOT NULL DEFAULT 1,
+    rep_type TEXT,
+    rep_racine INTEGER,
+    markers_json TEXT NOT NULL,
+    source_csv TEXT,
+    peak_stamp REAL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_training_external_animal
+    ON training_external_example(animal);
+
+-- eeg_file_location: persistent cache of where a recording filename was
+-- found on disk (or NULL = not found, with checked_at so the store can
+-- expire and re-search offline files). Lets the recursive multi-HDD search
+-- in past_events.EEGLocator walk each drive once, not once per event.
+CREATE TABLE IF NOT EXISTS eeg_file_location (
+    filename TEXT PRIMARY KEY,
+    path TEXT,
+    checked_at TEXT NOT NULL
+);
 """
