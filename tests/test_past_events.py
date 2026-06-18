@@ -206,6 +206,20 @@ def test_catalog_no_event_examples():
     assert out[0]["animal"] == "BCH060"
 
 
+# ---- channel selection: the electrode after stimCopy --------------- #
+
+def test_recording_channel_after_stimcopy():
+    from src.utils.animal import recording_channel_index, stim_copy_indices
+    names = ["stimCopy", "BCH061SLM", "stimCopy", "BCH062SLM", "BCH060SR"]
+    assert recording_channel_index(names) == 1          # after first stimCopy
+    assert sorted(stim_copy_indices(names)) == [0, 2]
+    # No stimCopy -> first animal channel.
+    assert recording_channel_index(["saline", "BCH040SR"]) == 1
+    # stimCopy with a non-animal after it -> fall back to first animal.
+    assert recording_channel_index(["stimCopy", "ref", "BCH040SR"]) == 2
+    assert recording_channel_index([]) == 0
+
+
 # ---- EEGLocator ------------------------------------------------------ #
 
 def test_locator_direct_hit(tmp_path):

@@ -28,14 +28,14 @@ def _rng():
     return random.Random(0)
 
 
-def test_stage1_75_25_split():
+def test_stage1_50_50_split():
     pool = ([_cand(i, seiz=False) for i in range(1, 11)]
             + [_cand(i, seiz=True) for i in range(11, 21)])
     by = {c["file_id"]: c for c in pool}
     out = select_round(pool, 1, 10, {}, _rng())
     assert len(out) == 10 and len(set(out)) == 10
     n_seiz = sum(1 for f in out if by[f]["has_seizure"])
-    assert n_seiz == 2          # round(0.25*10) -> 2 seizure, 8 no-seizure
+    assert n_seiz == 5          # round(0.5*10) -> 5 seizure, 5 no-seizure
 
 
 def test_stage1_degrades_when_bucket_short():
@@ -111,14 +111,24 @@ def test_stage3_excludes_non_seizure_files():
     assert all(by[f]["has_seizure"] for f in out)
 
 
-def test_stage1_mixes_seizure_and_negatives_75_25():
-    # With plenty of both, detection stays 8 no-event / 2 seizure.
+def test_stage1_mixes_seizure_and_negatives_50_50():
+    # With plenty of both, detection stays 5 no-event / 5 seizure.
     pool = ([_cand(i, seiz=False) for i in range(1, 30)]
             + [_cand(i, seiz=True) for i in range(30, 60)])
     by = {c["file_id"]: c for c in pool}
     out = select_round(pool, 1, 10, {}, _rng())
     n_seiz = sum(1 for f in out if by[f]["has_seizure"])
-    assert n_seiz == 2 and len(out) == 10
+    assert n_seiz == 5 and len(out) == 10
+
+
+def test_stage1_round_is_interleaved():
+    # The balanced round must not be all negatives then all seizures.
+    pool = ([_cand(i, seiz=False) for i in range(1, 30)]
+            + [_cand(i, seiz=True) for i in range(30, 60)])
+    by = {c["file_id"]: c for c in pool}
+    out = select_round(pool, 1, 10, {}, _rng())
+    first_half = out[:5]
+    assert any(by[f]["has_seizure"] for f in first_half)   # not back-loaded
 
 
 def test_least_seen_preferred():

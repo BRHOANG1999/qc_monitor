@@ -2563,6 +2563,35 @@ class Store:
         finally:
             conn.close()
 
+    def reset_student(self, student_email: str, stage: int) -> None:
+        """PI action: send a student BACK to *stage* (1 = start). Unlike
+        advance_student (monotonic-up), this SETs unlocked_stage (can go
+        down) and clears certification. All training_attempt / training_round
+        rows are kept as history; open rounds are closed so the rolling grade
+        restarts from a fresh boundary on the next round."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        now = datetime.now().isoformat()
+        email = student_email.lower()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO training_progress
+                   (student_email, unlocked_stage, certified_at, updated_at)
+                   VALUES (?, ?, NULL, ?)
+                   ON CONFLICT(student_email) DO UPDATE SET
+                     unlocked_stage=excluded.unlocked_stage,
+                     certified_at=NULL,
+                     updated_at=excluded.updated_at""",
+                (email, int(stage), now))
+            # Close any open round so the grade restarts (history kept).
+            conn.execute(
+                "UPDATE training_round SET ended_at=? "
+                "WHERE student_email=? AND ended_at IS NULL",
+                (now, email))
+            conn.commit()
+        finally:
+            conn.close()
+
     def all_training_progress(self) -> list[dict]:
         """Roster for the PI: every student who has a progress row OR
         any attempt, with their unlocked stage + certified status."""
@@ -2625,25 +2654,34 @@ class Store:
 
     # ---- training rounds (balanced batches + reset boundary) ---- #
 
-    def training_candidate_pool(self, student_email: str) -> list[dict]:
+    def training_candidate_pool(self, student_email: str,
+                                 min_duration_sec: float = 0.0) -> list[dict]:
         """All pi_approved files with the labels needed to build balanced
         rounds: has_seizure, representative type/Racine (highest-Racine real
-        event), the file's animals, and when this student last saw it."""
+        event), the file's animals, and when this student last saw it.
+
+        Recordings shorter than *min_duration_sec* are excluded; a file whose
+        duration_sec is unknown (NULL -- e.g. an imported historical file not
+        yet opened) is kept."""
         assert isinstance(student_email, str) and student_email, \
             "student_email required"
         from src.utils.training import _real_events
         email = student_email.lower()
+        # (duration_sec IS NULL OR > thr): drop measured-short files, keep
+        # unknown-length ones.
+        dur = "AND (pf.duration_sec IS NULL OR pf.duration_sec > ?)"
         conn = self._connect()
         try:
             rows = conn.execute(
-                """SELECT rs.file_id, rs.markers_json, pf.session_dir,
+                f"""SELECT rs.file_id, rs.markers_json, pf.session_dir,
                           (SELECT MAX(ta.id) FROM training_attempt ta
                             WHERE ta.student_email=? AND ta.file_id=rs.file_id)
                             AS last_seen
                    FROM review_state rs
                    JOIN processed_files pf ON pf.id = rs.file_id
-                   WHERE rs.status='pi_approved'
-                   GROUP BY rs.file_id""", (email,)).fetchall()
+                   WHERE rs.status='pi_approved' {dur}
+                   GROUP BY rs.file_id""",
+                (email, float(min_duration_sec))).fetchall()
         finally:
             conn.close()
         out: list[dict] = []
@@ -2655,27 +2693,31 @@ class Store:
         # through the live review pipeline. A real pi_approved row for the
         # same file wins, so dedupe by file_id.
         seen = {d["file_id"] for d in out}
-        for r in self._external_candidate_rows(email):
+        for r in self._external_candidate_rows(email, min_duration_sec):
             if r["file_id"] in seen:
                 continue
             out.append(r)
             seen.add(r["file_id"])
         return out
 
-    def _external_candidate_rows(self, email: str) -> list[dict]:
+    def _external_candidate_rows(self, email: str,
+                                  min_duration_sec: float = 0.0) -> list[dict]:
         """training_external_example rows shaped like _pool_row_labels: the
-        stored animal/labels/markers, with this student's last_seen."""
+        stored animal/labels/markers, with this student's last_seen. Same
+        keep-unknown-length duration gate as the pi_approved pool."""
+        dur = "AND (pf.duration_sec IS NULL OR pf.duration_sec > ?)"
         conn = self._connect()
         try:
             rows = conn.execute(
-                """SELECT e.file_id, e.has_seizure, e.rep_type, e.rep_racine,
+                f"""SELECT e.file_id, e.has_seizure, e.rep_type, e.rep_racine,
                           e.animal, pf.session_dir,
                           (SELECT MAX(ta.id) FROM training_attempt ta
                             WHERE ta.student_email=? AND ta.file_id=e.file_id)
                             AS last_seen
                    FROM training_external_example e
-                   JOIN processed_files pf ON pf.id = e.file_id""",
-                (email,)).fetchall()
+                   JOIN processed_files pf ON pf.id = e.file_id
+                   WHERE 1=1 {dur}""",
+                (email, float(min_duration_sec))).fetchall()
         finally:
             conn.close()
         out: list[dict] = []
@@ -2921,18 +2963,22 @@ class Store:
 
     @staticmethod
     def _upsert_historical_session(conn, ex: dict, now: str) -> None:
+        from src.utils.animal import stim_copy_indices
         sd = ex.get("session_dir")
         names = ex.get("channel_names") or []
         if not sd or not names:
             return
+        # stimCopy channels derived by name so stim-blanking lights up for
+        # historical files (which carry no session_config role tags).
+        copies = sorted(stim_copy_indices(names))
         # INSERT OR IGNORE: never clobber a real discovered session_config.
         conn.execute(
             """INSERT OR IGNORE INTO session_config
-               (session_dir, channel_names, sampling_rate, num_channels,
-                discovered_at)
-               VALUES (?,?,?,?,?)""",
-            (sd, json.dumps(names), int(ex.get("fs") or 0) or None,
-             len(names), now))
+               (session_dir, channel_names, stim_copy_channels,
+                sampling_rate, num_channels, discovered_at)
+               VALUES (?,?,?,?,?,?)""",
+            (sd, json.dumps(names), json.dumps(copies),
+             int(ex.get("fs") or 0) or None, len(names), now))
 
     @staticmethod
     def _upsert_external_example(conn, fid: int, ex: dict,
@@ -2956,6 +3002,23 @@ class Store:
              ex.get("rep_type"), ex.get("rep_racine"),
              json.dumps(ex.get("markers") or []), ex.get("source_csv"),
              ex.get("peak_stamp"), now))
+
+    def set_file_duration(self, file_id: int, duration_sec: float) -> None:
+        """Stamp a recording's length the first time it's read (only when
+        currently unknown), so the Training min-duration gate becomes real
+        for historical files once they've been opened."""
+        assert file_id is not None, "file_id required"
+        if not duration_sec or duration_sec <= 0:
+            return
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE processed_files SET duration_sec=? "
+                "WHERE id=? AND duration_sec IS NULL",
+                (float(duration_sec), int(file_id)))
+            conn.commit()
+        finally:
+            conn.close()
 
     def resolve_training_file(self, file_id: int, locator) -> str | None:
         """Confirm (and if needed relocate) the recording for a Training

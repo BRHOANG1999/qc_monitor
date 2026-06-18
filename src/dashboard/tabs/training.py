@@ -36,7 +36,7 @@ from src.dashboard.design import (
     COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, RADIUS_MD, RADIUS_SM,
     SPACE_2, SPACE_3, SPACE_4, FONT_SIZE_BODY, FONT_SIZE_CAPTION)
 from src.db.store import Store
-from src.utils.animal import is_animal_channel
+from src.utils.animal import is_animal_channel, recording_channel_index
 from src.utils import training as _grade
 from src.utils import past_events as _past
 
@@ -154,18 +154,18 @@ def _cfg(config: dict) -> dict:
         "onset_tol_s": float(t.get("onset_tol_s", 10)),
         "racine_tol": int(t.get("racine_tol", 1)),
         "examples_per_round": int(t.get("examples_per_round", 10)),
+        "min_file_duration_sec": float(t.get("min_file_duration_sec", 1800)),
     }
 
 
 def _first_animal_channel(store: Store, session_dir: str | None) -> int:
+    """The recording electrode to show: the animal channel immediately after
+    the stimCopy channel (lab layout), else the first animal channel."""
     try:
         names = store._channel_names_for_session(session_dir)
     except Exception:
         return 0
-    for i, n in enumerate(names or []):
-        if isinstance(n, str) and is_animal_channel(n):
-            return i
-    return 0
+    return recording_channel_index(names or [])
 
 
 def _filtered_trace(store: Store, file_id: int, channel: int,
@@ -212,13 +212,15 @@ def _build_figures(store: Store, file_id: int, channel: int,
     return lfp, _filtered_trace(store, file_id, channel, mode), float(dur)
 
 
-def _ensure_round(store: Store, email: str, stage: int, n: int):
+def _ensure_round(store: Store, email: str, stage: int, n: int,
+                   min_duration_sec: float = 0.0):
     """The open round for (email, stage), creating a balanced one when none
-    is open. None when there are no candidate files."""
+    is open. None when there are no candidate files. Recordings shorter than
+    *min_duration_sec* (when measured) are excluded from the pool."""
     rnd = store.current_training_round(email, stage)
     if rnd is not None:
         return rnd
-    pool = store.training_candidate_pool(email)
+    pool = store.training_candidate_pool(email, min_duration_sec)
     if not pool:
         return None
     seen = {c["file_id"]: (1 if c["last_seen"] else 0) for c in pool}
@@ -263,7 +265,8 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
                 config: dict | None = None):
     """('loaded', payload) for the next round example, ('complete', rnd) when
     the round is finished, or None when no candidate files exist."""
-    rnd = _ensure_round(store, email, stage, n)
+    min_dur = _cfg(config or {})["min_file_duration_sec"]
+    rnd = _ensure_round(store, email, stage, n, min_dur)
     if rnd is None:
         return None
     idx = _round_idx(store, email, stage, rnd)
@@ -275,6 +278,10 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     session_dir = _session_dir_for_file(store, file_id)
     channel = _first_animal_channel(store, session_dir)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
+    # Stamp the measured length so the min-duration gate becomes real for
+    # historical files once opened (no-op when already known).
+    if lfp_dur:
+        store.set_file_duration(file_id, lfp_dur)
     cur = {"file_id": file_id, "channel": channel,
            "validated": store.validated_events_for_file(file_id),
            "session_dir": session_dir, "lfp_dur": lfp_dur}
@@ -965,12 +972,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                             "fontSize": FONT_SIZE_CAPTION},
                     **({"disabled": True} if certified else {})),
                     style=_TD),
+                html.Td(html.Div([
+                    dcc.Dropdown(
+                        id={"type": "training-reset-stage", "email": em},
+                        options=[{"label": "Start", "value": 1},
+                                 {"label": "Stage 2", "value": 2},
+                                 {"label": "Stage 3", "value": 3}],
+                        value=1, clearable=False,
+                        style={"width": "92px", "fontSize": FONT_SIZE_CAPTION},
+                        className="dark-dropdown"),
+                    button("Reset", {"type": "training-reset", "email": em},
+                           variant="ghost",
+                           style={"padding": "2px 10px",
+                                   "fontSize": FONT_SIZE_CAPTION}),
+                ], style={"display": "flex", "alignItems": "center",
+                           "gap": SPACE_2}), style=_TD),
             ]))
         return html.Table([
             html.Thead(html.Tr([
                 html.Th(h, style=_TH) for h in
                 ("Student", "Stage", "Round grade", "Lifetime", "Status",
-                 "")])),
+                 "", "Reset to")])),
             html.Tbody(body),
         ], style={"width": "100%", "borderCollapse": "collapse"})
 
@@ -996,6 +1018,35 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update
         prog = store.get_training_progress(email)
         store.advance_student(email, int(prog.get("unlocked_stage", 1)) + 1)
+        return int(refresh or 0) + 1
+
+    # ---- PI reset: send a student back to start / a stage ---- #
+    @app.callback(
+        Output("training-refresh", "data", allow_duplicate=True),
+        Input({"type": "training-reset", "email": ALL}, "n_clicks"),
+        State({"type": "training-reset-stage", "email": ALL}, "value"),
+        State({"type": "training-reset-stage", "email": ALL}, "id"),
+        State("training-refresh", "data"),
+        State("training-is-pi", "data"),
+        prevent_initial_call=True,
+    )
+    def _reset(_clicks, stages, stage_ids, refresh, is_pi):
+        if not is_pi:
+            return no_update
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict) or not trig.get("email"):
+            return no_update
+        email = trig["email"]
+        # Find this student's chosen reset-stage from the matched ALL lists.
+        stage = 1
+        for sid, val in zip(stage_ids or [], stages or []):
+            if isinstance(sid, dict) and sid.get("email") == email:
+                stage = int(val or 1)
+                break
+        store.reset_student(email, stage)
         return int(refresh or 0) + 1
 
     # ---- Practice library: auto-catalog past scored events ---- #

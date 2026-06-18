@@ -22,6 +22,15 @@ def _store(tmp_path):
     return Store(str(tmp_path / "data" / "monitor.db"))
 
 
+def _pf(store, file_id, session="sessA"):
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_files (id, file_path, "
+            "session_dir, duration_sec) VALUES (?,?,?,?)",
+            (file_id, f"/f/{file_id}.mat", session, 3600.0))
+        conn.commit()
+
+
 def _example(path, *, animal="BCH060", racine=3, typ="HYP",
              names=("stimCopy", "BCH060SR"), markers=None):
     return {
@@ -149,6 +158,79 @@ def test_resolve_training_file_already_on_disk(tmp_path):
     # but the path already exists so resolution is a no-op stat.
     loc = pe.EEGLocator(auto_drives=False)
     assert store.resolve_training_file(fid, loc) == str(real / "rec1.mat")
+
+
+def test_historical_session_gets_stim_copy_channels(tmp_path):
+    store = _store(tmp_path)
+    store.import_historical_examples([_example(
+        "D:/arch/sessA/rec1.mat",
+        names=("stimCopy", "BCH060SR", "stimCopy", "BCH061SLM"))])
+    from src.utils.stim_blank import stim_copy_channels
+    got = stim_copy_channels(store, "D:/arch/sessA")
+    assert got == {0, 2}             # name-derived, so blanking can run
+
+
+def test_reset_student_lowers_stage_keeps_history(tmp_path):
+    store = _store(tmp_path)
+    _pf(store, 5)
+    # Build some attempt history at stage 1, then advance + certify-ish.
+    store.add_training_attempt("stu@x", 1, 5, json.dumps({}), 1.0)
+    store.advance_student("stu@x", 3)
+    assert store.get_training_progress("stu@x")["unlocked_stage"] == 3
+    # Open a round so we can confirm reset closes it.
+    store.create_training_round("stu@x", 1, [5])
+    assert store.current_training_round("stu@x", 1) is not None
+    # Reset back to start.
+    store.reset_student("stu@x", 1)
+    prog = store.get_training_progress("stu@x")
+    assert prog["unlocked_stage"] == 1 and prog["certified_at"] is None
+    assert store.current_training_round("stu@x", 1) is None   # round closed
+    # History survives.
+    assert store.training_lifetime_stats("stu@x", 1)["n"] == 1
+
+
+def _pf_dur(store, file_id, duration, session="sessD"):
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO processed_files (id, file_path, session_dir, "
+            "duration_sec) VALUES (?,?,?,?)",
+            (file_id, f"/f/{file_id}.mat", session, duration))
+        conn.execute(
+            """INSERT INTO review_state (file_id, user_email, status,
+                   markers_json, created_at, updated_at)
+               VALUES (?, 'pi@x', 'pi_approved', '[]',
+                       '2026-01-01','2026-01-01')""", (file_id,))
+        conn.commit()
+
+
+def test_duration_filter_keeps_unknown_drops_short(tmp_path):
+    store = _store(tmp_path)
+    _pf_dur(store, 1, 3600.0)     # 60 min -> kept
+    _pf_dur(store, 2, 600.0)      # 10 min -> dropped
+    _pf_dur(store, 3, None)       # unknown -> kept
+    # Historical (NULL duration) -> kept.
+    store.import_historical_examples([_example("D:/arch/h/recH.mat")])
+    pool = store.training_candidate_pool("stu@x", min_duration_sec=1800)
+    ids = {c["file_id"] for c in pool}
+    assert 1 in ids and 3 in ids and 2 not in ids
+    # The historical NULL-duration file is present too.
+    assert len(ids) == 3
+
+
+def test_set_file_duration_only_when_unknown(tmp_path):
+    store = _store(tmp_path)
+    _pf_dur(store, 7, None)
+    store.set_file_duration(7, 1234.0)
+    with store.connection() as conn:
+        d = conn.execute("SELECT duration_sec FROM processed_files WHERE id=7"
+                         ).fetchone()["duration_sec"]
+    assert d == 1234.0
+    # Does not overwrite a known duration.
+    store.set_file_duration(7, 9999.0)
+    with store.connection() as conn:
+        d = conn.execute("SELECT duration_sec FROM processed_files WHERE id=7"
+                         ).fetchone()["duration_sec"]
+    assert d == 1234.0
 
 
 def test_eeg_location_cache_positive_and_negative(tmp_path):

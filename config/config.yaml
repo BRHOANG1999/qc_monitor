@@ -265,10 +265,14 @@ training:
   # be to count as the same event / landmark, and the Racine slack.
   onset_tol_s: 10
   racine_tol: 1
-  # Examples per balanced round. Stage 1 is split 75% no-seizure / 25%
+  # Examples per balanced round. Stage 1 is split 50/50 no-seizure /
   # seizure; stage 2 even Racine + 50/50 LVF/HYP; stage 3 spread across
   # animals. After each round the student gets a confidence prompt.
   examples_per_round: 10
+  # Recordings shorter than this (seconds) are never shown as practice
+  # examples. Files whose length isn't known yet (imported historical files)
+  # are kept until their length is measured the first time they're opened.
+  min_file_duration_sec: 1800
 
 # Historical scored-event practice library for the Training tab. Reads the
 # lab's BHZ CSV exports (bhz_csv.base_dir) -- the same files the MATLAB BHZ

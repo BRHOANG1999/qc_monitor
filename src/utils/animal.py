@@ -72,3 +72,34 @@ def is_animal_channel(name: str | None) -> bool:
         return False
     lower = str(name).lower()
     return not any(kw in lower for kw in NON_ANIMAL_KEYWORDS)
+
+
+def stim_copy_indices(channel_names) -> set[int]:
+    """Indices of the stimCopy channels (the stimulator output recordings)
+    in *channel_names*. Name-based, so it works even when session_config has
+    no stim-copy role tags (e.g. imported historical recordings)."""
+    out: set[int] = set()
+    for i, n in enumerate(channel_names or []):
+        if isinstance(n, str) and "stimcopy" in n.lower():
+            out.add(i)
+    return out
+
+
+def recording_channel_index(channel_names) -> int:
+    """Index of the recording electrode to display for an animal.
+
+    The animal's electrode is the channel immediately AFTER its stimCopy
+    channel in the lab's channel layout (e.g.
+    ``stimCopy_BCH061SLM_stimCopy_BCH062SLM_...`` -> index 1 = BCH061SLM).
+    Returns the first animal channel that follows a stimCopy entry; falls
+    back to the first animal channel anywhere, else 0.
+    """
+    names = list(channel_names or [])
+    for i, n in enumerate(names):
+        if (isinstance(n, str) and "stimcopy" in n.lower()
+                and i + 1 < len(names) and is_animal_channel(names[i + 1])):
+            return i + 1
+    for i, n in enumerate(names):
+        if isinstance(n, str) and is_animal_channel(n):
+            return i
+    return 0

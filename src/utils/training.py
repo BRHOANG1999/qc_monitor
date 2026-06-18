@@ -196,10 +196,11 @@ def select_round(candidates: list, stage: int, n: int,
 
     *candidates* are dicts from ``Store.training_candidate_pool`` (file_id,
     has_seizure, rep_type, rep_racine, animals, last_seen). Balancing per
-    stage: 1 -> 75% no-seizure / 25% seizure; 2 -> even Racine + 50/50
+    stage: 1 -> 50/50 no-seizure / seizure; 2 -> even Racine + 50/50
     LVF/HYP; 3 -> even across animals (random when one). Ties break
     least-seen first then *rng* (inject a ``random.Random`` for determinism).
-    Returns <= min(n, len(pool)) ids, no repeats.
+    The final batch is shuffled so a round isn't blocky (all negatives then
+    all seizures). Returns <= min(n, len(pool)) ids, no repeats.
     """
     assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
     assert n >= 1, "n must be >= 1"
@@ -208,7 +209,7 @@ def select_round(candidates: list, stage: int, n: int,
     seen = seen_counts or {}
     pool = list(candidates)
     if stage == 1:
-        # Detection mixes seizures + no-event negatives (75/25).
+        # Detection mixes no-event negatives + seizures (50/50).
         chosen = _select_stage1(pool, n, seen, rng)
         pad_pool = pool
     else:
@@ -218,6 +219,7 @@ def select_round(candidates: list, stage: int, n: int,
         chosen = (_select_stage2(pad_pool, n, seen, rng) if stage == 2
                   else _select_stage3(pad_pool, n, seen, rng))
     _pad(chosen, pad_pool, n, seen, rng)
+    rng.shuffle(chosen)          # interleave so a round isn't blocky
     return [c["file_id"] for c in chosen]
 
 
@@ -241,7 +243,7 @@ def _select_stage1(pool, n, seen, rng):
     chosen: list = []
     no_seiz = [c for c in pool if not c["has_seizure"]]
     seiz = [c for c in pool if c["has_seizure"]]
-    n_no = round(0.75 * n)
+    n_no = round(0.5 * n)
     for _ in range(n_no):
         c = _pick_least_seen(no_seiz, used, seen, rng)
         if c is None:
