@@ -547,6 +547,9 @@ def layout(store: Store, config: dict | None = None):
         dcc.Interval(id="training-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="training-current-time", data=0.0),
         html.Div(id="training-seek-sink", style={"display": "none"}),
+        # Sink for the LFP<->Hilbert x-axis lock (the clientside callbacks
+        # relayout the sibling graph directly; this just terminates them).
+        dcc.Store(id="training-xsync-sink"),
     ])
 
 
@@ -1032,9 +1035,58 @@ function(currentTime, fig, current) {
 """
 
 
+def _xsync_js(target_id: str) -> str:
+    """Clientside: when the source graph's x-range (or autorange) changes,
+    Plotly.relayout the target graph to match. The echo guard (skip when the
+    target already holds that range) stops the two callbacks ping-ponging.
+    Same scheme the Video Review tab uses to lock its LFP + analysis x-axes;
+    uirevision keeps the zoom across the cursor/figure redraws."""
+    return ("""
+    function(rel) {
+        if (!rel) { return window.dash_clientside.no_update; }
+        var hasRange = ('xaxis.range[0]' in rel
+                         && 'xaxis.range[1]' in rel);
+        var hasAuto = !!rel['xaxis.autorange'];
+        if (!hasRange && !hasAuto) {
+            return window.dash_clientside.no_update;
+        }
+        var host = document.getElementById('%s');
+        var gd = null;
+        if (host) {
+            gd = host.classList
+                  && host.classList.contains('js-plotly-plot')
+                 ? host : host.querySelector('.js-plotly-plot');
+        }
+        if (!gd || !window.Plotly) {
+            return window.dash_clientside.no_update;
+        }
+        var cur = (gd.layout && gd.layout.xaxis)
+                   ? gd.layout.xaxis.range : null;
+        if (hasRange) {
+            var x0 = rel['xaxis.range[0]'];
+            var x1 = rel['xaxis.range[1]'];
+            if (cur && Math.abs(cur[0] - x0) < 1e-6
+                    && Math.abs(cur[1] - x1) < 1e-6) {
+                return window.dash_clientside.no_update;
+            }
+            window.Plotly.relayout(gd, {
+                'xaxis.range[0]': x0, 'xaxis.range[1]': x1});
+        } else {
+            if (gd.layout && gd.layout.xaxis
+                    && gd.layout.xaxis.autorange === true) {
+                return window.dash_clientside.no_update;
+            }
+            window.Plotly.relayout(gd, {'xaxis.autorange': true});
+        }
+        return window.dash_clientside.no_update;
+    }
+    """ % target_id)
+
+
 def _register_cursor_sync(app) -> None:
     """Wire the Training <video> to the cursor on both LFP panels, plus
-    click-to-seek -- the same scheme the Video Review tab uses."""
+    click-to-seek and the LFP<->Hilbert x-axis lock -- the same scheme the
+    Video Review tab uses."""
     # 1. Poll the <video> element 10 Hz; push currentTime into a Store.
     app.clientside_callback(
         """
@@ -1090,6 +1142,21 @@ def _register_cursor_sync(app) -> None:
         Output("training-seek-sink", "children"),
         Input("training-lfp", "clickData"),
         State("training-current", "data"),
+        prevent_initial_call=True,
+    )
+
+    # 4. Lock the LFP and Hilbert x-axes together: zooming/panning either
+    #    pans the other to the same window (echo-guarded against ping-pong).
+    app.clientside_callback(
+        _xsync_js("training-hilbert"),
+        Output("training-xsync-sink", "data", allow_duplicate=True),
+        Input("training-lfp", "relayoutData"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        _xsync_js("training-lfp"),
+        Output("training-xsync-sink", "data", allow_duplicate=True),
+        Input("training-hilbert", "relayoutData"),
         prevent_initial_call=True,
     )
 
