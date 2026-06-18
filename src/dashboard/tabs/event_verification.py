@@ -97,6 +97,13 @@ def layout(store: Store, config: dict | None = None):
                 id="evtv-approve-sel-btn", n_clicks=0,
                 style=_btn_style(accent=True)),
             html.Button(
+                "Approve ALL pending",
+                id="evtv-approve-all-btn", n_clicks=0,
+                style=_btn_style(accent=True),
+                title="Approve every pending file across all pages "
+                      "(not just the visible/selected ones), so the "
+                      "finalize CSV covers all of them."),
+            html.Button(
                 "Flag selected",
                 id="evtv-flag-sel-btn", n_clicks=0,
                 style=_btn_style(warning=True)),
@@ -742,12 +749,13 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("evtv-list-sig", "data",
                 allow_duplicate=True),
         Input("evtv-approve-sel-btn", "n_clicks"),
+        Input("evtv-approve-all-btn", "n_clicks"),
         Input("evtv-flag-sel-btn", "n_clicks"),
         State("evtv-pending-table", "selected_row_ids"),
         State("evtv-flag-note", "value"),
         prevent_initial_call=True,
     )
-    def _on_action(_bulk_a, _bulk_f, selected_ids, note):
+    def _on_action(_bulk_a, _all_a, _bulk_f, selected_ids, note):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return no_update, no_update, no_update, no_update
@@ -757,19 +765,24 @@ def register_callbacks(app, store, config: dict) -> None:
         if not _has_real_click(callback_context.triggered):
             return no_update, no_update, no_update, no_update
         trig = callback_context.triggered_id
-        targets = [int(x) for x in (selected_ids or [])]
-        if not targets:
-            return (no_update, no_update,
-                     "Tick at least one row first.", no_update)
-        if trig == "evtv-approve-sel-btn":
-            n = store.pi_bulk_approve(targets, email)
-            msg = f"Approved {n} file{'' if n == 1 else 's'}."
-        elif trig == "evtv-flag-sel-btn":
-            n = store.pi_bulk_flag(targets, email,
-                                     note=(note or ""))
-            msg = f"Flagged {n} file{'' if n == 1 else 's'}."
+        # "Approve ALL pending" ignores the table selection/pagination.
+        if trig == "evtv-approve-all-btn":
+            n = store.pi_approve_all_pending(email)
+            msg = f"Approved ALL {n} pending file{'' if n == 1 else 's'}."
         else:
-            return no_update, no_update, no_update, no_update
+            targets = [int(x) for x in (selected_ids or [])]
+            if not targets:
+                return (no_update, no_update,
+                         "Tick at least one row first.", no_update)
+            if trig == "evtv-approve-sel-btn":
+                n = store.pi_bulk_approve(targets, email)
+                msg = f"Approved {n} file{'' if n == 1 else 's'}."
+            elif trig == "evtv-flag-sel-btn":
+                n = store.pi_bulk_flag(targets, email,
+                                         note=(note or ""))
+                msg = f"Flagged {n} file{'' if n == 1 else 's'}."
+            else:
+                return no_update, no_update, no_update, no_update
         rows = store.pi_pending_files(limit=500)
         return (_pending_table_rows(store, rows), [], msg,
                 _pending_signature(rows))

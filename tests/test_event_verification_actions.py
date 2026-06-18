@@ -120,5 +120,41 @@ def test_pending_table_rows_shape(tmp_path):
     assert r["view"] == "Open >"
 
 
+def test_approve_all_pending_covers_every_file(tmp_path):
+    """Approve-all must approve every pending file, not just a table
+    page (the bug: finalize CSV only covered the first 25 rows)."""
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    n_files = 40   # > one 25-row page
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO session_config
+               (session_dir, channel_names, eeg_channels, discovered_at)
+               VALUES ('S1', ?, ?, '2026-01-01T00:00:00')""",
+            (json.dumps(["stimCopy", "BCH061SR"]), json.dumps([1])))
+        for i in range(1, n_files + 1):
+            conn.execute(
+                "INSERT INTO processed_files (id, file_path, session_dir, "
+                "chunk_datetime) VALUES (?, ?, 'S1', '2026_03_10__04_59_00')",
+                (i, f"/f/{i}.mat"))
+        conn.commit()
+    for i in range(1, n_files + 1):
+        store.mark_review(i, "u@lab", "pending_pi_review",
+                          markers=[{"type": "sz"}])
+
+    assert len(store.pi_pending_files(limit=500)) == n_files
+    approved = store.pi_approve_all_pending("pi@lab")
+    assert approved == n_files
+    # Nothing left pending; every file is now pi_approved.
+    assert store.pi_pending_files(limit=500) == []
+    with store.connection() as conn:
+        n_appr = conn.execute(
+            "SELECT COUNT(*) FROM review_state WHERE status='pi_approved'"
+        ).fetchone()[0]
+    assert n_appr == n_files
+    # A second call is a no-op (nothing pending).
+    assert store.pi_approve_all_pending("pi@lab") == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

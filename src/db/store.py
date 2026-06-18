@@ -2675,6 +2675,44 @@ class Store:
             )
         return n_done
 
+    def pi_approve_all_pending(self, pi_email: str,
+                                 *, animal_id: str | None = None) -> int:
+        """Approve EVERY file currently in ``pending_pi_review`` (not just a
+        table page). Used by the PI's "Approve all pending" so the finalize
+        CSV covers every file, regardless of pagination/selection.
+        """
+        assert pi_email, "pi_email required"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT rs.file_id, pf.session_dir
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   WHERE rs.status = 'pending_pi_review'
+                     AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
+                                  WHERE rs2.file_id = rs.file_id)
+                   ORDER BY rs.id ASC""").fetchall()
+        finally:
+            conn.close()
+        file_ids: list[int] = []
+        for r in rows:
+            if animal_id:
+                names = self._channel_names_for_session(r["session_dir"])
+                if not self._session_has_animal(names, animal_id):
+                    continue
+            file_ids.append(int(r["file_id"]))
+        n_done = 0
+        for i, fid in enumerate(file_ids):
+            assert i < 100000, "approve-all loop runaway"
+            if self.pi_approve(fid, pi_email):
+                n_done += 1
+        if n_done:
+            self.insert_review_event(
+                file_ids[0], pi_email, "pi_bulk_approve",
+                {"file_ids": file_ids, "n_approved": n_done,
+                 "scope": "all_pending"})
+        return n_done
+
     def pi_bulk_flag(self, file_ids: list[int], pi_email: str,
                        *, note: str) -> int:
         """Flag many files with a shared note."""
