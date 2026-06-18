@@ -145,6 +145,22 @@ class Store:
                 pass  # brand-new DB: tables may not exist yet
             conn.execute(
                 f"PRAGMA user_version = {_CACHE_SCHEMA_VERSION}")
+        # Past-events practice library: add the folder/filename columns used
+        # for lazy EEG resolution to a training_external_example created
+        # before they existed (CREATE TABLE IF NOT EXISTS won't add them).
+        try:
+            ext_cols = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA table_info(training_external_example)")
+            }
+            if ext_cols and "folder" not in ext_cols:
+                conn.execute("ALTER TABLE training_external_example "
+                             "ADD COLUMN folder TEXT")
+            if ext_cols and "filename" not in ext_cols:
+                conn.execute("ALTER TABLE training_external_example "
+                             "ADD COLUMN filename TEXT")
+        except Exception:
+            pass  # brand-new DB: SCHEMA_SQL already created the columns
         conn.commit()
         conn.close()
 
