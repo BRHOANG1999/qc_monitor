@@ -116,3 +116,52 @@ def test_roster_lists_students(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_candidate_pool_labels(tmp_path):
+    store = _store(tmp_path)
+    # session with two animal channels so animals resolve.
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO session_config (session_dir, channel_names, "
+            "eeg_channels, discovered_at) VALUES ('sessA', ?, ?, '2026-01-01')",
+            (json.dumps(["stimCopy", "BCH062SR", "BCH061SLM"]),
+             json.dumps([1])))
+        conn.commit()
+    _approve(store, 1, [{"type": "LVF", "EO_sec": 1.0, "racine": 4},
+                        {"type": "HYP", "EO_sec": 3.0, "racine": 7}])
+    _approve(store, 2, [])
+    pool = {c["file_id"]: c for c in store.training_candidate_pool("stu@x")}
+    assert pool[1]["has_seizure"] and not pool[2]["has_seizure"]
+    assert pool[1]["rep_racine"] == 7          # highest-Racine event
+    assert pool[1]["rep_type"] == "HYP"
+    assert set(pool[1]["animals"]) == {"BCH062", "BCH061"}
+
+
+def test_round_scoped_grade_reset_keeps_history(tmp_path):
+    store = _store(tmp_path)
+    for fid in (1, 2, 3):
+        _pf(store, fid)
+    store.add_training_attempt("stu@x", 1, 1, "{}", 0.2)   # pre-round
+    r1 = store.create_training_round("stu@x", 1, [1, 2, 3])
+    store.add_training_attempt("stu@x", 1, 1, "{}", 1.0)
+    store.add_training_attempt("stu@x", 1, 2, "{}", 1.0)
+    assert store.round_scores("stu@x", 1, r1["started_after_id"]) == [1.0, 1.0]
+    # New round = new boundary; round 1's attempts excluded from round 2.
+    store.finish_training_round(r1["round_id"], 4, "review_more")
+    r2 = store.create_training_round("stu@x", 1, [3])
+    assert store.round_scores("stu@x", 1, r2["started_after_id"]) == []
+    # Lifetime keeps ALL attempts (history persists across resets).
+    life = store.training_lifetime_stats("stu@x", 1)
+    assert life["n"] == 3
+
+
+def test_current_round_and_notify_dedup(tmp_path):
+    store = _store(tmp_path)
+    _pf(store, 1)
+    r = store.create_training_round("stu@x", 2, [1])
+    assert store.current_training_round("stu@x", 2)["round_id"] == r["round_id"]
+    assert store.mark_round_notified(r["round_id"]) is True
+    assert store.mark_round_notified(r["round_id"]) is False   # deduped
+    store.finish_training_round(r["round_id"], 5, "move_on")
+    assert store.current_training_round("stu@x", 2) is None     # ended

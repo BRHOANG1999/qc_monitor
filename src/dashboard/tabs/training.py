@@ -19,7 +19,9 @@ this tab reuses.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import random
 
 from dash import (Input, Output, State, dcc, html, no_update, ALL,
                    callback_context)
@@ -40,10 +42,13 @@ from src.utils import training as _grade
 # the file-path lookup. video.py never imports this module, so no cycle.
 from src.dashboard.tabs.video import (
     _file_path_for_id, _decimated_lfp, _build_lfp_figure,
-    _render_hilbert_trace, _empty_lfp_fig, _session_dir_for_file,
-    _stim_times_for_file, _stim_copy_channels)
+    _render_hilbert_trace, _render_auc_trace, _empty_lfp_fig,
+    _session_dir_for_file, _stim_times_for_file, _stim_copy_channels)
+
+logger = logging.getLogger("qc_monitor.dashboard.training")
 
 _LANDMARKS = _grade.LANDMARKS  # ("EO","LAS","BO","PID","BB")
+_AUC_WINDOW_SEC = 5.0          # sliding-window AUC width for the LFP toggle
 
 
 # ===================================================================== #
@@ -65,6 +70,7 @@ def _cfg(config: dict) -> dict:
         "window": int(t.get("window", 10)),
         "onset_tol_s": float(t.get("onset_tol_s", 10)),
         "racine_tol": int(t.get("racine_tol", 1)),
+        "examples_per_round": int(t.get("examples_per_round", 10)),
     }
 
 
@@ -79,9 +85,25 @@ def _first_animal_channel(store: Store, session_dir: str | None) -> int:
     return 0
 
 
-def _build_figures(store: Store, file_id: int, channel: int):
-    """(lfp_fig, hilbert_fig) for a recording -- stim-blanked like the
-    Video Review default. Falls back to placeholders on error."""
+def _filtered_trace(store: Store, file_id: int, channel: int,
+                     mode: str):
+    """The student's chosen 2nd-panel trace: raw Hilbert envelope (default)
+    or its sliding-window AUC. Falls back to a placeholder on error."""
+    try:
+        if mode == "auc":
+            fig, _s = _render_auc_trace(store, file_id, channel,
+                                        _AUC_WINDOW_SEC)
+        else:
+            fig, _s = _render_hilbert_trace(store, file_id, channel)
+        return fig
+    except Exception:
+        return _empty_lfp_fig("Trace failed to load.")
+
+
+def _build_figures(store: Store, file_id: int, channel: int,
+                    mode: str = "hilbert"):
+    """(lfp_fig, filtered_fig) for a recording -- stim-blanked like the
+    Video Review default. *mode* picks the 2nd panel (hilbert | auc)."""
     file_path = _file_path_for_id(store, file_id)
     if not file_path:
         ph = _empty_lfp_fig("Recording file not found.")
@@ -100,11 +122,127 @@ def _build_figures(store: Store, file_id: int, channel: int):
                                  uirevision=f"train:{file_id}:{channel}")
     except Exception:
         lfp = _empty_lfp_fig("LFP failed to load.")
+    return lfp, _filtered_trace(store, file_id, channel, mode)
+
+
+def _ensure_round(store: Store, email: str, stage: int, n: int):
+    """The open round for (email, stage), creating a balanced one when none
+    is open. None when there are no candidate files."""
+    rnd = store.current_training_round(email, stage)
+    if rnd is not None:
+        return rnd
+    pool = store.training_candidate_pool(email)
+    if not pool:
+        return None
+    seen = {c["file_id"]: (1 if c["last_seen"] else 0) for c in pool}
+    files = _grade.select_round(pool, int(stage), n, seen, random.Random())
+    if not files:
+        return None
+    return store.create_training_round(email, int(stage), files)
+
+
+def _round_idx(store: Store, email: str, stage: int, rnd: dict) -> int:
+    """Examples of this round the student has already submitted."""
+    return len(store.round_scores(email, int(stage),
+                                  rnd["started_after_id"]))
+
+
+def _history_text(store: Store, email: str, stage: int, rnd=None) -> str:
+    life = store.training_lifetime_stats(email, int(stage))
+    bits = []
+    if rnd is not None:
+        idx = min(_round_idx(store, email, stage, rnd), rnd["examples"])
+        bits.append(f"round {idx}/{rnd['examples']}")
+    if life["n"]:
+        bits.append(f"lifetime {life['mean'] * 100:.0f}% / {life['n']}")
+    return "  ·  ".join(bits)
+
+
+def _load_next(store: Store, email: str, stage: int, mode: str, n: int):
+    """('loaded', payload) for the next round example, ('complete', rnd) when
+    the round is finished, or None when no candidate files exist."""
+    rnd = _ensure_round(store, email, stage, n)
+    if rnd is None:
+        return None
+    idx = _round_idx(store, email, stage, rnd)
+    if idx >= rnd["examples"]:
+        return "complete", rnd
+    file_id = int(rnd["files"][idx])
+    session_dir = _session_dir_for_file(store, file_id)
+    channel = _first_animal_channel(store, session_dir)
+    lfp, hil = _build_figures(store, file_id, channel, mode)
+    cur = {"file_id": file_id, "channel": channel,
+           "validated": store.validated_events_for_file(file_id),
+           "session_dir": session_dir}
+    now = (f"Now scoring: example {idx + 1} of {rnd['examples']} "
+           f"(file #{file_id})")
+    return "loaded", (cur, _vid_player(file_id), lfp, hil, now,
+                      _history_text(store, email, stage, rnd))
+
+
+def _build_prompt(store: Store, email: str, stage: int,
+                   rnd: dict) -> html.Div:
+    scores = store.round_scores(email, int(stage), rnd["started_after_id"])
+    rmean = (sum(scores) / len(scores) * 100) if scores else 0.0
+    life = store.training_lifetime_stats(email, int(stage))
+    lifetxt = (f"{life['mean'] * 100:.0f}% over {life['n']} attempts"
+               if life["n"] else "—")
+    return card(
+        html.Div(f"Round complete — {rmean:.0f}% on these "
+                 f"{rnd['examples']} examples (lifetime {lifetxt}).",
+                 style={"fontWeight": "700", "color": COLOR_TEXT_PRIMARY,
+                        "marginBottom": SPACE_3}),
+        html.Div("How confident are you in your scoring now? (1 = unsure, "
+                 "5 = very confident)",
+                 style={"color": COLOR_TEXT_SECONDARY,
+                        "fontSize": FONT_SIZE_CAPTION,
+                        "marginBottom": SPACE_2}),
+        dcc.RadioItems(
+            id="training-confidence",
+            options=[{"label": f" {i}", "value": i} for i in range(1, 6)],
+            value=3, inline=True,
+            labelStyle={"marginRight": SPACE_3, "color": COLOR_TEXT_PRIMARY,
+                         "fontSize": FONT_SIZE_BODY}),
+        html.Div([
+            button("Review more examples", "training-review-more-btn",
+                   variant="secondary", style={"marginRight": SPACE_3}),
+            button("I'm confident — move on", "training-moveon-btn",
+                   variant="primary", tone="success"),
+        ], style={"marginTop": SPACE_3}),
+        html.Div(id="training-prompt-status",
+                 style={"color": COLOR_TEXT_TERTIARY,
+                        "fontSize": FONT_SIZE_CAPTION, "marginTop": SPACE_2}),
+        style={"borderLeft": f"3px solid {COLOR_ACCENT}",
+               "marginTop": SPACE_4},
+    )
+
+
+def _notify_pi(store: Store, config: dict, email: str, stage: int,
+                rnd: dict) -> bool:
+    """Email the PI(s) that a student finished a stage. Non-fatal."""
+    pis = (((config or {}).get("review_queue", {}) or {})
+           .get("pi_emails", []) or [])
+    if not pis:
+        return False
+    scores = store.round_scores(email, int(stage), rnd["started_after_id"])
+    rmean = (sum(scores) / len(scores) * 100) if scores else 0.0
+    life = store.training_lifetime_stats(email, int(stage))
+    lifetxt = (f"{life['mean'] * 100:.0f}% over {life['n']} attempts"
+               if life["n"] else "—")
+    label = STAGE_LABEL.get(int(stage), stage)
+    subject = f"Training: {email} finished Stage {stage} ({label})"
+    body = (f"{email} just finished a round of Stage {stage} ({label}) and "
+            f"says they're confident.\n\n"
+            f"Round score: {rmean:.0f}%\nLifetime: {lifetxt}\n\n"
+            f"Open the Training tab -> Student progress (PI) to review their "
+            f"performance and advance them.")
     try:
-        hil, _status = _render_hilbert_trace(store, file_id, channel)
-    except Exception:
-        hil = _empty_lfp_fig("Hilbert failed to load.")
-    return lfp, hil
+        from src.alerting.email_alert import EmailAlerter
+        return EmailAlerter(config).send(subject, body, recipients=pis,
+                                          subject_prefix=False)
+    except Exception as e:  # noqa: BLE001 -- email must never break the UI
+        logger.warning("PI training-stage email failed: %s", e)
+        return False
 
 
 def _events_table(events: list, title: str, color: str) -> html.Div:
@@ -167,8 +305,12 @@ def layout(store: Store, config: dict | None = None):
                     labelStyle={"marginRight": SPACE_4,
                                  "color": COLOR_TEXT_PRIMARY,
                                  "fontSize": FONT_SIZE_BODY}),
+                html.Span(id="training-history",
+                          style={"marginLeft": "auto",
+                                  "color": COLOR_TEXT_TERTIARY,
+                                  "fontSize": FONT_SIZE_CAPTION}),
                 html.Span(id="training-ready-badge",
-                          style={"marginLeft": "auto"}),
+                          style={"marginLeft": SPACE_3}),
             ], style={"display": "flex", "alignItems": "center",
                        "flexWrap": "wrap", "gap": SPACE_2}),
             html.Div(id="training-stage-hint",
@@ -194,6 +336,22 @@ def layout(store: Store, config: dict | None = None):
                           config={"displayModeBar": True,
                                    "displaylogo": False,
                                    "scrollZoom": True}),
+                html.Div([
+                    html.Span("2nd panel:", style={
+                        "color": COLOR_TEXT_SECONDARY,
+                        "fontSize": FONT_SIZE_CAPTION,
+                        "marginRight": SPACE_2}),
+                    dcc.RadioItems(
+                        id="training-lfp-mode",
+                        options=[{"label": " Hilbert envelope",
+                                  "value": "hilbert"},
+                                 {"label": " AUC", "value": "auc"}],
+                        value="hilbert", inline=True,
+                        labelStyle={"marginRight": SPACE_3,
+                                     "color": COLOR_TEXT_PRIMARY,
+                                     "fontSize": FONT_SIZE_CAPTION}),
+                ], style={"display": "flex", "alignItems": "center",
+                           "margin": f"{SPACE_2} 0"}),
                 dcc.Graph(id="training-hilbert",
                           figure=_empty_lfp_fig(""),
                           config={"displayModeBar": True,
@@ -230,6 +388,9 @@ def layout(store: Store, config: dict | None = None):
 
         # Feedback (student vs validated), revealed after submit.
         html.Div(id="training-feedback"),
+
+        # Post-round confidence prompt (hidden until a round completes).
+        html.Div(id="training-prompt", style={"display": "none"}),
 
         # PI roster.
         html.Div(
@@ -280,21 +441,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         value = cur_stage if (cur_stage and cur_stage <= unlocked) \
             else unlocked
         hint = _grade.STAGES[value]["scored"]
-        # Ready badge for the CURRENT stage.
         badge = ""
         if email:
-            scores = store.recent_training_scores(email, value,
-                                                   limit=cfg["window"])
+            # Readiness is round-scoped (resets when the student reviews more).
+            rnd = store.current_training_round(email, value)
+            scores = (store.round_scores(email, value, rnd["started_after_id"])
+                      if rnd else
+                      store.recent_training_scores(email, value,
+                                                   limit=cfg["window"]))
             if prog.get("certified_at"):
                 badge = _pill("Certified ✓", COLOR_SUCCESS)
-            elif value < 3 and value >= unlocked and _grade.rolling_ready(
-                    scores, cfg["pass_pct"], cfg["window"]):
-                badge = _pill("Ready to advance — ask your PI",
-                              COLOR_WARNING)
-            elif value == 3 and _grade.rolling_ready(
-                    scores, cfg["pass_pct"], cfg["window"]):
-                badge = _pill("Ready to certify — ask your PI",
-                              COLOR_WARNING)
+            elif _grade.rolling_ready(scores, cfg["pass_pct"], cfg["window"]):
+                badge = _pill(
+                    "Ready to certify — ask your PI" if value == 3
+                    else "Ready to advance — ask your PI", COLOR_WARNING)
         return opts, value, hint, badge
 
     # ---- Load the next example ---- #
@@ -306,35 +466,52 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("training-events", "data", allow_duplicate=True),
         Output("training-feedback", "children", allow_duplicate=True),
         Output("training-now", "children"),
+        Output("training-prompt", "children", allow_duplicate=True),
+        Output("training-prompt", "style", allow_duplicate=True),
+        Output("training-history", "children", allow_duplicate=True),
         Input("training-next-btn", "n_clicks"),
+        State("training-stage", "value"),
+        State("training-lfp-mode", "value"),
         prevent_initial_call="initial_duplicate",
     )
-    def _load_example(_n):
+    def _load_example(_n, stage, mode):
+        hide = {"display": "none"}
         email = current_user_email()
         if not email:
             ph = _empty_lfp_fig("Sign in to start training.")
             return (None, _vid_placeholder("Sign in to start training."),
-                    ph, ph, [], "", "")
-        nxt = store.next_training_file(email)
-        if not nxt:
+                    ph, ph, [], "", "", "", hide, "")
+        stage = int(stage or 1)
+        res = _load_next(store, email, stage, mode or "hilbert",
+                         cfg["examples_per_round"])
+        if res is None:
             ph = _empty_lfp_fig("No validated recordings yet.")
-            return (None,
-                    _vid_placeholder("No validated recordings to train "
-                                     "on yet — check back once the PI "
-                                     "has approved some."),
-                    ph, ph, [], "", "")
-        file_id = int(nxt["file_id"])
-        channel = _first_animal_channel(store, nxt.get("session_dir"))
-        lfp, hil = _build_figures(store, file_id, channel)
-        cur = {"file_id": file_id, "channel": channel,
-               "validated": nxt.get("events") or [],
-               "session_dir": nxt.get("session_dir"),
-               "chunk_datetime": nxt.get("chunk_datetime")}
-        vid = _vid_player(file_id)
-        when = (nxt.get("chunk_datetime") or "")[:16]
-        now = f"Now scoring: file #{file_id}" + (f" · {when}" if when
-                                                  else "")
-        return cur, vid, lfp, hil, [], "", now
+            return (None, _vid_placeholder(
+                "No validated recordings to train on yet — check back once "
+                "the PI has approved some."), ph, ph, [], "", "", "", hide, "")
+        kind, payload = res
+        if kind == "complete":
+            prompt = _build_prompt(store, email, stage, payload)
+            return (no_update, no_update, no_update, no_update, no_update, "",
+                    "Round complete — choose below.", prompt,
+                    {"display": "block"},
+                    _history_text(store, email, stage, payload))
+        cur, vid, lfp, hil, now, hist = payload
+        return cur, vid, lfp, hil, [], "", now, "", hide, hist
+
+    # ---- 2nd-panel filter: Hilbert envelope vs AUC ---- #
+    @app.callback(
+        Output("training-hilbert", "figure", allow_duplicate=True),
+        Input("training-lfp-mode", "value"),
+        State("training-current", "data"),
+        prevent_initial_call=True,
+    )
+    def _toggle_lfp_mode(mode, current):
+        if not current or not current.get("file_id"):
+            return no_update
+        return _filtered_trace(store, int(current["file_id"]),
+                               int(current.get("channel") or 0),
+                               mode or "hilbert")
 
     # ---- Stage-dependent scoring form ---- #
     @app.callback(
@@ -454,6 +631,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("training-feedback", "children"),
         Output("training-refresh", "data"),
+        Output("training-prompt", "children", allow_duplicate=True),
+        Output("training-prompt", "style", allow_duplicate=True),
+        Output("training-history", "children", allow_duplicate=True),
         Input("training-submit-btn", "n_clicks"),
         State("training-stage", "value"),
         State("training-detect", "value"),
@@ -463,19 +643,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _submit(_n, stage, detect, events, current, refresh):
+        nope = (no_update,) * 5
         if not _n:
-            return no_update, no_update
+            return nope
         email = current_user_email()
         if not email:
-            return _note("Sign in to submit.", COLOR_DANGER), no_update
+            return (_note("Sign in to submit.", COLOR_DANGER),) + nope[1:]
         if not current:
-            return _note("Load an example first.", COLOR_WARNING), no_update
+            return (_note("Load an example first.", COLOR_WARNING),) + nope[1:]
         stage = int(stage or 1)
         validated = current.get("validated") or []
         if stage == 1:
             if detect not in ("yes", "no"):
-                return _note("Pick yes or no first.",
-                             COLOR_WARNING), no_update
+                return (_note("Pick yes or no first.", COLOR_WARNING),
+                        ) + nope[1:]
             answer = {"events_present": detect == "yes", "events": []}
         else:
             answer = {"events_present": bool(events), "events": events or []}
@@ -489,10 +670,85 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 json.dumps(answer), float(score),
                 json.dumps(result.get("breakdown")))
         except Exception as e:
-            return _note(f"Save failed: {e}", COLOR_DANGER), no_update
+            return (_note(f"Save failed: {e}", COLOR_DANGER),) + nope[1:]
         fb = _feedback(stage, score, result.get("breakdown", {}),
                        answer, validated)
-        return fb, int(refresh or 0) + 1
+        hide = {"display": "none"}
+        rnd = store.current_training_round(email, stage)
+        hist = _history_text(store, email, stage, rnd)
+        nxt = int(refresh or 0) + 1
+        if rnd is not None and _round_idx(store, email, stage,
+                                          rnd) >= rnd["examples"]:
+            return (fb, nxt, _build_prompt(store, email, stage, rnd),
+                    {"display": "block"}, hist)
+        return fb, nxt, no_update, hide, hist
+
+    # ---- Post-round prompt: review more (reset grade) ---- #
+    @app.callback(
+        Output("training-current", "data", allow_duplicate=True),
+        Output("training-video", "children", allow_duplicate=True),
+        Output("training-lfp", "figure", allow_duplicate=True),
+        Output("training-hilbert", "figure", allow_duplicate=True),
+        Output("training-events", "data", allow_duplicate=True),
+        Output("training-feedback", "children", allow_duplicate=True),
+        Output("training-now", "children", allow_duplicate=True),
+        Output("training-prompt", "children", allow_duplicate=True),
+        Output("training-prompt", "style", allow_duplicate=True),
+        Output("training-history", "children", allow_duplicate=True),
+        Output("training-refresh", "data", allow_duplicate=True),
+        Input("training-review-more-btn", "n_clicks"),
+        State("training-stage", "value"),
+        State("training-lfp-mode", "value"),
+        State("training-confidence", "value"),
+        State("training-refresh", "data"),
+        prevent_initial_call=True,
+    )
+    def _review_more(_n, stage, mode, confidence, refresh):
+        if not _n:
+            return (no_update,) * 11
+        email = current_user_email()
+        stage = int(stage or 1)
+        hide = {"display": "none"}
+        bump = int(refresh or 0) + 1
+        rnd = store.current_training_round(email, stage)
+        if rnd is not None:
+            # Close the round -> a fresh round starts a new reset boundary,
+            # so the current grade restarts (history is kept).
+            store.finish_training_round(rnd["round_id"], confidence,
+                                        "review_more")
+        res = _load_next(store, email, stage, mode or "hilbert",
+                         cfg["examples_per_round"])
+        if res is None or res[0] != "loaded":
+            return ((no_update,) * 7 + ("", hide,
+                    _history_text(store, email, stage, None), bump))
+        cur, vid, lfp, hil, now, hist = res[1]
+        return cur, vid, lfp, hil, [], "", now, "", hide, hist, bump
+
+    # ---- Post-round prompt: move on (notify PI) ---- #
+    @app.callback(
+        Output("training-prompt-status", "children"),
+        Output("training-refresh", "data", allow_duplicate=True),
+        Input("training-moveon-btn", "n_clicks"),
+        State("training-stage", "value"),
+        State("training-confidence", "value"),
+        State("training-refresh", "data"),
+        prevent_initial_call=True,
+    )
+    def _move_on(_n, stage, confidence, refresh):
+        if not _n:
+            return no_update, no_update
+        email = current_user_email()
+        stage = int(stage or 1)
+        rnd = store.current_training_round(email, stage)
+        if rnd is None:
+            return "No active round.", no_update
+        store.finish_training_round(rnd["round_id"], confidence, "move_on")
+        sent = (_notify_pi(store, config, email, stage, rnd)
+                if store.mark_round_notified(rnd["round_id"]) else False)
+        msg = ("Sent to your PI — they'll review your performance and "
+               "advance you." if sent else
+               "Recorded. Your PI reviews and gates the next stage.")
+        return msg, int(refresh or 0) + 1
 
     # ---- PI roster ---- #
     @app.callback(
@@ -513,12 +769,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             em = r["student_email"]
             unlocked = int(r.get("unlocked_stage", 1))
             certified = bool(r.get("certified_at"))
-            # Rolling mean in the current (highest unlocked) stage.
-            scores = store.recent_training_scores(em, unlocked,
-                                                   limit=cfg["window"])
+            # Current grade is round-scoped (resets when they review more);
+            # lifetime is the full history.
+            rnd = store.current_training_round(em, unlocked)
+            scores = (store.round_scores(em, unlocked,
+                                         rnd["started_after_id"]) if rnd else
+                      store.recent_training_scores(em, unlocked,
+                                                   limit=cfg["window"]))
             mean = (sum(scores) / len(scores)) if scores else 0.0
             ready = _grade.rolling_ready(scores, cfg["pass_pct"],
                                          cfg["window"])
+            life = store.training_lifetime_stats(em, unlocked)
+            lifetxt = (f"{life['mean'] * 100:.0f}% / {life['n']}"
+                       if life["n"] else "—")
             status = ("Certified" if certified
                       else ("Ready" if ready else "In progress"))
             label = ("Certify" if unlocked >= 3 else
@@ -527,6 +790,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 html.Td(em, style=_TD),
                 html.Td(f"{unlocked}. {STAGE_LABEL[unlocked]}", style=_TD),
                 html.Td(f"{mean * 100:.0f}% (n={len(scores)})", style=_TD),
+                html.Td(lifetxt, style=_TD),
                 html.Td(status, style={**_TD, "color": (
                     COLOR_SUCCESS if certified or ready
                     else COLOR_TEXT_SECONDARY)}),
@@ -541,7 +805,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return html.Table([
             html.Thead(html.Tr([
                 html.Th(h, style=_TH) for h in
-                ("Student", "Stage", "Recent agreement", "Status", "")])),
+                ("Student", "Stage", "Round grade", "Lifetime", "Status",
+                 "")])),
             html.Tbody(body),
         ], style={"width": "100%", "borderCollapse": "collapse"})
 

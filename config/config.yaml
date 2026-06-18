@@ -265,6 +265,10 @@ training:
   # be to count as the same event / landmark, and the Racine slack.
   onset_tol_s: 10
   racine_tol: 1
+  # Examples per balanced round. Stage 1 is split 75% no-seizure / 25%
+  # seizure; stage 2 even Racine + 50/50 LVF/HYP; stage 3 spread across
+  # animals. After each round the student gets a confidence prompt.
+  examples_per_round: 10
 
 # Slow-gamma (30-50 Hz) induced-power feature in Video Review. Windows are
 # milliseconds relative to each stim onset. The post window starts AFTER the
