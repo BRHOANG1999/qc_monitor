@@ -25,7 +25,8 @@ def _store(tmp_path):
 def _example(path, *, animal="BCH060", racine=3, typ="HYP",
              names=("stimCopy", "BCH060SR"), markers=None):
     return {
-        "resolved_path": path,
+        "recorded_path": path,
+        "folder": os.path.dirname(path),
         "session_dir": os.path.dirname(path),
         "session_name": os.path.basename(os.path.dirname(path)),
         "filename": os.path.basename(path),
@@ -106,6 +107,48 @@ def test_real_approval_wins_over_external(tmp_path):
     # The real approval's answer wins.
     ev = store.validated_events_for_file(pool[0]["file_id"])
     assert ev[0]["type"] == "LVF" and ev[0]["EO_sec"] == 9.0
+
+
+def test_resolve_training_file_lazy(tmp_path):
+    store = _store(tmp_path)
+    # Catalog with a stale recorded path; the real file lives elsewhere.
+    real = tmp_path / "drive" / "MONTH" / "sess"
+    real.mkdir(parents=True)
+    fn = "rec1.mat"
+    (real / fn).write_bytes(b"x")
+    store.import_historical_examples(
+        [_example("Z:/offline/wrong/rec1.mat")])
+    pool = store.training_candidate_pool("stu@x")
+    fid = pool[0]["file_id"]
+
+    from src.utils import past_events as pe
+    loc = pe.EEGLocator([str(tmp_path / "drive")], auto_drives=False,
+                        cache_get=store.eeg_location_get,
+                        cache_put=store.eeg_location_put)
+    got = store.resolve_training_file(fid, loc)
+    assert got == str(real / fn)
+    # The processed_files row was repointed at the found path.
+    with store.connection() as conn:
+        row = conn.execute(
+            "SELECT file_path FROM processed_files WHERE id=?",
+            (fid,)).fetchone()
+    assert row["file_path"] == str(real / fn)
+
+
+def test_resolve_training_file_already_on_disk(tmp_path):
+    store = _store(tmp_path)
+    real = tmp_path / "sess"
+    real.mkdir()
+    (real / "rec1.mat").write_bytes(b"x")
+    store.import_historical_examples(
+        [_example(str(real / "rec1.mat"))])
+    fid = store.training_candidate_pool("stu@x")[0]["file_id"]
+
+    from src.utils import past_events as pe
+    # auto_drives off + no roots: if it tried to search it'd find nothing,
+    # but the path already exists so resolution is a no-op stat.
+    loc = pe.EEGLocator(auto_drives=False)
+    assert store.resolve_training_file(fid, loc) == str(real / "rec1.mat")
 
 
 def test_eeg_location_cache_positive_and_negative(tmp_path):

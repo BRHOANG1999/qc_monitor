@@ -222,31 +222,34 @@ def test_locator_negative_cache(tmp_path):
 
 # ---- example assembly ------------------------------------------------ #
 
-def test_build_file_examples(tmp_path):
-    d = tmp_path / "sess"
-    d.mkdir()
-    (d / _FN).write_bytes(b"x")
+def test_catalog_examples_no_disk_access():
+    # Cataloging is pure metadata -- no locator, no filesystem.
     evs = [
-        pe.parse_row(_norm(folder=str(d), filename=_FN, fs="20000",
+        pe.parse_row(_norm(folder="X:\\sess\\", filename=_FN, fs="20000",
                            Channel="5", Peak_Index="1", Score="2",
                            Onset="HYP", EventEO="40000"), "x.csv"),
-        pe.parse_row(_norm(folder=str(d), filename=_FN, fs="20000",
+        pe.parse_row(_norm(folder="X:\\sess\\", filename=_FN, fs="20000",
                            Channel="5", Peak_Index="2", Score="5",
                            Onset="LVF", EventEO="80000",
                            Peak_Stamp="999"), "x.csv"),
     ]
     seen = []
-    out = pe.build_file_examples(
-        evs, pe.EEGLocator(auto_drives=False),
-        progress=lambda i, n, f: seen.append((i, n)))
+    out = pe.catalog_examples(evs, progress=lambda i, n, f: seen.append((i, n)))
     assert len(out) == 1
     ex = out[0]
-    assert ex["resolved_path"] == str(d / _FN)
+    assert ex["filename"] == _FN and ex["folder"] == "X:\\sess\\"
+    assert ex["recorded_path"].endswith(_FN)
     assert ex["animal"] == "BCH060"
     assert len(ex["markers"]) == 2
     assert ex["rep_racine"] == 5 and ex["rep_type"] == "LVF"  # highest racine
     assert ex["channel_names"][4] == "BCH060SR"
     assert seen and seen[-1] == (1, 1)   # one file group; progress reached total
+
+
+def test_recorded_path_adds_mat_and_strips_trailing_sep():
+    rec = pe._recorded_path("X:\\sess\\", "rec_no_ext")
+    assert rec.endswith("rec_no_ext.mat")
+    assert pe._recorded_path("", "x.mat") == "x.mat"
 
 
 if __name__ == "__main__":

@@ -426,31 +426,43 @@ class EEGLocator:
 #  Example assembly + Training ingest orchestration
 # ===================================================================== #
 
-def build_file_examples(events: list[dict], locator: EEGLocator,
-                         progress: Callable[[int, int, str], None] | None
-                         = None) -> list[dict]:
-    """Resolve every distinct recording and assemble the ingest payloads.
-    Unresolved files (offline drive, deleted) are skipped. *progress* is
-    called ``(done, total, filename)`` so the UI can show a live count."""
+def _recorded_path(folder: str, filename: str) -> str:
+    """The recording path as captured in the CSV (folder + filename, ``.mat``
+    ensured). This is the *best-known* location; the actual file is only
+    confirmed/recursively relocated lazily, when an example is loaded."""
+    name = filename if filename.lower().endswith(".mat") else filename + ".mat"
+    folder = (folder or "").rstrip("/\\")
+    return os.path.join(folder, name) if folder else name
+
+
+def catalog_examples(events: list[dict],
+                     progress: Callable[[int, int, str], None] | None
+                     = None) -> list[dict]:
+    """Assemble one catalog payload per distinct recording from the parsed
+    events -- metadata + markers + the *recorded* path, with NO disk access.
+
+    Cataloging is cheap, so the whole scored-event population is available
+    for balanced round selection; the expensive recursive EEG search runs
+    lazily, only for the handful of files a student actually loads
+    (Store.resolve_training_file). *progress* is ``(done, total, filename)``.
+    """
     assert isinstance(events, list), "events must be a list"
     groups = group_by_file(events)
     total = len(groups)
     out: list[dict] = []
     for i, ((folder, filename), evs) in enumerate(groups.items()):
-        assert i < _MAX_GROUPS, "example assembly runaway"
+        assert i < _MAX_GROUPS, "catalog assembly runaway"
         if progress is not None:
             progress(i, total, filename)
-        path = locator.resolve(folder, filename)
-        if not path:
-            continue
         rep = max(evs, key=lambda e: (e.get("racine") or 0))
         dt = file_datetime(filename)
-        session_dir = os.path.dirname(path)
+        rec = _recorded_path(folder, filename)
         out.append({
-            "resolved_path": path,
-            "session_dir": session_dir,
-            "session_name": os.path.basename(session_dir),
+            "recorded_path": rec,
+            "folder": folder,
             "filename": filename,
+            "session_dir": os.path.dirname(rec),
+            "session_name": os.path.basename(os.path.dirname(rec)),
             "channel_names": extract_channel_names(filename),
             "fs": evs[0].get("fs") or 0.0,
             "animal": rep.get("animal"),
@@ -464,6 +476,18 @@ def build_file_examples(events: list[dict], locator: EEGLocator,
     if progress is not None:
         progress(total, total, "")
     return out
+
+
+def make_locator(store, config: dict) -> EEGLocator:
+    """An EEGLocator wired to the store's persistent location cache and the
+    configured search roots -- used for lazy, on-demand resolution."""
+    pe = (config or {}).get("past_events", {}) or {}
+    return EEGLocator(
+        search_roots(config),
+        cache_get=getattr(store, "eeg_location_get", None),
+        cache_put=getattr(store, "eeg_location_put", None),
+        auto_drives=bool(pe.get("auto_drives", True)),
+        max_dirs=int(pe.get("max_search_dirs", 200_000)))
 
 
 def bhz_csv_dir(config: dict) -> str:
@@ -486,21 +510,15 @@ def search_roots(config: dict) -> list[str]:
 def import_into_training(store, config: dict,
                          progress: Callable[[int, int, str], None] | None
                          = None) -> int:
-    """Load past scored events, resolve their EEG files, and ingest them as
-    Training practice examples. Returns the number of recordings imported.
-    Safe to re-run -- the store upserts by file path."""
+    """Catalog past scored events as Training practice examples -- cheap,
+    metadata only, NO drive scan. Each event's EEG is located lazily when a
+    student loads it (Store.resolve_training_file). Returns recordings
+    cataloged. Safe to re-run -- the store upserts by recorded path."""
     assert store is not None, "store required"
     base = bhz_csv_dir(config)
-    pe = (config or {}).get("past_events", {}) or {}
     events = dedup_events(load_scored_events(base))
-    locator = EEGLocator(
-        search_roots(config),
-        cache_get=getattr(store, "eeg_location_get", None),
-        cache_put=getattr(store, "eeg_location_put", None),
-        auto_drives=bool(pe.get("auto_drives", True)),
-        max_dirs=int(pe.get("max_search_dirs", 200_000)))
-    examples = build_file_examples(events, locator, progress=progress)
+    examples = catalog_examples(events, progress=progress)
     n = store.import_historical_examples(examples)
-    logger.info("past_events: imported %d/%d resolved recordings",
-                n, len(examples))
+    logger.info("past_events: cataloged %d recordings (EEG resolved on load)",
+                n)
     return n

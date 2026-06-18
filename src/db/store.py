@@ -2859,10 +2859,12 @@ class Store:
     EEG_NEG_TTL_HOURS = 24
 
     def import_historical_examples(self, examples: list[dict]) -> int:
-        """Ingest resolved historical recordings as Training practice
-        examples: a lean processed_files row + session_config (so animals
-        resolve) + a training_external_example holding the lab's markers.
-        Idempotent -- upserts by file path. Returns recordings ingested."""
+        """Catalog historical recordings as Training practice examples: a
+        lean processed_files row (file_path = the recorded path, NOT yet
+        confirmed on disk) + session_config (so animals resolve) + a
+        training_external_example holding the lab's markers and the
+        folder/filename for lazy EEG resolution. Idempotent -- upserts by
+        recorded path. Returns recordings cataloged."""
         assert isinstance(examples, list), "examples must be a list"
         if not examples:
             return 0
@@ -2885,7 +2887,7 @@ class Store:
 
     @staticmethod
     def _upsert_historical_file(conn, ex: dict, now: str) -> int | None:
-        path = ex.get("resolved_path")
+        path = ex.get("recorded_path")
         if not path:
             return None
         conn.execute(
@@ -2921,19 +2923,61 @@ class Store:
                                   now: str) -> None:
         conn.execute(
             """INSERT INTO training_external_example
-               (file_id, animal, fs, has_seizure, rep_type, rep_racine,
-                markers_json, source_csv, peak_stamp, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+               (file_id, folder, filename, animal, fs, has_seizure,
+                rep_type, rep_racine, markers_json, source_csv, peak_stamp,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(file_id) DO UPDATE SET
+                 folder=excluded.folder, filename=excluded.filename,
                  animal=excluded.animal, fs=excluded.fs,
                  rep_type=excluded.rep_type, rep_racine=excluded.rep_racine,
                  markers_json=excluded.markers_json,
                  source_csv=excluded.source_csv,
                  peak_stamp=excluded.peak_stamp""",
-            (int(fid), ex.get("animal"), ex.get("fs") or None, 1,
+            (int(fid), ex.get("folder"), ex.get("filename"),
+             ex.get("animal"), ex.get("fs") or None, 1,
              ex.get("rep_type"), ex.get("rep_racine"),
              json.dumps(ex.get("markers") or []), ex.get("source_csv"),
              ex.get("peak_stamp"), now))
+
+    def resolve_training_file(self, file_id: int, locator) -> str | None:
+        """Confirm (and if needed relocate) the recording for a Training
+        example, lazily. If the stored path is a real file, return it
+        as-is. Otherwise -- only for cataloged historical examples -- run
+        the recursive multi-drive search via *locator*, persist the found
+        path, and return it (None if still unresolved). This is where the
+        expensive scan happens: once, per loaded file, cached thereafter."""
+        assert file_id is not None, "file_id required"
+        conn = self._connect()
+        try:
+            pf = conn.execute(
+                "SELECT file_path FROM processed_files WHERE id=?",
+                (int(file_id),)).fetchone()
+            cur = pf["file_path"] if pf else None
+            if cur and os.path.isfile(cur):
+                return cur
+            ext = conn.execute(
+                "SELECT folder, filename FROM training_external_example "
+                "WHERE file_id=?", (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        if not ext or not ext["filename"]:
+            return cur            # a real DB file (not external); leave it
+        found = locator.resolve(ext["folder"] or "", ext["filename"])
+        if not found:
+            return None
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE processed_files SET file_path=?, session_dir=? "
+                "WHERE id=?",
+                (found, os.path.dirname(found), int(file_id)))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass              # another row already owns that path; fine
+        finally:
+            conn.close()
+        return found
 
     def eeg_location_get(self, filename: str) -> str | None:
         """Cached recording location for the EEGLocator. Returns the path

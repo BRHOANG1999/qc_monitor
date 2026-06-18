@@ -612,6 +612,8 @@ CREATE INDEX IF NOT EXISTS idx_training_round_student
 CREATE TABLE IF NOT EXISTS training_external_example (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL UNIQUE REFERENCES processed_files(id),
+    folder TEXT,
+    filename TEXT,
     animal TEXT,
     fs REAL,
     has_seizure INTEGER NOT NULL DEFAULT 1,

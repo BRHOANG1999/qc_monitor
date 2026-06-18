@@ -129,9 +129,9 @@ def _import_status_text(cfg_enabled: bool) -> str:
     if s["finished"]:
         if s["error"]:
             return f"Import failed: {s['error']}"
-        return (f"Imported {s['imported']} past-scored recordings into the "
-                f"practice pool. Load an example to see them.")
-    return "Starting the practice-library import…"
+        return (f"{s['imported']} past-scored recordings in your practice "
+                f"pool. Each one's EEG is located on disk when you load it.")
+    return "Cataloging the practice library…"
 
 
 # ===================================================================== #
@@ -245,7 +245,22 @@ def _history_text(store: Store, email: str, stage: int, rnd=None) -> str:
     return "  ·  ".join(bits)
 
 
-def _load_next(store: Store, email: str, stage: int, mode: str, n: int):
+def _resolve_for_load(store: Store, config: dict, file_id: int) -> None:
+    """Lazily confirm/relocate a Training recording right before it loads.
+    For a real DB file (path on disk) this is a quick stat; for a cataloged
+    historical example with a stale path it runs the recursive multi-drive
+    EEG search once (cached). Failures are non-fatal -- the figure builders
+    fall back to a 'file not found' placeholder."""
+    try:
+        loc = _past.make_locator(store, config or {})
+        store.resolve_training_file(int(file_id), loc)
+    except Exception as e:  # noqa: BLE001 -- resolution must not break load
+        logger.warning("training: lazy resolve failed for #%s: %s",
+                       file_id, e)
+
+
+def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
+                config: dict | None = None):
     """('loaded', payload) for the next round example, ('complete', rnd) when
     the round is finished, or None when no candidate files exist."""
     rnd = _ensure_round(store, email, stage, n)
@@ -255,6 +270,8 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int):
     if idx >= rnd["examples"]:
         return "complete", rnd
     file_id = int(rnd["files"][idx])
+    # Locate the EEG on disk now, only for this one file (lazy, cached).
+    _resolve_for_load(store, config or {}, file_id)
     session_dir = _session_dir_for_file(store, file_id)
     channel = _first_animal_channel(store, session_dir)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
@@ -617,7 +634,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     ph, ph, [], "", "", "", hide, "")
         stage = int(stage or 1)
         res = _load_next(store, email, stage, mode or "hilbert",
-                         cfg["examples_per_round"])
+                         cfg["examples_per_round"], config)
         if res is None:
             ph = _empty_lfp_fig("No validated recordings yet.")
             return (None, _vid_placeholder(
@@ -851,7 +868,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             store.finish_training_round(rnd["round_id"], confidence,
                                         "review_more")
         res = _load_next(store, email, stage, mode or "hilbert",
-                         cfg["examples_per_round"])
+                         cfg["examples_per_round"], config)
         if res is None or res[0] != "loaded":
             return ((no_update,) * 7 + ("", hide,
                     _history_text(store, email, stage, None), bump))
