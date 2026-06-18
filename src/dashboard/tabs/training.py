@@ -65,8 +65,11 @@ TRAINING_VIDEO_DOM_ID = "training-lfp-video"
 #
 # Resolving past scored events across the share roots + every mounted drive
 # can take a while, so it runs off-thread; the UI polls _IMPORT_STATE. One
-# import at a time (shared library) -- concurrent clicks coalesce.
+# import at a time (shared library) -- concurrent kicks coalesce. The import
+# is NOT optional: it auto-starts once per process the first time anyone
+# opens the Training tab (the button only forces a re-scan).
 _IMPORT_LOCK = threading.Lock()
+_IMPORT_AUTOSTARTED = False
 _IMPORT_STATE: dict = {
     "running": False, "done": 0, "total": 0, "imported": 0,
     "phase": "", "error": "", "finished": False,
@@ -128,8 +131,7 @@ def _import_status_text(cfg_enabled: bool) -> str:
             return f"Import failed: {s['error']}"
         return (f"Imported {s['imported']} past-scored recordings into the "
                 f"practice pool. Load an example to see them.")
-    return ("Pulls confirmed seizures from the lab's past scored CSVs and "
-            "finds their EEG on disk. Click to build the practice library.")
+    return "Starting the practice-library import…"
 
 
 # ===================================================================== #
@@ -372,14 +374,16 @@ def _import_card(config: dict) -> html.Div:
     return card(
         html.Div("Practice library — past scored events",
                   style={**LABEL_STYLE, "marginBottom": "2px"}),
-        html.Div("Import the lab's historical BHZ scorings as extra training "
-                  "examples; each event's EEG is located on disk by recursive "
-                  "search across the share roots and mounted drives.",
+        html.Div("The lab's historical BHZ scorings are imported automatically "
+                  "as extra training examples; each event's EEG is located on "
+                  "disk by recursive search across the share roots and mounted "
+                  "drives. Re-scan to pick up newly scored files or drives that "
+                  "just came online.",
                   style={"color": COLOR_TEXT_TERTIARY,
                           "fontSize": FONT_SIZE_CAPTION,
                           "marginBottom": SPACE_3}),
         html.Div([
-            button("Build / refresh from past events", "training-import-btn",
+            button("Re-scan past events", "training-import-btn",
                    variant="secondary", icon_name="inbox", **btn_kw),
             html.Span(id="training-import-status",
                       style={"marginLeft": SPACE_3,
@@ -985,7 +989,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _poll_import(_n):
-        return _import_status_text(_past_enabled(config))
+        global _IMPORT_AUTOSTARTED
+        enabled = _past_enabled(config)
+        # Not optional: the first poll after the tab mounts kicks the import
+        # automatically (once per process). The button is only a re-scan.
+        if (enabled and not _IMPORT_AUTOSTARTED
+                and not _IMPORT_STATE["running"]
+                and not _IMPORT_STATE["finished"]):
+            _IMPORT_AUTOSTARTED = True
+            _kick_import(store, config)
+        return _import_status_text(enabled)
 
     _register_cursor_sync(app)
 
