@@ -578,4 +578,26 @@ CREATE TABLE IF NOT EXISTS training_progress (
     certified_at TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- A "round" = a balanced batch of examples a student works through before
+-- the confidence prompt. started_after_id is the RESET boundary: the
+-- student's current grade counts only attempts with id > started_after_id,
+-- so "review more" restarts the grade while training_attempt keeps full
+-- history. confidence (1-5) + outcome captured at the prompt; notified_at
+-- dedups the PI "finished a stage" email.
+CREATE TABLE IF NOT EXISTS training_round (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_email TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    started_after_id INTEGER NOT NULL,
+    files_json TEXT NOT NULL,
+    examples INTEGER NOT NULL,
+    confidence INTEGER,
+    outcome TEXT,
+    notified_at TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_training_round_student
+    ON training_round(student_email, stage, id);
 """

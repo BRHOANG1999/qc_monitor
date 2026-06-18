@@ -2607,6 +2607,195 @@ class Store:
         finally:
             conn.close()
 
+    # ---- training rounds (balanced batches + reset boundary) ---- #
+
+    def training_candidate_pool(self, student_email: str) -> list[dict]:
+        """All pi_approved files with the labels needed to build balanced
+        rounds: has_seizure, representative type/Racine (highest-Racine real
+        event), the file's animals, and when this student last saw it."""
+        assert isinstance(student_email, str) and student_email, \
+            "student_email required"
+        from src.utils.training import _real_events
+        email = student_email.lower()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT rs.file_id, rs.markers_json, pf.session_dir,
+                          (SELECT MAX(ta.id) FROM training_attempt ta
+                            WHERE ta.student_email=? AND ta.file_id=rs.file_id)
+                            AS last_seen
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   WHERE rs.status='pi_approved'
+                   GROUP BY rs.file_id""", (email,)).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for i, r in enumerate(rows):
+            assert i < 1_000_000, "candidate pool scan exceeds bound"
+            out.append(self._pool_row_labels(r, _real_events))
+        return out
+
+    def _pool_row_labels(self, r, real_events_fn) -> dict:
+        try:
+            events = json.loads(r["markers_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            events = []
+        real = real_events_fn(events)
+        rep = (max(real, key=lambda e: (e.get("racine") or 0))
+               if real else None)
+        ls = r["last_seen"]
+        return {"file_id": int(r["file_id"]), "has_seizure": bool(real),
+                "rep_type": (rep.get("type") if rep else None),
+                "rep_racine": (rep.get("racine") if rep else None),
+                "animals": self._animals_for_session(r["session_dir"]),
+                "last_seen": (int(ls) if ls is not None else None)}
+
+    def _animals_for_session(self, session_dir: str) -> list[str]:
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel)
+        out: list[str] = []
+        for n in self._channel_names_for_session(session_dir):
+            if isinstance(n, str) and is_animal_channel(n):
+                a, _ = split_animal_electrode(n)
+                if a and a not in out:
+                    out.append(a)
+        return out
+
+    def create_training_round(self, student_email: str, stage: int,
+                               file_ids: list[int]) -> dict:
+        """Open a round; its started_after_id (max attempt id now) is the
+        reset boundary so the current grade restarts from this round."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        assert isinstance(file_ids, list) and file_ids, "file_ids required"
+        email = student_email.lower()
+        files = [int(f) for f in file_ids]
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            b = conn.execute(
+                "SELECT COALESCE(MAX(id),0) AS b FROM training_attempt "
+                "WHERE student_email=? AND stage=?",
+                (email, int(stage))).fetchone()["b"]
+            cur = conn.execute(
+                """INSERT INTO training_round (student_email, stage,
+                       started_after_id, files_json, examples, started_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (email, int(stage), int(b), json.dumps(files),
+                 len(files), now))
+            conn.commit()
+            return {"round_id": int(cur.lastrowid),
+                    "started_after_id": int(b),
+                    "files": files, "examples": len(files)}
+        finally:
+            conn.close()
+
+    def current_training_round(self, student_email: str,
+                                stage: int) -> dict | None:
+        """The open (not-yet-ended) round for (student, stage), or None."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id, started_after_id, files_json, examples
+                   FROM training_round
+                   WHERE student_email=? AND stage=? AND ended_at IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (student_email.lower(), int(stage))).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {"round_id": int(row["id"]),
+                "started_after_id": int(row["started_after_id"]),
+                "files": json.loads(row["files_json"] or "[]"),
+                "examples": int(row["examples"])}
+
+    def round_scores(self, student_email: str, stage: int,
+                      started_after_id: int) -> list[float]:
+        """Agreements for (student, stage) AFTER the reset boundary -- the
+        round-scoped readiness feed (oldest first)."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        assert int(started_after_id) >= 0, "boundary must be >= 0"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT agreement FROM training_attempt
+                   WHERE student_email=? AND stage=? AND id>?
+                   ORDER BY id""",
+                (student_email.lower(), int(stage),
+                 int(started_after_id))).fetchall()
+            return [float(r["agreement"]) for r in rows]
+        finally:
+            conn.close()
+
+    def training_lifetime_stats(self, student_email: str,
+                                 stage: int) -> dict:
+        """All-time {n, mean} over every attempt (history, ignores resets)."""
+        assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+        assert student_email, "student_email required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, AVG(agreement) AS mean "
+                "FROM training_attempt WHERE student_email=? AND stage=?",
+                (student_email.lower(), int(stage))).fetchone()
+        finally:
+            conn.close()
+        return {"n": int(row["n"] or 0),
+                "mean": (float(row["mean"]) if row["mean"] is not None
+                         else None)}
+
+    def finish_training_round(self, round_id: int, confidence,
+                               outcome: str) -> None:
+        """Close a round with the student's confidence + chosen outcome."""
+        assert outcome in ("review_more", "move_on"), "bad outcome"
+        assert isinstance(round_id, int), "round_id must be int"
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE training_round SET confidence=?, outcome=?, "
+                "ended_at=? WHERE id=?",
+                ((int(confidence) if confidence is not None else None),
+                 outcome, datetime.now().isoformat(), int(round_id)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def mark_round_notified(self, round_id: int) -> bool:
+        """Atomically claim the PI-notify for a round. True only for the
+        first caller -- dedups the 'finished a stage' email."""
+        assert isinstance(round_id, int), "round_id must be int"
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE training_round SET notified_at=? "
+                "WHERE id=? AND notified_at IS NULL",
+                (datetime.now().isoformat(), int(round_id)))
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def validated_events_for_file(self, file_id: int) -> list:
+        """PI-approved markers (the training ground truth) for one file."""
+        assert file_id is not None, "file_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT markers_json FROM review_state "
+                "WHERE file_id=? AND status='pi_approved' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return []
+        try:
+            return json.loads(row["markers_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+
     def pi_flag(self, file_id: int, pi_email: str,
                   *, note: str,
                   event_indices: list[int] | None = None) -> int:

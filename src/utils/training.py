@@ -21,6 +21,7 @@ Curriculum stages:
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
 # The five onset landmarks, in fill order. LAS is LVF-only; a validated
@@ -178,3 +179,129 @@ def rolling_ready(scores: list, pass_pct: float, window: int) -> bool:
         return False
     recent = vals[-window:]
     return (sum(recent) / len(recent)) >= (pass_pct / 100.0)
+
+
+# ===================================================================== #
+#  Balanced round selection (pure; stratified sampling per stage)
+# ===================================================================== #
+
+_TYPES = ("LVF", "HYP")
+_MAX_SLOTS = 100_000          # NASA Rule 2 loop bound.
+
+
+def select_round(candidates: list, stage: int, n: int,
+                 seen_counts: dict | None = None,
+                 rng: random.Random | None = None) -> list[int]:
+    """Pick an ordered, balanced batch of *n* file_ids for a training round.
+
+    *candidates* are dicts from ``Store.training_candidate_pool`` (file_id,
+    has_seizure, rep_type, rep_racine, animals, last_seen). Balancing per
+    stage: 1 -> 75% no-seizure / 25% seizure; 2 -> even Racine + 50/50
+    LVF/HYP; 3 -> even across animals (random when one). Ties break
+    least-seen first then *rng* (inject a ``random.Random`` for determinism).
+    Returns <= min(n, len(pool)) ids, no repeats.
+    """
+    assert stage in (1, 2, 3), "stage must be 1, 2 or 3"
+    assert n >= 1, "n must be >= 1"
+    assert isinstance(candidates, list), "candidates must be a list"
+    rng = rng or random.Random()
+    seen = seen_counts or {}
+    pool = list(candidates)
+    if stage == 1:
+        chosen = _select_stage1(pool, n, seen, rng)
+    elif stage == 2:
+        chosen = _select_stage2(pool, n, seen, rng)
+    else:
+        chosen = _select_stage3(pool, n, seen, rng)
+    _pad(chosen, pool, n, seen, rng)
+    return [c["file_id"] for c in chosen]
+
+
+def _pick_least_seen(pool, used: set, seen: dict, rng):
+    """The least-seen unused candidate (random tie-break), or None."""
+    avail = [c for c in pool if c["file_id"] not in used]
+    if not avail:
+        return None
+    rng.shuffle(avail)                      # randomise ties
+    avail.sort(key=lambda c: seen.get(c["file_id"], 0))   # stable -> least first
+    return avail[0]
+
+
+def _take(chosen, used, c) -> None:
+    used.add(c["file_id"])
+    chosen.append(c)
+
+
+def _select_stage1(pool, n, seen, rng):
+    used: set = set()
+    chosen: list = []
+    no_seiz = [c for c in pool if not c["has_seizure"]]
+    seiz = [c for c in pool if c["has_seizure"]]
+    n_no = round(0.75 * n)
+    for _ in range(n_no):
+        c = _pick_least_seen(no_seiz, used, seen, rng)
+        if c is None:
+            break
+        _take(chosen, used, c)
+    for _ in range(n - n_no):
+        c = _pick_least_seen(seiz, used, seen, rng)
+        if c is None:
+            break
+        _take(chosen, used, c)
+    return chosen
+
+
+def _pick_stratum(pool, used, seen, rng, racine, typ):
+    cands = [c for c in pool if c["rep_racine"] == racine
+             and c["rep_type"] == typ]
+    return _pick_least_seen(cands, used, seen, rng)
+
+
+def _select_stage2(pool, n, seen, rng):
+    used: set = set()
+    chosen: list = []
+    racines = list(range(1, 9))
+    for slot in range(n):
+        assert slot < _MAX_SLOTS, "stage-2 slot loop runaway"
+        rac, typ = racines[slot % 8], _TYPES[slot % 2]
+        other = _TYPES[(slot + 1) % 2]
+        by_type = [c for c in pool if c["rep_type"] == typ]
+        c = (_pick_stratum(pool, used, seen, rng, rac, typ)
+             or _pick_stratum(pool, used, seen, rng, rac, other)
+             or _pick_least_seen(by_type, used, seen, rng)
+             or _pick_least_seen(pool, used, seen, rng))
+        if c is None:
+            break
+        _take(chosen, used, c)
+    return chosen
+
+
+def _select_stage3(pool, n, seen, rng):
+    used: set = set()
+    chosen: list = []
+    animals = sorted({a for c in pool for a in (c.get("animals") or [])})
+    for slot in range(n):
+        assert slot < _MAX_SLOTS, "stage-3 slot loop runaway"
+        c = None
+        if len(animals) > 1:
+            animal = animals[slot % len(animals)]
+            by_animal = [c for c in pool
+                         if animal in (c.get("animals") or [])]
+            c = _pick_least_seen(by_animal, used, seen, rng)
+        c = c or _pick_least_seen(pool, used, seen, rng)
+        if c is None:
+            break
+        _take(chosen, used, c)
+    return chosen
+
+
+def _pad(chosen, pool, n, seen, rng) -> None:
+    """Top up a short/imbalanced round from the remaining least-seen pool."""
+    used = {c["file_id"] for c in chosen}
+    for _ in range(n):
+        if len(chosen) >= n:
+            break
+        c = _pick_least_seen(pool, used, seen, rng)
+        if c is None:
+            break
+        _take(chosen, used, c)
