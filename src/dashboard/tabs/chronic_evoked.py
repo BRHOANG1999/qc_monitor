@@ -27,7 +27,7 @@ from dash import (
     Input, Output, State, callback_context, dash_table, dcc, html)
 
 from src.dashboard.components import (
-    DARK_TABLE_STYLE, DROPDOWN_STYLE, LABEL_STYLE, ZEBRA_STRIPE)
+    DARK_TABLE_STYLE, DROPDOWN_STYLE, LABEL_STYLE, ZEBRA_STRIPE, loading_icon)
 from src.dashboard.data_helpers import (
     EVOKED_FEATURE_LABELS, TIME_RANGE_OPTIONS, empty_fig)
 from src.utils import evoked_features as ef
@@ -228,24 +228,6 @@ def layout(store):
                           value=301, min=11, step=20, style=_INPUT_STYLE),
             ], style={"flex": "0 0 190px"}),
             html.Div([
-                html.Label("Extra panels (off = faster)", style=LABEL_STYLE),
-                dcc.Checklist(
-                    id="chronic-panels",
-                    options=[{"label": "Per-recording trend", "value": "rec"},
-                             {"label": "Mean waveform", "value": "wave"},
-                             {"label": "Stim↔evoked corr", "value": "corr"},
-                             {"label": "Circadian", "value": "circ"},
-                             {"label": "Table", "value": "table"}],
-                    value=[], inline=True, style={"fontSize": "12px"},
-                    labelStyle={"color": "#cfd0d6", "marginRight": "12px",
-                                "display": "inline-flex",
-                                "alignItems": "center"},
-                    inputStyle={"marginRight": "5px"}),
-            ], style={"flex": "1", "minWidth": "320px"}),
-        ], style={"display": "flex", "gap": "14px", "alignItems": "center",
-                  "marginBottom": "8px", "flexWrap": "wrap"}),
-        html.Div([
-            html.Div([
                 html.Label("Window (h, 0=all)", style=LABEL_STYLE),
                 dcc.Input(id="chronic-window-hours", type="number",
                           value=0, min=0, step=12, style=_INPUT_STYLE),
@@ -257,22 +239,34 @@ def layout(store):
                            tooltip={"placement": "bottom"}),
             ], style={"flex": "1", "minWidth": "200px"}),
         ], style={"display": "flex", "gap": "14px", "alignItems": "center",
-                  "marginBottom": "8px"}),
+                  "marginBottom": "8px", "flexWrap": "wrap"}),
+        dcc.Store(id="chronic-selection"),
+        dcc.Interval(id="chronic-warm-poll", interval=1500, disabled=True),
         html.Div(id="chronic-status",
                  style={"color": "#8a8d99", "fontSize": "11px",
                         "minHeight": "14px"}),
         html.Div(id="chronic-trend-stats",
                  style={"color": "#cfd0d6", "fontSize": "12px",
                         "minHeight": "16px", "marginBottom": "6px"}),
-        dcc.Loading(type="default", color="#5e7ce2", children=[
-            dcc.Graph(id="chronic-feature-plot",
-                      figure=empty_fig("Pick animal / session(s) / feature, "
-                                       "then click ▶ Plot")),
-            dcc.Graph(id="chronic-recording-plot"),
-            dcc.Graph(id="chronic-circadian-plot"),
-            dcc.Graph(id="chronic-waveform-plot"),
+        # Primary plot -- always rendered on ▶ Plot.
+        dcc.Loading(
+            custom_spinner=loading_icon("Plotting…"),
+            overlay_style={"visibility": "visible", "opacity": 0.45},
+            children=dcc.Graph(
+                id="chronic-feature-plot",
+                figure=empty_fig("Pick animal / session(s) / feature, "
+                                 "then click ▶ Plot"))),
+        # Other analyses -- expand each on demand (computed lazily).
+        html.Div("Other analyses (expand to compute)",
+                 style={**LABEL_STYLE, "marginTop": "12px",
+                        "color": "#8a8d99"}),
+        _expandable("rec", "Per-recording trend",
+                    dcc.Graph(id="chronic-recording-plot")),
+        _expandable("wave", "Mean waveform overlay",
+                    dcc.Graph(id="chronic-waveform-plot")),
+        _expandable("corr", "Stim↔evoked correlation", html.Div([
             html.Div([
-                html.Label("Correlation", style=LABEL_STYLE),
+                html.Label("Correlation mode", style=LABEL_STYLE),
                 dcc.Dropdown(
                     id="chronic-corr-mode",
                     options=[{"label": lbl, "value": v}
@@ -280,18 +274,16 @@ def layout(store):
                     value=_CORR_MODES[0][0], clearable=False,
                     style={**DROPDOWN_STYLE, "maxWidth": "320px"},
                     className="dark-dropdown"),
-            ], style={"marginTop": "6px"}),
+            ], style={"marginBottom": "6px"}),
             dcc.Graph(id="chronic-corr-plot"),
-            html.Div("Per-recording summary", style={**LABEL_STYLE,
-                     "marginTop": "10px"}),
-            dash_table.DataTable(
-                id="chronic-stats-table", page_size=15,
-                sort_action="native",
-                columns=[{"name": c, "id": c} for c in
-                         ["Recording", "N", "Mean", "SD"]],
-                style_data_conditional=[ZEBRA_STRIPE],
-                **DARK_TABLE_STYLE),
-        ]),
+        ])),
+        _expandable("circ", "Circadian (time of day)",
+                    dcc.Graph(id="chronic-circadian-plot")),
+        _expandable("table", "Per-recording table", dash_table.DataTable(
+            id="chronic-stats-table", page_size=15, sort_action="native",
+            columns=[{"name": c, "id": c} for c in
+                     ["Recording", "N", "Mean", "SD"]],
+            style_data_conditional=[ZEBRA_STRIPE], **DARK_TABLE_STYLE)),
     ])
 
 
@@ -315,6 +307,37 @@ _BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#2a2d3a",
 _PLOT_BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#5e7ce2",
                    "color": "white", "border": "none", "fontWeight": "700",
                    "borderRadius": "6px", "cursor": "pointer"}
+_SECTION_BTN_STYLE = {"width": "100%", "padding": "10px 14px",
+                      "textAlign": "left", "background": "#1f2230",
+                      "color": "#cfd0d6", "border": "1px solid #3a3d4a",
+                      "borderRadius": "6px", "cursor": "pointer",
+                      "fontSize": "13px", "fontWeight": "600"}
+
+# Expandable analysis sections: (key, title, child-builder-tag). Each is a
+# toggle button + a collapsed container that computes its figure lazily on
+# first/each expand. (id, target-prop) pairs drive the per-section callbacks.
+_SECTIONS = [
+    ("rec", "Per-recording trend", "chronic-recording-plot", "figure"),
+    ("wave", "Mean waveform overlay", "chronic-waveform-plot", "figure"),
+    ("corr", "Stim↔evoked correlation", "chronic-corr-plot", "figure"),
+    ("circ", "Circadian (time of day)", "chronic-circadian-plot", "figure"),
+    ("table", "Per-recording table", "chronic-stats-table", "data"),
+]
+
+
+def _expandable(key: str, title: str, child) -> html.Div:
+    """A toggle button + collapsed (display:none) container wrapping *child*
+    in its own spinner. Click expands + computes; click again collapses."""
+    return html.Div([
+        html.Button(f"▸ {title}", id=f"chronic-{key}-btn", n_clicks=0,
+                    style=_SECTION_BTN_STYLE),
+        html.Div(
+            dcc.Loading(
+                custom_spinner=loading_icon(f"Computing {title}…", small=True),
+                overlay_style={"visibility": "visible", "opacity": 0.45},
+                children=child),
+            id=f"chronic-{key}-wrap", style={"display": "none"}),
+    ], style={"marginTop": "8px"})
 
 
 def register_callbacks(app, store, config: dict) -> None:
@@ -339,15 +362,14 @@ def register_callbacks(app, store, config: dict) -> None:
         clear = callback_context.triggered_id == "chronic-animal-dropdown"
         return _session_options(animal), ([] if clear else no_update)
 
+    # Primary render: only the feature-vs-time plot + trend stats. Captures
+    # the current selection into chronic-selection so the expandable sections
+    # can re-query lazily. Fires only on ▶ Plot / ↻ Refresh.
     @app.callback(
         Output("chronic-feature-plot", "figure"),
-        Output("chronic-recording-plot", "figure"),
-        Output("chronic-circadian-plot", "figure"),
-        Output("chronic-waveform-plot", "figure"),
-        Output("chronic-corr-plot", "figure"),
-        Output("chronic-stats-table", "data"),
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
+        Output("chronic-selection", "data"),
         Input("chronic-load-btn", "n_clicks"),
         Input("chronic-refresh-btn", "n_clicks"),
         State("chronic-animal-dropdown", "value"),
@@ -355,60 +377,149 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-feature-dropdown", "value"),
         State("chronic-hours-dropdown", "value"),
         State("chronic-trend-toggles", "value"),
-        State("chronic-corr-mode", "value"),
         State("chronic-window-hours", "value"),
         State("chronic-window-scroll", "value"),
-        State("chronic-panels", "value"),
         State("chronic-roll-window", "value"),
         prevent_initial_call=True,
     )
     def _update(_load, _refresh, animal, sessions, feature, hours, overlays,
-                corr_mode, win_hours, scroll, panels, roll_window):
-        blank = empty_fig("(enable in 'Extra panels')")
-        off = empty_fig("")
+                win_hours, scroll, roll_window):
         if not animal:
-            return (empty_fig("Select an animal, then ▶ Plot"), off, off, off,
-                    off, [], "", "")
+            return empty_fig("Select an animal, then ▶ Plot"), "", "", None
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
-        panels = panels or []
-        # Query-only render; the heavy build runs off-thread on Refresh.
         if callback_context.triggered_id == "chronic-refresh-btn":
             _kick_warm(animal)
-        sess = sessions or None
+        sel = {"animal": animal, "sessions": sessions or None, "hours": hours,
+               "win_hours": win_hours, "scroll": scroll, "feature": feature,
+               "roll_window": roll_window}
         try:
-            cache = _cache()
-            rows = cache.query(animal, hours=(hours or None), sessions=sess)
-            need_wave = "wave" in panels
-            means = (cache.query_recording_means(
-                animal, hours=(hours or None), sessions=sess)
-                if need_wave else [])
+            rows, _means, win_lbl = _query_for_selection(sel, need_means=False)
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
-            err = empty_fig("Couldn't read the cache", hint=str(e))
-            return err, off, off, off, off, [], "", f"Error: {e}"
-        rows, means, win_lbl = _apply_window(rows, means, win_hours, scroll)
+            return (empty_fig("Couldn't read the cache", hint=str(e)),
+                    "", f"Error: {e}", sel)
         pts = _feature_points(rows, feature)
         warming = " · ⏳ warming…" if _is_warming(animal) else ""
-        sess_lbl = f" · {len(sess)} session(s)" if sess else ""
+        sess_lbl = (f" · {len(sessions)} session(s)" if sessions else "")
         status = (f"{len(rows)} responses · {len(pts[0])} with "
                   f"{_label(feature)}{sess_lbl}{win_lbl}{warming}.")
         if not pts[0]:
             hint = ("" if rows else
                     f" — not cached yet; click ↻ Refresh / warm to build "
-                    f"{animal}, then refresh.")
+                    f"{animal}.")
             return (empty_fig(f"No {_label(feature)} for {animal}{hint}"),
-                    off, off, off, off, [], "", status + hint)
-        # Optional panels: only compute the ones that are enabled.
-        rec = _build_recording_trend(rows, feature) if "rec" in panels else blank
-        circ = _build_circadian(rows, feature) if "circ" in panels else blank
-        wave = (_build_waveform_overlay(means, animal)
-                if "wave" in panels else blank)
-        corr = (_build_stim_corr(rows, corr_mode)
-                if "corr" in panels else blank)
-        table = _stats_table_rows(rows, feature) if "table" in panels else []
+                    "", status + hint, sel)
         return (_build_feature_scatter(pts, feature, animal, overlays or [],
                                        roll_window),
-                rec, circ, wave, corr, table,
-                _trend_stats(pts, feature), status)
+                _trend_stats(pts, feature), status, sel)
+
+    # Live warm feedback: enable the poll on Refresh; the poll updates the
+    # status while the off-thread warm runs and auto re-plots when it ends.
+    @app.callback(
+        Output("chronic-warm-poll", "disabled", allow_duplicate=True),
+        Input("chronic-refresh-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _enable_warm_poll(_n):
+        return False
+
+    @app.callback(
+        Output("chronic-status", "children", allow_duplicate=True),
+        Output("chronic-warm-poll", "disabled", allow_duplicate=True),
+        Output("chronic-load-btn", "n_clicks", allow_duplicate=True),
+        Input("chronic-warm-poll", "n_intervals"),
+        State("chronic-animal-dropdown", "value"),
+        State("chronic-load-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _warm_poll(_n, animal, load_clicks):
+        from dash import no_update
+        if not animal:
+            return no_update, True, no_update
+        if _is_warming(animal):
+            return _warm_status_text(animal), False, no_update
+        # Warm finished: stop polling + bump ▶ Plot to re-plot the warmed data.
+        return ("Warm finished — re-plotted.", True, int(load_clicks or 0) + 1)
+
+    # One lazy compute callback per expandable section (factory-registered).
+    for key, _title, target, prop in _SECTIONS:
+        _register_section(app, key, target, prop)
+
+
+# --------------------------------------------------------------------- #
+#  Lazy section plumbing
+# --------------------------------------------------------------------- #
+
+def _query_for_selection(sel: dict, need_means: bool = True):
+    """Re-query the cache for a saved selection dict -> (rows, means, label).
+    Cheap post-warm; means is small and only fetched when *need_means*."""
+    assert isinstance(sel, dict), "selection must be a dict"
+    animal = sel.get("animal")
+    assert animal, "selection animal required"
+    cache = _cache()
+    hours = sel.get("hours") or None
+    sessions = sel.get("sessions") or None
+    rows = cache.query(animal, hours=hours, sessions=sessions)
+    means = (cache.query_recording_means(animal, hours=hours, sessions=sessions)
+             if need_means else [])
+    return _apply_window(rows, means, sel.get("win_hours"), sel.get("scroll"))
+
+
+def _build_section(key: str, rows, means, sel: dict, corr_mode):
+    """Dispatch one expandable section to its pure builder."""
+    feature = sel.get("feature") or _DEFAULT_FEATURE
+    animal = sel.get("animal") or "?"
+    if key == "rec":
+        return _build_recording_trend(rows, feature)
+    if key == "wave":
+        return _build_waveform_overlay(means, animal)
+    if key == "corr":
+        return _build_stim_corr(rows, corr_mode or _CORR_MODES[0][0])
+    if key == "circ":
+        return _build_circadian(rows, feature)
+    if key == "table":
+        return _stats_table_rows(rows, feature)
+    return empty_fig("?")
+
+
+def _register_section(app, key: str, target: str, prop: str) -> None:
+    """Register a lazy expandable section: toggle button expands the
+    container and computes its figure/table on demand; re-click collapses
+    (figure stays cached, no recompute)."""
+
+    @app.callback(
+        Output(target, prop),
+        Output(f"chronic-{key}-wrap", "style"),
+        Input(f"chronic-{key}-btn", "n_clicks"),
+        State("chronic-selection", "data"),
+        State(f"chronic-{key}-wrap", "style"),
+        State("chronic-corr-mode", "value"),
+        prevent_initial_call=True,
+    )
+    def _toggle(_n, sel, style, corr_mode, _key=key, _prop=prop):
+        from dash import no_update
+        style = dict(style or {})
+        if style.get("display", "none") != "none":
+            style["display"] = "none"            # collapse; keep cached output
+            return no_update, style
+        style["display"] = "block"
+        empty = ([] if _prop == "data" else empty_fig("Click ▶ Plot first"))
+        if not sel or not sel.get("animal"):
+            return empty, style
+        try:
+            rows, means, _ = _query_for_selection(
+                sel, need_means=(_key == "wave"))
+            out = _build_section(_key, rows, means, sel, corr_mode)
+        except Exception as e:  # noqa: BLE001 -- never crash the UI
+            out = [] if _prop == "data" else empty_fig("Couldn't compute",
+                                                       hint=str(e))
+        return out, style
+
+
+def _warm_status_text(animal: str) -> str:
+    p = warm_progress(animal)
+    if p and p.get("total"):
+        return f"⏳ warming {animal} — {p['done']} of {p['total']} files…"
+    return f"⏳ warming {animal} in background…"
 
 
 # --------------------------------------------------------------------- #
@@ -564,16 +675,19 @@ def _trend_stats(pts, feature) -> str:
     _, secs, vals = pts
     if vals.size < 3:
         return ""
-    from scipy.stats import linregress
-    days = (secs - secs.min()) / 86400.0
-    lr = linregress(days, vals)
     mean = float(np.mean(vals))
     std = float(np.std(vals, ddof=1))
     cv = (std / mean) if mean != 0 else float("nan")
     rng = float(np.max(vals) - np.min(vals))
-    return (f"slope {lr.slope:.3g}/day · r {lr.rvalue:.2f} · p {lr.pvalue:.1e}"
-            f"  |  mean {mean:.3g} · SD {std:.3g} · CV {cv:.2f} · "
+    base = (f"mean {mean:.3g} · SD {std:.3g} · CV {cv:.2f} · "
             f"range {rng:.3g} · n {vals.size}")
+    days = (secs - secs.min()) / 86400.0
+    if np.ptp(days) == 0:          # all one instant -> no slope/r/p
+        return base
+    from scipy.stats import linregress
+    lr = linregress(days, vals)
+    return (f"slope {lr.slope:.3g}/day · r {lr.rvalue:.2f} · "
+            f"p {lr.pvalue:.1e}  |  " + base)
 
 
 def _build_waveform_overlay(means, animal) -> go.Figure:
@@ -640,6 +754,10 @@ def _stim_amp(r, src):
 
 def _add_regression(fig, xa, ya) -> None:
     from scipy.stats import linregress
+    # linregress fails when every x is identical (degenerate stim amplitudes);
+    # skip the fit line in that case rather than crash the panel.
+    if np.ptp(xa) == 0:
+        return
     lr = linregress(xa, ya)
     xline = np.array([xa.min(), xa.max()])
     fig.add_trace(go.Scattergl(
