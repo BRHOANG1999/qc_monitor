@@ -2935,7 +2935,8 @@ class Store:
                  source_csv=excluded.source_csv,
                  peak_stamp=excluded.peak_stamp""",
             (int(fid), ex.get("folder"), ex.get("filename"),
-             ex.get("animal"), ex.get("fs") or None, 1,
+             ex.get("animal"), ex.get("fs") or None,
+             1 if ex.get("has_seizure", True) else 0,
              ex.get("rep_type"), ex.get("rep_racine"),
              json.dumps(ex.get("markers") or []), ex.get("source_csv"),
              ex.get("peak_stamp"), now))

@@ -162,6 +162,50 @@ def test_load_scored_events_missing_dir():
     assert pe.load_scored_events("Z:\\does\\not\\exist") == []
 
 
+# ---- no-event recordings (stage-1 negatives) ------------------------ #
+
+def test_parse_no_event_row():
+    # Peak_Index unset -> a no-event recording (the lab's negative rows).
+    m = pe.parse_no_event_row(_norm(folder="X:\\s\\", filename=_FN,
+                                     fs="20000", Channel="5",
+                                     Peak_Index="NaN",
+                                     Comment="No events in file"))
+    assert m is not None and m["filename"] == _FN
+    assert m["animal"] == "BCH060"
+    # A row WITH a peak index is a scored event, not a negative.
+    assert pe.parse_no_event_row(_norm(filename=_FN, Peak_Index="5")) is None
+
+
+def test_load_no_event_recordings_excludes_seizure_files(tmp_path):
+    other = ("base__stimCopy_BCH039SR___2026_06_03__01_02_03.mat")
+    csv = tmp_path / "20260602_BCH060.csv"
+    csv.write_text(
+        _HEADER + "\n"
+        # seizure row for _FN
+        f"X:\\s\\,{_FN},20000,0.05,5,123,1.0,2026-06-02,10:11:41,0,0,0,"
+        "2,LVF,,40000\n"
+        # no-event row for _FN (same file -> excluded as a negative)
+        f"X:\\s\\,{_FN},20000,0.05,5,NaN,NaN,2026-06-02,10:11:41,,,,"
+        "NaN,,No events,NaN\n"
+        # no-event row for a DIFFERENT file -> a real negative
+        f"X:\\s\\,{other},20000,0.05,1,NaN,NaN,2026-06-03,01:02:03,,,,"
+        "NaN,,No events,NaN\n",
+        encoding="utf-8")
+    seizures = pe.dedup_events(pe.load_scored_events(str(tmp_path)))
+    keys = {(e["folder"], e["filename"]) for e in seizures}
+    negs = pe.load_no_event_recordings(str(tmp_path), keys)
+    assert len(negs) == 1 and negs[0]["filename"] == other
+
+
+def test_catalog_no_event_examples():
+    metas = [{"folder": "X:\\s\\", "filename": _FN, "fs": 20000.0,
+              "channel": 5, "animal": "BCH060"}]
+    out = pe.catalog_no_event_examples(metas)
+    assert len(out) == 1
+    assert out[0]["has_seizure"] is False and out[0]["markers"] == []
+    assert out[0]["animal"] == "BCH060"
+
+
 # ---- EEGLocator ------------------------------------------------------ #
 
 def test_locator_direct_hit(tmp_path):

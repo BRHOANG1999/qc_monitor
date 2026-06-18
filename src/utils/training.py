@@ -208,12 +208,16 @@ def select_round(candidates: list, stage: int, n: int,
     seen = seen_counts or {}
     pool = list(candidates)
     if stage == 1:
+        # Detection mixes seizures + no-event negatives (75/25).
         chosen = _select_stage1(pool, n, seen, rng)
-    elif stage == 2:
-        chosen = _select_stage2(pool, n, seen, rng)
+        pad_pool = pool
     else:
-        chosen = _select_stage3(pool, n, seen, rng)
-    _pad(chosen, pool, n, seen, rng)
+        # Type/Racine/landmark scoring is only meaningful on real seizures,
+        # so stages 2-3 (and their padding) draw from seizure files only.
+        pad_pool = [c for c in pool if c.get("has_seizure")]
+        chosen = (_select_stage2(pad_pool, n, seen, rng) if stage == 2
+                  else _select_stage3(pad_pool, n, seen, rng))
+    _pad(chosen, pad_pool, n, seen, rng)
     return [c["file_id"] for c in chosen]
 
 

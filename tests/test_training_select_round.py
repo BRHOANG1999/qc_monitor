@@ -92,6 +92,35 @@ def test_stage3_single_animal_is_random():
     assert len(out) == 5 and len(set(out)) == 5
 
 
+def test_stage2_excludes_non_seizure_files():
+    # Negatives (has_seizure=False) must never enter a scoring round.
+    pool = [_cand(i, typ="LVF" if i % 2 else "HYP",
+                  racine=(i % 8) + 1, seiz=True) for i in range(1, 17)]
+    pool += [_cand(i, seiz=False) for i in range(100, 120)]
+    by = {c["file_id"]: c for c in pool}
+    out = select_round(pool, 2, 12, {}, _rng())
+    assert len(out) == 12
+    assert all(by[f]["has_seizure"] for f in out)
+
+
+def test_stage3_excludes_non_seizure_files():
+    pool = [_cand(i, animals=["BCH040"], seiz=True) for i in range(1, 11)]
+    pool += [_cand(i, animals=["BCH040"], seiz=False) for i in range(100, 110)]
+    by = {c["file_id"]: c for c in pool}
+    out = select_round(pool, 3, 6, {}, _rng())
+    assert all(by[f]["has_seizure"] for f in out)
+
+
+def test_stage1_mixes_seizure_and_negatives_75_25():
+    # With plenty of both, detection stays 8 no-event / 2 seizure.
+    pool = ([_cand(i, seiz=False) for i in range(1, 30)]
+            + [_cand(i, seiz=True) for i in range(30, 60)])
+    by = {c["file_id"]: c for c in pool}
+    out = select_round(pool, 1, 10, {}, _rng())
+    n_seiz = sum(1 for f in out if by[f]["has_seizure"])
+    assert n_seiz == 2 and len(out) == 10
+
+
 def test_least_seen_preferred():
     pool = [_cand(1, seiz=False, seen=9), _cand(2, seiz=False, seen=0)]
     out = select_round(pool, 1, 1, {1: 9, 2: 0}, _rng())

@@ -222,6 +222,64 @@ def load_scored_events(base_dir: str) -> list[dict]:
     return out
 
 
+def parse_no_event_row(norm: dict) -> dict | None:
+    """A normalized CSV row that records a recording with NO seizure
+    (Peak_Index unset -- the lab's "No events in file" rows) -> a recording
+    meta dict, or None. These are the negatives stage-1 detection needs."""
+    if _to_float(norm.get("peak_index")) is not None:
+        return None                      # has a peak -> a scored event row
+    filename = (norm.get("filename") or "").strip()
+    if not filename:
+        return None
+    channel = _to_int(norm.get("channel"))
+    return {"folder": (norm.get("folder") or "").strip(),
+            "filename": filename,
+            "fs": _to_float(norm.get("fs")) or 0.0,
+            "channel": channel,
+            "animal": animal_for_event(filename, channel)}
+
+
+def load_no_event_recordings(base_dir: str,
+                             exclude_keys: set | None = None) -> list[dict]:
+    """Distinct recordings that have a 'No events' row and are NOT in
+    *exclude_keys* (the seizure files). One meta per (folder, filename),
+    first row wins. These become has_seizure=False practice negatives."""
+    assert isinstance(base_dir, str), "base_dir must be a str"
+    if not base_dir or not os.path.isdir(base_dir):
+        return []
+    exclude = exclude_keys or set()
+    by_key: dict[tuple[str, str], dict] = {}
+    names = sorted(n for n in os.listdir(base_dir)
+                   if n.lower().endswith(".csv"))
+    for i, name in enumerate(names):
+        assert i < _MAX_GROUPS, "no-event CSV scan runaway"
+        for meta in _read_no_event_rows(os.path.join(base_dir, name)):
+            key = (meta["folder"], meta["filename"])
+            if key in exclude or key in by_key:
+                continue
+            by_key[key] = meta
+    logger.info("past_events: %d no-event recordings (negatives)",
+                len(by_key))
+    return list(by_key.values())
+
+
+def _read_no_event_rows(path: str) -> list[dict]:
+    out: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="",
+                  errors="replace") as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                assert i < _MAX_ROWS, "no-event row scan runaway"
+                norm = {(k or "").strip().lower(): v for k, v in row.items()}
+                meta = parse_no_event_row(norm)
+                if meta is not None:
+                    out.append(meta)
+    except (OSError, csv.Error) as e:
+        logger.warning("past_events: failed to read %s: %s", path, e)
+    return out
+
+
 # ===================================================================== #
 #  Dedup + grouping + markers
 # ===================================================================== #
@@ -468,6 +526,7 @@ def catalog_examples(events: list[dict],
             "animal": rep.get("animal"),
             "chunk_datetime": dt.isoformat() if dt else None,
             "markers": [markers_for_event(e) for e in evs],
+            "has_seizure": True,
             "rep_type": rep.get("type"),
             "rep_racine": rep.get("racine"),
             "source_csv": evs[0].get("source_csv"),
@@ -475,6 +534,36 @@ def catalog_examples(events: list[dict],
         })
     if progress is not None:
         progress(total, total, "")
+    return out
+
+
+def catalog_no_event_examples(metas: list[dict]) -> list[dict]:
+    """Catalog payloads for no-event recordings: has_seizure=False, empty
+    markers (the stage-1 detection negatives). No disk access."""
+    assert isinstance(metas, list), "metas must be a list"
+    out: list[dict] = []
+    for i, m in enumerate(metas):
+        assert i < _MAX_GROUPS, "no-event catalog runaway"
+        folder, filename = m["folder"], m["filename"]
+        dt = file_datetime(filename)
+        rec = _recorded_path(folder, filename)
+        out.append({
+            "recorded_path": rec,
+            "folder": folder,
+            "filename": filename,
+            "session_dir": os.path.dirname(rec),
+            "session_name": os.path.basename(os.path.dirname(rec)),
+            "channel_names": extract_channel_names(filename),
+            "fs": m.get("fs") or 0.0,
+            "animal": m.get("animal"),
+            "chunk_datetime": dt.isoformat() if dt else None,
+            "markers": [],
+            "has_seizure": False,
+            "rep_type": None,
+            "rep_racine": None,
+            "source_csv": None,
+            "peak_stamp": None,
+        })
     return out
 
 
@@ -517,8 +606,13 @@ def import_into_training(store, config: dict,
     assert store is not None, "store required"
     base = bhz_csv_dir(config)
     events = dedup_events(load_scored_events(base))
-    examples = catalog_examples(events, progress=progress)
-    n = store.import_historical_examples(examples)
-    logger.info("past_events: cataloged %d recordings (EEG resolved on load)",
-                n)
+    seizures = catalog_examples(events, progress=progress)
+    # No-event recordings -> stage-1 detection negatives (the lab's "No
+    # events in file" rows), excluding any file that also has a seizure.
+    seizure_keys = {(e["folder"], e["filename"]) for e in seizures}
+    negatives = catalog_no_event_examples(
+        load_no_event_recordings(base, seizure_keys))
+    n = store.import_historical_examples(seizures + negatives)
+    logger.info("past_events: cataloged %d recordings (%d seizure, %d none; "
+                "EEG resolved on load)", n, len(seizures), len(negatives))
     return n
