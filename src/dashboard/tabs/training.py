@@ -50,6 +50,12 @@ logger = logging.getLogger("qc_monitor.dashboard.training")
 _LANDMARKS = _grade.LANDMARKS  # ("EO","LAS","BO","PID","BB")
 _AUC_WINDOW_SEC = 5.0          # sliding-window AUC width for the LFP toggle
 
+# DOM id of the Training <video> element. The cursor-sync clientside
+# callbacks find it with document.getElementById(), exactly like the Video
+# Review tab does with VIDEO_DOM_ID -- a distinct id so the two tabs never
+# collide if both are ever in the DOM.
+TRAINING_VIDEO_DOM_ID = "training-lfp-video"
+
 
 # ===================================================================== #
 #  Helpers
@@ -102,12 +108,15 @@ def _filtered_trace(store: Store, file_id: int, channel: int,
 
 def _build_figures(store: Store, file_id: int, channel: int,
                     mode: str = "hilbert"):
-    """(lfp_fig, filtered_fig) for a recording -- stim-blanked like the
-    Video Review default. *mode* picks the 2nd panel (hilbert | auc)."""
+    """(lfp_fig, filtered_fig, lfp_dur_s) for a recording -- stim-blanked
+    like the Video Review default. *mode* picks the 2nd panel (hilbert |
+    auc). *lfp_dur_s* is the recording length in seconds (0.0 if unknown);
+    the cursor-sync clientside callback maps video time onto it."""
     file_path = _file_path_for_id(store, file_id)
     if not file_path:
         ph = _empty_lfp_fig("Recording file not found.")
-        return ph, ph
+        return ph, ph, 0.0
+    dur = 0.0
     try:
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
@@ -122,7 +131,8 @@ def _build_figures(store: Store, file_id: int, channel: int,
                                  uirevision=f"train:{file_id}:{channel}")
     except Exception:
         lfp = _empty_lfp_fig("LFP failed to load.")
-    return lfp, _filtered_trace(store, file_id, channel, mode)
+        dur = 0.0
+    return lfp, _filtered_trace(store, file_id, channel, mode), float(dur)
 
 
 def _ensure_round(store: Store, email: str, stage: int, n: int):
@@ -170,10 +180,10 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int):
     file_id = int(rnd["files"][idx])
     session_dir = _session_dir_for_file(store, file_id)
     channel = _first_animal_channel(store, session_dir)
-    lfp, hil = _build_figures(store, file_id, channel, mode)
+    lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
     cur = {"file_id": file_id, "channel": channel,
            "validated": store.validated_events_for_file(file_id),
-           "session_dir": session_dir}
+           "session_dir": session_dir, "lfp_dur": lfp_dur}
     now = (f"Now scoring: example {idx + 1} of {rnd['examples']} "
            f"(file #{file_id})")
     return "loaded", (cur, _vid_player(file_id), lfp, hil, now,
@@ -405,10 +415,19 @@ def layout(store: Store, config: dict | None = None):
 
         # State.
         dcc.Store(id="training-current"),          # {file_id, channel,
-                                                   #  validated events, ...}
+                                                   #  validated events,
+                                                   #  lfp_dur, ...}
         dcc.Store(id="training-events", data=[]),  # student events
         dcc.Store(id="training-refresh", data=0),  # bump -> roster/badge
         dcc.Store(id="training-is-pi", data=bool(is_pi)),
+
+        # Video <-> LFP cursor sync (mirrors the Video Review tab). The
+        # interval samples the <video> element's currentTime 10x/s; the
+        # store carries it to the clientside callbacks that move the cursor
+        # on both panels. The sink swallows the click-to-seek return value.
+        dcc.Interval(id="training-time-tick", interval=100, n_intervals=0),
+        dcc.Store(id="training-current-time", data=0.0),
+        html.Div(id="training-seek-sink", style={"display": "none"}),
     ])
 
 
@@ -834,6 +853,109 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         store.advance_student(email, int(prog.get("unlocked_stage", 1)) + 1)
         return int(refresh or 0) + 1
 
+    _register_cursor_sync(app)
+
+
+# ===================================================================== #
+#  Video <-> LFP cursor sync (clientside; mirrors the Video Review tab)
+# ===================================================================== #
+
+# Move the cursor (shapes[0]) on one panel to the video's current time,
+# mapped onto the LFP duration so container-FPS drift can't accumulate:
+#   cursor_x = currentTime * (lfp_dur / video_duration).
+# shapes[1:] (e.g. the Hilbert threshold line) are preserved untouched.
+_CURSOR_JS = """
+function(currentTime, fig, current) {
+    if (fig === undefined || fig === null) {
+        return window.dash_clientside.no_update;
+    }
+    if (currentTime === null || currentTime === undefined) {
+        return window.dash_clientside.no_update;
+    }
+    var t = currentTime;
+    var v = document.getElementById('""" + TRAINING_VIDEO_DOM_ID + """');
+    var lfp_dur = (current && current.lfp_dur) ? current.lfp_dur : 0;
+    if (v && isFinite(v.duration) && v.duration > 0
+            && lfp_dur && lfp_dur > 0) {
+        t = currentTime * (lfp_dur / v.duration);
+    }
+    var keep = ((fig.layout && fig.layout.shapes) || []).slice(1);
+    var cursor = {
+        type: 'line', xref: 'x', yref: 'paper',
+        x0: t, x1: t, y0: 0, y1: 1,
+        line: {color: '#ff9f0a', width: 2}
+    };
+    return {
+        data: fig.data,
+        layout: Object.assign({}, fig.layout, {
+            shapes: [cursor].concat(keep)
+        })
+    };
+}
+"""
+
+
+def _register_cursor_sync(app) -> None:
+    """Wire the Training <video> to the cursor on both LFP panels, plus
+    click-to-seek -- the same scheme the Video Review tab uses."""
+    # 1. Poll the <video> element 10 Hz; push currentTime into a Store.
+    app.clientside_callback(
+        """
+        function(_n) {
+            const v = document.getElementById('""" +
+        TRAINING_VIDEO_DOM_ID + """');
+            if (!v || isNaN(v.currentTime)) {
+                return window.dash_clientside.no_update;
+            }
+            return v.currentTime;
+        }
+        """,
+        Output("training-current-time", "data"),
+        Input("training-time-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+
+    # 2. Mirror the current time onto the cursor of each panel.
+    for graph_id in ("training-lfp", "training-hilbert"):
+        app.clientside_callback(
+            _CURSOR_JS,
+            Output(graph_id, "figure", allow_duplicate=True),
+            Input("training-current-time", "data"),
+            State(graph_id, "figure"),
+            State("training-current", "data"),
+            prevent_initial_call=True,
+        )
+
+    # 3. Click the LFP trace -> seek the video to that x value.
+    #    Inverse mapping: video_t = x * (video_duration / lfp_dur).
+    app.clientside_callback(
+        """
+        function(clickData, current) {
+            if (!clickData || !clickData.points || !clickData.points.length) {
+                return '';
+            }
+            const x = clickData.points[0].x;
+            const v = document.getElementById('""" +
+        TRAINING_VIDEO_DOM_ID + """');
+            if (!v || !isFinite(x)) { return ''; }
+            var lfp_dur = (current && current.lfp_dur) ? current.lfp_dur : 0;
+            var vt = x;
+            if (isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                vt = x * (v.duration / lfp_dur);
+            }
+            if (vt < 0) { vt = 0; }
+            if (isFinite(v.duration) && vt > v.duration) { vt = v.duration; }
+            v.currentTime = vt;
+            return '';
+        }
+        """,
+        Output("training-seek-sink", "children"),
+        Input("training-lfp", "clickData"),
+        State("training-current", "data"),
+        prevent_initial_call=True,
+    )
+
 
 # ===================================================================== #
 #  Small render helpers (module-level; no app/store needed)
@@ -867,6 +989,7 @@ def _vid_placeholder(text: str) -> html.Div:
 
 def _vid_player(file_id: int) -> html.Video:
     return html.Video(
+        id=TRAINING_VIDEO_DOM_ID,
         src=f"/media/video/{file_id}",
         controls=True, preload="metadata",
         style={"width": "100%", "maxHeight": "360px",
