@@ -326,6 +326,16 @@ event_clip:
   ffmpeg_bin: ffmpeg
   fallback_to_reencode: true
 
+# On-demand .avi -> mp4 transcoding so the Training tab can play the lab's
+# behavioral videos (which ship as .avi, unplayable in a browser). Stream-
+# copies an H.264 .avi into mp4 (fast) or re-encodes to H.264, caching the
+# result. Reuses event_clip.ffmpeg_bin. See src/utils/avi_transcode.py.
+video_transcode:
+  enabled: true
+  cache_dir: secrets/avi_mp4_cache
+  cache_max_gb: 10
+  reencode_timeout_sec: 1800
+
 # BHZ_DETECTOR-compatible CSV export. Each completed Mark-done
 # in Video Review appends rows here so the lab's downstream
 # MATLAB pipelines see the same 44-column schema they always

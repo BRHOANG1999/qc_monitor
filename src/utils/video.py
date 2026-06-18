@@ -39,6 +39,39 @@ def avi_companion_exists(mat_path: str) -> bool:
 _V_SUFFIX_RE = re.compile(r"_v(\d+)\.mp4$", re.IGNORECASE)
 
 
+def companion_videos(mat_path: str) -> list[dict]:
+    """Every companion video for *mat_path*, one entry per camera, as
+    ``[{"cam": N, "path": str, "kind": "mp4"|"avi"}]`` sorted by camera N.
+
+    Handles ``<base>_vN.mp4`` / ``<base>_vN.avi`` (multi-camera) and a bare
+    ``<base>.mp4`` / ``<base>.avi`` (single camera = cam 1). When a camera has
+    both kinds, mp4 wins (no transcode needed). The lab's behavioral
+    recordings are typically ``_v1.avi`` + ``_v2.avi``.
+    """
+    if not isinstance(mat_path, str) or not mat_path:
+        return []
+    if "." not in os.path.basename(mat_path):
+        return []
+    base = mat_path.rsplit(".", 1)[0]
+    by_cam: dict[int, dict] = {}
+    for kind in ("mp4", "avi"):
+        for m in glob.glob(base + "_v*." + kind):
+            mm = re.search(r"_v(\d+)\." + kind + r"$", m, re.IGNORECASE)
+            if not mm:
+                continue
+            n = int(mm.group(1))
+            cur = by_cam.get(n)
+            if cur is None or (kind == "mp4" and cur["kind"] == "avi"):
+                by_cam[n] = {"cam": n, "path": m, "kind": kind}
+    if not by_cam:
+        for kind in ("mp4", "avi"):
+            cand = base + "." + kind
+            if os.path.isfile(cand):
+                by_cam[1] = {"cam": 1, "path": cand, "kind": kind}
+                break
+    return [by_cam[n] for n in sorted(by_cam)]
+
+
 def companion_video_paths(mat_path: str) -> list[str]:
     """Every ``<basename>_vN.mp4`` companion of *mat_path*, sorted by N.
 

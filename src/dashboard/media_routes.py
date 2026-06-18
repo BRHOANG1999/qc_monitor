@@ -14,7 +14,9 @@ import time
 from flask import abort, g, jsonify, send_file
 
 from src.utils import event_clip as _event_clip
-from src.utils.video import video_path_for_mat, companion_video_paths
+from src.utils import avi_transcode as _avi
+from src.utils.video import (video_path_for_mat, companion_video_paths,
+                              companion_videos)
 
 logger = logging.getLogger("qc_monitor.dashboard.media")
 
@@ -178,6 +180,33 @@ def register_media_routes(server, store, config: dict) -> None:
             conditional=True,
             as_attachment=False,
         )
+
+    @server.route("/media/video/<int:file_id>/cam/<int:cam>")
+    def serve_video_cam_n(file_id: int, cam: int):  # pragma: no cover
+        """Serve camera number *cam* for a chunk, transcoding .avi -> mp4 on
+        demand (cached). mp4 companions stream directly; an .avi camera
+        returns 202 (JSON 'transcoding') until its cached mp4 is ready, so
+        the Training tab can poll and load it when done."""
+        if not getattr(g, "user", None):
+            abort(403)
+        mat_path = _lookup_mat_path(store, file_id)
+        if mat_path is None:
+            abort(404, description=f"Unknown file_id {file_id}")
+        entry = next((e for e in companion_videos(mat_path)
+                      if e["cam"] == cam), None)
+        if entry is None:
+            abort(404, description=f"Camera v{cam} not available")
+        if entry["kind"] == "mp4":
+            return send_file(entry["path"], mimetype="video/mp4",
+                             conditional=True, as_attachment=False)
+        # .avi -> transcoded mp4 (background, cached).
+        ready = _avi.ensure_async(entry["path"], config)
+        if ready:
+            return send_file(ready, mimetype="video/mp4",
+                             conditional=True, as_attachment=False)
+        st = _avi.status(entry["path"], config)
+        return jsonify({"status": "error" if st == "error" else
+                        "transcoding", "cam": cam}), 202
 
     @server.route("/media/clip/<spec_hash>")
     def serve_event_clip(spec_hash: str):  # pragma: no cover

@@ -289,7 +289,9 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
            "session_dir": session_dir, "lfp_dur": lfp_dur,
            "filename": fname}
     now = (f"Example {idx + 1} of {rnd['examples']}  ·  {fname}")
-    return "loaded", (cur, _vid_player(file_id, mat_path), lfp, hil, now,
+    # The video is rendered by _render_video (camera picker + .avi transcode);
+    # show a transient placeholder until that fires.
+    return "loaded", (cur, _vid_placeholder("Loading video…"), lfp, hil, now,
                       _history_text(store, email, stage, rnd))
 
 
@@ -459,15 +461,31 @@ def layout(store: Store, config: dict | None = None):
 
         # Viewer: video | LFP + Hilbert.
         html.Div([
-            dcc.Loading(
-                html.Div(id="training-video",
-                          style={"background": "#000",
-                                  "borderRadius": RADIUS_MD,
-                                  "minHeight": "300px",
-                                  "display": "flex",
-                                  "alignItems": "center",
-                                  "justifyContent": "center"}),
-                type="default"),
+            html.Div([
+                # Camera picker (shown only when a recording is multi-camera).
+                html.Div([
+                    html.Span("Camera:", style={
+                        "color": COLOR_TEXT_SECONDARY,
+                        "fontSize": FONT_SIZE_CAPTION,
+                        "marginRight": SPACE_2}),
+                    dcc.RadioItems(id="training-cam", inline=True, value=1,
+                                    labelStyle={"marginRight": SPACE_3,
+                                                 "color": COLOR_TEXT_PRIMARY,
+                                                 "fontSize":
+                                                     FONT_SIZE_CAPTION}),
+                ], id="training-cam-wrap",
+                   style={"display": "none", "alignItems": "center",
+                           "marginBottom": SPACE_2}),
+                dcc.Loading(
+                    html.Div(id="training-video",
+                              style={"background": "#000",
+                                      "borderRadius": RADIUS_MD,
+                                      "minHeight": "300px",
+                                      "display": "flex",
+                                      "alignItems": "center",
+                                      "justifyContent": "center"}),
+                    type="default"),
+            ]),
             dcc.Loading(html.Div([
                 dcc.Graph(id="training-lfp",
                           figure=_empty_lfp_fig("Load an example below."),
@@ -572,6 +590,11 @@ def layout(store: Store, config: dict | None = None):
         dcc.Interval(id="training-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="training-current-time", data=0.0),
         html.Div(id="training-seek-sink", style={"display": "none"}),
+        # Camera/video rendering: a 2.5 s tick polls the .avi->mp4 transcode
+        # so the player loads when ready; the signature store dedupes renders
+        # so a playing <video> isn't reset every tick.
+        dcc.Interval(id="training-cam-tick", interval=2500, n_intervals=0),
+        dcc.Store(id="training-vidsig"),
         # Sink for the LFP<->Hilbert x-axis lock (the clientside callbacks
         # relayout the sibling graph directly; this just terminates them).
         dcc.Store(id="training-xsync-sink"),
@@ -1069,6 +1092,48 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _kick_import(store, config)
         return _import_status_text(enabled)
 
+    # ---- Camera picker: populate from the loaded recording ---- #
+    @app.callback(
+        Output("training-cam", "options"),
+        Output("training-cam", "value"),
+        Output("training-cam-wrap", "style"),
+        Input("training-current", "data"),
+        prevent_initial_call=True,
+    )
+    def _cam_options(current):
+        hide = {"display": "none"}
+        if not current or not current.get("file_id"):
+            return [], 1, hide
+        from src.utils.video import companion_videos
+        mat_path = _file_path_for_id(store, int(current["file_id"]))
+        cams = companion_videos(mat_path) if mat_path else []
+        opts = [{"label": f" Cam {c['cam']}", "value": c["cam"]}
+                for c in cams]
+        first = cams[0]["cam"] if cams else 1
+        if len(cams) < 2:                 # no picker for single/no camera
+            return opts, first, hide
+        return opts, first, {"display": "flex", "alignItems": "center",
+                             "marginBottom": SPACE_2}
+
+    # ---- Render the video (camera + .avi transcode polling) ---- #
+    @app.callback(
+        Output("training-video", "children", allow_duplicate=True),
+        Output("training-vidsig", "data"),
+        Input("training-current", "data"),
+        Input("training-cam", "value"),
+        Input("training-cam-tick", "n_intervals"),
+        State("training-vidsig", "data"),
+        prevent_initial_call=True,
+    )
+    def _render_video(current, cam, _tick, last_sig):
+        if not current or not current.get("file_id"):
+            return no_update, no_update
+        children, sig = _video_children_and_sig(
+            store, config, int(current["file_id"]), int(cam or 1))
+        if sig == last_sig:
+            return no_update, no_update      # nothing changed -> don't reset
+        return children, sig
+
     _register_cursor_sync(app)
 
 
@@ -1267,25 +1332,45 @@ def _vid_placeholder(text: str) -> html.Div:
     return empty_state("No recording loaded", hint=text, icon_name="video")
 
 
-def _vid_player(file_id: int, mat_path: str | None = None):
-    """The <video> for this example, or a placeholder when no browser-
-    playable companion video exists next to the recording (common for older
-    historical files -- they may have no video, or only a .avi). Score from
-    the EEG in that case."""
-    from src.utils.video import video_path_for_mat, avi_companion_exists
-    if mat_path and video_path_for_mat(mat_path):
-        return html.Video(
-            id=TRAINING_VIDEO_DOM_ID,
-            src=f"/media/video/{file_id}",
-            controls=True, preload="metadata",
-            style={"width": "100%", "maxHeight": "360px",
-                   "borderRadius": RADIUS_MD, "background": "#000"})
-    if mat_path and avi_companion_exists(mat_path):
-        return _vid_placeholder(
-            "This recording's video is .avi, which browsers can't play — "
-            "score from the EEG below.")
-    return _vid_placeholder("No companion video for this recording — "
-                            "score from the EEG below.")
+def _cam_video(file_id: int, cam: int):
+    """The <video> element for one camera (mp4 served directly, .avi served
+    as its cached transcode) -- keeps the cursor-sync DOM id."""
+    return html.Video(
+        id=TRAINING_VIDEO_DOM_ID,
+        src=f"/media/video/{file_id}/cam/{cam}",
+        controls=True, preload="metadata",
+        style={"width": "100%", "maxHeight": "360px",
+               "borderRadius": RADIUS_MD, "background": "#000"})
+
+
+def _video_children_and_sig(store: Store, config: dict, file_id: int,
+                             cam: int):
+    """Render the video area for *cam* and a signature string. The signature
+    lets the render callback skip redundant re-renders (so a playing <video>
+    isn't reset) -- it changes only when the file, camera, or transcode
+    readiness changes."""
+    from src.utils import avi_transcode as _avi
+    from src.utils.video import companion_videos
+    mat_path = _file_path_for_id(store, file_id)
+    cams = companion_videos(mat_path) if mat_path else []
+    if not cams:
+        return (_vid_placeholder("No companion video for this recording — "
+                                 "score from the EEG below."),
+                f"{file_id}:none")
+    entry = next((e for e in cams if e["cam"] == cam), cams[0])
+    cn = entry["cam"]
+    if entry["kind"] == "mp4":
+        return _cam_video(file_id, cn), f"{file_id}:{cn}:mp4"
+    # .avi -> on-demand transcode to a cached mp4 (background).
+    if _avi.ready_path(entry["path"], config):
+        return _cam_video(file_id, cn), f"{file_id}:{cn}:ready"
+    _avi.ensure_async(entry["path"], config)
+    if _avi.status(entry["path"], config) == "error":
+        return (_vid_placeholder("Couldn't prepare this video — score from "
+                                 "the EEG below."), f"{file_id}:{cn}:err")
+    return (_vid_placeholder(f"Preparing camera {cn} video… (converting .avi "
+                             f"to a playable format, first time only)"),
+            f"{file_id}:{cn}:prep")
 
 
 def _event_row(event: dict, idx: int, stage: int) -> html.Div:
