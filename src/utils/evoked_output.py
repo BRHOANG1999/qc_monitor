@@ -53,12 +53,21 @@ DEFAULT_CACHE_DB = os.path.join("data", "evoked_chronic_cache.db")
 
 # Bump when the cache layout changes; a mismatch wipes + rebuilds (the DB
 # is a throwaway cache, gitignored).
-SCHEMA_VERSION = "3"
+#   v4: per-epoch traces (epoch_trace table) added so the Configure panel can
+#       recompute features (window/filter/smooth/baseline) from raw epochs.
+SCHEMA_VERSION = "4"
 
 # Per-recording mean waveforms are stored downsampled to this many points;
 # the overlay never needs the raw ~20k-sample resolution, and full traces
 # as JSON would bloat the cache (~16 MB/file).
 _MEAN_TRACE_POINTS = 1000
+
+# Per-epoch traces are stored int16 (one BLOB per file+channel, shape
+# [n_epochs x n_samples]); cap the time resolution so a pathological file
+# can't bloat the cache. The toolkit's evoked window is ~600 ms; at 10 kHz
+# that's ~6k samples, well under this cap.
+_MAX_TRACE_SAMPLES = 20000
+_INT16_HEADROOM = 32000.0
 
 # epoch columns = stim scalars (raw) + the computed evoked feature set.
 _BASE_EPOCH_COLS = ["file_id", "animal", "electrode", "channel",
@@ -308,6 +317,7 @@ class ChronicEvokedCache:
         conn.executescript(
             f"""
             DROP TABLE IF EXISTS epoch;
+            DROP TABLE IF EXISTS epoch_trace;
             DROP TABLE IF EXISTS recording_mean;
             DROP TABLE IF EXISTS file_meta;
             CREATE TABLE file_meta (
@@ -327,9 +337,19 @@ class ChronicEvokedCache:
                 channel TEXT, time_axis TEXT, mean_trace TEXT,
                 std_trace TEXT, n_epochs INTEGER
             );
+            CREATE TABLE epoch_trace (
+                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
+                channel TEXT, electrode TEXT,
+                t0_ms REAL, dt_ms REAL, n_samples INTEGER,
+                n_epochs INTEGER, scale REAL,
+                stim_times TEXT, peaks TEXT, troughs TEXT,
+                data BLOB
+            );
             CREATE INDEX idx_epoch_animal ON epoch(animal);
             CREATE INDEX idx_epoch_file ON epoch(file_id);
             CREATE INDEX idx_recmean_animal ON recording_mean(animal);
+            CREATE INDEX idx_etrace_animal ON epoch_trace(animal);
+            CREATE INDEX idx_etrace_file ON epoch_trace(file_id);
             CREATE INDEX idx_fm_session ON file_meta(session);
             """
         )
@@ -429,9 +449,11 @@ class ChronicEvokedCache:
         file_id = self._upsert_file(conn, path, mtime, rec_iso)
         conn.execute("DELETE FROM epoch WHERE file_id = ?", (file_id,))
         conn.execute("DELETE FROM recording_mean WHERE file_id = ?", (file_id,))
+        conn.execute("DELETE FROM epoch_trace WHERE file_id = ?", (file_id,))
         channels = read_file_evoked(path)
         rows: list = []
         means: list = []
+        traces_rows: list = []
         n_total = 0
         fs_seen = None
         for ch, info in channels.items():
@@ -444,6 +466,9 @@ class ChronicEvokedCache:
             n_total += len(erows)
             if mrow is not None:
                 means.append(mrow)
+            trow = self._trace_row(file_id, animal, electrode, ch, info)
+            if trow is not None:
+                traces_rows.append(trow)
             fs_seen = fs_seen or fs
         if rows:
             ph = ",".join("?" * len(_EPOCH_COLS))
@@ -455,8 +480,43 @@ class ChronicEvokedCache:
                 "INSERT INTO recording_mean (file_id, animal, channel, "
                 "time_axis, mean_trace, std_trace, n_epochs) "
                 "VALUES (?,?,?,?,?,?,?)", means)
+        if traces_rows:
+            conn.executemany(
+                "INSERT INTO epoch_trace (file_id, animal, channel, electrode,"
+                " t0_ms, dt_ms, n_samples, n_epochs, scale, stim_times, peaks,"
+                " troughs, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                traces_rows)
         conn.execute("UPDATE file_meta SET n_epochs=?, fs=? WHERE id=?",
                      (n_total, fs_seen, file_id))
+
+    @staticmethod
+    def _trace_row(file_id, animal, electrode, ch, info):
+        """One epoch_trace insert tuple for a channel: the per-epoch traces
+        int16-encoded ([n_epochs x n_samples], C-order) + the time axis and
+        the per-epoch stim scalars, so a block is self-contained for the
+        Configure recompute. None when the channel has no traces."""
+        traces = info.get("traces")
+        time_ms = info.get("time_ms")
+        if traces is None or time_ms is None or traces.shape[0] < 1:
+            return None
+        t = np.asarray(time_ms, dtype=np.float64).ravel()
+        tr = np.asarray(traces, dtype=np.float64)
+        # Optional time-decimation guard (keeps the cache bounded).
+        if tr.shape[1] > _MAX_TRACE_SAMPLES:
+            step = int(np.ceil(tr.shape[1] / _MAX_TRACE_SAMPLES))
+            tr = tr[:, ::step]
+            t = t[::step]
+        scale = max(1e-9, float(np.nanmax(np.abs(tr)))) / _INT16_HEADROOM
+        q = np.clip(np.round(np.nan_to_num(tr) / scale),
+                    -32768, 32767).astype("<i2")
+        dt = float(np.mean(np.diff(t))) if t.size >= 2 else 0.0
+        times = info.get("times") or []
+        sp = info.get("stim_peak") or []
+        st = info.get("stim_trough") or []
+        return (file_id, animal, ch, electrode, float(t[0]), dt,
+                int(tr.shape[1]), int(tr.shape[0]), scale,
+                json.dumps(_round(list(times))), json.dumps(_round(list(sp))),
+                json.dumps(_round(list(st))), q.tobytes())
 
     def _channel_rows(self, file_id, animal, electrode, ch, info):
         """Epoch insert tuples + a recording_mean tuple for one channel.
@@ -596,6 +656,53 @@ class ChronicEvokedCache:
         finally:
             conn.close()
         return [_mean_row_to_dict(r) for r in rows]
+
+    def query_epoch_traces(self, animal: str, hours: int | None = None,
+                           sessions: list | None = None) -> list[dict]:
+        """Per-(file, channel) trace blocks for *animal*, oldest first.
+
+        Each block decodes the int16 BLOB back to ``traces`` [n_epochs x
+        n_samples] float, with ``time_ms``, ``rec_dt``, ``session``, and the
+        per-epoch ``stim_times``/``peaks``/``troughs``. This feeds the
+        Configure recompute (window/filter/smooth/baseline) from raw epochs.
+        """
+        if not animal:
+            return []
+        conn = self._conn()
+        try:
+            sess_sel = "m.session" if self._has_session else "NULL AS session"
+            sql = ("SELECT et.channel, et.electrode, m.rec_dt, " + sess_sel +
+                   ", et.t0_ms, et.dt_ms, et.n_samples, et.n_epochs, "
+                   "et.scale, et.stim_times, et.peaks, et.troughs, et.data "
+                   "FROM epoch_trace et JOIN file_meta m ON et.file_id = m.id "
+                   "WHERE et.animal = ?")
+            params: list = [animal]
+            use_sessions = sessions if self._has_session else None
+            sql, params = _add_time_session(sql, params, hours, use_sessions)
+            sql += " ORDER BY m.rec_dt ASC, et.channel ASC"
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        return [self._trace_row_to_dict(r) for r in rows
+                if r["data"] is not None]
+
+    @staticmethod
+    def _trace_row_to_dict(r) -> dict:
+        n_ep, n_s = int(r["n_epochs"]), int(r["n_samples"])
+        scale = float(r["scale"] or 1.0)
+        q = np.frombuffer(r["data"], dtype="<i2")
+        traces = (q.astype(np.float64).reshape(n_ep, n_s) * scale
+                  if q.size == n_ep * n_s else np.zeros((0, n_s)))
+        t0, dt = float(r["t0_ms"] or 0.0), float(r["dt_ms"] or 0.0)
+        time_ms = t0 + dt * np.arange(n_s, dtype=np.float64)
+        return {
+            "channel": r["channel"], "electrode": r["electrode"],
+            "rec_dt": r["rec_dt"], "session": r["session"],
+            "traces": traces, "time_ms": time_ms,
+            "stim_times": json.loads(r["stim_times"] or "[]"),
+            "peaks": json.loads(r["peaks"] or "[]"),
+            "troughs": json.loads(r["troughs"] or "[]"),
+        }
 
     @staticmethod
     def _row_to_dict(r) -> dict:

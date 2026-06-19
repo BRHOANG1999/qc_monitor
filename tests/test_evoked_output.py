@@ -24,8 +24,10 @@ from src.utils.evoked_output import (  # noqa: E402
 )
 
 
-def _write_evoked(path, channels):
-    """Write allAnimalResults/<ch>/{stimulusTimes,Peak,Trough}."""
+def _write_evoked(path, channels, traces=None, time_ms=None):
+    """Write allAnimalResults/<ch>/{stimulusTimes,Peak,Trough[,evokedData,
+    timeAxis]}. *traces* maps channel -> ndarray[epochs x samples]."""
+    import numpy as np
     with h5py.File(path, "w") as g:
         root = g.create_group("allAnimalResults")
         for ch, (times, peak, trough) in channels.items():
@@ -35,6 +37,10 @@ def _write_evoked(path, channels):
                                data=[[v] for v in peak])           # (n, 1)
             grp.create_dataset("stimulusTroughAmplitudes",
                                data=[[v] for v in trough])
+            if traces is not None and ch in traces:
+                grp.create_dataset("evokedData",
+                                   data=np.asarray(traces[ch]))    # (E, T)
+                grp.create_dataset("timeAxis", data=np.asarray(time_ms))
 
 
 def test_filename_parsers():
@@ -85,6 +91,34 @@ def test_cache_build_query_and_guards(tmp_path):
     # Unknown / empty animal -> [].
     assert cache.query("BCH999") == []
     assert cache.query("") == []
+
+
+def test_epoch_trace_cache_roundtrip(tmp_path):
+    import numpy as np
+    ed = tmp_path / "evokedOutput"
+    ed.mkdir()
+    rng = np.random.default_rng(0)
+    tr = rng.standard_normal((6, 600)) * 80.0          # 6 epochs, 600 samples
+    tax = np.linspace(-100, 500, 600)
+    _write_evoked(
+        str(ed / "base__BCH062SR___2026_05_10__06_00_00_evoked.mat"),
+        {"BCH062SR": ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                      [1.0] * 6, [-1.0] * 6)},
+        traces={"BCH062SR": tr}, time_ms=tax)
+
+    cache = ChronicEvokedCache(str(ed), str(tmp_path / "cache.db"))
+    cache.ensure_animal("BCH062")
+
+    blocks = cache.query_epoch_traces("BCH062")
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert b["channel"] == "BCH062SR"
+    assert b["traces"].shape == (6, 600)
+    # int16 round-trip is accurate to well under 1 uV.
+    assert np.max(np.abs(b["traces"] - tr)) < 0.1
+    assert b["time_ms"][0] == pytest.approx(-100.0)
+    assert b["time_ms"][-1] == pytest.approx(500.0)
+    assert len(b["stim_times"]) == 6 and b["peaks"][0] == pytest.approx(1.0)
 
 
 if __name__ == "__main__":
