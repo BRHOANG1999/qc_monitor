@@ -33,7 +33,7 @@ from src.dashboard.data_helpers import (
 from src.utils import evoked_features as ef
 from src.utils.evoked_output import (
     ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals,
-    sessions_for_animal)
+    sessions_for_animal, sessions_with_dt_for_animal)
 
 # Feature dropdown = every cached evoked feature, friendly labels from the
 # app-wide map. Expensive ones are flagged so the UI can disable them.
@@ -139,22 +139,41 @@ def _feature_options() -> list[dict]:
     return opts
 
 
-def _session_options(animal) -> list[dict]:
-    """Session labels for *animal*, or [] (best-effort; never raises).
+def _session_label(rec: dict) -> str:
+    """'session  ·  <date(s)>' from a {session, first, last} record."""
+    s = rec["session"]
+    first, last = rec.get("first") or "", rec.get("last") or ""
+    if not first:
+        return s
+    fd = first[:10]
+    if last and last[:10] != fd:
+        return f"{s}  ·  {fd} → {last[:10]}"
+    return f"{s}  ·  {first[:16].replace('T', ' ')}"
 
-    Reads the sessions straight from the evoked filenames so the dropdown
-    populates the moment an animal is selected (no warm needed); unions in
-    any warmed-cache sessions as a backstop.
+
+def _session_options(animal) -> list[dict]:
+    """Session options for *animal* (label shows the recording timestamp),
+    or [] (best-effort; never raises).
+
+    Read straight from the evoked filenames so the dropdown populates the
+    moment an animal is selected (no warm needed); unions in any warmed-cache
+    sessions (without dates) as a backstop. The value stays the bare session
+    label so filtering is unchanged.
     """
     if not animal:
         return []
     try:
-        sessions = set(sessions_for_animal(_EVOKED_DIR, animal))
+        dated = sessions_with_dt_for_animal(_EVOKED_DIR, animal)
+        opts = [{"label": _session_label(r), "value": r["session"]}
+                for r in dated]
+        seen = {r["session"] for r in dated}
         try:
-            sessions |= set(_cache().list_sessions(animal))
+            for s in _cache().list_sessions(animal):
+                if s not in seen:
+                    opts.append({"label": s, "value": s})
         except Exception:  # noqa: BLE001 -- cache optional; disk is enough
             pass
-        return [{"label": s, "value": s} for s in sorted(sessions)]
+        return opts
     except Exception:  # noqa: BLE001
         return []
 

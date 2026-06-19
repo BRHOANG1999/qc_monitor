@@ -193,6 +193,30 @@ def sessions_for_animal(evoked_dir: str, animal: str) -> list[str]:
     return sorted(seen)
 
 
+def sessions_with_dt_for_animal(evoked_dir: str,
+                                animal: str) -> list[dict]:
+    """[{session, first, last}] for *animal* (ISO recording datetimes parsed
+    from the filenames), sorted by first time -- so the session dropdown can
+    show each session's timestamp without a cache warm."""
+    if not animal or not evoked_dir:
+        return []
+    by_sess: dict[str, list] = {}
+    for i, f in enumerate(list_evoked_files(evoked_dir)):
+        assert i < _MAX_FILES, "evoked file count exceeds bound"
+        if animal in animals_in_filename(f):
+            s = parse_session(f)
+            if s:
+                by_sess.setdefault(s, []).append(parse_recording_dt(f))
+    out: list[dict] = []
+    for s, dts in by_sess.items():
+        valid = sorted(d for d in dts if d is not None)
+        out.append({"session": s,
+                    "first": valid[0].isoformat() if valid else "",
+                    "last": valid[-1].isoformat() if valid else ""})
+    out.sort(key=lambda r: (r["first"] or r["session"]))
+    return out
+
+
 def list_evoked_files(evoked_dir: str) -> list[str]:
     """All ``*_evoked.mat`` files directly in *evoked_dir* (sorted)."""
     assert isinstance(evoked_dir, str) and evoked_dir, "evoked_dir required"
