@@ -51,6 +51,15 @@ def load_mat(path: str) -> ChunkData:
     if sbuf.ndim == 1:
         sbuf = sbuf.reshape(-1, 1)
 
+    # Orient to [samples x channels]. MATLAB v7.3 (HDF5) stores arrays
+    # transposed vs MATLAB, so _load_hdf5 returns sbuf as [channels x
+    # samples]; v7 (scipy) returns [samples x channels]. Samples always far
+    # outnumber channels (>=1 s @ kHz vs <=64 ch), so the longer axis is
+    # samples -- transpose when it isn't axis 0. Without this a v7.3 file
+    # reads as e.g. 5 "samples" x 72M "channels" (a 250 us degenerate trace).
+    if sbuf.ndim == 2 and sbuf.shape[0] < sbuf.shape[1]:
+        sbuf = sbuf.T
+
     num_samples, num_channels = sbuf.shape
     duration_sec = num_samples / fs
 
