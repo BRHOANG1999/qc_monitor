@@ -252,6 +252,7 @@ def layout(store):
         ], style={"display": "flex", "gap": "14px", "alignItems": "center",
                   "marginBottom": "8px", "flexWrap": "wrap"}),
         dcc.Store(id="chronic-selection"),
+        dcc.Store(id="chronic-config"),   # Configure panel settings (Phase 2)
         dcc.Interval(id="chronic-warm-poll", interval=1500, disabled=True),
         html.Div(id="chronic-status",
                  style={"color": "#8a8d99", "fontSize": "11px",
@@ -391,10 +392,11 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-window-hours", "value"),
         State("chronic-window-scroll", "value"),
         State("chronic-roll-window", "value"),
+        State("chronic-config", "data"),
         prevent_initial_call=True,
     )
     def _update(_load, _refresh, animal, sessions, feature, hours, overlays,
-                win_hours, scroll, roll_window):
+                win_hours, scroll, roll_window, cfg_dict):
         if not animal:
             return empty_fig("Select an animal, then ▶ Plot"), "", "", None
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
@@ -402,7 +404,7 @@ def register_callbacks(app, store, config: dict) -> None:
             _kick_warm(animal)
         sel = {"animal": animal, "sessions": sessions or None, "hours": hours,
                "win_hours": win_hours, "scroll": scroll, "feature": feature,
-               "roll_window": roll_window}
+               "roll_window": roll_window, "config": cfg_dict or None}
         try:
             rows, _means, win_lbl = _query_for_selection(sel, need_means=False)
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
@@ -460,16 +462,83 @@ def register_callbacks(app, store, config: dict) -> None:
 #  Lazy section plumbing
 # --------------------------------------------------------------------- #
 
+# In-memory recompute cache: (animal, hours, sessions, config-hash) -> rows.
+# Bounded; a recompute over thousands of epochs is a few seconds, so re-plots
+# / lazy sections of the same selection are instant.
+_RECOMPUTE_CACHE: "dict[tuple, list]" = {}
+_RECOMPUTE_MAX = 6
+
+
+def _config_key(cfg_dict) -> tuple:
+    f = ef.FeatureConfig.from_dict(cfg_dict)
+    return tuple(getattr(f, k) for k in f.__dataclass_fields__)
+
+
+def _abs_dt_iso(rec_iso, seconds) -> str:
+    """recording ISO + stim offset seconds -> ISO (mirrors evoked_output)."""
+    if not rec_iso:
+        return ""
+    if seconds is None:
+        return rec_iso
+    try:
+        from datetime import timedelta
+        return (_parse_iso(rec_iso) + timedelta(seconds=float(seconds))
+                ).isoformat()
+    except (ValueError, TypeError):
+        return rec_iso
+
+
+def _recompute_rows(cache, animal, hours, sessions, cfg) -> list:
+    """Per-epoch feature rows recomputed from the cached traces with the
+    Configure *cfg* -- same row shape as ``cache.query`` so the plot/section
+    code is unchanged."""
+    blocks = cache.query_epoch_traces(animal, hours=hours, sessions=sessions)
+    rows: list = []
+    for b in blocks:
+        traces, tms = b["traces"], b["time_ms"]
+        if traces.shape[0] < 1 or tms.size < 2:
+            continue
+        fs = 1000.0 / float(np.mean(np.diff(tms)))
+        feats = ef.compute_all(traces, tms, fs, _EXPENSIVE_ENABLED, cfg)
+        sts, pks, trs = b["stim_times"], b["peaks"], b["troughs"]
+        for j in range(traces.shape[0]):
+            st = sts[j] if j < len(sts) else None
+            row = {"channel": b["channel"], "electrode": b["electrode"],
+                   "rec_dt": b["rec_dt"], "session": b["session"],
+                   "stim_time_sec": st, "abs_dt": _abs_dt_iso(b["rec_dt"], st),
+                   "peak": pks[j] if j < len(pks) else None,
+                   "trough": trs[j] if j < len(trs) else None}
+            for col in ef.ALL_COLUMNS:
+                v = float(feats[col][j])
+                row[col] = v if np.isfinite(v) else None
+            rows.append(row)
+    rows.sort(key=lambda r: r.get("abs_dt") or "")
+    return rows
+
+
 def _query_for_selection(sel: dict, need_means: bool = True):
     """Re-query the cache for a saved selection dict -> (rows, means, label).
-    Cheap post-warm; means is small and only fetched when *need_means*."""
+    Cheap post-warm; means is small and only fetched when *need_means*. When
+    the Configure panel is non-default, features are recomputed from the
+    cached per-epoch traces instead of read from the fast feature columns."""
     assert isinstance(sel, dict), "selection must be a dict"
     animal = sel.get("animal")
     assert animal, "selection animal required"
     cache = _cache()
     hours = sel.get("hours") or None
     sessions = sel.get("sessions") or None
-    rows = cache.query(animal, hours=hours, sessions=sessions)
+    cfg = ef.FeatureConfig.from_dict(sel.get("config"))
+    if cfg.is_passthrough():
+        rows = cache.query(animal, hours=hours, sessions=sessions)
+    else:
+        ckey = (animal, hours, tuple(sessions or ()),
+                _config_key(sel.get("config")))
+        rows = _RECOMPUTE_CACHE.get(ckey)
+        if rows is None:
+            rows = _recompute_rows(cache, animal, hours, sessions, cfg)
+            _RECOMPUTE_CACHE[ckey] = rows
+            while len(_RECOMPUTE_CACHE) > _RECOMPUTE_MAX:
+                _RECOMPUTE_CACHE.pop(next(iter(_RECOMPUTE_CACHE)))
     means = (cache.query_recording_means(animal, hours=hours, sessions=sessions)
              if need_means else [])
     return _apply_window(rows, means, sel.get("win_hours"), sel.get("scroll"))

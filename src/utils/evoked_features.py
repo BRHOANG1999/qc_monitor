@@ -17,6 +17,8 @@ Exp-Fit A) fit per epoch and are computed only when asked (opt-in).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # Spectral integration bands (Hz), matching FeatureExtractor.m.
@@ -39,6 +41,97 @@ EXPENSIVE_COLUMNS = [
 ALL_COLUMNS = CHEAP_COLUMNS + EXPENSIVE_COLUMNS
 
 _MAX_EPOCHS = 1_000_000     # NASA Rule 2: explicit per-epoch loop bound.
+
+
+# --------------------------------------------------------------------- #
+#  Configure: optional pre-processing applied before the feature math
+# --------------------------------------------------------------------- #
+#  The toolkit's evoked traces are already filtered + baseline-corrected at
+#  extraction, so the DEFAULT config is a pass-through (features run on the
+#  traces as-is, reproducing today's cached columns). The Chronic Evoked
+#  "Configure" panel lets the user crop the feature window and apply extra
+#  bandpass / notch / smoothing / baseline on top -- mirroring
+#  ChronicTabController.openConfigDialog (ChronicTabState.m defaults).
+
+@dataclass
+class FeatureConfig:
+    window_start_ms: float | None = None   # None = no crop (full trace)
+    window_end_ms: float | None = None
+    bandpass: bool = False
+    bp_low_hz: float = 1.0
+    bp_high_hz: float = 100.0
+    notch: bool = False
+    notch_hz: float = 60.0
+    smoothing: bool = False
+    smooth_ms: float = 5.0
+    baseline: bool = False                 # subtract pre-stim (t<=0) mean
+
+    def is_passthrough(self) -> bool:
+        return not (self.bandpass or self.notch or self.smoothing
+                    or self.baseline
+                    or self.window_start_ms is not None
+                    or self.window_end_ms is not None)
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "FeatureConfig":
+        d = d or {}
+        f = cls()
+        for k in cls.__dataclass_fields__:
+            if k in d and d[k] is not None:
+                setattr(f, k, d[k])
+        return f
+
+
+def _bandpass(a: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
+    from scipy.signal import butter, filtfilt
+    nyq = 0.5 * fs
+    lo = max(1e-3, min(lo, nyq * 0.99))
+    hi = max(lo + 1e-3, min(hi, nyq * 0.99))
+    b, c = butter(4, [lo / nyq, hi / nyq], btype="band")
+    pad = min(a.shape[1] - 1, 3 * max(len(b), len(c)))
+    return filtfilt(b, c, a, axis=1, padlen=pad)
+
+
+def _notch(a: np.ndarray, fs: float, f0: float) -> np.ndarray:
+    from scipy.signal import iirnotch, filtfilt
+    if f0 <= 0 or f0 >= 0.5 * fs:
+        return a
+    b, c = iirnotch(f0, 30.0, fs)
+    pad = min(a.shape[1] - 1, 3 * max(len(b), len(c)))
+    return filtfilt(b, c, a, axis=1, padlen=pad)
+
+
+def _smooth(a: np.ndarray, fs: float, win_ms: float) -> np.ndarray:
+    from scipy.ndimage import uniform_filter1d
+    n = max(1, int(round(win_ms * 1e-3 * fs)))
+    return uniform_filter1d(a, size=n, axis=1, mode="nearest")
+
+
+def preprocess(traces, time_ms, fs: float,
+               cfg: "FeatureConfig") -> tuple[np.ndarray, np.ndarray]:
+    """Apply the Configure pipeline (filter -> notch -> smooth -> baseline ->
+    window crop) and return (processed_traces, processed_time_ms). A
+    pass-through config returns the inputs unchanged."""
+    a = _check(traces)
+    t = np.asarray(time_ms, dtype=np.float64).ravel()
+    if cfg is None or cfg.is_passthrough():
+        return a, t
+    if cfg.bandpass:
+        a = _bandpass(a, fs, cfg.bp_low_hz, cfg.bp_high_hz)
+    if cfg.notch:
+        a = _notch(a, fs, cfg.notch_hz)
+    if cfg.smoothing:
+        a = _smooth(a, fs, cfg.smooth_ms)
+    if cfg.baseline:
+        pre = t <= 0.0
+        if pre.any():
+            a = a - np.nanmean(a[:, pre], axis=1, keepdims=True)
+    ws = cfg.window_start_ms if cfg.window_start_ms is not None else t[0]
+    we = cfg.window_end_ms if cfg.window_end_ms is not None else t[-1]
+    mask = (t >= ws) & (t <= we)
+    if mask.sum() >= 2:
+        a, t = a[:, mask], t[mask]
+    return a, t
 
 
 def _check(traces) -> np.ndarray:
@@ -386,16 +479,19 @@ def compute_expensive(traces, time_ms, fs: float) -> dict:
     }
 
 
-def compute_all(traces, time_ms, fs: float, expensive: bool = False) -> dict:
+def compute_all(traces, time_ms, fs: float, expensive: bool = False,
+                cfg: "FeatureConfig | None" = None) -> dict:
     """Cheap features always; expensive ones only when *expensive*.
 
-    Columns not computed are present as all-NaN arrays so the cache schema
-    is uniform regardless of the flag.
+    When *cfg* is given (and not pass-through) the traces are pre-processed
+    (Configure: filter/notch/smooth/baseline/window-crop) before the feature
+    math; the default cfg=None reproduces today's behavior exactly. Columns
+    not computed are present as all-NaN arrays so the schema stays uniform.
     """
-    a = _check(traces)
-    out = compute_cheap(a, time_ms, fs)
+    a, t = preprocess(traces, time_ms, fs, cfg or FeatureConfig())
+    out = compute_cheap(a, t, fs)
     if expensive:
-        out.update(compute_expensive(a, time_ms, fs))
+        out.update(compute_expensive(a, t, fs))
     else:
         nan = np.full(a.shape[0], np.nan)
         for col in EXPENSIVE_COLUMNS:

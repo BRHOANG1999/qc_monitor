@@ -303,7 +303,16 @@ class ChronicEvokedCache:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
-            if row is None or row["value"] != SCHEMA_VERSION:
+            ver = row["value"] if row else None
+            if ver == SCHEMA_VERSION:
+                pass
+            elif ver == "3":
+                # Additive v3 -> v4: add epoch_trace WITHOUT wiping the warmed
+                # features/means. A full reset here would force a heavy re-warm
+                # that holds the write lock (the "database is locked" the tab
+                # hit). Traces backfill incrementally on the next warm.
+                self._migrate_v3_to_v4(conn)
+            else:
                 self._reset_schema(conn)
             self._has_session = self._ensure_session_column(conn)
             conn.commit()
@@ -324,7 +333,8 @@ class ChronicEvokedCache:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT UNIQUE NOT NULL,
                 mtime REAL NOT NULL, rec_dt TEXT, built_at TEXT,
-                n_epochs INTEGER, fs REAL, session TEXT
+                n_epochs INTEGER, fs REAL, session TEXT,
+                has_traces INTEGER
             );
             CREATE TABLE epoch (
                 file_id INTEGER NOT NULL, animal TEXT NOT NULL,
@@ -353,6 +363,32 @@ class ChronicEvokedCache:
             CREATE INDEX idx_fm_session ON file_meta(session);
             """
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('schema_version', ?)", (SCHEMA_VERSION,))
+
+    def _migrate_v3_to_v4(self, conn) -> None:
+        """Add the epoch_trace table to an existing v3 cache without dropping
+        the warmed features/means (non-destructive upgrade)."""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS epoch_trace (
+                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
+                channel TEXT, electrode TEXT,
+                t0_ms REAL, dt_ms REAL, n_samples INTEGER,
+                n_epochs INTEGER, scale REAL,
+                stim_times TEXT, peaks TEXT, troughs TEXT,
+                data BLOB
+            );
+            CREATE INDEX IF NOT EXISTS idx_etrace_animal
+                ON epoch_trace(animal);
+            CREATE INDEX IF NOT EXISTS idx_etrace_file
+                ON epoch_trace(file_id);
+            """)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(file_meta)")]
+        if "has_traces" not in cols:
+            # NULL = built before traces existed -> _needs_build rebuilds once.
+            conn.execute("ALTER TABLE file_meta ADD COLUMN has_traces INTEGER")
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('schema_version', ?)", (SCHEMA_VERSION,))
@@ -400,9 +436,14 @@ class ChronicEvokedCache:
         except OSError:
             return False
         row = conn.execute(
-            "SELECT mtime FROM file_meta WHERE file_path = ?",
+            "SELECT mtime, has_traces FROM file_meta WHERE file_path = ?",
             (path,)).fetchone()
-        return row is None or abs(float(row["mtime"]) - mtime) > 1e-6
+        if row is None or abs(float(row["mtime"]) - mtime) > 1e-6:
+            return True
+        # Built before per-epoch traces existed (v3 cache upgraded additively
+        # to v4): rebuild once so Configure recompute has its traces. Files
+        # with no evokedData record has_traces=0 and aren't re-triggered.
+        return row["has_traces"] is None
 
     def ensure_animal(self, animal: str, progress=None,
                       force: bool = False) -> dict:
@@ -486,8 +527,9 @@ class ChronicEvokedCache:
                 " t0_ms, dt_ms, n_samples, n_epochs, scale, stim_times, peaks,"
                 " troughs, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 traces_rows)
-        conn.execute("UPDATE file_meta SET n_epochs=?, fs=? WHERE id=?",
-                     (n_total, fs_seen, file_id))
+        conn.execute(
+            "UPDATE file_meta SET n_epochs=?, fs=?, has_traces=? WHERE id=?",
+            (n_total, fs_seen, 1 if traces_rows else 0, file_id))
 
     @staticmethod
     def _trace_row(file_id, animal, electrode, ch, info):

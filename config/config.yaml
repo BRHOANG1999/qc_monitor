@@ -313,6 +313,23 @@ chronic_evoked:
   # the cheap vectorized features only. To enable: set true AND re-warm with
   # `python tools/warm_evoked_cache.py --expensive`.
   compute_expensive: false
+  # "Configure" defaults (the analyzer's processing panel; mirrors the MATLAB
+  # ChronicTabController config dialog / ChronicTabState defaults). These seed
+  # the in-tab controls; features are recomputed from the cached per-epoch
+  # traces when the user changes any of them. window_*_ms null = use the full
+  # extracted window (the toolkit's traces are already filtered + baseline-
+  # corrected, so the defaults are a pass-through = today's behavior).
+  configure:
+    window_start_ms: null
+    window_end_ms: null
+    bandpass: false
+    bp_low_hz: 1.0
+    bp_high_hz: 100.0
+    notch: false
+    notch_hz: 60.0
+    smoothing: false
+    smooth_ms: 5.0
+    baseline: false
 
 # Event-clip extractor (ffmpeg) for the PI verification flow.
 # Builds a stitched 10+ min clip (5 min before EO to 5 min
