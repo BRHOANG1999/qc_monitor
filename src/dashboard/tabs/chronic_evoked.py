@@ -270,6 +270,7 @@ def layout(store):
             ], style={"flex": "1", "minWidth": "200px"}),
         ], style={"display": "flex", "gap": "14px", "alignItems": "center",
                   "marginBottom": "8px", "flexWrap": "wrap"}),
+        _configure_card(),
         dcc.Store(id="chronic-selection"),
         dcc.Store(id="chronic-config"),   # Configure panel settings (Phase 2)
         dcc.Interval(id="chronic-warm-poll", interval=1500, disabled=True),
@@ -356,6 +357,71 @@ _SECTIONS = [
 ]
 
 
+def _cfg_check(label: str, cid: str):
+    return dcc.Checklist(
+        id=cid, options=[{"label": f" {label}", "value": "on"}], value=[],
+        inline=True, style={"display": "inline-block"},
+        labelStyle={"color": "#cfd0d6", "fontSize": "12px"})
+
+
+def _cfg_num(cid: str, val, **kw):
+    return dcc.Input(id=cid, type="number", value=val, style=_INPUT_STYLE,
+                     **kw)
+
+
+def _configure_card() -> html.Div:
+    """Collapsible Configure panel: crop the feature window + optional
+    bandpass / notch / smoothing / baseline applied (on raw epoch traces)
+    before the feature math. Defaults are a pass-through (= the toolkit's
+    already-extracted traces). Settings are gathered into chronic-config and
+    applied on ▶ Plot."""
+    def cell(*children, w="0 0 150px", end=False):
+        st = {"flex": w}
+        if end:
+            st["alignSelf"] = "flex-end"
+        return html.Div(list(children), style=st)
+    return html.Div([
+        html.Button("▸ Configure (window / filter / smoothing / baseline)",
+                    id="chronic-configure-btn", n_clicks=0,
+                    style=_SECTION_BTN_STYLE),
+        html.Div([
+            html.Div([
+                cell(html.Label("Window start (ms, blank=full)",
+                                style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-win-start", None, step=10), w="0 0 190px"),
+                cell(html.Label("Window end (ms)", style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-win-end", None, step=10)),
+                cell(_cfg_check("Baseline (subtract pre-stim mean)",
+                                "chronic-cfg-baseline"), w="0 0 240px", end=True),
+            ], style={"display": "flex", "gap": "14px", "flexWrap": "wrap",
+                      "marginBottom": "8px"}),
+            html.Div([
+                cell(_cfg_check("Bandpass", "chronic-cfg-bandpass"),
+                     w="0 0 100px", end=True),
+                cell(html.Label("Low (Hz)", style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-bp-lo", 1.0, step=0.5), w="0 0 100px"),
+                cell(html.Label("High (Hz)", style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-bp-hi", 100.0, step=5), w="0 0 100px"),
+                cell(_cfg_check("Notch", "chronic-cfg-notch"),
+                     w="0 0 80px", end=True),
+                cell(html.Label("Notch (Hz)", style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-notch-hz", 60.0, step=10), w="0 0 100px"),
+                cell(_cfg_check("Smoothing", "chronic-cfg-smooth"),
+                     w="0 0 110px", end=True),
+                cell(html.Label("Smooth (ms)", style=LABEL_STYLE),
+                     _cfg_num("chronic-cfg-smooth-ms", 5.0, step=1), w="0 0 100px"),
+            ], style={"display": "flex", "gap": "14px", "flexWrap": "wrap",
+                      "marginBottom": "6px"}),
+            html.Div("Applied on ▶ Plot — features are recomputed from the raw "
+                     "epoch traces (warm the animal first so its traces are "
+                     "cached). Defaults = the toolkit's extracted traces.",
+                     style={"color": "#8a8d99", "fontSize": "11px"}),
+        ], id="chronic-configure-wrap",
+           style={"display": "none", "padding": "8px",
+                  "border": "1px solid #2a2d3a", "borderRadius": "6px"}),
+    ], style={"marginBottom": "8px"})
+
+
 def _expandable(key: str, title: str, child) -> html.Div:
     """A toggle button + collapsed (display:none) container wrapping *child*
     in its own spinner. Click expands + computes; click again collapses."""
@@ -392,6 +458,41 @@ def register_callbacks(app, store, config: dict) -> None:
         from dash import no_update
         clear = callback_context.triggered_id == "chronic-animal-dropdown"
         return _session_options(animal), ([] if clear else no_update)
+
+    # ---- Configure panel: collapse toggle + gather settings ---- #
+    @app.callback(
+        Output("chronic-configure-wrap", "style"),
+        Input("chronic-configure-btn", "n_clicks"),
+        State("chronic-configure-wrap", "style"),
+        prevent_initial_call=True,
+    )
+    def _toggle_configure(_n, style):
+        style = dict(style or {})
+        style["display"] = "none" if style.get("display") != "none" else "block"
+        return style
+
+    @app.callback(
+        Output("chronic-config", "data"),
+        Input("chronic-cfg-win-start", "value"),
+        Input("chronic-cfg-win-end", "value"),
+        Input("chronic-cfg-baseline", "value"),
+        Input("chronic-cfg-bandpass", "value"),
+        Input("chronic-cfg-bp-lo", "value"),
+        Input("chronic-cfg-bp-hi", "value"),
+        Input("chronic-cfg-notch", "value"),
+        Input("chronic-cfg-notch-hz", "value"),
+        Input("chronic-cfg-smooth", "value"),
+        Input("chronic-cfg-smooth-ms", "value"),
+    )
+    def _gather_config(ws, we, bl, bp, lo, hi, nt, nhz, sm, sms):
+        def on(v):
+            return bool(v) and "on" in v
+        return {
+            "window_start_ms": ws, "window_end_ms": we, "baseline": on(bl),
+            "bandpass": on(bp), "bp_low_hz": lo or 1.0, "bp_high_hz": hi or 100.0,
+            "notch": on(nt), "notch_hz": nhz or 60.0,
+            "smoothing": on(sm), "smooth_ms": sms or 5.0,
+        }
 
     # Primary render: only the feature-vs-time plot + trend stats. Captures
     # the current selection into chronic-selection so the expandable sections

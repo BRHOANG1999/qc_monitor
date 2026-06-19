@@ -143,5 +143,34 @@ def test_rolling_centered():
         np.isnan(ef.rolling_centered(np.ones(5), 3, "cv")[2])
 
 
+def test_feature_config_passthrough_and_from_dict():
+    assert ef.FeatureConfig().is_passthrough()
+    assert not ef.FeatureConfig(window_start_ms=0.0).is_passthrough()
+    assert not ef.FeatureConfig(baseline=True).is_passthrough()
+    d = ef.FeatureConfig.from_dict({"window_start_ms": None,
+                                    "smoothing": True, "smooth_ms": 7.0})
+    assert d.window_start_ms is None and d.smoothing and d.smooth_ms == 7.0
+
+
+def test_compute_all_default_matches_no_cfg():
+    rng = np.random.default_rng(3)
+    tr = rng.standard_normal((8, 600)) * 40.0
+    t = np.linspace(-100, 500, 600)
+    a = ef.compute_all(tr, t, 1000.0)
+    b = ef.compute_all(tr, t, 1000.0, cfg=ef.FeatureConfig())
+    assert all(np.allclose(a[c], b[c], equal_nan=True)
+               for c in ef.CHEAP_COLUMNS)
+
+
+def test_preprocess_baseline_and_window_crop():
+    t = np.linspace(-100, 500, 600)
+    tr = np.ones((4, 600)) * 5.0
+    a, _ = ef.preprocess(tr, t, 1000.0, ef.FeatureConfig(baseline=True))
+    assert np.allclose(a, 0.0, atol=1e-9)            # pre-stim mean removed
+    cfg = ef.FeatureConfig(window_start_ms=0.0, window_end_ms=200.0)
+    a2, tt2 = ef.preprocess(tr, t, 1000.0, cfg)
+    assert tt2[0] >= 0.0 and tt2[-1] <= 200.0 and a2.shape[1] < 600
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
