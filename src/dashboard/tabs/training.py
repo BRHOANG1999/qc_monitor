@@ -37,7 +37,7 @@ from src.dashboard.design import (
     SPACE_2, SPACE_3, SPACE_4, FONT_SIZE_BODY, FONT_SIZE_CAPTION)
 from src.db.store import Store
 from src.utils.animal import (is_animal_channel, recording_channel_index,
-                               split_animal_electrode)
+                               split_animal_electrode, stim_copy_indices)
 from src.utils import training as _grade
 from src.utils import past_events as _past
 
@@ -159,24 +159,39 @@ def _cfg(config: dict) -> dict:
     }
 
 
-def _first_animal_channel(store: Store, session_dir: str | None) -> int:
-    """The recording electrode to show: the animal channel immediately after
-    the stimCopy channel (lab layout), else the first animal channel."""
-    try:
-        names = store._channel_names_for_session(session_dir)
-    except Exception:
-        return 0
-    return recording_channel_index(names or [])
-
-
-def _channel_animal(store: Store, session_dir: str | None,
-                     channel: int) -> tuple[str, str]:
-    """(channel_name, animal_id) for the displayed channel, or ("","") when
-    the session's channel names aren't known."""
+def _channel_names(store: Store, session_dir: str | None,
+                    file_path: str | None = None) -> list:
+    """Channel names for the session: from session_config when known, else
+    parsed from the filename. Historical practice files often have no
+    session_config row, so without the fallback the channel defaults to 0
+    (the stimCopy) -- the bug the reviewer hit."""
     try:
         names = store._channel_names_for_session(session_dir) or []
     except Exception:
-        return "", ""
+        names = []
+    if names:
+        return names
+    if file_path:
+        try:
+            return _past.extract_channel_names(file_path)
+        except Exception:
+            return []
+    return []
+
+
+def _first_animal_channel(store: Store, session_dir: str | None,
+                          file_path: str | None = None) -> int:
+    """The recording electrode to show: the animal channel immediately after
+    the stimCopy channel (lab layout), else the first animal channel."""
+    return recording_channel_index(
+        _channel_names(store, session_dir, file_path))
+
+
+def _channel_animal(store: Store, session_dir: str | None, channel: int,
+                    file_path: str | None = None) -> tuple[str, str]:
+    """(channel_name, animal_id) for the displayed channel, or ("","") when
+    the session's channel names aren't known."""
+    names = _channel_names(store, session_dir, file_path)
     if not (0 <= channel < len(names)) or not isinstance(names[channel], str):
         return "", ""
     name = names[channel]
@@ -213,6 +228,9 @@ def _build_figures(store: Store, file_id: int, channel: int,
     try:
         session_dir = _session_dir_for_file(store, file_id)
         stim_copy = _stim_copy_channels(store, session_dir)
+        if not stim_copy:   # historical files have no session_config role tags
+            stim_copy = stim_copy_indices(
+                _channel_names(store, session_dir, file_path))
         do_blank = channel not in stim_copy
         stim_times = (_stim_times_for_file(store, file_id)
                       if do_blank else None)
@@ -294,8 +312,8 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     mat_path = _file_path_for_id(store, file_id)
     fname = os.path.basename(mat_path) if mat_path else f"file #{file_id}"
     session_dir = _session_dir_for_file(store, file_id)
-    channel = _first_animal_channel(store, session_dir)
-    chan_name, animal = _channel_animal(store, session_dir, channel)
+    channel = _first_animal_channel(store, session_dir, mat_path)
+    chan_name, animal = _channel_animal(store, session_dir, channel, mat_path)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
     # Stamp the measured length so the min-duration gate becomes real for
     # historical files once opened (no-op when already known).
@@ -612,7 +630,8 @@ def layout(store: Store, config: dict | None = None):
         # Camera/video rendering: a 2.5 s tick polls the .avi->mp4 transcode
         # so the player loads when ready; the signature store dedupes renders
         # so a playing <video> isn't reset every tick.
-        dcc.Interval(id="training-cam-tick", interval=2500, n_intervals=0),
+        dcc.Interval(id="training-cam-tick", interval=2500, n_intervals=0,
+                     disabled=True),
         dcc.Store(id="training-vidsig"),
         # Sink for the LFP<->Hilbert x-axis lock (the clientside callbacks
         # relayout the sibling graph directly; this just terminates them).
@@ -1138,6 +1157,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("training-video", "children", allow_duplicate=True),
         Output("training-vidsig", "data"),
+        Output("training-cam-tick", "disabled"),
         Input("training-current", "data"),
         Input("training-cam", "value"),
         Input("training-cam-tick", "n_intervals"),
@@ -1146,12 +1166,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _render_video(current, cam, _tick, last_sig):
         if not current or not current.get("file_id"):
-            return no_update, no_update
+            return no_update, no_update, no_update
         children, sig = _video_children_and_sig(
             store, config, int(current["file_id"]), int(cam or 1))
+        # Only keep the poll alive while an .avi transcode is in progress;
+        # once the video is ready/mp4 (or there's none) stop ticking so the
+        # dcc.Loading spinner doesn't flash over a playing video every 2.5 s.
+        keep_ticking = sig.endswith(":prep")
         if sig == last_sig:
-            return no_update, no_update      # nothing changed -> don't reset
-        return children, sig
+            return no_update, no_update, (not keep_ticking)
+        return children, sig, (not keep_ticking)
 
     _register_cursor_sync(app)
 
