@@ -56,7 +56,10 @@ def cache_dir(config: dict) -> Path:
     raw = _cfg(config).get("cache_dir", "secrets/avi_mp4_cache")
     p = Path(raw)
     p.mkdir(parents=True, exist_ok=True)
-    return p
+    # Absolute: Flask send_file resolves a relative path against the app
+    # root_path (src/dashboard, from Dash(__name__)), not the CWD where the
+    # transcode worker writes -- so a relative cache path 404s on serve.
+    return p.resolve()
 
 
 def _cache_max_gb(config: dict) -> float:

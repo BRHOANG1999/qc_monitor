@@ -36,7 +36,8 @@ from src.dashboard.design import (
     COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, RADIUS_MD, RADIUS_SM,
     SPACE_2, SPACE_3, SPACE_4, FONT_SIZE_BODY, FONT_SIZE_CAPTION)
 from src.db.store import Store
-from src.utils.animal import is_animal_channel, recording_channel_index
+from src.utils.animal import (is_animal_channel, recording_channel_index,
+                               split_animal_electrode)
 from src.utils import training as _grade
 from src.utils import past_events as _past
 
@@ -168,6 +169,21 @@ def _first_animal_channel(store: Store, session_dir: str | None) -> int:
     return recording_channel_index(names or [])
 
 
+def _channel_animal(store: Store, session_dir: str | None,
+                     channel: int) -> tuple[str, str]:
+    """(channel_name, animal_id) for the displayed channel, or ("","") when
+    the session's channel names aren't known."""
+    try:
+        names = store._channel_names_for_session(session_dir) or []
+    except Exception:
+        return "", ""
+    if not (0 <= channel < len(names)) or not isinstance(names[channel], str):
+        return "", ""
+    name = names[channel]
+    animal, _elec = split_animal_electrode(name)
+    return name, (animal or "")
+
+
 def _filtered_trace(store: Store, file_id: int, channel: int,
                      mode: str):
     """The student's chosen 2nd-panel trace: raw Hilbert envelope (default)
@@ -279,6 +295,7 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     fname = os.path.basename(mat_path) if mat_path else f"file #{file_id}"
     session_dir = _session_dir_for_file(store, file_id)
     channel = _first_animal_channel(store, session_dir)
+    chan_name, animal = _channel_animal(store, session_dir, channel)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
     # Stamp the measured length so the min-duration gate becomes real for
     # historical files once opened (no-op when already known).
@@ -287,8 +304,10 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     cur = {"file_id": file_id, "channel": channel,
            "validated": store.validated_events_for_file(file_id),
            "session_dir": session_dir, "lfp_dur": lfp_dur,
-           "filename": fname}
-    now = (f"Example {idx + 1} of {rnd['examples']}  ·  {fname}")
+           "filename": fname, "animal": animal, "channel_name": chan_name}
+    who = f"{animal} · Ch{channel} {chan_name}" if animal else \
+        f"Ch{channel} {chan_name}".strip()
+    now = (f"Example {idx + 1} of {rnd['examples']}  ·  {who}  ·  {fname}")
     # The video is rendered by _render_video (camera picker + .avi transcode);
     # show a transient placeholder until that fires.
     return "loaded", (cur, _vid_placeholder("Loading video…"), lfp, hil, now,

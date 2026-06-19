@@ -76,6 +76,16 @@ def _cfg(tmp_path):
             "event_clip": {"ffmpeg_bin": "ffmpeg"}}
 
 
+def test_cache_dir_is_absolute(tmp_path, monkeypatch):
+    # A relative config path must resolve to an absolute dir, else Flask
+    # send_file resolves it against the app root_path and 404s.
+    monkeypatch.chdir(tmp_path)
+    cfg = {"video_transcode": {"cache_dir": "secrets/avi_mp4_cache"}}
+    d = avi.cache_dir(cfg)
+    assert os.path.isabs(str(d))
+    assert avi.cache_path(_touch(tmp_path / "rec_v1.avi"), cfg).is_absolute()
+
+
 def test_cache_path_deterministic_and_mtime_sensitive(tmp_path):
     cfg = _cfg(tmp_path)
     avi_path = _touch(tmp_path / "rec_v1.avi")
