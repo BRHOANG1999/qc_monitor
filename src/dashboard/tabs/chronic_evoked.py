@@ -32,7 +32,8 @@ from src.dashboard.data_helpers import (
     EVOKED_FEATURE_LABELS, TIME_RANGE_OPTIONS, empty_fig)
 from src.utils import evoked_features as ef
 from src.utils.evoked_output import (
-    ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals)
+    ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals,
+    sessions_for_animal)
 
 # Feature dropdown = every cached evoked feature, friendly labels from the
 # app-wide map. Expensive ones are flagged so the UI can disable them.
@@ -139,11 +140,21 @@ def _feature_options() -> list[dict]:
 
 
 def _session_options(animal) -> list[dict]:
-    """Session labels for *animal*, or [] (best-effort; never raises)."""
+    """Session labels for *animal*, or [] (best-effort; never raises).
+
+    Reads the sessions straight from the evoked filenames so the dropdown
+    populates the moment an animal is selected (no warm needed); unions in
+    any warmed-cache sessions as a backstop.
+    """
     if not animal:
         return []
     try:
-        return [{"label": s, "value": s} for s in _cache().list_sessions(animal)]
+        sessions = set(sessions_for_animal(_EVOKED_DIR, animal))
+        try:
+            sessions |= set(_cache().list_sessions(animal))
+        except Exception:  # noqa: BLE001 -- cache optional; disk is enough
+            pass
+        return [{"label": s, "value": s} for s in sorted(sessions)]
     except Exception:  # noqa: BLE001
         return []
 

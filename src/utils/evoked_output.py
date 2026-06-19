@@ -168,6 +168,22 @@ def parse_session(filename: str) -> str:
     return b.split("__", 1)[0] if b else ""
 
 
+def sessions_for_animal(evoked_dir: str, animal: str) -> list[str]:
+    """Distinct session labels for *animal*, read straight from the evoked
+    filenames -- so the session dropdown can populate the moment an animal is
+    picked, without waiting for that animal's cache to warm."""
+    if not animal or not evoked_dir:
+        return []
+    seen: set[str] = set()
+    for i, f in enumerate(list_evoked_files(evoked_dir)):
+        assert i < _MAX_FILES, "evoked file count exceeds bound"
+        if animal in animals_in_filename(f):
+            s = parse_session(f)
+            if s:
+                seen.add(s)
+    return sorted(seen)
+
+
 def list_evoked_files(evoked_dir: str) -> list[str]:
     """All ``*_evoked.mat`` files directly in *evoked_dir* (sorted)."""
     assert isinstance(evoked_dir, str) and evoked_dir, "evoked_dir required"
