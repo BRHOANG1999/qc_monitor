@@ -103,25 +103,33 @@ def _stim_times_from_copy(store, file_id: int,
         return hit
     result = np.zeros(0, dtype=np.float64)
     copies = stim_copy_channels(store, session_dir)
-    if copies:
-        row = store.file_row(file_id)
-        fp = (row or {}).get("file_path")
-        if fp:
-            try:
-                from src.utils.chunk_cache import get_chunk
-                chunk = get_chunk(fp)
-                sig = chunk.signal
-                if sig.ndim == 2:
-                    for ci in sorted(copies):
-                        if ci < sig.shape[1]:
-                            result = detect_stim_onsets(
-                                sig[:, ci], float(chunk.fs))
-                            if result.size:
-                                break
-            except Exception as e:
-                logger.warning(
-                    "stimCopy onset detect failed file=%s: %s",
-                    file_id, e)
+    row = store.file_row(file_id)
+    fp = (row or {}).get("file_path") if row else None
+    if not copies and fp:
+        # Historical practice files have no session_config role tags; derive
+        # the stimCopy channels from the filename so the LFP still blanks.
+        try:
+            from src.utils.past_events import extract_channel_names
+            from src.utils.animal import stim_copy_indices
+            copies = stim_copy_indices(extract_channel_names(fp))
+        except Exception:  # noqa: BLE001
+            copies = set()
+    if copies and fp:
+        try:
+            from src.utils.chunk_cache import get_chunk
+            chunk = get_chunk(fp)
+            sig = chunk.signal
+            if sig.ndim == 2:
+                for ci in sorted(copies):
+                    if ci < sig.shape[1]:
+                        result = detect_stim_onsets(
+                            sig[:, ci], float(chunk.fs))
+                        if result.size:
+                            break
+        except Exception as e:
+            logger.warning(
+                "stimCopy onset detect failed file=%s: %s",
+                file_id, e)
     with _copy_cache_lock:
         _copy_cache[file_id] = result
         while len(_copy_cache) > _COPY_CACHE_MAX:
