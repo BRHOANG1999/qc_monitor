@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -42,6 +43,8 @@ import numpy as np
 
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.utils import evoked_features as ef
+
+logger = logging.getLogger("qc_monitor.utils.evoked_output")
 
 # Default location of the toolkit's evoked output (Windows path). Override
 # via ``config.chronic_evoked.evoked_output_dir``.
@@ -497,6 +500,15 @@ class ChronicEvokedCache:
                             # Transient lock contention: skip this file (a
                             # later run rebuilds it) rather than abort.
                             conn.rollback()
+                        except Exception as e:  # noqa: BLE001
+                            # A single unreadable / malformed file must NOT
+                            # abort the whole animal's warm -- skip + log.
+                            try:
+                                conn.rollback()
+                            except sqlite3.Error:
+                                pass
+                            logger.warning("evoked warm: skipping %s: %s",
+                                           os.path.basename(path), e)
                     if progress is not None:
                         progress(i + 1, len(files), path)
             finally:
@@ -565,6 +577,16 @@ class ChronicEvokedCache:
         time_ms = info.get("time_ms")
         if traces is None or time_ms is None or traces.shape[0] < 1:
             return None
+        try:
+            return ChronicEvokedCache._encode_trace_row(
+                file_id, animal, electrode, ch, info, traces, time_ms)
+        except Exception as e:  # noqa: BLE001 -- traces are best-effort
+            logger.warning("epoch_trace encode failed (%s): %s", ch, e)
+            return None
+
+    @staticmethod
+    def _encode_trace_row(file_id, animal, electrode, ch, info,
+                          traces, time_ms):
         t = np.asarray(time_ms, dtype=np.float64).ravel()
         tr = np.asarray(traces, dtype=np.float64)
         # Optional time-decimation guard (keeps the cache bounded).

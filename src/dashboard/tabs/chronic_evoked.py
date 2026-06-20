@@ -16,10 +16,13 @@ with ``--expensive``.
 
 from __future__ import annotations
 
+import logging
 import statistics
 import threading
 from collections import OrderedDict
 from datetime import datetime
+
+logger = logging.getLogger("qc_monitor.dashboard.chronic_evoked")
 
 import numpy as np
 import plotly.graph_objects as go
@@ -96,11 +99,12 @@ def _set_warm_progress(animal: str, done: int, total: int) -> None:
 
 def _warm_worker(animal: str) -> None:
     try:
-        _cache().ensure_animal(
+        stats = _cache().ensure_animal(
             animal,
             progress=lambda d, t, _p: _set_warm_progress(animal, d, t))
-    except Exception:  # noqa: BLE001 -- lock contention is non-fatal here
-        pass
+        logger.info("chronic warm %s: %s", animal, stats)
+    except Exception as e:  # noqa: BLE001 -- never crash the daemon thread
+        logger.warning("chronic warm failed for %s: %s", animal, e)
 
 
 def _is_warming(animal: str) -> bool:
