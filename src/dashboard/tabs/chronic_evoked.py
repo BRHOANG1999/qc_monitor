@@ -52,6 +52,7 @@ _MA_WINDOW = 50            # per-animal moving-average window (epochs).
 _EVOKED_DIR = DEFAULT_EVOKED_DIR
 _CACHE_DB = DEFAULT_CACHE_DB
 _EXPENSIVE_ENABLED = False
+_STORE_TRACES = False        # per-epoch traces (Configure); heavy, opt-in
 _cache_singleton: ChronicEvokedCache | None = None
 
 
@@ -63,7 +64,8 @@ def _cache() -> ChronicEvokedCache:
     global _cache_singleton
     if _cache_singleton is None:
         _cache_singleton = ChronicEvokedCache(
-            _EVOKED_DIR, _CACHE_DB, compute_expensive=_EXPENSIVE_ENABLED)
+            _EVOKED_DIR, _CACHE_DB, compute_expensive=_EXPENSIVE_ENABLED,
+            store_traces=_STORE_TRACES)
     return _cache_singleton
 
 
@@ -450,11 +452,12 @@ def _expandable(key: str, title: str, child) -> html.Div:
 def register_callbacks(app, store, config: dict) -> None:
     """Wire pickers + trend toggles -> (rainbow scatter, per-recording trend,
     stats, status). Reads ``config.chronic_evoked``."""
-    global _EVOKED_DIR, _CACHE_DB, _EXPENSIVE_ENABLED
+    global _EVOKED_DIR, _CACHE_DB, _EXPENSIVE_ENABLED, _STORE_TRACES
     ce = (config or {}).get("chronic_evoked", {}) or {}
     _EVOKED_DIR = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
     _CACHE_DB = ce.get("cache_db") or DEFAULT_CACHE_DB
     _EXPENSIVE_ENABLED = bool(ce.get("compute_expensive", False))
+    _STORE_TRACES = bool(ce.get("store_traces", False))
 
     @app.callback(
         Output("chronic-session-dropdown", "options"),

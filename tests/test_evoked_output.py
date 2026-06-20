@@ -127,7 +127,8 @@ def test_epoch_trace_cache_roundtrip(tmp_path):
                       [1.0] * 6, [-1.0] * 6)},
         traces={"BCH062SR": tr}, time_ms=tax)
 
-    cache = ChronicEvokedCache(str(ed), str(tmp_path / "cache.db"))
+    cache = ChronicEvokedCache(str(ed), str(tmp_path / "cache.db"),
+                               store_traces=True)   # opt-in trace storage
     cache.ensure_animal("BCH062")
 
     blocks = cache.query_epoch_traces("BCH062")

@@ -294,10 +294,17 @@ class ChronicEvokedCache:
 
     def __init__(self, evoked_dir: str | None = None,
                  cache_db: str | None = None,
-                 compute_expensive: bool = False) -> None:
+                 compute_expensive: bool = False,
+                 store_traces: bool = False) -> None:
         self.evoked_dir = evoked_dir or DEFAULT_EVOKED_DIR
         self.cache_db = cache_db or DEFAULT_CACHE_DB
         self.compute_expensive = bool(compute_expensive)
+        # Per-epoch traces (for the Configure recompute) are heavy to store
+        # -- a chronic session has tens of thousands of epochs, so the int16
+        # BLOBs add minutes/GBs to a warm. OFF by default keeps the basic
+        # feature-only load fast; opt in (config + Reload from disk) for
+        # Configure.
+        self.store_traces = bool(store_traces)
         self._has_session = False   # set by _init_schema (may be locked out)
         assert isinstance(self.evoked_dir, str), "evoked_dir must be str"
         assert isinstance(self.cache_db, str), "cache_db must be str"
@@ -550,9 +557,10 @@ class ChronicEvokedCache:
             n_total += len(erows)
             if mrow is not None:
                 means.append(mrow)
-            trow = self._trace_row(file_id, animal, electrode, ch, info)
-            if trow is not None:
-                traces_rows.append(trow)
+            if self.store_traces:
+                trow = self._trace_row(file_id, animal, electrode, ch, info)
+                if trow is not None:
+                    traces_rows.append(trow)
             fs_seen = fs_seen or fs
         if rows:
             ph = ",".join("?" * len(_EPOCH_COLS))
