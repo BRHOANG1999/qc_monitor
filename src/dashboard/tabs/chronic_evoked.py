@@ -76,8 +76,10 @@ _warm_progress: dict = {}        # animal -> {"done": int, "total": int}
 _warm_lock = threading.Lock()
 
 
-def _kick_warm(animal: str) -> bool:
-    """Start a background warm for *animal* unless one is already running."""
+def _kick_warm(animal: str, sessions: list | None = None,
+               force: bool = False) -> bool:
+    """Start a background load for *animal* (optionally just *sessions*)
+    unless one is already running."""
     if not animal:
         return False
     with _warm_lock:
@@ -85,7 +87,8 @@ def _kick_warm(animal: str) -> bool:
         if t is not None and t.is_alive():
             return False
         _warm_progress[animal] = {"done": 0, "total": 0}
-        th = threading.Thread(target=_warm_worker, args=(animal,),
+        th = threading.Thread(target=_warm_worker,
+                              args=(animal, sessions, force),
                               daemon=True, name=f"chronic-warm-{animal}")
         _warm_threads[animal] = th
         th.start()
@@ -97,14 +100,16 @@ def _set_warm_progress(animal: str, done: int, total: int) -> None:
         _warm_progress[animal] = {"done": int(done), "total": int(total)}
 
 
-def _warm_worker(animal: str) -> None:
+def _warm_worker(animal: str, sessions: list | None = None,
+                 force: bool = False) -> None:
     try:
         stats = _cache().ensure_animal(
-            animal,
+            animal, sessions=sessions, force=force,
             progress=lambda d, t, _p: _set_warm_progress(animal, d, t))
-        logger.info("chronic warm %s: %s", animal, stats)
+        logger.info("chronic load %s (sessions=%s): %s",
+                    animal, sessions, stats)
     except Exception as e:  # noqa: BLE001 -- never crash the daemon thread
-        logger.warning("chronic warm failed for %s: %s", animal, e)
+        logger.warning("chronic load failed for %s: %s", animal, e)
 
 
 def _is_warming(animal: str) -> bool:
@@ -247,11 +252,12 @@ def layout(store):
             ], style={"flex": "0 0 110px"}),
             html.Div([
                 html.Label(" ", style=LABEL_STYLE),
-                html.Button("↻ Refresh / warm", id="chronic-refresh-btn",
+                html.Button("↻ Reload from disk", id="chronic-refresh-btn",
                             n_clicks=0, style=_BTN_STYLE,
-                            title="Warm this animal in the background if it "
-                                  "isn't cached yet, then re-plot."),
-            ], style={"flex": "0 0 140px"}),
+                            title="Re-read this selection from evokedOutput "
+                                  "(picks up new/changed files). ▶ Plot "
+                                  "already loads automatically."),
+            ], style={"flex": "0 0 150px"}),
         ], style={"display": "flex", "gap": "14px", "marginBottom": "10px",
                   "flexWrap": "wrap"}),
 
@@ -506,6 +512,7 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("chronic-trend-stats", "children"),
         Output("chronic-status", "children"),
         Output("chronic-selection", "data"),
+        Output("chronic-warm-poll", "disabled"),
         Input("chronic-load-btn", "n_clicks"),
         Input("chronic-refresh-btn", "n_clicks"),
         State("chronic-animal-dropdown", "value"),
@@ -522,43 +529,52 @@ def register_callbacks(app, store, config: dict) -> None:
     def _update(_load, _refresh, animal, sessions, feature, hours, overlays,
                 win_hours, scroll, roll_window, cfg_dict):
         if not animal:
-            return empty_fig("Select an animal, then ▶ Plot"), "", "", None
+            return (empty_fig("Select an animal, then ▶ Plot"),
+                    "", "", None, True)
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
-        if callback_context.triggered_id == "chronic-refresh-btn":
-            _kick_warm(animal)
-        sel = {"animal": animal, "sessions": sessions or None, "hours": hours,
+        sess = sessions or None
+        sel = {"animal": animal, "sessions": sess, "hours": hours,
                "win_hours": win_hours, "scroll": scroll, "feature": feature,
                "roll_window": roll_window, "config": cfg_dict or None}
+        scope = (f"the {len(sessions)} selected session(s)" if sessions
+                 else "all sessions")
+        # "Reload from disk" forces a fresh re-read of the selection -> show
+        # the loading state + enable the progress poll.
+        if callback_context.triggered_id == "chronic-refresh-btn":
+            _kick_warm(animal, sess, force=True)
+            return (empty_fig(f"Reloading {scope} for {animal} from "
+                              f"evokedOutput…"),
+                    "", f"Reloading {animal} from evokedOutput…", sel, False)
         try:
             rows, _means, win_lbl = _query_for_selection(sel, need_means=False)
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
-            return (empty_fig("Couldn't read the cache", hint=str(e)),
-                    "", f"Error: {e}", sel)
+            return (empty_fig("Couldn't read the data", hint=str(e)),
+                    "", f"Error: {e}", sel, True)
+        # Nothing loaded yet for this selection -> auto-load it from
+        # evokedOutput (scoped to the chosen session(s)); the poll re-plots
+        # when it finishes. No separate "warm" step for the user.
+        if not rows and not _is_warming(animal):
+            _kick_warm(animal, sess)
+            return (empty_fig(f"Loading {scope} for {animal} from "
+                              f"evokedOutput…"),
+                    "", f"Loading {animal} from evokedOutput…", sel, False)
         pts = _feature_points(rows, feature)
-        warming = " · ⏳ warming…" if _is_warming(animal) else ""
         sess_lbl = (f" · {len(sessions)} session(s)" if sessions else "")
-        status = (f"{len(rows)} responses · {len(pts[0])} with "
-                  f"{_label(feature)}{sess_lbl}{win_lbl}{warming}.")
+        loading = " · ⏳ loading…" if _is_warming(animal) else ""
+        keep_poll = _is_warming(animal)
+        status = (f"Loaded {len(rows)} evoked responses · {len(pts[0])} with "
+                  f"{_label(feature)}{sess_lbl}{win_lbl}{loading}.")
         if not pts[0]:
-            hint = ("" if rows else
-                    f" — not cached yet; click ↻ Refresh / warm to build "
-                    f"{animal}.")
-            return (empty_fig(f"No {_label(feature)} for {animal}{hint}"),
-                    "", status + hint, sel)
+            return (empty_fig(f"No {_label(feature)} values for {animal} "
+                              f"in this selection."), "", status, sel,
+                    not keep_poll)
         return (_build_feature_scatter(pts, feature, animal, overlays or [],
                                        roll_window),
-                _trend_stats(pts, feature), status, sel)
+                _trend_stats(pts, feature), status, sel, not keep_poll)
 
-    # Live warm feedback: enable the poll on Refresh; the poll updates the
-    # status while the off-thread warm runs and auto re-plots when it ends.
-    @app.callback(
-        Output("chronic-warm-poll", "disabled", allow_duplicate=True),
-        Input("chronic-refresh-btn", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def _enable_warm_poll(_n):
-        return False
-
+    # Live load feedback: while an off-thread load runs, update progress; when
+    # it finishes, stop polling + bump ▶ Plot so the data plots itself.
+    # (_update is the sole enabler of the poll -- see its disabled output.)
     @app.callback(
         Output("chronic-status", "children", allow_duplicate=True),
         Output("chronic-warm-poll", "disabled", allow_duplicate=True),
@@ -574,8 +590,8 @@ def register_callbacks(app, store, config: dict) -> None:
             return no_update, True, no_update
         if _is_warming(animal):
             return _warm_status_text(animal), False, no_update
-        # Warm finished: stop polling + bump ▶ Plot to re-plot the warmed data.
-        return ("Warm finished — re-plotted.", True, int(load_clicks or 0) + 1)
+        # Load finished: stop polling + bump ▶ Plot so the data plots itself.
+        return ("Loaded — plotting.", True, int(load_clicks or 0) + 1)
 
     # One lazy compute callback per expandable section (factory-registered).
     for key, _title, target, prop in _SECTIONS:
@@ -722,8 +738,9 @@ def _register_section(app, key: str, target: str, prop: str) -> None:
 def _warm_status_text(animal: str) -> str:
     p = warm_progress(animal)
     if p and p.get("total"):
-        return f"⏳ warming {animal} — {p['done']} of {p['total']} files…"
-    return f"⏳ warming {animal} in background…"
+        return (f"⏳ Loading {animal} from evokedOutput — "
+                f"{p['done']} of {p['total']} files…")
+    return f"⏳ Loading {animal} from evokedOutput…"
 
 
 # --------------------------------------------------------------------- #

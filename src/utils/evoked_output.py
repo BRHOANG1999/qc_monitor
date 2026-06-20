@@ -446,12 +446,17 @@ class ChronicEvokedCache:
             conn.rollback()
             return "session" in cols
 
-    def files_for_animal(self, animal: str) -> list[str]:
-        """Evoked files whose filename names *animal* (sorted by time)."""
+    def files_for_animal(self, animal: str,
+                         sessions: list | None = None) -> list[str]:
+        """Evoked files whose filename names *animal* (sorted by time).
+        When *sessions* is given, restrict to those session labels so the tab
+        can load just the selected session(s) instead of the whole animal."""
         if not animal:
             return []
+        keep = set(sessions) if sessions else None
         files = [f for f in list_evoked_files(self.evoked_dir)
-                 if animal in animals_in_filename(f)]
+                 if animal in animals_in_filename(f)
+                 and (keep is None or parse_session(f) in keep)]
         return sorted(files, key=lambda f: (parse_recording_dt(f)
                                             or datetime.min))
 
@@ -473,16 +478,18 @@ class ChronicEvokedCache:
         return row["has_traces"] is None
 
     def ensure_animal(self, animal: str, progress=None,
-                      force: bool = False) -> dict:
-        """Cache every not-yet-current evoked file for *animal*.
+                      force: bool = False, sessions: list | None = None
+                      ) -> dict:
+        """Cache every not-yet-current evoked file for *animal* (optionally
+        only the given *sessions* -- so a one-session Plot loads a handful of
+        files, not the whole animal).
 
         *progress* (optional) is called ``progress(done, total, path)``
-        after each file. *force* recomputes even unchanged files (used to
-        backfill expensive features after enabling them). Returns
+        after each file. *force* recomputes even unchanged files. Returns
         ``{"files": n, "built": k}``.
         """
         assert isinstance(animal, str) and animal, "animal required"
-        files = self.files_for_animal(animal)
+        files = self.files_for_animal(animal, sessions)
         built = 0
         # One builder at a time across threads (see _BUILD_LOCK). A second
         # caller waits, then re-checks _needs_build and finds nothing to do.

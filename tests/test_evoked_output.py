@@ -93,6 +93,27 @@ def test_cache_build_query_and_guards(tmp_path):
     assert cache.query("") == []
 
 
+def test_ensure_animal_session_scope(tmp_path):
+    ed = tmp_path / "evokedOutput"
+    ed.mkdir()
+    # Two sessions for BCH062 (session = filename prefix before '__').
+    _write_evoked(
+        str(ed / "sessA__BCH062SR___2026_05_10__06_00_00_evoked.mat"),
+        {"BCH062SR": ([1.0], [1.0], [-1.0])})
+    _write_evoked(
+        str(ed / "sessB__BCH062SR___2026_05_12__06_00_00_evoked.mat"),
+        {"BCH062SR": ([2.0], [2.0], [-2.0])})
+    cache = ChronicEvokedCache(str(ed), str(tmp_path / "cache.db"))
+    # files_for_animal restricts to the requested session(s).
+    assert len(cache.files_for_animal("BCH062")) == 2
+    assert len(cache.files_for_animal("BCH062", ["sessA"])) == 1
+    # Scoped warm builds only sessA -> only its epoch is queryable by session.
+    stats = cache.ensure_animal("BCH062", sessions=["sessA"])
+    assert stats["files"] == 1 and stats["built"] == 1
+    assert len(cache.query("BCH062", sessions=["sessA"])) == 1
+    assert cache.query("BCH062", sessions=["sessB"]) == []
+
+
 def test_epoch_trace_cache_roundtrip(tmp_path):
     import numpy as np
     ed = tmp_path / "evokedOutput"
