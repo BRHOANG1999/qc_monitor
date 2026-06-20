@@ -97,9 +97,11 @@ def _kick_warm(animal: str, sessions: list | None = None,
         return True
 
 
-def _set_warm_progress(animal: str, done: int, total: int) -> None:
+def _set_warm_progress(animal: str, done: int, total: int,
+                       path: str = "", phase: str = "") -> None:
     with _warm_lock:
-        _warm_progress[animal] = {"done": int(done), "total": int(total)}
+        _warm_progress[animal] = {"done": int(done), "total": int(total),
+                                  "path": path or "", "phase": phase or ""}
 
 
 def _warm_worker(animal: str, sessions: list | None = None,
@@ -107,7 +109,8 @@ def _warm_worker(animal: str, sessions: list | None = None,
     try:
         stats = _cache().ensure_animal(
             animal, sessions=sessions, force=force,
-            progress=lambda d, t, _p: _set_warm_progress(animal, d, t))
+            progress=lambda d, t, p, ph: _set_warm_progress(
+                animal, d, t, p, ph))
         logger.info("chronic load %s (sessions=%s): %s",
                     animal, sessions, stats)
     except Exception as e:  # noqa: BLE001 -- never crash the daemon thread
@@ -738,12 +741,27 @@ def _register_section(app, key: str, target: str, prop: str) -> None:
         return out, style
 
 
+_PHASE_LABEL = {"opening": "opening", "reading": "reading file",
+                "computing features": "computing features",
+                "saving": "saving", "done": "finishing"}
+
+
 def _warm_status_text(animal: str) -> str:
-    p = warm_progress(animal)
-    if p and p.get("total"):
-        return (f"⏳ Loading {animal} from evokedOutput — "
-                f"{p['done']} of {p['total']} files…")
-    return f"⏳ Loading {animal} from evokedOutput…"
+    p = warm_progress(animal) or {}
+    total = int(p.get("total") or 0)
+    if not total:
+        return f"⏳ Loading {animal} from evokedOutput…"
+    done = min(int(p.get("done") or 0), total)
+    phase = _PHASE_LABEL.get(p.get("phase") or "", "")
+    # The session/protocol label = filename prefix before the channel list.
+    raw = (p.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    sess = raw.split("__", 1)[0] if raw else ""
+    bits = [f"⏳ Loading {animal} — file {max(done, 1)} of {total}"]
+    if phase:
+        bits.append(phase)
+    if sess:
+        bits.append(sess)
+    return "  ·  ".join(bits) + "…"
 
 
 # --------------------------------------------------------------------- #

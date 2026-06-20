@@ -518,12 +518,15 @@ class ChronicEvokedCache:
         only the given *sessions* -- so a one-session Plot loads a handful of
         files, not the whole animal).
 
-        *progress* (optional) is called ``progress(done, total, path)``
-        after each file. *force* recomputes even unchanged files. Returns
-        ``{"files": n, "built": k}``.
+        *progress* (optional) is called ``progress(done, total, path, phase)``
+        -- ``done`` is the 1-based current file and ``phase`` names the
+        pipeline step ("reading" / "computing features" / "saving") so the UI
+        can show granular progress within each (large) file. *force*
+        recomputes even unchanged files. Returns ``{"files": n, "built": k}``.
         """
         assert isinstance(animal, str) and animal, "animal required"
         files = self.files_for_animal(animal, sessions)
+        n = len(files)
         built = 0
         # One builder at a time across threads (see _BUILD_LOCK). A second
         # caller waits, then re-checks _needs_build and finds nothing to do.
@@ -532,9 +535,16 @@ class ChronicEvokedCache:
             try:
                 for i, path in enumerate(files):
                     assert i < _MAX_FILES, "file loop exceeds bound"
+                    cur = i + 1
+                    if progress is not None:
+                        progress(cur, n, path, "opening")
                     if self._needs_build(conn, path, force, animal=animal):
                         try:
-                            self._build_one(conn, path, only_animal=animal)
+                            self._build_one(
+                                conn, path, only_animal=animal,
+                                on_phase=(lambda ph, _c=cur, _p=path:
+                                          progress(_c, n, _p, ph))
+                                if progress is not None else None)
                             conn.commit()   # release the lock per file so
                             built += 1       # the dashboard reads mid-warm.
                         except sqlite3.OperationalError:
@@ -550,18 +560,22 @@ class ChronicEvokedCache:
                                 pass
                             logger.warning("evoked warm: skipping %s: %s",
                                            os.path.basename(path), e)
-                    if progress is not None:
-                        progress(i + 1, len(files), path)
             finally:
                 conn.close()
-        return {"files": len(files), "built": built}
+        if progress is not None:
+            progress(n, n, "", "done")
+        return {"files": n, "built": built}
 
-    def _build_one(self, conn, path: str, only_animal: str | None = None
-                   ) -> None:
+    def _build_one(self, conn, path: str, only_animal: str | None = None,
+                   on_phase=None) -> None:
         """(Re)extract one file's epochs + mean waveforms (keyed by file_id).
         When *only_animal* is given, read + (re)build ONLY that animal's
         channel -- so warming one animal of a multi-animal file does ~1/N the
-        work (the rest stay cached / are built when their animal is warmed)."""
+        work (the rest stay cached / are built when their animal is warmed).
+        *on_phase(str)* reports the pipeline step for live progress."""
+        def phase(p):
+            if on_phase is not None:
+                on_phase(p)
         rec_dt = parse_recording_dt(path)
         rec_iso = rec_dt.isoformat() if rec_dt else ""
         try:
@@ -576,8 +590,10 @@ class ChronicEvokedCache:
         conn.execute(f"DELETE FROM epoch WHERE {where}", args)
         conn.execute(f"DELETE FROM recording_mean WHERE {where}", args)
         conn.execute(f"DELETE FROM epoch_trace WHERE {where}", args)
+        phase("reading")
         channels = read_file_evoked(
             path, [only_animal] if only_animal else None)
+        phase("computing features")
         rows: list = []
         means: list = []
         traces_rows: list = []
@@ -598,6 +614,7 @@ class ChronicEvokedCache:
                 if trow is not None:
                     traces_rows.append(trow)
             fs_seen = fs_seen or fs
+        phase("saving")
         if rows:
             ph = ",".join("?" * len(_EPOCH_COLS))
             conn.executemany(

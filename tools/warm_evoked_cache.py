@@ -45,9 +45,9 @@ def main(argv: list[str]) -> int:
     for animal in animals:
         t0 = time.time()
 
-        def _progress(done, total, _path, _a=animal):
-            if done % 25 == 0 or done == total:
-                print(f"  {_a}: {done}/{total}", flush=True)
+        def _progress(done, total, _path, _phase="", _a=animal):
+            if _phase in ("reading", "done") or done == total:
+                print(f"  {_a}: {done}/{total} {_phase}", flush=True)
 
         stats = cache.ensure_animal(animal, progress=_progress,
                                     force=expensive)
