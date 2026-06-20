@@ -723,17 +723,29 @@ def _yrange_pad(time_ms, trace, x0: float, x1: float,
     return lo - pad, hi + pad
 
 
-def _decimate_trace(t, m, s, target: int = 1000):
-    """Stride-decimate three aligned numpy arrays to <= *target* points,
-    returning plain Python lists for the figure. Keeps the thumbnail's
-    full-resolution evoked window (~6k samples) from bloating the page."""
+def _decimate_trace(t, m, s, target: int = 1400, fine_ms: float = 2.0):
+    """Decimate three aligned numpy arrays to ~*target* points for the
+    figure, but keep FULL resolution within +/- *fine_ms* of t=0.
+
+    The evoked file's time axis is ~20 k samples over +/-500 ms (20 kHz);
+    a uniform stride to *target* points lands ~1 ms apart and strides
+    right past the sub-millisecond stimulus artifact at t=0 -- which is
+    exactly what the +/-1 ms stim-window panel needs. So we preserve
+    every sample near t=0 and only stride-decimate the slow far field.
+    """
+    import numpy as np
     assert len(t) == len(m) == len(s), "trace arrays must align"
     assert target > 0, "target must be positive"
     n = len(t)
     if n <= target:
         return t.tolist(), m.tolist(), s.tolist()
-    step = (n // target) + 1
-    return t[::step].tolist(), m[::step].tolist(), s[::step].tolist()
+    fine = np.abs(np.asarray(t)) <= fine_ms
+    coarse_idx = np.where(~fine)[0]
+    budget = max(1, target - int(fine.sum()))
+    step = max(1, coarse_idx.size // budget)
+    keep = fine.copy()
+    keep[coarse_idx[::step]] = True
+    return t[keep].tolist(), m[keep].tolist(), s[keep].tolist()
 
 
 def _evoked_channels_to_waveforms(chans: dict, latest_dt) -> list[dict]:
