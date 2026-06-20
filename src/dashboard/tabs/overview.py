@@ -723,6 +723,106 @@ def _yrange_pad(time_ms, trace, x0: float, x1: float,
     return lo - pad, hi + pad
 
 
+def _decimate_trace(t, m, s, target: int = 1000):
+    """Stride-decimate three aligned numpy arrays to <= *target* points,
+    returning plain Python lists for the figure. Keeps the thumbnail's
+    full-resolution evoked window (~6k samples) from bloating the page."""
+    assert len(t) == len(m) == len(s), "trace arrays must align"
+    assert target > 0, "target must be positive"
+    n = len(t)
+    if n <= target:
+        return t.tolist(), m.tolist(), s.tolist()
+    step = (n // target) + 1
+    return t[::step].tolist(), m[::step].tolist(), s[::step].tolist()
+
+
+def _evoked_channels_to_waveforms(chans: dict, latest_dt) -> list[dict]:
+    """Shape ``read_file_evoked`` output into the per-channel waveform
+    dicts the thumbnail expects (mean/SEM across this file's epochs).
+
+    Only real animal channels are kept (stimCopy/ref dropped). SEM =
+    std/sqrt(n). Channel index is positional since evokedOutput keys on
+    channel name, not the DB's integer index.
+    """
+    import numpy as np
+    from src.utils.animal import is_animal_channel
+    assert isinstance(chans, dict), "chans must be a dict"
+    assert latest_dt is not None, "latest_dt required"
+    chunk_dt = latest_dt.strftime(_CHUNK_DT_FMT)
+    out: list[dict] = []
+    for ch_name in sorted(chans.keys()):
+        if not is_animal_channel(ch_name):
+            continue
+        rec = chans[ch_name]
+        traces = rec.get("traces")
+        time_ms = rec.get("time_ms")
+        if traces is None or time_ms is None or len(traces) == 0:
+            continue
+        arr = np.asarray(traces, dtype=np.float64)
+        n_ep = int(arr.shape[0])
+        mean_tr = arr.mean(axis=0)
+        sem_tr = (arr.std(axis=0, ddof=1) / np.sqrt(n_ep)
+                  if n_ep > 1 else np.zeros_like(mean_tr))
+        t, m, s = _decimate_trace(np.asarray(time_ms, dtype=np.float64),
+                                  mean_tr, sem_tr)
+        out.append({
+            "channel": len(out), "channel_name": ch_name,
+            "n_epochs": n_ep, "time_axis_ms": t,
+            "mean_trace": m, "sem_trace": s, "chunk_datetime": chunk_dt,
+        })
+    return out
+
+
+# Memoize the evokedOutput fallback by (path, mtime) so the Overview
+# refresh tick doesn't re-read the (potentially ~100s-of-MB) latest
+# *_evoked.mat every few seconds. Invalidates when the file changes.
+_EVOKED_FALLBACK_CACHE: dict = {"key": None, "value": ([], "")}
+
+
+def _latest_evoked_from_output(config: dict | None) -> tuple[list[dict], str]:
+    """Per-channel mean traces from the most recent ``*_evoked.mat`` in
+    the toolkit's evokedOutput folder.
+
+    Fallback source for the Latest-Evoked thumbnail when QC's own
+    ``evoked_waveforms`` DB table has no rows for the newest session
+    (the dispatcher's MATLAB Tier-2 hasn't repopulated it, but the
+    toolkit already processed the recording into evokedOutput). Returns
+    ``(waveforms, latest_chunk_dt)`` or ``([], "")`` when nothing's there.
+    """
+    ce = (config or {}).get("chronic_evoked", {}) or {}
+    try:
+        from src.utils.evoked_output import (
+            DEFAULT_EVOKED_DIR, list_evoked_files, parse_recording_dt,
+            read_file_evoked)
+    except Exception as e:
+        logger.debug("evokedOutput fallback import failed: %s", e)
+        return [], ""
+    evoked_dir = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
+    dated = [(parse_recording_dt(f), f)
+             for f in list_evoked_files(evoked_dir)]
+    dated = [(d, f) for d, f in dated if d is not None]
+    if not dated:
+        return [], ""
+    latest_dt, latest_path = max(dated, key=lambda t: t[0])
+    try:
+        key = (latest_path, os.path.getmtime(latest_path))
+    except OSError:
+        key = (latest_path, 0.0)
+    cache = _EVOKED_FALLBACK_CACHE
+    if cache["key"] == key:
+        return cache["value"]
+    try:
+        chans = read_file_evoked(latest_path)
+    except Exception as e:
+        logger.debug("evokedOutput fallback read failed: %s", e)
+        return [], ""
+    waveforms = _evoked_channels_to_waveforms(chans, latest_dt)
+    value = (waveforms,
+             latest_dt.strftime(_CHUNK_DT_FMT) if waveforms else "")
+    cache["key"], cache["value"] = key, value
+    return value
+
+
 def _build_overview_thumbnail(store: Store, config: dict | None,
                                 session_dir: str, trace_mode: str
                                 ) -> list:
@@ -734,13 +834,18 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
     not the stim copy channel. Y-axis on every panel scales so the
     data spans 80% of the plot height.
     """
-    if not session_dir:
-        return [html.Div()]
-    try:
-        waveforms = store.get_evoked_waveforms_for_session(session_dir)
-    except Exception as e:
-        logger.debug("Could not load waveform thumbnail: %s", e)
-        return [html.Div()]
+    waveforms = []
+    if session_dir:
+        try:
+            waveforms = store.get_evoked_waveforms_for_session(session_dir)
+        except Exception as e:
+            logger.debug("Could not load waveform thumbnail: %s", e)
+            waveforms = []
+    if not waveforms:
+        # The newest session may not yet have QC dispatcher-populated
+        # evoked_waveforms rows; the toolkit's evokedOutput folder already
+        # holds the processed traces, so fall back to the latest file there.
+        waveforms, _ = _latest_evoked_from_output(config)
     if not waveforms:
         return [html.Div()]
 
