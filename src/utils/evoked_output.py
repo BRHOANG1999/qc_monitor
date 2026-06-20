@@ -306,10 +306,12 @@ class ChronicEvokedCache:
     def __init__(self, evoked_dir: str | None = None,
                  cache_db: str | None = None,
                  compute_expensive: bool = False,
-                 store_traces: bool = False) -> None:
+                 store_traces: bool = False,
+                 warm_workers: int = 0) -> None:
         self.evoked_dir = evoked_dir or DEFAULT_EVOKED_DIR
         self.cache_db = cache_db or DEFAULT_CACHE_DB
         self.compute_expensive = bool(compute_expensive)
+        self.warm_workers = int(warm_workers or 0)   # 0 = auto (~CPU count)
         # Per-epoch traces (for the Configure recompute) are heavy to store
         # -- a chronic session has tens of thousands of epochs, so the int16
         # BLOBs add minutes/GBs to a warm. OFF by default keeps the basic
@@ -525,115 +527,143 @@ class ChronicEvokedCache:
         recomputes even unchanged files. Returns ``{"files": n, "built": k}``.
         """
         assert isinstance(animal, str) and animal, "animal required"
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         files = self.files_for_animal(animal, sessions)
         n = len(files)
         built = 0
-        # One builder at a time across threads (see _BUILD_LOCK). A second
-        # caller waits, then re-checks _needs_build and finds nothing to do.
+        # One builder at a time across CALLS (see _BUILD_LOCK). Within a call,
+        # files are read + feature-extracted in PARALLEL worker threads (h5py
+        # + numpy release the GIL); the main thread writes the small payloads
+        # to sqlite serially (single writer, no DB contention).
         with _BUILD_LOCK:
             conn = self._conn()
             try:
-                for i, path in enumerate(files):
-                    assert i < _MAX_FILES, "file loop exceeds bound"
-                    cur = i + 1
-                    if progress is not None:
-                        progress(cur, n, path, "opening")
-                    if self._needs_build(conn, path, force, animal=animal):
-                        try:
-                            self._build_one(
-                                conn, path, only_animal=animal,
-                                on_phase=(lambda ph, _c=cur, _p=path:
-                                          progress(_c, n, _p, ph))
-                                if progress is not None else None)
-                            conn.commit()   # release the lock per file so
-                            built += 1       # the dashboard reads mid-warm.
-                        except sqlite3.OperationalError:
-                            # Transient lock contention: skip this file (a
-                            # later run rebuilds it) rather than abort.
-                            conn.rollback()
-                        except Exception as e:  # noqa: BLE001
-                            # A single unreadable / malformed file must NOT
-                            # abort the whole animal's warm -- skip + log.
+                todo = [p for p in files
+                        if self._needs_build(conn, p, force, animal=animal)]
+                done = n - len(todo)        # cached files are already done
+                workers = self._warm_workers(len(todo))
+                if progress is not None:
+                    progress(done, n, "", f"loading ({workers} in parallel)")
+                if todo:
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        futs = {ex.submit(self._read_compute, p, animal): p
+                                for p in todo}
+                        for fut in as_completed(futs):
+                            p = futs[fut]
                             try:
-                                conn.rollback()
-                            except sqlite3.Error:
-                                pass
-                            logger.warning("evoked warm: skipping %s: %s",
-                                           os.path.basename(path), e)
+                                self._write_payload(conn, fut.result())
+                                conn.commit()   # per file -> dashboard reads
+                                built += 1        # mid-warm
+                            except Exception as e:  # noqa: BLE001
+                                try:
+                                    conn.rollback()
+                                except sqlite3.Error:
+                                    pass
+                                logger.warning("evoked warm: skipping %s: %s",
+                                               os.path.basename(p), e)
+                            done += 1
+                            if progress is not None:
+                                progress(done, n, p,
+                                         f"loading ({workers} in parallel)")
             finally:
                 conn.close()
         if progress is not None:
             progress(n, n, "", "done")
         return {"files": n, "built": built}
 
+    def _warm_workers(self, n_files: int) -> int:
+        """Worker-thread count for the parallel warm: config override, else
+        ~half the CPUs (capped), bounded by the file count."""
+        cpu = os.cpu_count() or 4
+        w = self.warm_workers if self.warm_workers else max(2, min(cpu, 6))
+        return max(1, min(int(w), max(1, n_files)))
+
     def _build_one(self, conn, path: str, only_animal: str | None = None,
                    on_phase=None) -> None:
-        """(Re)extract one file's epochs + mean waveforms (keyed by file_id).
-        When *only_animal* is given, read + (re)build ONLY that animal's
-        channel -- so warming one animal of a multi-animal file does ~1/N the
-        work (the rest stay cached / are built when their animal is warmed).
-        *on_phase(str)* reports the pipeline step for live progress."""
-        def phase(p):
-            if on_phase is not None:
-                on_phase(p)
+        """Serial build of one file (read+compute then write). The warm uses
+        the parallel ``_read_compute`` / ``_write_payload`` split instead;
+        this stays for the single-file / test path."""
+        if on_phase is not None:
+            on_phase("reading")
+        payload = self._read_compute(path, only_animal)
+        if on_phase is not None:
+            on_phase("saving")
+        self._write_payload(conn, payload)
+
+    def _read_compute(self, path: str,
+                      only_animal: str | None = None) -> dict:
+        """Read + feature-extract one file (scoped to *only_animal*) WITHOUT
+        touching the DB -- safe to run in a worker thread (h5py reads + numpy/
+        scipy feature math release the GIL). Heavy traces are reduced to the
+        small epoch/mean/trace rows here, so the returned payload is small and
+        the main thread just writes it (``_write_payload``)."""
         rec_dt = parse_recording_dt(path)
         rec_iso = rec_dt.isoformat() if rec_dt else ""
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             mtime = 0.0
-        file_id = self._upsert_file(conn, path, mtime, rec_iso)
-        if only_animal:
-            where, args = "file_id = ? AND animal = ?", (file_id, only_animal)
+        channels = read_file_evoked(
+            path, [only_animal] if only_animal else None)
+        out: list = []
+        for ch, info in channels.items():
+            if not is_animal_channel(ch):
+                continue
+            animal, electrode = split_animal_electrode(ch)
+            erows, mrow, fs = self._channel_rows(None, animal, electrode,
+                                                 ch, info)
+            trow = (self._trace_row(None, animal, electrode, ch, info)
+                    if self.store_traces else None)
+            out.append((animal, electrode, ch, erows, mrow, fs, trow))
+        return {"path": path, "mtime": mtime, "rec_iso": rec_iso,
+                "only_animal": only_animal, "channels": out}
+
+    def _write_payload(self, conn, payload: dict) -> None:
+        """Write a ``_read_compute`` payload (main thread): upsert the file,
+        replace the (animal-scoped) rows, and stamp file_meta. The per-channel
+        rows were built with a None file_id placeholder, replaced here."""
+        file_id = self._upsert_file(conn, payload["path"], payload["mtime"],
+                                    payload["rec_iso"])
+        only = payload.get("only_animal")
+        if only:
+            where, args = "file_id = ? AND animal = ?", (file_id, only)
         else:
             where, args = "file_id = ?", (file_id,)
         conn.execute(f"DELETE FROM epoch WHERE {where}", args)
         conn.execute(f"DELETE FROM recording_mean WHERE {where}", args)
         conn.execute(f"DELETE FROM epoch_trace WHERE {where}", args)
-        phase("reading")
-        channels = read_file_evoked(
-            path, [only_animal] if only_animal else None)
-        phase("computing features")
-        rows: list = []
-        means: list = []
-        traces_rows: list = []
+        epoch_rows: list = []
+        mean_rows: list = []
+        trace_rows: list = []
         n_total = 0
         fs_seen = None
-        for ch, info in channels.items():
-            if not is_animal_channel(ch):
-                continue
-            animal, electrode = split_animal_electrode(ch)
-            erows, mrow, fs = self._channel_rows(
-                file_id, animal, electrode, ch, info)
-            rows.extend(erows)
+        for (_a, _elec, _ch, erows, mrow, fs, trow) in payload["channels"]:
+            epoch_rows.extend((file_id,) + tuple(r[1:]) for r in erows)
             n_total += len(erows)
             if mrow is not None:
-                means.append(mrow)
-            if self.store_traces:
-                trow = self._trace_row(file_id, animal, electrode, ch, info)
-                if trow is not None:
-                    traces_rows.append(trow)
+                mean_rows.append((file_id,) + tuple(mrow[1:]))
+            if trow is not None:
+                trace_rows.append((file_id,) + tuple(trow[1:]))
             fs_seen = fs_seen or fs
-        phase("saving")
-        if rows:
+        if epoch_rows:
             ph = ",".join("?" * len(_EPOCH_COLS))
             conn.executemany(
                 f"INSERT INTO epoch ({','.join(_EPOCH_COLS)}) VALUES ({ph})",
-                rows)
-        if means:
+                epoch_rows)
+        if mean_rows:
             conn.executemany(
                 "INSERT INTO recording_mean (file_id, animal, channel, "
                 "time_axis, mean_trace, std_trace, n_epochs) "
-                "VALUES (?,?,?,?,?,?,?)", means)
-        if traces_rows:
+                "VALUES (?,?,?,?,?,?,?)", mean_rows)
+        if trace_rows:
             conn.executemany(
                 "INSERT INTO epoch_trace (file_id, animal, channel, electrode,"
                 " t0_ms, dt_ms, n_samples, n_epochs, scale, stim_times, peaks,"
                 " troughs, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                traces_rows)
+                trace_rows)
         conn.execute(
             "UPDATE file_meta SET n_epochs=?, fs=?, has_traces=? WHERE id=?",
-            (n_total, fs_seen, 1 if traces_rows else 0, file_id))
+            (n_total, fs_seen, 1 if trace_rows else 0, file_id))
 
     @staticmethod
     def _trace_row(file_id, animal, electrode, ch, info):

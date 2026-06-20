@@ -313,6 +313,9 @@ chronic_evoked:
   # the cheap vectorized features only. To enable: set true AND re-warm with
   # `python tools/warm_evoked_cache.py --expensive`.
   compute_expensive: false
+  # Parallel warm: files are read + feature-extracted in this many worker
+  # threads (the main thread writes to sqlite). 0 = auto (~min(CPUs, 6)).
+  warm_workers: 0
   # Cache the per-epoch traces needed by the Configure panel's feature
   # recompute. OFF by default: a chronic session has tens of thousands of
   # epochs, so storing the int16 trace BLOBs adds minutes + GBs to a load.

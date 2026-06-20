@@ -53,6 +53,7 @@ _EVOKED_DIR = DEFAULT_EVOKED_DIR
 _CACHE_DB = DEFAULT_CACHE_DB
 _EXPENSIVE_ENABLED = False
 _STORE_TRACES = False        # per-epoch traces (Configure); heavy, opt-in
+_WARM_WORKERS = 0            # parallel-warm thread count (0 = auto)
 _cache_singleton: ChronicEvokedCache | None = None
 
 
@@ -65,7 +66,7 @@ def _cache() -> ChronicEvokedCache:
     if _cache_singleton is None:
         _cache_singleton = ChronicEvokedCache(
             _EVOKED_DIR, _CACHE_DB, compute_expensive=_EXPENSIVE_ENABLED,
-            store_traces=_STORE_TRACES)
+            store_traces=_STORE_TRACES, warm_workers=_WARM_WORKERS)
     return _cache_singleton
 
 
@@ -456,11 +457,13 @@ def register_callbacks(app, store, config: dict) -> None:
     """Wire pickers + trend toggles -> (rainbow scatter, per-recording trend,
     stats, status). Reads ``config.chronic_evoked``."""
     global _EVOKED_DIR, _CACHE_DB, _EXPENSIVE_ENABLED, _STORE_TRACES
+    global _WARM_WORKERS
     ce = (config or {}).get("chronic_evoked", {}) or {}
     _EVOKED_DIR = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
     _CACHE_DB = ce.get("cache_db") or DEFAULT_CACHE_DB
     _EXPENSIVE_ENABLED = bool(ce.get("compute_expensive", False))
     _STORE_TRACES = bool(ce.get("store_traces", False))
+    _WARM_WORKERS = int(ce.get("warm_workers", 0) or 0)
 
     @app.callback(
         Output("chronic-session-dropdown", "options"),
@@ -752,7 +755,8 @@ def _warm_status_text(animal: str) -> str:
     if not total:
         return f"⏳ Loading {animal} from evokedOutput…"
     done = min(int(p.get("done") or 0), total)
-    phase = _PHASE_LABEL.get(p.get("phase") or "", "")
+    raw_phase = p.get("phase") or ""
+    phase = _PHASE_LABEL.get(raw_phase, raw_phase)   # unknown -> pass through
     # The session/protocol label = filename prefix before the channel list.
     raw = (p.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]
     sess = raw.split("__", 1)[0] if raw else ""
