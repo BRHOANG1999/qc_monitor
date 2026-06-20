@@ -56,6 +56,15 @@ _STORE_TRACES = False        # per-epoch traces (Configure); heavy, opt-in
 _WARM_WORKERS = 0            # parallel-warm thread count (0 = auto)
 _cache_singleton: ChronicEvokedCache | None = None
 
+# Selections (animal, sessions) auto-loaded at least once -- so an empty
+# result AFTER a completed load shows a message instead of re-kicking the
+# warm forever (the "loading the same files 3 times" loop).
+_autoloaded: set = set()
+
+
+def _sel_key(animal, sess):
+    return (animal or "", tuple(sorted(sess or [])))
+
 
 def _label(col: str) -> str:
     return EVOKED_FEATURE_LABELS.get(col, col.replace("_", " ").title())
@@ -547,9 +556,12 @@ def register_callbacks(app, store, config: dict) -> None:
                "roll_window": roll_window, "config": cfg_dict or None}
         scope = (f"the {len(sessions)} selected session(s)" if sessions
                  else "all sessions")
-        # "Reload from disk" forces a fresh re-read of the selection -> show
-        # the loading state + enable the progress poll.
+        key = _sel_key(animal, sess)
+        # "Reload from disk" forces a fresh re-read -> clear the once-flag so
+        # it retries, show the loading state, enable the progress poll.
         if callback_context.triggered_id == "chronic-refresh-btn":
+            _autoloaded.discard(key)
+            _autoloaded.add(key)
             _kick_warm(animal, sess, force=True)
             return (empty_fig(f"Reloading {scope} for {animal} from "
                               f"evokedOutput…"),
@@ -559,14 +571,28 @@ def register_callbacks(app, store, config: dict) -> None:
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             return (empty_fig("Couldn't read the data", hint=str(e)),
                     "", f"Error: {e}", sel, True)
-        # Nothing loaded yet for this selection -> auto-load it from
-        # evokedOutput (scoped to the chosen session(s)); the poll re-plots
-        # when it finishes. No separate "warm" step for the user.
-        if not rows and not _is_warming(animal):
+        if not rows:
+            if _is_warming(animal):                       # still loading
+                return (empty_fig(f"Loading {scope} for {animal} from "
+                                  f"evokedOutput…"),
+                        "", _warm_status_text(animal), sel, False)
+            if key in _autoloaded:
+                # Already auto-loaded once and STILL empty -> stop looping;
+                # surface it instead of re-kicking the warm forever.
+                return (empty_fig(
+                    f"No evoked data for {animal} in this selection. The files "
+                    f"may have no detected stimuli, or the load didn't persist "
+                    f"(try ↻ Reload from disk; check the logs)."),
+                    "", "No evoked data for this selection.", sel, True)
+            # First time for this selection -> auto-load it.
+            _autoloaded.add(key)
             _kick_warm(animal, sess)
             return (empty_fig(f"Loading {scope} for {animal} from "
                               f"evokedOutput…"),
                     "", f"Loading {animal} from evokedOutput…", sel, False)
+        # We have data: clear the once-flag so a later (e.g. cache-cleared)
+        # empty result can auto-load again.
+        _autoloaded.discard(key)
         pts = _feature_points(rows, feature)
         sess_lbl = (f" · {len(sessions)} session(s)" if sessions else "")
         loading = " · ⏳ loading…" if _is_warming(animal) else ""
