@@ -82,7 +82,10 @@ def test_cache_build_query_and_guards(tmp_path):
     assert rows[0]["peak_to_trough"] is None
     assert rows[0]["line_length"] is None
 
-    # The other animal is isolated to its own channel.
+    # Warming is per-animal now: BCH062's warm built only BCH062's channel,
+    # so the other animal isn't cached until it's warmed too.
+    assert cache.query("BCH061") == []
+    cache.ensure_animal("BCH061")
     other = cache.query("BCH061")
     assert len(other) == 1 and other[0]["channel"] == "BCH061SLM"
 

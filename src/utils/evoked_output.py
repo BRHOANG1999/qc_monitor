@@ -238,8 +238,14 @@ def list_animals(evoked_dir: str) -> list[str]:
     return sorted(seen)
 
 
-def read_file_evoked(path: str) -> dict[str, dict]:
+def read_file_evoked(path: str,
+                     only_animals: list | None = None) -> dict[str, dict]:
     """Per-channel data for one ``*_evoked.mat`` (h5py read).
+
+    When *only_animals* is given, channels whose animal id isn't in it are
+    skipped BEFORE their (large) ``evokedData`` is read -- so warming one
+    animal of a multi-animal file (e.g. 4 animals x 1795 epochs x 20 k
+    samples = ~600 MB) reads/decodes only that animal's channel, not all.
 
     Returns ``{channel: {"times":[...], "stim_peak":[...],
     "stim_trough":[...], "traces": ndarray[E,T] or None,
@@ -250,6 +256,7 @@ def read_file_evoked(path: str) -> dict[str, dict]:
     """
     assert isinstance(path, str) and path, "path required"
     import h5py  # lazy: keeps the dependency off non-chronic code paths.
+    keep = set(only_animals) if only_animals else None
     out: dict[str, dict] = {}
     try:
         with h5py.File(path, "r") as g:
@@ -257,6 +264,10 @@ def read_file_evoked(path: str) -> dict[str, dict]:
             if grp is None:
                 return {}
             for ch in list(grp.keys()):
+                if keep is not None:
+                    a, _e = split_animal_electrode(str(ch))
+                    if a not in keep:
+                        continue
                 rec = _read_channel(grp.get(ch))
                 if rec is not None:
                     out[str(ch)] = rec
@@ -467,7 +478,8 @@ class ChronicEvokedCache:
         return sorted(files, key=lambda f: (parse_recording_dt(f)
                                             or datetime.min))
 
-    def _needs_build(self, conn, path: str, force: bool) -> bool:
+    def _needs_build(self, conn, path: str, force: bool,
+                     animal: str | None = None) -> bool:
         if force:
             return True
         try:
@@ -475,14 +487,29 @@ class ChronicEvokedCache:
         except OSError:
             return False
         row = conn.execute(
-            "SELECT mtime, has_traces FROM file_meta WHERE file_path = ?",
+            "SELECT id, mtime FROM file_meta WHERE file_path = ?",
             (path,)).fetchone()
         if row is None or abs(float(row["mtime"]) - mtime) > 1e-6:
             return True
-        # Built before per-epoch traces existed (v3 cache upgraded additively
-        # to v4): rebuild once so Configure recompute has its traces. Files
-        # with no evokedData record has_traces=0 and aren't re-triggered.
-        return row["has_traces"] is None
+        fid = int(row["id"])
+        if animal:
+            # This animal's channel already built from this file? (Per-animal
+            # so warming BCH062 doesn't pull in / re-do the other animals.)
+            built = conn.execute(
+                "SELECT 1 FROM epoch WHERE file_id=? AND animal=? LIMIT 1",
+                (fid, animal)).fetchone()
+            if built is None:
+                return True
+            if self.store_traces:
+                tr = conn.execute(
+                    "SELECT 1 FROM epoch_trace WHERE file_id=? AND animal=? "
+                    "LIMIT 1", (fid, animal)).fetchone()
+                return tr is None
+            return False
+        # File-level (no animal scope): rebuild only to backfill traces.
+        ht = conn.execute("SELECT has_traces FROM file_meta WHERE id=?",
+                          (fid,)).fetchone()
+        return self.store_traces and (ht is None or ht["has_traces"] is None)
 
     def ensure_animal(self, animal: str, progress=None,
                       force: bool = False, sessions: list | None = None
@@ -505,9 +532,9 @@ class ChronicEvokedCache:
             try:
                 for i, path in enumerate(files):
                     assert i < _MAX_FILES, "file loop exceeds bound"
-                    if self._needs_build(conn, path, force):
+                    if self._needs_build(conn, path, force, animal=animal):
                         try:
-                            self._build_one(conn, path)
+                            self._build_one(conn, path, only_animal=animal)
                             conn.commit()   # release the lock per file so
                             built += 1       # the dashboard reads mid-warm.
                         except sqlite3.OperationalError:
@@ -529,8 +556,12 @@ class ChronicEvokedCache:
                 conn.close()
         return {"files": len(files), "built": built}
 
-    def _build_one(self, conn, path: str) -> None:
-        """(Re)extract one file's epochs + mean waveforms (keyed by file_id)."""
+    def _build_one(self, conn, path: str, only_animal: str | None = None
+                   ) -> None:
+        """(Re)extract one file's epochs + mean waveforms (keyed by file_id).
+        When *only_animal* is given, read + (re)build ONLY that animal's
+        channel -- so warming one animal of a multi-animal file does ~1/N the
+        work (the rest stay cached / are built when their animal is warmed)."""
         rec_dt = parse_recording_dt(path)
         rec_iso = rec_dt.isoformat() if rec_dt else ""
         try:
@@ -538,10 +569,15 @@ class ChronicEvokedCache:
         except OSError:
             mtime = 0.0
         file_id = self._upsert_file(conn, path, mtime, rec_iso)
-        conn.execute("DELETE FROM epoch WHERE file_id = ?", (file_id,))
-        conn.execute("DELETE FROM recording_mean WHERE file_id = ?", (file_id,))
-        conn.execute("DELETE FROM epoch_trace WHERE file_id = ?", (file_id,))
-        channels = read_file_evoked(path)
+        if only_animal:
+            where, args = "file_id = ? AND animal = ?", (file_id, only_animal)
+        else:
+            where, args = "file_id = ?", (file_id,)
+        conn.execute(f"DELETE FROM epoch WHERE {where}", args)
+        conn.execute(f"DELETE FROM recording_mean WHERE {where}", args)
+        conn.execute(f"DELETE FROM epoch_trace WHERE {where}", args)
+        channels = read_file_evoked(
+            path, [only_animal] if only_animal else None)
         rows: list = []
         means: list = []
         traces_rows: list = []
