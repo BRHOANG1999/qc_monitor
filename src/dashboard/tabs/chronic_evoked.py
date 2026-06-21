@@ -17,6 +17,7 @@ with ``--expensive``.
 from __future__ import annotations
 
 import logging
+import os
 import statistics
 import threading
 from collections import OrderedDict
@@ -34,9 +35,11 @@ from src.dashboard.components import (
 from src.dashboard.data_helpers import (
     EVOKED_FEATURE_LABELS, TIME_RANGE_OPTIONS, empty_fig)
 from src.utils import evoked_features as ef
+from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.evoked_output import (
     ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals,
-    sessions_for_animal, sessions_with_dt_for_animal)
+    list_evoked_files, parse_recording_dt, parse_session, read_file_evoked,
+    animals_in_filename, sessions_for_animal, sessions_with_dt_for_animal)
 
 # Feature dropdown = every cached evoked feature, friendly labels from the
 # app-wide map. Expensive ones are flagged so the UI can disable them.
@@ -257,6 +260,15 @@ def layout(store):
                                 "alignItems": "center"},
                     inputStyle={"marginRight": "5px"}),
             ], style={"flex": "0 0 260px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
+                html.Button("👁 Preview", id="chronic-preview-btn", n_clicks=0,
+                            style=_BTN_STYLE,
+                            title="Quick look at the most recent recording for "
+                                  "this animal / session(s), read straight from "
+                                  "evokedOutput — no full chronic load. Use it "
+                                  "to confirm there's signal before ▶ Plot."),
+            ], style={"flex": "0 0 110px"}),
             html.Div([
                 html.Label(" ", style=LABEL_STYLE),
                 html.Button("▶ Plot", id="chronic-load-btn", n_clicks=0,
@@ -533,6 +545,7 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("chronic-warm-poll", "disabled"),
         Input("chronic-load-btn", "n_clicks"),
         Input("chronic-refresh-btn", "n_clicks"),
+        Input("chronic-preview-btn", "n_clicks"),
         State("chronic-animal-dropdown", "value"),
         State("chronic-session-dropdown", "value"),
         State("chronic-feature-dropdown", "value"),
@@ -544,8 +557,8 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-config", "data"),
         prevent_initial_call=True,
     )
-    def _update(_load, _refresh, animal, sessions, feature, hours, overlays,
-                win_hours, scroll, roll_window, cfg_dict):
+    def _update(_load, _refresh, _preview, animal, sessions, feature, hours,
+                overlays, win_hours, scroll, roll_window, cfg_dict):
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
@@ -557,6 +570,18 @@ def register_callbacks(app, store, config: dict) -> None:
         scope = (f"the {len(sessions)} selected session(s)" if sessions
                  else "all sessions")
         key = _sel_key(animal, sess)
+        # Preview: read just the most recent recording for this selection
+        # straight from evokedOutput (no cache, no warm) so the user can
+        # confirm there's signal before committing to the full chronic load.
+        if callback_context.triggered_id == "chronic-preview-btn":
+            try:
+                fig, status, stats = _build_preview(
+                    animal, sess, feature, cfg_dict, overlays or [],
+                    roll_window)
+            except Exception as e:  # noqa: BLE001 -- surface, never crash UI
+                return (empty_fig("Preview failed", hint=str(e)),
+                        "", f"Preview error: {e}", sel, True)
+            return (fig, stats, status, sel, True)
         # "Reload from disk" forces a fresh re-read -> clear the once-flag so
         # it retries, show the loading state, enable the progress poll.
         if callback_context.triggered_id == "chronic-refresh-btn":
@@ -797,6 +822,87 @@ def _warm_status_text(animal: str) -> str:
 # --------------------------------------------------------------------- #
 #  Data shaping + builders (pure)
 # --------------------------------------------------------------------- #
+
+def _latest_preview_file(animal: str, sessions) -> str | None:
+    """Most recent ``*_evoked.mat`` in evokedOutput for *animal* (optionally
+    restricted to *sessions*). Used by the no-cache preview path."""
+    assert animal, "animal required"
+    sset = set(sessions) if sessions else None
+    cands: list = []
+    for i, f in enumerate(list_evoked_files(_EVOKED_DIR)):
+        assert i < 1000000, "evoked file scan runaway"
+        if animal not in animals_in_filename(f):
+            continue
+        if sset is not None and parse_session(f) not in sset:
+            continue
+        cands.append((parse_recording_dt(f) or datetime.min, f))
+    if not cands:
+        return None
+    return max(cands, key=lambda t: t[0])[1]
+
+
+def _preview_rows(path: str, animal: str, cfg) -> list:
+    """Per-epoch feature rows for ONE evoked file, read straight from disk
+    (same row shape as ``cache.query`` so the scatter code is unchanged).
+    Only *animal*'s channels are read + feature-extracted."""
+    assert path and animal, "path and animal required"
+    chans = read_file_evoked(path, only_animals=[animal])
+    rec_iso = (parse_recording_dt(path) or datetime.min).isoformat()
+    session = parse_session(path)
+    rows: list = []
+    for ch, rec in chans.items():
+        a, electrode = split_animal_electrode(ch)
+        if a != animal or not is_animal_channel(ch):
+            continue
+        traces, tms = rec.get("traces"), rec.get("time_ms")
+        if traces is None or tms is None or len(traces) < 1 or tms.size < 2:
+            continue
+        fs = 1000.0 / float(np.mean(np.diff(tms)))
+        feats = ef.compute_all(traces, tms, fs, _EXPENSIVE_ENABLED, cfg)
+        times, pk, tr = (rec.get("times") or [], rec.get("stim_peak") or [],
+                         rec.get("stim_trough") or [])
+        for j in range(traces.shape[0]):
+            st = times[j] if j < len(times) else None
+            row = {"channel": ch, "electrode": electrode, "rec_dt": rec_iso,
+                   "session": session, "stim_time_sec": st,
+                   "abs_dt": _abs_dt_iso(rec_iso, st),
+                   "peak": pk[j] if j < len(pk) else None,
+                   "trough": tr[j] if j < len(tr) else None}
+            for col in ef.ALL_COLUMNS:
+                v = float(feats[col][j])
+                row[col] = v if np.isfinite(v) else None
+            rows.append(row)
+    rows.sort(key=lambda r: r.get("abs_dt") or "")
+    return rows
+
+
+def _build_preview(animal, sessions, feature, cfg_dict, overlays,
+                   roll_window):
+    """(figure, status, trend_stats) for a one-recording preview read
+    directly from evokedOutput -- no sqlite cache, no background warm."""
+    assert animal, "animal required"
+    cfg = ef.FeatureConfig.from_dict(cfg_dict)
+    path = _latest_preview_file(animal, sessions)
+    if not path:
+        return (empty_fig(f"No evokedOutput file found for {animal} in this "
+                          f"selection."), "Nothing to preview.", "")
+    fname = os.path.basename(path)
+    rows = _preview_rows(path, animal, cfg)
+    if not rows:
+        return (empty_fig(f"{fname} has no readable epochs for {animal}."),
+                f"Preview · {fname} · no epochs.", "")
+    pts = _feature_points(rows, feature)
+    status = (f"Preview · {fname} · {len(rows)} epochs from 1 recording · "
+              f"{len(pts[0])} with {_label(feature)}. ▶ Plot loads the full "
+              f"chronic history.")
+    if not pts[0]:
+        return (empty_fig(f"No {_label(feature)} values in this preview."),
+                status, "")
+    fig = _build_feature_scatter(pts, feature, animal, overlays, roll_window)
+    fig.update_layout(title=f"PREVIEW (1 recording, {len(rows)} epochs) — "
+                            f"{_label(feature)} · {fname}")
+    return (fig, status, _trend_stats(pts, feature))
+
 
 def _feature_points(rows, feature):
     """(iso_times, seconds, values) for rows with a finite feature value."""
