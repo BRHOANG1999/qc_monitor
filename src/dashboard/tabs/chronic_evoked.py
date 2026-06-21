@@ -37,7 +37,7 @@ from src.dashboard.data_helpers import (
 from src.utils import evoked_features as ef
 from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.evoked_output import (
-    ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals,
+    DEFAULT_EVOKED_DIR, compute_feature_rows, list_animals,
     list_evoked_files, parse_recording_dt, parse_session, read_file_evoked,
     read_feature_sidecar, write_feature_sidecar,
     animals_in_filename, sessions_for_animal, sessions_with_dt_for_animal)
@@ -54,11 +54,7 @@ _MA_WINDOW = 50            # per-animal moving-average window (epochs).
 
 # Configured in register_callbacks(); layout() reads them on tab open.
 _EVOKED_DIR = DEFAULT_EVOKED_DIR
-_CACHE_DB = DEFAULT_CACHE_DB
 _EXPENSIVE_ENABLED = False
-_STORE_TRACES = False        # per-epoch traces (Configure); heavy, opt-in
-_WARM_WORKERS = 0            # parallel-warm thread count (0 = auto)
-_cache_singleton: ChronicEvokedCache | None = None
 
 # Selections (animal, sessions) auto-loaded at least once -- so an empty
 # result AFTER a completed load shows a message instead of re-kicking the
@@ -74,28 +70,24 @@ def _label(col: str) -> str:
     return EVOKED_FEATURE_LABELS.get(col, col.replace("_", " ").title())
 
 
-def _cache() -> ChronicEvokedCache:
-    global _cache_singleton
-    if _cache_singleton is None:
-        _cache_singleton = ChronicEvokedCache(
-            _EVOKED_DIR, _CACHE_DB, compute_expensive=_EXPENSIVE_ENABLED,
-            store_traces=_STORE_TRACES, warm_workers=_WARM_WORKERS)
-    return _cache_singleton
-
-
-# Background warm: building an animal's cache (reading + feature-extracting
+# No sqlite cache: features live in per-(recording, animal) JSON sidecars next
+# to each *_evoked.mat in evokedOutput. The render path reads those sidecars
+# (computing+writing any missing in a background "load"); the heavy trace reads
+# only happen once per recording, then the sidecar makes every re-plot instant.
+#
+# Background load: building an animal's sidecars (reading + feature-extracting
 # hundreds of files) must NEVER run inside the render callback -- it would
-# hang the UI. The render path is query-only; the Refresh button kicks an
-# off-thread warm so the page stays responsive and the cache fills in.
+# hang the UI. The render path is read-only; ▶ Plot kicks an off-thread load
+# so the page stays responsive and the sidecars fill in.
 _warm_threads: dict = {}
 _warm_progress: dict = {}        # animal -> {"done": int, "total": int}
 _warm_lock = threading.Lock()
 
 
 def _kick_warm(animal: str, sessions: list | None = None,
-               force: bool = False) -> bool:
-    """Start a background load for *animal* (optionally just *sessions*)
-    unless one is already running."""
+               cfg_dict: dict | None = None, force: bool = False) -> bool:
+    """Start a background sidecar-build for *animal* (optionally just
+    *sessions*) unless one is already running."""
     if not animal:
         return False
     with _warm_lock:
@@ -104,7 +96,7 @@ def _kick_warm(animal: str, sessions: list | None = None,
             return False
         _warm_progress[animal] = {"done": 0, "total": 0}
         th = threading.Thread(target=_warm_worker,
-                              args=(animal, sessions, force),
+                              args=(animal, sessions, cfg_dict, force),
                               daemon=True, name=f"chronic-warm-{animal}")
         _warm_threads[animal] = th
         th.start()
@@ -119,14 +111,39 @@ def _set_warm_progress(animal: str, done: int, total: int,
 
 
 def _warm_worker(animal: str, sessions: list | None = None,
-                 force: bool = False) -> None:
+                 cfg_dict: dict | None = None, force: bool = False) -> None:
+    """Build *animal*'s feature sidecars for the selection (default config) or
+    recompute its rows into the in-memory store (custom Configure). Reads each
+    *_evoked.mat at most once; an existing fresh sidecar is skipped."""
     try:
-        stats = _cache().ensure_animal(
-            animal, sessions=sessions, force=force,
-            progress=lambda d, t, p, ph: _set_warm_progress(
-                animal, d, t, p, ph))
-        logger.info("chronic load %s (sessions=%s): %s",
-                    animal, sessions, stats)
+        cfg = ef.FeatureConfig.from_dict(cfg_dict)
+        passthrough = cfg.is_passthrough()
+        files = _selection_files(animal, sessions)
+        n = len(files)
+        recompute: list = []
+        for i, fp in enumerate(files):
+            _set_warm_progress(animal, i, n, os.path.basename(fp), "reading")
+            if passthrough and not force and read_feature_sidecar(
+                    fp, animal) is not None:
+                continue
+            rows = _preview_rows(fp, animal, cfg)
+            if passthrough:
+                if rows:
+                    try:
+                        write_feature_sidecar(fp, animal, rows)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("sidecar write failed %s: %s", fp, e)
+            else:
+                recompute.extend(rows)
+        if not passthrough:
+            recompute.sort(key=lambda r: r.get("abs_dt") or "")
+            _RECOMPUTE_CACHE[_recompute_key(animal, sessions, cfg_dict)] = \
+                recompute
+            while len(_RECOMPUTE_CACHE) > _RECOMPUTE_MAX:
+                _RECOMPUTE_CACHE.pop(next(iter(_RECOMPUTE_CACHE)))
+        _set_warm_progress(animal, n, n, "", "done")
+        logger.info("chronic load %s (sessions=%s, passthrough=%s): %d files",
+                    animal, sessions, passthrough, n)
     except Exception as e:  # noqa: BLE001 -- never crash the daemon thread
         logger.warning("chronic load failed for %s: %s", animal, e)
 
@@ -184,24 +201,15 @@ def _session_options(animal) -> list[dict]:
     or [] (best-effort; never raises).
 
     Read straight from the evoked filenames so the dropdown populates the
-    moment an animal is selected (no warm needed); unions in any warmed-cache
-    sessions (without dates) as a backstop. The value stays the bare session
-    label so filtering is unchanged.
+    moment an animal is selected. The value stays the bare session label so
+    filtering is unchanged.
     """
     if not animal:
         return []
     try:
         dated = sessions_with_dt_for_animal(_EVOKED_DIR, animal)
-        opts = [{"label": _session_label(r), "value": r["session"]}
+        return [{"label": _session_label(r), "value": r["session"]}
                 for r in dated]
-        seen = {r["session"] for r in dated}
-        try:
-            for s in _cache().list_sessions(animal):
-                if s not in seen:
-                    opts.append({"label": s, "value": s})
-        except Exception:  # noqa: BLE001 -- cache optional; disk is enough
-            pass
-        return opts
     except Exception:  # noqa: BLE001
         return []
 
@@ -488,14 +496,10 @@ def _expandable(key: str, title: str, child) -> html.Div:
 def register_callbacks(app, store, config: dict) -> None:
     """Wire pickers + trend toggles -> (rainbow scatter, per-recording trend,
     stats, status). Reads ``config.chronic_evoked``."""
-    global _EVOKED_DIR, _CACHE_DB, _EXPENSIVE_ENABLED, _STORE_TRACES
-    global _WARM_WORKERS
+    global _EVOKED_DIR, _EXPENSIVE_ENABLED
     ce = (config or {}).get("chronic_evoked", {}) or {}
     _EVOKED_DIR = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
-    _CACHE_DB = ce.get("cache_db") or DEFAULT_CACHE_DB
     _EXPENSIVE_ENABLED = bool(ce.get("compute_expensive", False))
-    _STORE_TRACES = bool(ce.get("store_traces", False))
-    _WARM_WORKERS = int(ce.get("warm_workers", 0) or 0)
 
     @app.callback(
         Output("chronic-session-dropdown", "options"),
@@ -598,7 +602,7 @@ def register_callbacks(app, store, config: dict) -> None:
         if callback_context.triggered_id == "chronic-refresh-btn":
             _autoloaded.discard(key)
             _autoloaded.add(key)
-            _kick_warm(animal, sess, force=True)
+            _kick_warm(animal, sess, cfg_dict, force=True)
             return (empty_fig(f"Reloading {scope} for {animal} from "
                               f"evokedOutput…"),
                     "", f"Reloading {animal} from evokedOutput…", sel, False)
@@ -622,7 +626,7 @@ def register_callbacks(app, store, config: dict) -> None:
                     "", "No evoked data for this selection.", sel, True)
             # First time for this selection -> auto-load it.
             _autoloaded.add(key)
-            _kick_warm(animal, sess)
+            _kick_warm(animal, sess, cfg_dict)
             return (empty_fig(f"Loading {scope} for {animal} from "
                               f"evokedOutput…"),
                     "", f"Loading {animal} from evokedOutput…", sel, False)
@@ -710,6 +714,23 @@ def _config_key(cfg_dict) -> tuple:
     return tuple(getattr(f, k) for k in f.__dataclass_fields__)
 
 
+def _recompute_key(animal, sessions, cfg_dict) -> tuple:
+    """Key for the in-memory custom-config row store (sidecars cover the
+    default config; custom Configure settings are transient, kept in RAM)."""
+    return (animal, tuple(sorted(sessions or ())), _config_key(cfg_dict))
+
+
+def _filter_by_hours(rows: list, hours) -> list:
+    """Keep rows whose recording is within the last *hours* (0/None = all).
+    Sidecars hold a recording's full history, so the Time Range is applied
+    here at read time rather than in a SQL WHERE."""
+    if not hours:
+        return rows
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(hours=float(hours))).isoformat()
+    return [r for r in rows if (r.get("rec_dt") or "") > cutoff]
+
+
 def _abs_dt_iso(rec_iso, seconds) -> str:
     """recording ISO + stim offset seconds -> ISO (mirrors evoked_output)."""
     if not rec_iso:
@@ -724,58 +745,65 @@ def _abs_dt_iso(rec_iso, seconds) -> str:
         return rec_iso
 
 
-def _recompute_rows(cache, animal, hours, sessions, cfg) -> list:
-    """Per-epoch feature rows recomputed from the cached traces with the
-    Configure *cfg* -- same row shape as ``cache.query`` so the plot/section
-    code is unchanged."""
-    blocks = cache.query_epoch_traces(animal, hours=hours, sessions=sessions)
-    rows: list = []
-    for b in blocks:
-        traces, tms = b["traces"], b["time_ms"]
-        if traces.shape[0] < 1 or tms.size < 2:
-            continue
-        fs = 1000.0 / float(np.mean(np.diff(tms)))
-        feats = ef.compute_all(traces, tms, fs, _EXPENSIVE_ENABLED, cfg)
-        sts, pks, trs = b["stim_times"], b["peaks"], b["troughs"]
-        for j in range(traces.shape[0]):
-            st = sts[j] if j < len(sts) else None
-            row = {"channel": b["channel"], "electrode": b["electrode"],
-                   "rec_dt": b["rec_dt"], "session": b["session"],
-                   "stim_time_sec": st, "abs_dt": _abs_dt_iso(b["rec_dt"], st),
-                   "peak": pks[j] if j < len(pks) else None,
-                   "trough": trs[j] if j < len(trs) else None}
-            for col in ef.ALL_COLUMNS:
-                v = float(feats[col][j])
-                row[col] = v if np.isfinite(v) else None
-            rows.append(row)
-    rows.sort(key=lambda r: r.get("abs_dt") or "")
-    return rows
+def _recording_means_for_selection(animal: str, files: list) -> list:
+    """Per-recording mean/std evoked waveform for the overlay, computed on
+    demand from at most ``_MAX_WAVEFORMS`` evenly-sampled recordings (reading
+    their traces straight from disk -- the overlay is a lazy section)."""
+    if not files:
+        return []
+    step = max(1, len(files) // _MAX_WAVEFORMS)
+    out: list = []
+    for fp in files[::step]:
+        rec_iso = (parse_recording_dt(fp) or datetime.min).isoformat()
+        chans = read_file_evoked(fp, only_animals=[animal])
+        for ch, rec in chans.items():
+            a, _e = split_animal_electrode(ch)
+            if a != animal or not is_animal_channel(ch):
+                continue
+            tr, tms = rec.get("traces"), rec.get("time_ms")
+            if tr is None or tms is None or len(tr) < 1 or tms.size < 2:
+                continue
+            t, m, s = _decimate3(np.asarray(tms), tr.mean(axis=0),
+                                 tr.std(axis=0))
+            out.append({"channel": ch, "rec_dt": rec_iso,
+                        "n_epochs": int(tr.shape[0]),
+                        "time_axis": t, "mean_trace": m, "std_trace": s})
+    return out
+
+
+def _decimate3(t, m, s, target: int = 1000):
+    """Stride-decimate three aligned arrays to <= *target* points (lists)."""
+    n = len(t)
+    if n <= target:
+        return t.tolist(), m.tolist(), s.tolist()
+    step = (n // target) + 1
+    return t[::step].tolist(), m[::step].tolist(), s[::step].tolist()
 
 
 def _query_for_selection(sel: dict, need_means: bool = True):
-    """Re-query the cache for a saved selection dict -> (rows, means, label).
-    Cheap post-warm; means is small and only fetched when *need_means*. When
-    the Configure panel is non-default, features are recomputed from the
-    cached per-epoch traces instead of read from the fast feature columns."""
+    """Rows + per-recording means + window-label for a saved selection dict,
+    read from the evokedOutput feature sidecars (default config) or the
+    in-memory recompute store (custom Configure). No sqlite cache: a selection
+    with no sidecars yet reads empty and the caller kicks a background load."""
     assert isinstance(sel, dict), "selection must be a dict"
     animal = sel.get("animal")
     assert animal, "selection animal required"
-    cache = _cache()
     hours = sel.get("hours") or None
     sessions = sel.get("sessions") or None
     cfg = ef.FeatureConfig.from_dict(sel.get("config"))
+    files = _selection_files(animal, sessions)
     if cfg.is_passthrough():
-        rows = cache.query(animal, hours=hours, sessions=sessions)
+        rows: list = []
+        for fp in files:
+            sc = read_feature_sidecar(fp, animal)
+            if sc:
+                rows.extend(sc)
+        rows.sort(key=lambda r: r.get("abs_dt") or "")
     else:
-        ckey = (animal, hours, tuple(sessions or ()),
-                _config_key(sel.get("config")))
-        rows = _RECOMPUTE_CACHE.get(ckey)
-        if rows is None:
-            rows = _recompute_rows(cache, animal, hours, sessions, cfg)
-            _RECOMPUTE_CACHE[ckey] = rows
-            while len(_RECOMPUTE_CACHE) > _RECOMPUTE_MAX:
-                _RECOMPUTE_CACHE.pop(next(iter(_RECOMPUTE_CACHE)))
-    means = (cache.query_recording_means(animal, hours=hours, sessions=sessions)
+        rows = _RECOMPUTE_CACHE.get(
+            _recompute_key(animal, sessions, sel.get("config"))) or []
+    rows = _filter_by_hours(rows, hours)
+    means = (_recording_means_for_selection(animal, files)
              if need_means else [])
     return _apply_window(rows, means, sel.get("win_hours"), sel.get("scroll"))
 
@@ -878,38 +906,11 @@ def _latest_preview_file(animal: str, sessions) -> str | None:
 
 
 def _preview_rows(path: str, animal: str, cfg) -> list:
-    """Per-epoch feature rows for ONE evoked file, read straight from disk
-    (same row shape as ``cache.query`` so the scatter code is unchanged).
-    Only *animal*'s channels are read + feature-extracted."""
+    """Per-epoch feature rows for ONE evoked file (delegates to the shared
+    pure ``compute_feature_rows``; honours the tab's expensive-features flag).
+    Same row shape as the sidecar payload so plot/section code is unchanged."""
     assert path and animal, "path and animal required"
-    chans = read_file_evoked(path, only_animals=[animal])
-    rec_iso = (parse_recording_dt(path) or datetime.min).isoformat()
-    session = parse_session(path)
-    rows: list = []
-    for ch, rec in chans.items():
-        a, electrode = split_animal_electrode(ch)
-        if a != animal or not is_animal_channel(ch):
-            continue
-        traces, tms = rec.get("traces"), rec.get("time_ms")
-        if traces is None or tms is None or len(traces) < 1 or tms.size < 2:
-            continue
-        fs = 1000.0 / float(np.mean(np.diff(tms)))
-        feats = ef.compute_all(traces, tms, fs, _EXPENSIVE_ENABLED, cfg)
-        times, pk, tr = (rec.get("times") or [], rec.get("stim_peak") or [],
-                         rec.get("stim_trough") or [])
-        for j in range(traces.shape[0]):
-            st = times[j] if j < len(times) else None
-            row = {"channel": ch, "electrode": electrode, "rec_dt": rec_iso,
-                   "session": session, "stim_time_sec": st,
-                   "abs_dt": _abs_dt_iso(rec_iso, st),
-                   "peak": pk[j] if j < len(pk) else None,
-                   "trough": tr[j] if j < len(tr) else None}
-            for col in ef.ALL_COLUMNS:
-                v = float(feats[col][j])
-                row[col] = v if np.isfinite(v) else None
-            rows.append(row)
-    rows.sort(key=lambda r: r.get("abs_dt") or "")
-    return rows
+    return compute_feature_rows(path, animal, cfg, _EXPENSIVE_ENABLED)
 
 
 def _build_preview(animal, sessions, feature, cfg_dict, overlays,

@@ -20,12 +20,17 @@ recording carries several channels.
 
 To faithfully reproduce the toolkit's "Chronic Evoked Features" tab we read
 the (already filtered + baseline-corrected) ``evokedData`` traces and
-compute the full ~25-feature set per epoch (``src.utils.evoked_features``)
-plus a per-recording mean/std waveform. Opening + feature-extracting each
-file is slow, so results are cached once into a compact sqlite DB keyed by
-file mtime; rebuilds are incremental and re-reads are instant. The cheap
-vectorized features are always computed; the expensive per-epoch fits are
-opt-in (``compute_expensive``).
+compute the full ~25-feature set per epoch (``src.utils.evoked_features``).
+
+This module is pure: filename parsing, an h5py trace reader
+(``read_file_evoked``), and the per-(recording, animal) feature **sidecar**
+(``read_feature_sidecar`` / ``write_feature_sidecar``) -- a small JSON written
+next to each ``*_evoked.mat`` holding that animal's computed feature rows.
+The sidecar co-locates the derived features with their source, so the chronic
+view reads them without re-reading the heavy traces and without any database;
+the one-time trace read per recording is paid once, then the sidecar makes
+every re-plot instant. (The former sqlite feature cache was removed in favor
+of these sidecars.)
 """
 
 from __future__ import annotations
@@ -35,8 +40,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
-import threading
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -52,31 +55,6 @@ DEFAULT_EVOKED_DIR = (
     r"D:\code\Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit"
     r"\daqSignalGenerator\evokedOutput"
 )
-DEFAULT_CACHE_DB = os.path.join("data", "evoked_chronic_cache.db")
-
-# Bump when the cache layout changes; a mismatch wipes + rebuilds (the DB
-# is a throwaway cache, gitignored).
-#   v4: per-epoch traces (epoch_trace table) added so the Configure panel can
-#       recompute features (window/filter/smooth/baseline) from raw epochs.
-SCHEMA_VERSION = "4"
-
-# Per-recording mean waveforms are stored downsampled to this many points;
-# the overlay never needs the raw ~20k-sample resolution, and full traces
-# as JSON would bloat the cache (~16 MB/file).
-_MEAN_TRACE_POINTS = 1000
-
-# Per-epoch traces are stored int16 (one BLOB per file+channel, shape
-# [n_epochs x n_samples]); cap the time resolution so a pathological file
-# can't bloat the cache. The toolkit's evoked window is ~600 ms; at 10 kHz
-# that's ~6k samples, well under this cap.
-_MAX_TRACE_SAMPLES = 20000
-_INT16_HEADROOM = 32000.0
-
-# epoch columns = stim scalars (raw) + the computed evoked feature set.
-_BASE_EPOCH_COLS = ["file_id", "animal", "electrode", "channel",
-                    "stim_time_sec", "peak", "trough"]
-_EPOCH_COLS = _BASE_EPOCH_COLS + ef.ALL_COLUMNS
-
 # Trailing ``..._YYYY_MM_DD__HH_MM_SS_evoked.mat`` recording timestamp.
 _DT_RX = re.compile(
     r"(\d{4})_(\d{2})_(\d{2})__(\d{2})_(\d{2})_(\d{2})_evoked\.mat$")
@@ -84,12 +62,6 @@ _DT_RX = re.compile(
 _ANIMAL_RX = re.compile(r"(BCH\d+)")
 
 _MAX_FILES = 100000          # NASA Rule 2: explicit loop bound.
-
-# Serialize cache builds: the dashboard fires the chronic callback from
-# multiple worker threads (page auto-refresh), and two concurrent builds
-# would race on the file_meta INSERT. One builder at a time; the others
-# wait, then find the work already done.
-_BUILD_LOCK = threading.Lock()
 
 
 def parse_recording_dt(filename: str) -> datetime | None:
@@ -103,65 +75,6 @@ def parse_recording_dt(filename: str) -> datetime | None:
         return datetime(*(int(g) for g in m.groups()))
     except (ValueError, TypeError):
         return None
-
-
-def _add_seconds(rec_iso: str | None, seconds) -> str:
-    """ISO recording time + a stim offset (seconds) -> ISO, or '' / rec."""
-    if not rec_iso:
-        return ""
-    if seconds is None:
-        return rec_iso
-    try:
-        base = datetime.fromisoformat(rec_iso)
-        return (base + timedelta(seconds=float(seconds))).isoformat()
-    except (ValueError, TypeError):
-        return rec_iso
-
-
-def _num(v):
-    """Cache-friendly scalar: NaN/inf/None -> None (SQL NULL), else float."""
-    if v is None:
-        return None
-    f = float(v)
-    return f if np.isfinite(f) else None
-
-
-def _downsample(time_ms, mean_tr, std_tr, target):
-    """Stride-decimate the three aligned arrays to <= *target* points."""
-    n = len(time_ms)
-    if n <= target or target <= 0:
-        return time_ms, mean_tr, std_tr
-    step = (n // target) + 1
-    return time_ms[::step], mean_tr[::step], std_tr[::step]
-
-
-def _round(arr) -> list:
-    """Compact JSON: round to 4 sig-ish figures to keep the cache small."""
-    return [round(float(v), 4) for v in np.asarray(arr).ravel()]
-
-
-def _add_time_session(sql: str, params: list, hours, sessions):
-    """Append the optional ``rec_dt > cutoff`` and ``session IN (...)``
-    clauses (both join on file_meta alias ``m``)."""
-    if hours:
-        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-        sql += " AND m.rec_dt > ?"
-        params.append(cutoff)
-    if sessions:
-        marks = ",".join("?" * len(sessions))
-        sql += f" AND m.session IN ({marks})"
-        params.extend(sessions)
-    return sql, params
-
-
-def _mean_row_to_dict(r) -> dict:
-    d = dict(r)
-    for k in ("time_axis", "mean_trace", "std_trace"):
-        try:
-            d[k] = json.loads(d[k]) if d.get(k) else []
-        except (ValueError, TypeError):
-            d[k] = []
-    return d
 
 
 def animals_in_filename(filename: str) -> set[str]:
@@ -354,604 +267,53 @@ def _read_channel(node):
             "traces": traces, "time_ms": time_ms}
 
 
-class ChronicEvokedCache:
-    """Per-epoch evoked scalars cached from ``evokedOutput`` into sqlite.
+def _abs_dt(rec_iso: str, seconds) -> str:
+    """ISO recording time + a stim offset (seconds) -> ISO, or '' / rec."""
+    if not rec_iso:
+        return ""
+    if seconds is None:
+        return rec_iso
+    try:
+        return (datetime.fromisoformat(rec_iso)
+                + timedelta(seconds=float(seconds))).isoformat()
+    except (ValueError, TypeError):
+        return rec_iso
 
-    The cache is animal-agnostic on disk (one row per epoch per channel);
-    callers query by animal id. ``ensure_animal`` is incremental -- it
-    skips files whose mtime already matches the cached value.
+
+def compute_feature_rows(path: str, animal: str, cfg=None,
+                         expensive: bool = False) -> list:
+    """Per-epoch feature rows for one ``*_evoked.mat`` / *animal* -- the
+    canonical sidecar payload. Pure: reads the animal's traces, computes the
+    full feature set (optionally with *cfg* window/filter/smoothing/baseline),
+    and returns oldest-first rows. Shared by the dashboard preview/load path
+    and the offline sidecar-build tool.
     """
-
-    def __init__(self, evoked_dir: str | None = None,
-                 cache_db: str | None = None,
-                 compute_expensive: bool = False,
-                 store_traces: bool = False,
-                 warm_workers: int = 0) -> None:
-        self.evoked_dir = evoked_dir or DEFAULT_EVOKED_DIR
-        self.cache_db = cache_db or DEFAULT_CACHE_DB
-        self.compute_expensive = bool(compute_expensive)
-        self.warm_workers = int(warm_workers or 0)   # 0 = auto (~CPU count)
-        # Per-epoch traces (for the Configure recompute) are heavy to store
-        # -- a chronic session has tens of thousands of epochs, so the int16
-        # BLOBs add minutes/GBs to a warm. OFF by default keeps the basic
-        # feature-only load fast; opt in (config + Reload from disk) for
-        # Configure.
-        self.store_traces = bool(store_traces)
-        self._has_session = False   # set by _init_schema (may be locked out)
-        assert isinstance(self.evoked_dir, str), "evoked_dir must be str"
-        assert isinstance(self.cache_db, str), "cache_db must be str"
-        d = os.path.dirname(self.cache_db)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        self._init_schema()
-
-    def _conn(self) -> sqlite3.Connection:
-        # WAL + a generous busy timeout so the dashboard can read while a
-        # warm pass (tools/warm_evoked_cache.py) writes concurrently.
-        conn = sqlite3.connect(self.cache_db, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError:
-            pass
-        return conn
-
-    def _init_schema(self) -> None:
-        # epoch rows reference file_meta by integer id (not the long
-        # file_path) so neither the column nor its index bloats the cache.
-        # A schema-version mismatch wipes the data tables and rebuilds.
-        conn = self._conn()
-        try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS meta "
-                "(key TEXT PRIMARY KEY, value TEXT)")
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-            ver = row["value"] if row else None
-            if ver == SCHEMA_VERSION:
-                pass
-            elif ver == "3":
-                # Additive v3 -> v4: add epoch_trace WITHOUT wiping the warmed
-                # features/means. A full reset here would force a heavy re-warm
-                # that holds the write lock (the "database is locked" the tab
-                # hit). Traces backfill incrementally on the next warm.
-                self._migrate_v3_to_v4(conn)
-            else:
-                self._reset_schema(conn)
-            self._has_session = self._ensure_session_column(conn)
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _reset_schema(self, conn) -> None:
-        """Drop + recreate the data tables for the current schema version."""
-        feat_ddl = ",\n                ".join(
-            f"{c} REAL" for c in ef.ALL_COLUMNS)
-        conn.executescript(
-            f"""
-            DROP TABLE IF EXISTS epoch;
-            DROP TABLE IF EXISTS epoch_trace;
-            DROP TABLE IF EXISTS recording_mean;
-            DROP TABLE IF EXISTS file_meta;
-            CREATE TABLE file_meta (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT UNIQUE NOT NULL,
-                mtime REAL NOT NULL, rec_dt TEXT, built_at TEXT,
-                n_epochs INTEGER, fs REAL, session TEXT,
-                has_traces INTEGER
-            );
-            CREATE TABLE epoch (
-                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
-                electrode TEXT, channel TEXT, stim_time_sec REAL,
-                peak REAL, trough REAL,
-                {feat_ddl}
-            );
-            CREATE TABLE recording_mean (
-                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
-                channel TEXT, time_axis TEXT, mean_trace TEXT,
-                std_trace TEXT, n_epochs INTEGER
-            );
-            CREATE TABLE epoch_trace (
-                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
-                channel TEXT, electrode TEXT,
-                t0_ms REAL, dt_ms REAL, n_samples INTEGER,
-                n_epochs INTEGER, scale REAL,
-                stim_times TEXT, peaks TEXT, troughs TEXT,
-                data BLOB
-            );
-            CREATE INDEX idx_epoch_animal ON epoch(animal);
-            CREATE INDEX idx_epoch_file ON epoch(file_id);
-            CREATE INDEX idx_recmean_animal ON recording_mean(animal);
-            CREATE INDEX idx_etrace_animal ON epoch_trace(animal);
-            CREATE INDEX idx_etrace_file ON epoch_trace(file_id);
-            CREATE INDEX idx_fm_session ON file_meta(session);
-            """
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES "
-            "('schema_version', ?)", (SCHEMA_VERSION,))
-
-    def _migrate_v3_to_v4(self, conn) -> None:
-        """Add the epoch_trace table to an existing v3 cache without dropping
-        the warmed features/means (non-destructive upgrade)."""
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS epoch_trace (
-                file_id INTEGER NOT NULL, animal TEXT NOT NULL,
-                channel TEXT, electrode TEXT,
-                t0_ms REAL, dt_ms REAL, n_samples INTEGER,
-                n_epochs INTEGER, scale REAL,
-                stim_times TEXT, peaks TEXT, troughs TEXT,
-                data BLOB
-            );
-            CREATE INDEX IF NOT EXISTS idx_etrace_animal
-                ON epoch_trace(animal);
-            CREATE INDEX IF NOT EXISTS idx_etrace_file
-                ON epoch_trace(file_id);
-            """)
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(file_meta)")]
-        if "has_traces" not in cols:
-            # NULL = built before traces existed -> _needs_build rebuilds once.
-            conn.execute("ALTER TABLE file_meta ADD COLUMN has_traces INTEGER")
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES "
-            "('schema_version', ?)", (SCHEMA_VERSION,))
-
-    def _ensure_session_column(self, conn) -> bool:
-        """Add + backfill file_meta.session without re-warming (parses the
-        path string only). Returns True when the column is available.
-
-        Resilient: if the ALTER/backfill can't get the write lock (a warm is
-        running), return False -- queries fall back to no-session mode and a
-        later cache open retries. Avoids breaking the tab under contention.
-        """
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(file_meta)")]
-        try:
-            if "session" not in cols:
-                conn.execute("ALTER TABLE file_meta ADD COLUMN session TEXT")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_fm_session "
-                             "ON file_meta(session)")
-            rows = conn.execute(
-                "SELECT id, file_path FROM file_meta "
-                "WHERE session IS NULL").fetchall()
-            for i, r in enumerate(rows):
-                assert i < _MAX_FILES, "session backfill exceeds bound"
-                conn.execute("UPDATE file_meta SET session=? WHERE id=?",
-                             (parse_session(r["file_path"]), r["id"]))
-            return True
-        except sqlite3.OperationalError:
-            conn.rollback()
-            return "session" in cols
-
-    def files_for_animal(self, animal: str,
-                         sessions: list | None = None) -> list[str]:
-        """Evoked files whose filename names *animal* (sorted by time).
-        When *sessions* is given, restrict to those session labels so the tab
-        can load just the selected session(s) instead of the whole animal."""
-        if not animal:
-            return []
-        keep = set(sessions) if sessions else None
-        files = [f for f in list_evoked_files(self.evoked_dir)
-                 if animal in animals_in_filename(f)
-                 and (keep is None or parse_session(f) in keep)]
-        return sorted(files, key=lambda f: (parse_recording_dt(f)
-                                            or datetime.min))
-
-    def _needs_build(self, conn, path: str, force: bool,
-                     animal: str | None = None) -> bool:
-        if force:
-            return True
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return False
-        row = conn.execute(
-            "SELECT id, mtime FROM file_meta WHERE file_path = ?",
-            (path,)).fetchone()
-        if row is None or abs(float(row["mtime"]) - mtime) > 1e-6:
-            return True
-        fid = int(row["id"])
-        if animal:
-            # This animal's channel already built from this file? (Per-animal
-            # so warming BCH062 doesn't pull in / re-do the other animals.)
-            built = conn.execute(
-                "SELECT 1 FROM epoch WHERE file_id=? AND animal=? LIMIT 1",
-                (fid, animal)).fetchone()
-            if built is None:
-                return True
-            if self.store_traces:
-                tr = conn.execute(
-                    "SELECT 1 FROM epoch_trace WHERE file_id=? AND animal=? "
-                    "LIMIT 1", (fid, animal)).fetchone()
-                return tr is None
-            return False
-        # File-level (no animal scope): rebuild only to backfill traces.
-        ht = conn.execute("SELECT has_traces FROM file_meta WHERE id=?",
-                          (fid,)).fetchone()
-        return self.store_traces and (ht is None or ht["has_traces"] is None)
-
-    def ensure_animal(self, animal: str, progress=None,
-                      force: bool = False, sessions: list | None = None
-                      ) -> dict:
-        """Cache every not-yet-current evoked file for *animal* (optionally
-        only the given *sessions* -- so a one-session Plot loads a handful of
-        files, not the whole animal).
-
-        *progress* (optional) is called ``progress(done, total, path, phase)``
-        -- ``done`` is the 1-based current file and ``phase`` names the
-        pipeline step ("reading" / "computing features" / "saving") so the UI
-        can show granular progress within each (large) file. *force*
-        recomputes even unchanged files. Returns ``{"files": n, "built": k}``.
-        """
-        assert isinstance(animal, str) and animal, "animal required"
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        files = self.files_for_animal(animal, sessions)
-        n = len(files)
-        built = 0
-        # One builder at a time across CALLS (see _BUILD_LOCK). Within a call,
-        # files are read + feature-extracted in PARALLEL worker threads (h5py
-        # + numpy release the GIL); the main thread writes the small payloads
-        # to sqlite serially (single writer, no DB contention).
-        with _BUILD_LOCK:
-            conn = self._conn()
-            try:
-                todo = [p for p in files
-                        if self._needs_build(conn, p, force, animal=animal)]
-                done = n - len(todo)        # cached files are already done
-                workers = self._warm_workers(len(todo))
-                if progress is not None:
-                    progress(done, n, "", f"loading ({workers} in parallel)")
-                if todo:
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        futs = {ex.submit(self._read_compute, p, animal): p
-                                for p in todo}
-                        for fut in as_completed(futs):
-                            p = futs[fut]
-                            try:
-                                self._write_payload(conn, fut.result())
-                                conn.commit()   # per file -> dashboard reads
-                                built += 1        # mid-warm
-                            except Exception as e:  # noqa: BLE001
-                                try:
-                                    conn.rollback()
-                                except sqlite3.Error:
-                                    pass
-                                logger.warning("evoked warm: skipping %s: %s",
-                                               os.path.basename(p), e)
-                            done += 1
-                            if progress is not None:
-                                progress(done, n, p,
-                                         f"loading ({workers} in parallel)")
-            finally:
-                conn.close()
-        if progress is not None:
-            progress(n, n, "", "done")
-        return {"files": n, "built": built}
-
-    def _warm_workers(self, n_files: int) -> int:
-        """Worker-thread count for the parallel warm: config override, else
-        ~half the CPUs (capped), bounded by the file count."""
-        cpu = os.cpu_count() or 4
-        w = self.warm_workers if self.warm_workers else max(2, min(cpu, 6))
-        return max(1, min(int(w), max(1, n_files)))
-
-    def _build_one(self, conn, path: str, only_animal: str | None = None,
-                   on_phase=None) -> None:
-        """Serial build of one file (read+compute then write). The warm uses
-        the parallel ``_read_compute`` / ``_write_payload`` split instead;
-        this stays for the single-file / test path."""
-        if on_phase is not None:
-            on_phase("reading")
-        payload = self._read_compute(path, only_animal)
-        if on_phase is not None:
-            on_phase("saving")
-        self._write_payload(conn, payload)
-
-    def _read_compute(self, path: str,
-                      only_animal: str | None = None) -> dict:
-        """Read + feature-extract one file (scoped to *only_animal*) WITHOUT
-        touching the DB -- safe to run in a worker thread (h5py reads + numpy/
-        scipy feature math release the GIL). Heavy traces are reduced to the
-        small epoch/mean/trace rows here, so the returned payload is small and
-        the main thread just writes it (``_write_payload``)."""
-        rec_dt = parse_recording_dt(path)
-        rec_iso = rec_dt.isoformat() if rec_dt else ""
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = 0.0
-        channels = read_file_evoked(
-            path, [only_animal] if only_animal else None)
-        out: list = []
-        for ch, info in channels.items():
-            if not is_animal_channel(ch):
-                continue
-            animal, electrode = split_animal_electrode(ch)
-            erows, mrow, fs = self._channel_rows(None, animal, electrode,
-                                                 ch, info)
-            trow = (self._trace_row(None, animal, electrode, ch, info)
-                    if self.store_traces else None)
-            out.append((animal, electrode, ch, erows, mrow, fs, trow))
-        return {"path": path, "mtime": mtime, "rec_iso": rec_iso,
-                "only_animal": only_animal, "channels": out}
-
-    def _write_payload(self, conn, payload: dict) -> None:
-        """Write a ``_read_compute`` payload (main thread): upsert the file,
-        replace the (animal-scoped) rows, and stamp file_meta. The per-channel
-        rows were built with a None file_id placeholder, replaced here."""
-        file_id = self._upsert_file(conn, payload["path"], payload["mtime"],
-                                    payload["rec_iso"])
-        only = payload.get("only_animal")
-        if only:
-            where, args = "file_id = ? AND animal = ?", (file_id, only)
-        else:
-            where, args = "file_id = ?", (file_id,)
-        conn.execute(f"DELETE FROM epoch WHERE {where}", args)
-        conn.execute(f"DELETE FROM recording_mean WHERE {where}", args)
-        conn.execute(f"DELETE FROM epoch_trace WHERE {where}", args)
-        epoch_rows: list = []
-        mean_rows: list = []
-        trace_rows: list = []
-        n_total = 0
-        fs_seen = None
-        for (_a, _elec, _ch, erows, mrow, fs, trow) in payload["channels"]:
-            epoch_rows.extend((file_id,) + tuple(r[1:]) for r in erows)
-            n_total += len(erows)
-            if mrow is not None:
-                mean_rows.append((file_id,) + tuple(mrow[1:]))
-            if trow is not None:
-                trace_rows.append((file_id,) + tuple(trow[1:]))
-            fs_seen = fs_seen or fs
-        if epoch_rows:
-            ph = ",".join("?" * len(_EPOCH_COLS))
-            conn.executemany(
-                f"INSERT INTO epoch ({','.join(_EPOCH_COLS)}) VALUES ({ph})",
-                epoch_rows)
-        if mean_rows:
-            conn.executemany(
-                "INSERT INTO recording_mean (file_id, animal, channel, "
-                "time_axis, mean_trace, std_trace, n_epochs) "
-                "VALUES (?,?,?,?,?,?,?)", mean_rows)
-        if trace_rows:
-            conn.executemany(
-                "INSERT INTO epoch_trace (file_id, animal, channel, electrode,"
-                " t0_ms, dt_ms, n_samples, n_epochs, scale, stim_times, peaks,"
-                " troughs, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                trace_rows)
-        conn.execute(
-            "UPDATE file_meta SET n_epochs=?, fs=?, has_traces=? WHERE id=?",
-            (n_total, fs_seen, 1 if trace_rows else 0, file_id))
-
-    @staticmethod
-    def _trace_row(file_id, animal, electrode, ch, info):
-        """One epoch_trace insert tuple for a channel: the per-epoch traces
-        int16-encoded ([n_epochs x n_samples], C-order) + the time axis and
-        the per-epoch stim scalars, so a block is self-contained for the
-        Configure recompute. None when the channel has no traces."""
-        traces = info.get("traces")
-        time_ms = info.get("time_ms")
-        if traces is None or time_ms is None or traces.shape[0] < 1:
-            return None
-        try:
-            return ChronicEvokedCache._encode_trace_row(
-                file_id, animal, electrode, ch, info, traces, time_ms)
-        except Exception as e:  # noqa: BLE001 -- traces are best-effort
-            logger.warning("epoch_trace encode failed (%s): %s", ch, e)
-            return None
-
-    @staticmethod
-    def _encode_trace_row(file_id, animal, electrode, ch, info,
-                          traces, time_ms):
-        t = np.asarray(time_ms, dtype=np.float64).ravel()
-        tr = np.asarray(traces, dtype=np.float64)
-        # Optional time-decimation guard (keeps the cache bounded).
-        if tr.shape[1] > _MAX_TRACE_SAMPLES:
-            step = int(np.ceil(tr.shape[1] / _MAX_TRACE_SAMPLES))
-            tr = tr[:, ::step]
-            t = t[::step]
-        scale = max(1e-9, float(np.nanmax(np.abs(tr)))) / _INT16_HEADROOM
-        q = np.clip(np.round(np.nan_to_num(tr) / scale),
-                    -32768, 32767).astype("<i2")
-        dt = float(np.mean(np.diff(t))) if t.size >= 2 else 0.0
-        times = info.get("times") or []
-        sp = info.get("stim_peak") or []
-        st = info.get("stim_trough") or []
-        return (file_id, animal, ch, electrode, float(t[0]), dt,
-                int(tr.shape[1]), int(tr.shape[0]), scale,
-                json.dumps(_round(list(times))), json.dumps(_round(list(sp))),
-                json.dumps(_round(list(st))), q.tobytes())
-
-    def _channel_rows(self, file_id, animal, electrode, ch, info):
-        """Epoch insert tuples + a recording_mean tuple for one channel.
-
-        Returns ``(epoch_rows, recording_mean_row_or_None, fs_or_None)``.
-        """
-        times = info.get("times") or []
-        sp = info.get("stim_peak") or []
-        st = info.get("stim_trough") or []
-        traces = info.get("traces")
-        time_ms = info.get("time_ms")
-        feats, fs, mrow = None, None, None
-        if traces is not None and time_ms is not None and traces.shape[0] >= 1:
-            fs = 1000.0 / float(np.mean(np.diff(time_ms)))
-            feats = ef.compute_all(traces, time_ms, fs, self.compute_expensive)
-            mrow = self._mean_row(file_id, animal, ch, traces, time_ms)
-        n = min(len(times), len(sp), len(st))
-        if traces is not None:
-            n = min(n, traces.shape[0])
-        rows = self._epoch_tuples(file_id, animal, electrode, ch,
-                                  times, sp, st, feats, n)
-        return rows, mrow, fs
-
-    @staticmethod
-    def _mean_row(file_id, animal, ch, traces, time_ms):
-        mean_tr = np.nanmean(traces, axis=0)
-        std_tr = np.nanstd(traces, axis=0)
-        t, m, s = _downsample(time_ms, mean_tr, std_tr, _MEAN_TRACE_POINTS)
-        return (file_id, animal, ch, json.dumps(_round(t)),
-                json.dumps(_round(m)), json.dumps(_round(s)),
-                int(traces.shape[0]))
-
-    @staticmethod
-    def _epoch_tuples(file_id, animal, electrode, ch, times, sp, st, feats, n):
-        rows = []
-        for j in range(n):
-            assert j < _MAX_FILES * 100, "epoch loop exceeds bound"
-            base = [file_id, animal, electrode, ch, _num(times[j]),
-                    _num(sp[j]), _num(st[j])]
-            if feats is None:
-                base.extend([None] * len(ef.ALL_COLUMNS))
-            else:
-                base.extend(_num(feats[c][j]) for c in ef.ALL_COLUMNS)
-            rows.append(tuple(base))
-        return rows
-
-    @staticmethod
-    def _upsert_file(conn, path, mtime, rec_iso) -> int:
-        """Insert/refresh the file_meta row, returning its integer id.
-
-        Idempotent: ``INSERT OR IGNORE`` never collides on the file_path
-        UNIQUE, then we set the fresh values and read the id back -- safe
-        even if two builders touch the same path.
-        """
-        now = datetime.now().isoformat()
-        session = parse_session(path)
-        conn.execute(
-            "INSERT OR IGNORE INTO file_meta (file_path, mtime, rec_dt, "
-            "built_at, session) VALUES (?,?,?,?,?)",
-            (path, mtime, rec_iso, now, session))
-        conn.execute(
-            "UPDATE file_meta SET mtime=?, rec_dt=?, built_at=?, session=? "
-            "WHERE file_path=?", (mtime, rec_iso, now, session, path))
-        row = conn.execute("SELECT id FROM file_meta WHERE file_path = ?",
-                           (path,)).fetchone()
-        assert row is not None, "file_meta upsert lost its row"
-        return int(row["id"])
-
-    def list_sessions(self, animal: str) -> list[str]:
-        """Distinct session labels for *animal* (sorted)."""
-        if not animal or not self._has_session:
-            return []
-        conn = self._conn()
-        try:
-            rows = conn.execute(
-                "SELECT DISTINCT m.session FROM epoch e "
-                "JOIN file_meta m ON e.file_id = m.id "
-                "WHERE e.animal = ? AND m.session IS NOT NULL "
-                "ORDER BY m.session", (animal,)).fetchall()
-        finally:
-            conn.close()
-        return [r["session"] for r in rows if r["session"]]
-
-    def query(self, animal: str, hours: int | None = None,
-              sessions: list | None = None) -> list[dict]:
-        """Per-epoch rows for *animal*, oldest first (optionally last N h).
-
-        ``abs_dt`` (recording time + stim offset) is computed here from the
-        joined ``rec_dt``; ``hours`` filters on recording datetime;
-        ``sessions`` (a list of session labels) restricts to those sessions
-        (combining several when more than one is given). Each dict carries
-        channel/electrode/rec_dt/abs_dt/stim_time_sec/session, the raw stim
-        ``peak``/``trough``, and every computed evoked feature column.
-        """
-        if not animal:
-            return []
-        feat_sel = ", ".join("e." + c for c in ef.ALL_COLUMNS)
-        sess_sel = "m.session" if self._has_session else "NULL AS session"
-        use_sessions = sessions if self._has_session else None
-        conn = self._conn()
-        try:
-            sql = ("SELECT e.channel, e.electrode, m.rec_dt, " + sess_sel +
-                   ", e.stim_time_sec, e.peak, e.trough, " + feat_sel +
-                   " FROM epoch e JOIN file_meta m ON e.file_id = m.id "
-                   "WHERE e.animal = ?")
-            params: list = [animal]
-            sql, params = _add_time_session(sql, params, hours, use_sessions)
-            sql += " ORDER BY m.rec_dt ASC, e.stim_time_sec ASC"
-            rows = conn.execute(sql, params).fetchall()
-        finally:
-            conn.close()
-        return [self._row_to_dict(r) for r in rows]
-
-    def query_recording_means(self, animal: str,
-                              hours: int | None = None,
-                              sessions: list | None = None) -> list[dict]:
-        """Per-recording mean/std evoked waveforms for *animal*, oldest first.
-
-        Each dict: channel, rec_dt, n_epochs, and ``time_axis``/``mean_trace``/
-        ``std_trace`` decoded back to Python float lists. ``sessions`` filters
-        to the given session labels.
-        """
-        if not animal:
-            return []
-        conn = self._conn()
-        try:
-            sql = ("SELECT rm.channel, m.rec_dt, rm.n_epochs, rm.time_axis, "
-                   "rm.mean_trace, rm.std_trace "
-                   "FROM recording_mean rm "
-                   "JOIN file_meta m ON rm.file_id = m.id "
-                   "WHERE rm.animal = ?")
-            params: list = [animal]
-            use_sessions = sessions if self._has_session else None
-            sql, params = _add_time_session(sql, params, hours, use_sessions)
-            sql += " ORDER BY m.rec_dt ASC"
-            rows = conn.execute(sql, params).fetchall()
-        finally:
-            conn.close()
-        return [_mean_row_to_dict(r) for r in rows]
-
-    def query_epoch_traces(self, animal: str, hours: int | None = None,
-                           sessions: list | None = None) -> list[dict]:
-        """Per-(file, channel) trace blocks for *animal*, oldest first.
-
-        Each block decodes the int16 BLOB back to ``traces`` [n_epochs x
-        n_samples] float, with ``time_ms``, ``rec_dt``, ``session``, and the
-        per-epoch ``stim_times``/``peaks``/``troughs``. This feeds the
-        Configure recompute (window/filter/smooth/baseline) from raw epochs.
-        """
-        if not animal:
-            return []
-        conn = self._conn()
-        try:
-            sess_sel = "m.session" if self._has_session else "NULL AS session"
-            sql = ("SELECT et.channel, et.electrode, m.rec_dt, " + sess_sel +
-                   ", et.t0_ms, et.dt_ms, et.n_samples, et.n_epochs, "
-                   "et.scale, et.stim_times, et.peaks, et.troughs, et.data "
-                   "FROM epoch_trace et JOIN file_meta m ON et.file_id = m.id "
-                   "WHERE et.animal = ?")
-            params: list = [animal]
-            use_sessions = sessions if self._has_session else None
-            sql, params = _add_time_session(sql, params, hours, use_sessions)
-            sql += " ORDER BY m.rec_dt ASC, et.channel ASC"
-            rows = conn.execute(sql, params).fetchall()
-        finally:
-            conn.close()
-        return [self._trace_row_to_dict(r) for r in rows
-                if r["data"] is not None]
-
-    @staticmethod
-    def _trace_row_to_dict(r) -> dict:
-        n_ep, n_s = int(r["n_epochs"]), int(r["n_samples"])
-        scale = float(r["scale"] or 1.0)
-        q = np.frombuffer(r["data"], dtype="<i2")
-        traces = (q.astype(np.float64).reshape(n_ep, n_s) * scale
-                  if q.size == n_ep * n_s else np.zeros((0, n_s)))
-        t0, dt = float(r["t0_ms"] or 0.0), float(r["dt_ms"] or 0.0)
-        time_ms = t0 + dt * np.arange(n_s, dtype=np.float64)
-        return {
-            "channel": r["channel"], "electrode": r["electrode"],
-            "rec_dt": r["rec_dt"], "session": r["session"],
-            "traces": traces, "time_ms": time_ms,
-            "stim_times": json.loads(r["stim_times"] or "[]"),
-            "peaks": json.loads(r["peaks"] or "[]"),
-            "troughs": json.loads(r["troughs"] or "[]"),
-        }
-
-    @staticmethod
-    def _row_to_dict(r) -> dict:
-        """Add abs_dt to a queried epoch row."""
-        d = dict(r)
-        d["abs_dt"] = _add_seconds(d.get("rec_dt"), d.get("stim_time_sec"))
-        return d
+    assert path and animal, "path and animal required"
+    chans = read_file_evoked(path, only_animals=[animal])
+    rec_iso = (parse_recording_dt(path) or datetime.min).isoformat()
+    session = parse_session(path)
+    rows: list = []
+    for ch, rec in chans.items():
+        a, electrode = split_animal_electrode(ch)
+        if a != animal or not is_animal_channel(ch):
+            continue
+        traces, tms = rec.get("traces"), rec.get("time_ms")
+        if traces is None or tms is None or len(traces) < 1 or tms.size < 2:
+            continue
+        fs = 1000.0 / float(np.mean(np.diff(tms)))
+        feats = ef.compute_all(traces, tms, fs, expensive, cfg)
+        times = rec.get("times") or []
+        pk, tr = rec.get("stim_peak") or [], rec.get("stim_trough") or []
+        for j in range(traces.shape[0]):
+            st = times[j] if j < len(times) else None
+            row = {"channel": ch, "electrode": electrode, "rec_dt": rec_iso,
+                   "session": session, "stim_time_sec": st,
+                   "abs_dt": _abs_dt(rec_iso, st),
+                   "peak": pk[j] if j < len(pk) else None,
+                   "trough": tr[j] if j < len(tr) else None}
+            for col in ef.ALL_COLUMNS:
+                v = float(feats[col][j])
+                row[col] = v if np.isfinite(v) else None
+            rows.append(row)
+    rows.sort(key=lambda r: r.get("abs_dt") or "")
+    return rows

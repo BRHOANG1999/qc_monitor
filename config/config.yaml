@@ -303,29 +303,20 @@ slow_gamma:
 
 # Chronic Evoked Analyzer tab: reads one implanted animal's full evoked
 # history (per stimulus) from the MATLAB toolkit's evokedOutput folder.
-# First read of an animal warms a compact sqlite cache; later reads are
-# instant. evoked_output_dir defaults to <stimnet_root>/evokedOutput.
+# Features are computed once per recording and stored as JSON sidecars next to
+# each *_evoked.mat (no database); later reads are instant. evoked_output_dir
+# defaults to <stimnet_root>/evokedOutput.
 chronic_evoked:
   evoked_output_dir: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/evokedOutput
-  cache_db: data/evoked_chronic_cache.db
   # Compute the heavy per-epoch features (recovery tau/slope, template
-  # correlation, PCA recon error, AC width, exp-fit A). Off = fast warm with
-  # the cheap vectorized features only. To enable: set true AND re-warm with
+  # correlation, PCA recon error, AC width, exp-fit A). Off = the cheap
+  # vectorized features only. To enable: set true AND rebuild the sidecars with
   # `python tools/warm_evoked_cache.py --expensive`.
   compute_expensive: false
-  # Parallel warm: files are read + feature-extracted in this many worker
-  # threads (the main thread writes to sqlite). 0 = auto (~min(CPUs, 6)).
-  warm_workers: 0
-  # Cache the per-epoch traces needed by the Configure panel's feature
-  # recompute. OFF by default: a chronic session has tens of thousands of
-  # epochs, so storing the int16 trace BLOBs adds minutes + GBs to a load.
-  # Turn on ONLY if you use Configure (window/filter/smoothing/baseline), then
-  # "Reload from disk" to backfill traces.
-  store_traces: false
   # "Configure" defaults (the analyzer's processing panel; mirrors the MATLAB
   # ChronicTabController config dialog / ChronicTabState defaults). These seed
-  # the in-tab controls; features are recomputed from the cached per-epoch
-  # traces when the user changes any of them. window_*_ms null = use the full
+  # the in-tab controls; features are recomputed from the raw epoch traces
+  # when the user changes any of them. window_*_ms null = use the full
   # extracted window (the toolkit's traces are already filtered + baseline-
   # corrected, so the defaults are a pass-through = today's behavior).
   configure:
