@@ -39,6 +39,7 @@ from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.evoked_output import (
     ChronicEvokedCache, DEFAULT_EVOKED_DIR, DEFAULT_CACHE_DB, list_animals,
     list_evoked_files, parse_recording_dt, parse_session, read_file_evoked,
+    read_feature_sidecar, write_feature_sidecar,
     animals_in_filename, sessions_for_animal, sessions_with_dt_for_animal)
 
 # Feature dropdown = every cached evoked feature, friendly labels from the
@@ -285,6 +286,16 @@ def layout(store):
                                   "(picks up new/changed files). ▶ Plot "
                                   "already loads automatically."),
             ], style={"flex": "0 0 150px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
+                html.Button("⬇ Export CSV", id="chronic-export-btn",
+                            n_clicks=0, style=_BTN_STYLE,
+                            title="Download the per-epoch features for the "
+                                  "current animal / session(s) as CSV. Uses "
+                                  "the loaded data (Plot warms the full "
+                                  "history; otherwise the latest recording)."),
+            ], style={"flex": "0 0 130px"}),
+            dcc.Download(id="chronic-export-dl"),
         ], style={"display": "flex", "gap": "14px", "marginBottom": "10px",
                   "flexWrap": "wrap"}),
 
@@ -653,6 +664,31 @@ def register_callbacks(app, store, config: dict) -> None:
         # Load finished: stop polling + bump ▶ Plot so the data plots itself.
         return ("Loaded — plotting.", True, int(load_clicks or 0) + 1)
 
+    # Export: download the current selection's per-epoch features as CSV.
+    @app.callback(
+        Output("chronic-export-dl", "data"),
+        Output("chronic-status", "children", allow_duplicate=True),
+        Input("chronic-export-btn", "n_clicks"),
+        State("chronic-animal-dropdown", "value"),
+        State("chronic-session-dropdown", "value"),
+        State("chronic-config", "data"),
+        prevent_initial_call=True,
+    )
+    def _export(_n, animal, sessions, cfg_dict):
+        from dash import no_update
+        if not animal:
+            return no_update, "Pick an animal, then ⬇ Export CSV."
+        try:
+            rows, note = _export_rows(animal, sessions or None, cfg_dict)
+        except Exception as e:  # noqa: BLE001 -- surface, never crash UI
+            return no_update, f"Export failed: {e}"
+        if not rows:
+            return no_update, (f"No features to export for {animal}. "
+                               f"Preview or ▶ Plot first.")
+        fname = f"{animal}_evoked_features.csv"
+        return (dict(content=_rows_to_csv(rows), filename=fname),
+                f"Exported {len(rows)} epoch rows to {fname}.{note}")
+
     # One lazy compute callback per expandable section (factory-registered).
     for key, _title, target, prop in _SECTIONS:
         _register_section(app, key, target, prop)
@@ -891,6 +927,14 @@ def _build_preview(animal, sessions, feature, cfg_dict, overlays,
     if not rows:
         return (empty_fig(f"{fname} has no readable epochs for {animal}."),
                 f"Preview · {fname} · no epochs.", "")
+    # Persist this recording's features beside the source .mat (only for the
+    # default feature config -- a custom Configure window is a transient view,
+    # not the canonical export). Best-effort; never break the preview.
+    if cfg.is_passthrough():
+        try:
+            write_feature_sidecar(path, animal, rows)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("sidecar write failed for %s: %s", fname, e)
     pts = _feature_points(rows, feature)
     status = (f"Preview · {fname} · {len(rows)} epochs from 1 recording · "
               f"{len(pts[0])} with {_label(feature)}. ▶ Plot loads the full "
@@ -902,6 +946,83 @@ def _build_preview(animal, sessions, feature, cfg_dict, overlays,
     fig.update_layout(title=f"PREVIEW (1 recording, {len(rows)} epochs) — "
                             f"{_label(feature)} · {fname}")
     return (fig, status, _trend_stats(pts, feature))
+
+
+# Cold export (no warm cache, no sidecars) computes features file-by-file in
+# the request thread; cap it so an unwarmed full-animal export can't hang the
+# UI. Sidecars (written by Preview) + a warmed cache make larger exports
+# instant, so this bound only bites a truly cold, broad selection.
+_EXPORT_MAX_COMPUTE = 12
+
+
+def _selection_files(animal: str, sessions) -> list:
+    """evokedOutput files for *animal* (optionally restricted to *sessions*),
+    oldest recording first."""
+    assert animal, "animal required"
+    sset = set(sessions) if sessions else None
+    out: list = []
+    for i, f in enumerate(list_evoked_files(_EVOKED_DIR)):
+        assert i < 1000000, "evoked file scan runaway"
+        if animal not in animals_in_filename(f):
+            continue
+        if sset is not None and parse_session(f) not in sset:
+            continue
+        out.append(f)
+    return sorted(out, key=lambda f: parse_recording_dt(f) or datetime.min)
+
+
+def _export_rows(animal: str, sessions, cfg_dict) -> tuple:
+    """Per-epoch feature rows for the selection -> (rows, note).
+
+    Cache first (instant when ▶ Plot warmed it). Otherwise sidecar-first per
+    file (Preview writes those), computing+writing at most
+    ``_EXPORT_MAX_COMPUTE`` missing files so a cold export never hangs.
+    """
+    assert animal, "animal required"
+    cfg = ef.FeatureConfig.from_dict(cfg_dict)
+    cached = _query_for_selection({"animal": animal, "sessions": sessions,
+                                   "config": cfg_dict}, need_means=False)[0]
+    if cached:
+        return cached, ""
+    files = _selection_files(animal, sessions)
+    rows: list = []
+    computed = 0
+    skipped = 0
+    for fp in files:
+        sc = read_feature_sidecar(fp, animal) if cfg.is_passthrough() else None
+        if sc is None:
+            if computed >= _EXPORT_MAX_COMPUTE:
+                skipped += 1
+                continue
+            sc = _preview_rows(fp, animal, cfg)
+            computed += 1
+            if cfg.is_passthrough() and sc:
+                try:
+                    write_feature_sidecar(fp, animal, sc)
+                except Exception:  # noqa: BLE001 -- export is best-effort
+                    pass
+        rows.extend(sc)
+    rows.sort(key=lambda r: r.get("abs_dt") or "")
+    note = ("" if not skipped else
+            f" ({skipped} recording(s) skipped — ▶ Plot to warm the full "
+            f"history, then re-export).")
+    return rows, note
+
+
+def _rows_to_csv(rows: list) -> str:
+    """Per-epoch feature rows -> CSV text (metadata columns + every feature)."""
+    import csv
+    import io
+    assert isinstance(rows, list), "rows must be a list"
+    meta = ["channel", "electrode", "rec_dt", "session", "stim_time_sec",
+            "abs_dt", "peak", "trough"]
+    cols = meta + list(ef.ALL_COLUMNS)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([r.get(c) for c in cols])
+    return buf.getvalue()
 
 
 def _feature_points(rows, feature):

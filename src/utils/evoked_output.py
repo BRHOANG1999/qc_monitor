@@ -238,6 +238,65 @@ def list_animals(evoked_dir: str) -> list[str]:
     return sorted(seen)
 
 
+# Per-epoch feature sidecar: a small JSON written next to each *_evoked.mat,
+# one per animal, holding that animal's computed feature rows. It co-locates
+# the derived features with their source so the chronic view can read them
+# WITHOUT re-reading the heavy traces or warming the sqlite cache -- and it
+# doubles as the on-disk export. Bump the version if the row schema changes.
+_FEATURE_SIDECAR_VERSION = "1"
+
+
+def feature_sidecar_path(mat_path: str, animal: str) -> str:
+    """Path of *animal*'s per-epoch feature sidecar next to a *_evoked.mat."""
+    assert mat_path and animal, "mat_path and animal required"
+    base = mat_path[:-4] if mat_path.lower().endswith(".mat") else mat_path
+    return f"{base}.features.{animal}.json"
+
+
+def write_feature_sidecar(mat_path: str, animal: str, rows: list) -> str:
+    """Atomically write *animal*'s feature rows beside the source .mat as
+    JSON, stamped with the source mtime so a stale sidecar is detectable."""
+    assert mat_path and animal, "mat_path and animal required"
+    assert isinstance(rows, list), "rows must be a list"
+    sp = feature_sidecar_path(mat_path, animal)
+    try:
+        src_mtime = os.path.getmtime(mat_path)
+    except OSError:
+        src_mtime = 0.0
+    payload = {"version": _FEATURE_SIDECAR_VERSION, "animal": animal,
+               "source": os.path.basename(mat_path), "source_mtime": src_mtime,
+               "columns": list(ef.ALL_COLUMNS), "rows": rows}
+    tmp = sp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, sp)        # atomic on the same volume
+    return sp
+
+
+def read_feature_sidecar(mat_path: str, animal: str) -> list | None:
+    """*animal*'s feature rows from the sidecar, or None when it's missing,
+    unreadable, a different schema version, or stale (source .mat changed)."""
+    assert mat_path and animal, "mat_path and animal required"
+    sp = feature_sidecar_path(mat_path, animal)
+    if not os.path.exists(sp):
+        return None
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if payload.get("version") != _FEATURE_SIDECAR_VERSION:
+        return None
+    try:
+        if abs(float(payload.get("source_mtime", -1.0))
+               - os.path.getmtime(mat_path)) > 1e-6:
+            return None
+    except OSError:
+        return None
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else None
+
+
 def read_file_evoked(path: str,
                      only_animals: list | None = None) -> dict[str, dict]:
     """Per-channel data for one ``*_evoked.mat`` (h5py read).

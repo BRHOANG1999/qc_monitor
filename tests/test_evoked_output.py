@@ -146,5 +146,26 @@ def test_epoch_trace_cache_roundtrip(tmp_path):
     assert len(b["stim_times"]) == 6 and b["peaks"][0] == pytest.approx(1.0)
 
 
+def test_feature_sidecar_roundtrip_and_guards(tmp_path):
+    from src.utils.evoked_output import (
+        feature_sidecar_path, read_feature_sidecar, write_feature_sidecar)
+    mat = tmp_path / "s__BCH062SLM___2026_05_10__06_00_00_evoked.mat"
+    mat.write_bytes(b"raw")
+    rows = [{"channel": "BCH062SLM", "abs_dt": "2026-05-10T06:00:01",
+             "line_length": 238.0}]
+    sp = write_feature_sidecar(str(mat), "BCH062", rows)
+    assert sp == feature_sidecar_path(str(mat), "BCH062")
+    assert sp.endswith(".features.BCH062.json")
+    # Round-trips; a different animal has no sidecar.
+    assert read_feature_sidecar(str(mat), "BCH062") == rows
+    assert read_feature_sidecar(str(mat), "BCH999") is None
+    # Source change -> the sidecar reads as stale (None), not wrong data.
+    import os
+    import time
+    future = time.time() + 10
+    os.utime(str(mat), (future, future))
+    assert read_feature_sidecar(str(mat), "BCH062") is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
