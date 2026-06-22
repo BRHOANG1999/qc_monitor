@@ -70,6 +70,31 @@ def _label(col: str) -> str:
     return EVOKED_FEATURE_LABELS.get(col, col.replace("_", " ").title())
 
 
+def _window_summary(cfg_dict) -> str:
+    """One-line description of the time window + processing the features are
+    computed over, for the banner above the plot. Reflects the live Configure
+    state: default = full extracted trace + toolkit defaults."""
+    cfg = ef.FeatureConfig.from_dict(cfg_dict)
+    ws, we = cfg.window_start_ms, cfg.window_end_ms
+    if ws is None and we is None:
+        win = "full extracted trace"
+    else:
+        lo = f"{ws:g}" if ws is not None else "trace start"
+        hi = f"{we:g}" if we is not None else "trace end"
+        win = f"{lo}–{hi} ms"
+    proc = []
+    if cfg.bandpass:
+        proc.append(f"bandpass {cfg.bp_low_hz:g}–{cfg.bp_high_hz:g} Hz")
+    if cfg.notch:
+        proc.append(f"notch {cfg.notch_hz:g} Hz")
+    if cfg.smoothing:
+        proc.append(f"smoothing {cfg.smooth_ms:g} ms")
+    if cfg.baseline:
+        proc.append("baseline")
+    tail = " · ".join(proc) if proc else "toolkit defaults"
+    return f"Computing features over: {win} · {tail}"
+
+
 # No sqlite cache: features live in per-(recording, animal) JSON sidecars next
 # to each *_evoked.mat in evokedOutput. The render path reads those sidecars
 # (computing+writing any missing in a background "load"); the heavy trace reads
@@ -281,6 +306,18 @@ def layout(store):
                     inputStyle={"marginRight": "5px"}),
             ], style={"flex": "0 0 150px"}),
             html.Div([
+                html.Label("View", style=LABEL_STYLE),
+                dcc.RadioItems(
+                    id="chronic-view-mode",
+                    options=[{"label": "Density", "value": "density"},
+                             {"label": "Scatter", "value": "scatter"}],
+                    value="density", inline=True, style={"fontSize": "12px"},
+                    labelStyle={"color": "#cfd0d6", "marginRight": "10px",
+                                "display": "inline-flex",
+                                "alignItems": "center"},
+                    inputStyle={"marginRight": "5px"}),
+            ], style={"flex": "0 0 150px"}),
+            html.Div([
                 html.Label(" ", style=LABEL_STYLE),
                 html.Button("👁 Preview", id="chronic-preview-btn", n_clicks=0,
                             style=_BTN_STYLE,
@@ -347,6 +384,10 @@ def layout(store):
         html.Div(id="chronic-trend-stats",
                  style={"color": "#cfd0d6", "fontSize": "12px",
                         "minHeight": "16px", "marginBottom": "6px"}),
+        # Live indicator of the window/processing features are computed over.
+        html.Div(id="chronic-window-info", children=_window_summary(None),
+                 style={"color": "#7f8290", "fontSize": "11px",
+                        "fontStyle": "italic", "marginBottom": "6px"}),
         # Primary plot -- always rendered on ▶ Plot.
         dcc.Loading(
             custom_spinner=loading_icon("Plotting…"),
@@ -560,6 +601,16 @@ def register_callbacks(app, store, config: dict) -> None:
             "smoothing": on(sm), "smooth_ms": sms or 5.0,
         }
 
+    # Live banner: which window + processing features are computed over. Driven
+    # by chronic-config (populated on load), so it's correct from first render
+    # and updates the instant the user edits Configure -- before ▶ Plot.
+    @app.callback(
+        Output("chronic-window-info", "children"),
+        Input("chronic-config", "data"),
+    )
+    def _window_banner(cfg):
+        return _window_summary(cfg)
+
     # Primary render: only the feature-vs-time plot + trend stats. Captures
     # the current selection into chronic-selection so the expandable sections
     # can re-query lazily. Fires only on ▶ Plot / ↻ Refresh.
@@ -578,6 +629,7 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-hours-dropdown", "value"),
         State("chronic-trend-toggles", "value"),
         State("chronic-event-toggles", "value"),
+        State("chronic-view-mode", "value"),
         State("chronic-window-hours", "value"),
         State("chronic-window-scroll", "value"),
         State("chronic-roll-window", "value"),
@@ -585,8 +637,8 @@ def register_callbacks(app, store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _update(_load, _refresh, _preview, animal, sessions, feature, hours,
-                overlays, event_overlays, win_hours, scroll, roll_window,
-                cfg_dict):
+                overlays, event_overlays, view_mode, win_hours, scroll,
+                roll_window, cfg_dict):
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
@@ -659,7 +711,8 @@ def register_callbacks(app, store, config: dict) -> None:
         events = (_onset_events_for_animal(config, animal)
                   if event_overlays and "onsets" in event_overlays else None)
         return (_build_feature_scatter(pts, feature, animal, overlays or [],
-                                       roll_window, events),
+                                       roll_window, events,
+                                       view_mode or "density"),
                 _trend_stats(pts, feature), status, sel, not keep_poll)
 
     # Live load feedback: while an off-thread load runs, update progress; when
@@ -958,7 +1011,9 @@ def _build_preview(animal, sessions, feature, cfg_dict, overlays,
     if not pts[0]:
         return (empty_fig(f"No {_label(feature)} values in this preview."),
                 status, "")
-    fig = _build_feature_scatter(pts, feature, animal, overlays, roll_window)
+    # One recording is sparse -> show individual epochs (scatter), not density.
+    fig = _build_feature_scatter(pts, feature, animal, overlays, roll_window,
+                                 None, "scatter")
     fig.update_layout(title=f"PREVIEW (1 recording, {len(rows)} epochs) — "
                             f"{_label(feature)} · {fname}")
     return (fig, status, _trend_stats(pts, feature))
@@ -1110,30 +1165,45 @@ def _onset_events_for_animal(config, animal: str) -> list:
 
 
 def _build_feature_scatter(pts, feature, animal, overlays,
-                            roll_window, events=None) -> go.Figure:
-    """Every evoked response (faded markers) + a sliding-window rolling
-    median line with two percentile ribbons: 10-90 (light) and 25-75
-    (darker). Optional linear/quad trend overlays + seizure-onset vlines."""
+                            roll_window, events=None,
+                            view="density") -> go.Figure:
+    """Per-epoch base layer (density heatmap by default, or a faded marker
+    cloud) + a sliding-window rolling median with 10-90 / 25-75 percentile
+    ribbons. Optional linear/quad trend overlays + seizure-onset vlines.
+
+    Density is the default for the all-epochs view: at ~10^5 epochs the marker
+    cloud is pure overplotting and ships up to _MAX_POINTS to the browser,
+    whereas a 2-D histogram's cost is ~independent of N and shows the spread.
+    """
     iso, secs, vals = pts
     label = _label(feature)
     order = np.argsort(secs)            # time-ascending for the ribbon
     iso_s = np.asarray(iso)[order]
     secs_s = secs[order]
     vals_s = vals[order]
-    step = _stride(len(secs_s), _MAX_POINTS)
     fig = go.Figure()
-    # Faded raw responses so the ribbon reads on top.
-    fig.add_trace(go.Scattergl(
-        x=iso_s[::step], y=vals_s[::step], mode="markers",
-        marker=dict(size=3, color="#8a8d99", opacity=0.25),
-        name="responses", hoverinfo="x+y"))
+    if view == "scatter":
+        step = _stride(len(secs_s), _MAX_POINTS)
+        fig.add_trace(go.Scattergl(
+            x=iso_s[::step], y=vals_s[::step], mode="markers",
+            marker=dict(size=3, color="#8a8d99", opacity=0.25),
+            name="responses", hoverinfo="x+y"))
+        mode_note = " (markers stride-sampled)" if step > 1 else ""
+    else:
+        fig.add_trace(go.Histogram2d(
+            x=iso_s, y=vals_s, nbinsx=240, nbinsy=80,
+            colorscale="Viridis", zsmooth=False,
+            colorbar=dict(title=dict(text="epochs", font=dict(size=9)),
+                          thickness=10, len=0.7, x=1.005),
+            hovertemplate="%{x}<br>%{y}<br>%{z} epochs<extra></extra>",
+            name="density"))
+        mode_note = " (density)"
     _add_ribbon(fig, secs_s, vals_s, roll_window)
     _add_trend_overlays(fig, iso_s, secs_s, vals_s, overlays)
     n_onsets = _add_onset_lines(fig, events, secs_s, vals_s)
-    note = " (markers stride-sampled)" if step > 1 else ""
     onset_note = f" · {n_onsets} seizure onset(s)" if n_onsets else ""
     fig.update_layout(
-        title=f"{label} per evoked response — {animal}{note}{onset_note}",
+        title=f"{label} per evoked response — {animal}{mode_note}{onset_note}",
         xaxis_title="Recording time", yaxis_title=label,
         height=460, hovermode="closest", showlegend=True,
         legend=dict(font=dict(size=10), orientation="h", y=1.02,
