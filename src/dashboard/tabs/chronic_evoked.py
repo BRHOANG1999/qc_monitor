@@ -270,6 +270,17 @@ def layout(store):
                     inputStyle={"marginRight": "5px"}),
             ], style={"flex": "0 0 260px"}),
             html.Div([
+                html.Label("Overlays", style=LABEL_STYLE),
+                dcc.Checklist(
+                    id="chronic-event-toggles",
+                    options=[{"label": "Seizure onsets", "value": "onsets"}],
+                    value=[], inline=True, style={"fontSize": "12px"},
+                    labelStyle={"color": "#cfd0d6",
+                                "display": "inline-flex",
+                                "alignItems": "center"},
+                    inputStyle={"marginRight": "5px"}),
+            ], style={"flex": "0 0 150px"}),
+            html.Div([
                 html.Label(" ", style=LABEL_STYLE),
                 html.Button("👁 Preview", id="chronic-preview-btn", n_clicks=0,
                             style=_BTN_STYLE,
@@ -566,6 +577,7 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-feature-dropdown", "value"),
         State("chronic-hours-dropdown", "value"),
         State("chronic-trend-toggles", "value"),
+        State("chronic-event-toggles", "value"),
         State("chronic-window-hours", "value"),
         State("chronic-window-scroll", "value"),
         State("chronic-roll-window", "value"),
@@ -573,7 +585,8 @@ def register_callbacks(app, store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _update(_load, _refresh, _preview, animal, sessions, feature, hours,
-                overlays, win_hours, scroll, roll_window, cfg_dict):
+                overlays, event_overlays, win_hours, scroll, roll_window,
+                cfg_dict):
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
@@ -643,8 +656,10 @@ def register_callbacks(app, store, config: dict) -> None:
             return (empty_fig(f"No {_label(feature)} values for {animal} "
                               f"in this selection."), "", status, sel,
                     not keep_poll)
+        events = (_onset_events_for_animal(config, animal)
+                  if event_overlays and "onsets" in event_overlays else None)
         return (_build_feature_scatter(pts, feature, animal, overlays or [],
-                                       roll_window),
+                                       roll_window, events),
                 _trend_stats(pts, feature), status, sel, not keep_poll)
 
     # Live load feedback: while an off-thread load runs, update progress; when
@@ -1046,11 +1061,59 @@ def _stride(n, cap):
     return (n // cap) + 1
 
 
+# Scored BHZ events change rarely; cache the full parse per CSV dir so the
+# onset overlay doesn't re-read ~200 CSVs on every Plot click.
+_SCORED_EVENTS_CACHE: dict = {"dir": None, "events": None}
+
+
+def _datenum_to_dt(dn):
+    """MATLAB datenum (days, epoch year 0) -> python datetime, or None."""
+    if dn is None:
+        return None
+    try:
+        from datetime import timedelta
+        return (datetime.fromordinal(int(dn)) + timedelta(days=dn % 1)
+                - timedelta(days=366))
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _onset_events_for_animal(config, animal: str) -> list:
+    """Deduped flagged seizure onsets for *animal* from the BHZ scored CSVs,
+    as ``[{dt, type, racine}]`` sorted by time. Best-effort: [] if the CSV
+    dir is unreachable / past_events disabled (the overlay just shows nothing).
+    """
+    if not animal:
+        return []
+    try:
+        from src.utils.past_events import (
+            bhz_csv_dir, load_scored_events, dedup_events)
+        d = bhz_csv_dir(config or {})
+        if not d or not os.path.isdir(d):
+            return []
+        cache = _SCORED_EVENTS_CACHE
+        if cache["dir"] != d:
+            cache["dir"], cache["events"] = d, load_scored_events(d)
+        evs = dedup_events([e for e in cache["events"]
+                            if e.get("animal") == animal])
+    except Exception as e:  # noqa: BLE001 -- overlay is optional
+        logger.debug("onset events load failed: %s", e)
+        return []
+    out = []
+    for e in evs:
+        dt = _datenum_to_dt(e.get("peak_stamp"))
+        if dt is not None:
+            out.append({"dt": dt, "type": e.get("type"),
+                        "racine": e.get("racine")})
+    out.sort(key=lambda r: r["dt"])
+    return out
+
+
 def _build_feature_scatter(pts, feature, animal, overlays,
-                            roll_window) -> go.Figure:
+                            roll_window, events=None) -> go.Figure:
     """Every evoked response (faded markers) + a sliding-window rolling
     median line with two percentile ribbons: 10-90 (light) and 25-75
-    (darker). Optional linear/quad trend overlays."""
+    (darker). Optional linear/quad trend overlays + seizure-onset vlines."""
     iso, secs, vals = pts
     label = _label(feature)
     order = np.argsort(secs)            # time-ascending for the ribbon
@@ -1066,14 +1129,52 @@ def _build_feature_scatter(pts, feature, animal, overlays,
         name="responses", hoverinfo="x+y"))
     _add_ribbon(fig, secs_s, vals_s, roll_window)
     _add_trend_overlays(fig, iso_s, secs_s, vals_s, overlays)
+    n_onsets = _add_onset_lines(fig, events, secs_s, vals_s)
     note = " (markers stride-sampled)" if step > 1 else ""
+    onset_note = f" · {n_onsets} seizure onset(s)" if n_onsets else ""
     fig.update_layout(
-        title=f"{label} per evoked response — {animal}{note}",
+        title=f"{label} per evoked response — {animal}{note}{onset_note}",
         xaxis_title="Recording time", yaxis_title=label,
         height=460, hovermode="closest", showlegend=True,
         legend=dict(font=dict(size=10), orientation="h", y=1.02,
                     yanchor="bottom"))
     return fig
+
+
+# Cap on how many onset vlines to draw -- above this the figure gets a shape
+# per line and reads as a solid band; an animal with hundreds of events in the
+# window is better served by the hover markers alone.
+_MAX_ONSET_LINES = 200
+
+
+def _add_onset_lines(fig, events, secs_sorted, vals_sorted) -> int:
+    """Draw a dashed vertical line at each flagged seizure onset that falls
+    inside the plotted time range, plus one hover/legend marker trace. Returns
+    how many onsets were in range (0 when *events* is None/empty)."""
+    if not events or secs_sorted.size == 0:
+        return 0
+    lo, hi = float(secs_sorted[0]), float(secs_sorted[-1])
+    in_range = [e for e in events if lo <= e["dt"].timestamp() <= hi]
+    if not in_range:
+        return 0
+    y_top = float(np.nanmax(vals_sorted))
+    if len(in_range) <= _MAX_ONSET_LINES:
+        for e in in_range:
+            fig.add_vline(x=e["dt"].isoformat(),
+                          line=dict(color="rgba(239,85,59,0.45)", width=1,
+                                    dash="dot"))
+    # Hover/legend markers at the top of the plot (always drawn, even when
+    # there are too many for individual lines).
+    fig.add_trace(go.Scatter(
+        x=[e["dt"].isoformat() for e in in_range],
+        y=[y_top] * len(in_range), mode="markers",
+        marker=dict(color="#EF553B", size=7, symbol="triangle-down"),
+        name="seizure onset",
+        text=[f"{e['dt']:%Y-%m-%d %H:%M}"
+              f"  {(e.get('type') or '?')}  Racine {e.get('racine')}"
+              for e in in_range],
+        hoverinfo="text"))
+    return len(in_range)
 
 
 def _add_ribbon(fig, secs_sorted, vals_sorted, roll_window) -> None:
