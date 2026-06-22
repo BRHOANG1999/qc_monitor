@@ -35,6 +35,11 @@ logger = logging.getLogger("qc_monitor.dashboard.auth")
 
 # Cloudflare's public-key set has a 1h refresh window; we cache it.
 _CERT_CACHE_TTL_SEC = 3600
+
+# Tolerance for server/Google clock skew when checking a token's iat/nbf/exp.
+# Without this, a host whose clock lags Google by even a second rejects every
+# freshly issued ID token with "token is not yet valid (iat)" -> a bare 403.
+_CLOCK_SKEW_LEEWAY_SEC = 30
 _cert_cache: dict[str, dict] = {}
 _cert_lock = threading.Lock()
 
@@ -91,6 +96,7 @@ def verify_cf_access_jwt(token: str, team_domain: str,
             algorithms=["RS256"],
             audience=audience,
             issuer=f"https://{team_domain}",
+            leeway=_CLOCK_SKEW_LEEWAY_SEC,
         )
         return claims
     except jwt.PyJWTError as e:
@@ -158,7 +164,8 @@ def verify_google_id_token(id_token: str, client_id: str) -> dict | None:
             return None
         public_key = jwt.algorithms.RSAAlgorithm.from_jwk(key_data)
         claims = jwt.decode(id_token, public_key, algorithms=["RS256"],
-                             audience=client_id)
+                             audience=client_id,
+                             leeway=_CLOCK_SKEW_LEEWAY_SEC)
         if claims.get("iss") not in _GOOGLE_ISSUERS:
             logger.warning("Google ID token bad issuer: %s",
                            claims.get("iss"))
