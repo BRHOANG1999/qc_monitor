@@ -457,6 +457,17 @@ def layout(store):
         ])),
         _expandable("circ", "Circadian (time of day)",
                     dcc.Graph(id="chronic-circadian-plot")),
+        _expandable("rhythm", "Rhythm / cycles (periodogram + phase)",
+                    html.Div([
+                        html.Div([
+                            html.Label("Period override (days, blank = "
+                                       "auto-detect dominant)", style=LABEL_STYLE),
+                            dcc.Input(id="chronic-rhythm-period", type="number",
+                                      value=None, min=0.25, step="any",
+                                      style={**_INPUT_STYLE, "maxWidth": "280px"}),
+                        ], style={"marginBottom": "6px"}),
+                        dcc.Graph(id="chronic-rhythm-plot"),
+                    ])),
         _expandable("table", "Per-recording table", dash_table.DataTable(
             id="chronic-stats-table", page_size=15, sort_action="native",
             columns=[{"name": c, "id": c} for c in
@@ -854,6 +865,39 @@ def register_callbacks(app, store, config: dict) -> None:
     # One lazy compute callback per expandable section (factory-registered).
     for key, _title, target, prop in _SECTIONS:
         _register_section(app, key, target, prop)
+
+    # Rhythm section gets its own callback (not the generic factory) so the
+    # plot recomputes live when the period override changes, not only on
+    # expand/collapse.
+    @app.callback(
+        Output("chronic-rhythm-plot", "figure"),
+        Output("chronic-rhythm-wrap", "style"),
+        Input("chronic-rhythm-btn", "n_clicks"),
+        Input("chronic-rhythm-period", "value"),
+        State("chronic-selection", "data"),
+        State("chronic-rhythm-wrap", "style"),
+        prevent_initial_call=True,
+    )
+    def _rhythm(_n, period, sel, style):
+        from dash import no_update
+        trig = callback_context.triggered_id
+        style = dict(style or {})
+        if trig == "chronic-rhythm-btn":
+            if style.get("display", "none") != "none":
+                style["display"] = "none"          # collapse; keep cached fig
+                return no_update, style
+            style["display"] = "block"
+        if style.get("display", "none") == "none":  # period changed while hidden
+            return no_update, no_update
+        if not sel or not sel.get("animal"):
+            return empty_fig("Click ▶ Plot first"), style
+        try:
+            rows, _means, _ = _query_for_selection(sel, need_means=False)
+            fig = _build_rhythm(rows, sel.get("feature") or _DEFAULT_FEATURE,
+                                period)
+        except Exception as e:  # noqa: BLE001 -- never crash the UI
+            fig = empty_fig("Couldn't compute rhythm", hint=str(e))
+        return fig, style
 
 
 # --------------------------------------------------------------------- #
@@ -1815,6 +1859,128 @@ def _rayleigh(angles):
     z = n * R * R
     p = float(np.exp(-z) * (1 + (2 * z - z * z) / (4 * n)))
     return R, min(1.0, max(0.0, p))
+
+
+# --------------------------------------------------------------------- #
+#  Rhythm / cycles: Lomb-Scargle periodogram + phase plot (Baud-style)
+# --------------------------------------------------------------------- #
+
+def _per_recording_series(rows, feature):
+    """Per-recording mean of *feature* -> (timestamps, values), time-ascending.
+    One robust value per recording is the right granularity for a days-scale
+    cycle estimate (per-epoch values are noisier and unevenly spaced)."""
+    grouped: "OrderedDict[str, list]" = OrderedDict()
+    for r in rows:
+        v = r.get(feature)
+        if v is not None and r.get("rec_dt"):
+            grouped.setdefault(r["rec_dt"], []).append(float(v))
+    pairs = []
+    for rd, vals in grouped.items():
+        dt = _parse_iso(rd)
+        if dt is not None:
+            pairs.append((dt.timestamp(), float(np.mean(vals))))
+    pairs.sort()
+    ts = np.array([p[0] for p in pairs], float)
+    y = np.array([p[1] for p in pairs], float)
+    return ts, y
+
+
+def _lomb_scargle(ts, y, pmin_d=0.25, pmax_cap=40.0, n=2000):
+    """Normalized Lomb-Scargle power over a period grid (handles the irregular
+    recording times). Returns (periods_d, power, dominant_period_d, span_d) or
+    None when the span is too short / the series is flat."""
+    assert ts.size == y.size, "ts/y length mismatch"
+    span_d = (ts[-1] - ts[0]) / 86400.0 if ts.size > 1 else 0.0
+    pmax = min(pmax_cap, span_d / 2.0)
+    if pmax <= pmin_d:
+        return None
+    yz = y - y.mean()
+    if yz.std() == 0:
+        return None
+    from scipy.signal import lombscargle
+    t_h = (ts - ts[0]) / 3600.0
+    periods = np.linspace(pmin_d, pmax, n)
+    ang = 2 * np.pi / (periods * 24.0)         # rad per hour
+    power = lombscargle(t_h, yz / yz.std(), ang, normalize=True)
+    return periods, power, float(periods[int(np.argmax(power))]), span_d
+
+
+def _phase_at_period(ts, y, period_d):
+    """Phase angle (rad) of each sample within a *period_d*-day cycle, plus a
+    modulation index in [0,1] = how strongly the feature locks to that phase."""
+    ang = 2 * np.pi * (((ts - ts[0]) / 86400.0) % period_d) / period_d
+    w = y - y.mean()
+    c, s = float(np.sum(w * np.cos(ang))), float(np.sum(w * np.sin(ang)))
+    denom = float(np.sum(np.abs(w))) or 1.0
+    return ang, float(np.hypot(c, s) / denom)
+
+
+def _phase_means(ang, y, nb=24):
+    """Mean *y* in each of *nb* phase bins -> (theta_deg, value) at bin centres."""
+    deg = np.degrees(ang)
+    bidx = np.floor(deg / (360.0 / nb)).astype(int) % nb
+    bx, by = [], []
+    for b in range(nb):
+        m = bidx == b
+        if np.any(m):
+            bx.append((b + 0.5) * (360.0 / nb))
+            by.append(float(np.mean(y[m])))
+    return bx, by
+
+
+def _build_rhythm(rows, feature, period_override) -> go.Figure:
+    """Lomb-Scargle periodogram (left) + polar phase plot at the dominant (or
+    overridden) period (right). The 'is there rhythm' view: the spectrum finds
+    the cycle, the phase plot shows the feature's modulation within it."""
+    from plotly.subplots import make_subplots
+    label = _label(feature)
+    ts, y = _per_recording_series(rows, feature)
+    if ts.size < 12:
+        return empty_fig(f"Only {int(ts.size)} recording(s) with {label} — a "
+                         f"rhythm estimate needs ≥12 over several days. Warm a "
+                         f"longer span first.")
+    ls = _lomb_scargle(ts, y)
+    if ls is None:
+        return empty_fig(f"{label}: span too short or series flat for a "
+                         f"periodogram (need a few days of recordings).")
+    periods, power, dom_p, span_d = ls
+    try:
+        p_over = float(period_override) if period_override else 0.0
+    except (TypeError, ValueError):
+        p_over = 0.0
+    period = p_over if p_over > 0 else dom_p
+    ang, mod = _phase_at_period(ts, y, period)
+    bx, by = _phase_means(ang, y)
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.55, 0.45],
+        specs=[[{"type": "xy"}, {"type": "polar"}]],
+        subplot_titles=(f"Lomb–Scargle periodogram · span {span_d:.0f} d",
+                        f"Phase at {period:.2f} d · modulation {mod:.2f}"))
+    fig.add_trace(go.Scatter(x=periods, y=power, mode="lines",
+                             line=dict(color="#5e7ce2"), name="power"),
+                  row=1, col=1)
+    fig.add_vline(x=period, line=dict(color="#ff453a", dash="dash"),
+                  row=1, col=1)
+    if periods[0] <= 1.0 <= periods[-1]:
+        fig.add_vline(x=1.0, line=dict(color="#30d158", dash="dot"),
+                      row=1, col=1)          # circadian reference
+    shift = -min(0.0, float(y.min()))
+    fig.add_trace(go.Scatterpolar(
+        theta=np.degrees(ang), r=y + shift, mode="markers",
+        marker=dict(size=4, color=np.degrees(ang), colorscale="Turbo",
+                    opacity=0.4), name="recordings"), row=1, col=2)
+    if bx:
+        fig.add_trace(go.Scatterpolar(
+            theta=bx + [bx[0]], r=[v + shift for v in by] + [by[0] + shift],
+            mode="lines", line=dict(color="#ff453a", width=2),
+            name="phase mean"), row=1, col=2)
+    over = f" · viewing {period:.2f} d" if abs(period - dom_p) > 1e-6 else ""
+    fig.update_layout(
+        height=420, showlegend=False,
+        title=f"{label} rhythm — dominant period {dom_p:.2f} d{over}")
+    fig.update_xaxes(title_text="Period (days)", row=1, col=1)
+    fig.update_yaxes(title_text="LS power", row=1, col=1)
+    return fig
 
 
 def _stats_table_rows(rows, feature) -> list:
