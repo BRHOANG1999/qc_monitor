@@ -36,6 +36,7 @@ from src.dashboard.data_helpers import (
     EVOKED_FEATURE_LABELS, TIME_RANGE_OPTIONS, empty_fig)
 from src.utils import evoked_features as ef
 from src.utils.animal import is_animal_channel, split_animal_electrode
+from src.utils.decimate import parse_relayout
 from src.utils.evoked_output import (
     DEFAULT_EVOKED_DIR, compute_feature_rows, list_animals,
     list_evoked_files, parse_recording_dt, parse_session, read_file_evoked,
@@ -51,6 +52,18 @@ _DEFAULT_FEATURE = "line_length"
 # WebGL stays smooth to ~10^5 markers; above this we stride-sample.
 _MAX_POINTS = 60000
 _MA_WINDOW = 50            # per-animal moving-average window (epochs).
+
+# Density heatmap render grid. Constant pixel resolution; the *temporal*
+# resolution follows the zoom (relayout rebins to the visible window).
+_DENSITY_NX = 300
+_DENSITY_NY = 150
+# Onset-aligned view: default lookback (hours before an onset) to include.
+_ONSET_DEFAULT_LOOKBACK_H = 24
+
+# Last-plotted density arrays, keyed by selection signature, so the zoom
+# relayout callback rebins in RAM instead of re-reading sidecars. Bounded.
+_PLOT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_PLOT_CACHE_MAX = 4
 
 # Configured in register_callbacks(); layout() reads them on tab open.
 _EVOKED_DIR = DEFAULT_EVOKED_DIR
@@ -310,7 +323,8 @@ def layout(store):
                 dcc.RadioItems(
                     id="chronic-view-mode",
                     options=[{"label": "Density", "value": "density"},
-                             {"label": "Scatter", "value": "scatter"}],
+                             {"label": "Scatter", "value": "scatter"},
+                             {"label": "Onset-aligned", "value": "onset"}],
                     value="density", inline=True, style={"fontSize": "12px"},
                     labelStyle={"color": "#cfd0d6", "marginRight": "10px",
                                 "display": "inline-flex",
@@ -372,6 +386,30 @@ def layout(store):
                            step=0.01, value=0, marks=None,
                            tooltip={"placement": "bottom"}),
             ], style={"flex": "1", "minWidth": "200px"}),
+        ], style={"display": "flex", "gap": "14px", "alignItems": "center",
+                  "marginBottom": "8px", "flexWrap": "wrap"}),
+        # Controls for the Onset-aligned view (ignored by the other views).
+        html.Div([
+            html.Div([
+                html.Label("Onset lookback (h)", style=LABEL_STYLE),
+                dcc.Input(id="chronic-onset-lookback", type="number",
+                          value=_ONSET_DEFAULT_LOOKBACK_H, min=1, step=6,
+                          style=_INPUT_STYLE),
+            ], style={"flex": "0 0 170px"}),
+            html.Div([
+                html.Label("Onset time axis", style=LABEL_STYLE),
+                dcc.Checklist(
+                    id="chronic-onset-logtime",
+                    options=[{"label": " Log scale", "value": "log"}],
+                    value=["log"], style={"fontSize": "12px"},
+                    labelStyle={"color": "#cfd0d6", "display": "inline-flex",
+                                "alignItems": "center"},
+                    inputStyle={"marginRight": "5px"}),
+            ], style={"flex": "0 0 170px"}),
+            html.Div("Used by the Onset-aligned view — bins each epoch by time "
+                     "before its nearest upcoming seizure onset.",
+                     style={"color": "#8a8d99", "fontSize": "11px",
+                            "alignSelf": "flex-end"}),
         ], style={"display": "flex", "gap": "14px", "alignItems": "center",
                   "marginBottom": "8px", "flexWrap": "wrap"}),
         _configure_card(),
@@ -634,11 +672,13 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-window-scroll", "value"),
         State("chronic-roll-window", "value"),
         State("chronic-config", "data"),
+        State("chronic-onset-lookback", "value"),
+        State("chronic-onset-logtime", "value"),
         prevent_initial_call=True,
     )
     def _update(_load, _refresh, _preview, animal, sessions, feature, hours,
                 overlays, event_overlays, view_mode, win_hours, scroll,
-                roll_window, cfg_dict):
+                roll_window, cfg_dict, onset_lookback, onset_logtime):
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
@@ -708,12 +748,62 @@ def register_callbacks(app, store, config: dict) -> None:
             return (empty_fig(f"No {_label(feature)} values for {animal} "
                               f"in this selection."), "", status, sel,
                     not keep_poll)
+        view = view_mode or "density"
+        want_onsets = bool(event_overlays and "onsets" in event_overlays)
         events = (_onset_events_for_animal(config, animal)
-                  if event_overlays and "onsets" in event_overlays else None)
-        return (_build_feature_scatter(pts, feature, animal, overlays or [],
-                                       roll_window, events,
-                                       view_mode or "density"),
-                _trend_stats(pts, feature), status, sel, not keep_poll)
+                  if want_onsets or view == "onset" else None)
+        stats = _trend_stats(pts, feature)
+        if view == "onset":
+            if not events:
+                return (empty_fig(
+                    f"No scored seizure onsets for {animal} — the onset-aligned "
+                    f"view needs flagged BHZ events."),
+                    "", status, sel, not keep_poll)
+            fig = _build_onset_aligned(pts, feature, animal, events,
+                                       onset_lookback,
+                                       "log" in (onset_logtime or []))
+            return (fig, stats, status, sel, not keep_poll)
+        if view == "scatter":
+            fig = _build_feature_scatter(pts, feature, animal, overlays or [],
+                                         roll_window, events)
+            return (fig, stats, status, sel, not keep_poll)
+        fig, payload = _build_timeline_density(pts, feature, animal,
+                                               overlays or [], roll_window,
+                                               events)
+        _PLOT_CACHE[_plot_key(sel)] = payload
+        while len(_PLOT_CACHE) > _PLOT_CACHE_MAX:
+            _PLOT_CACHE.popitem(last=False)
+        return (fig, stats, status, sel, not keep_poll)
+
+    # Zoom-rebin: on pan/zoom of the density timeline, re-histogram the cached
+    # epochs to the visible x-range (constant pixel grid, finer time bins as you
+    # zoom). Other views and non-range relayout events are ignored.
+    @app.callback(
+        Output("chronic-feature-plot", "figure", allow_duplicate=True),
+        Input("chronic-feature-plot", "relayoutData"),
+        State("chronic-selection", "data"),
+        State("chronic-view-mode", "value"),
+        prevent_initial_call=True,
+    )
+    def _zoom_rebin(relayout, sel, view_mode):
+        from dash import no_update
+        if not relayout or not sel or (view_mode or "density") != "density":
+            return no_update
+        payload = _PLOT_CACHE.get(_plot_key(sel))
+        if not payload:
+            return no_update
+        x0, x1, is_reset = parse_relayout(relayout)
+        if not is_reset and (x0 is None or x1 is None):
+            return no_update
+        ts0 = ts1 = None
+        if not is_reset:
+            ts0, ts1 = _relayout_ts(x0), _relayout_ts(x1)
+            if ts0 is None or ts1 is None or ts1 <= ts0:
+                return no_update
+        return _timeline_density_fig(
+            payload["secs"], payload["vals"], payload["iso"],
+            payload["feature"], payload["animal"], payload["overlays"],
+            payload["roll_window"], payload["events"], ts0, ts1)
 
     # Live load feedback: while an off-thread load runs, update progress; when
     # it finishes, stop polling + bump ▶ Plot so the data plots itself.
@@ -1013,7 +1103,7 @@ def _build_preview(animal, sessions, feature, cfg_dict, overlays,
                 status, "")
     # One recording is sparse -> show individual epochs (scatter), not density.
     fig = _build_feature_scatter(pts, feature, animal, overlays, roll_window,
-                                 None, "scatter")
+                                 None)
     fig.update_layout(title=f"PREVIEW (1 recording, {len(rows)} epochs) — "
                             f"{_label(feature)} · {fname}")
     return (fig, status, _trend_stats(pts, feature))
@@ -1165,15 +1255,11 @@ def _onset_events_for_animal(config, animal: str) -> list:
 
 
 def _build_feature_scatter(pts, feature, animal, overlays,
-                            roll_window, events=None,
-                            view="density") -> go.Figure:
-    """Per-epoch base layer (density heatmap by default, or a faded marker
-    cloud) + a sliding-window rolling median with 10-90 / 25-75 percentile
-    ribbons. Optional linear/quad trend overlays + seizure-onset vlines.
-
-    Density is the default for the all-epochs view: at ~10^5 epochs the marker
-    cloud is pure overplotting and ships up to _MAX_POINTS to the browser,
-    whereas a 2-D histogram's cost is ~independent of N and shows the spread.
+                            roll_window, events=None) -> go.Figure:
+    """Per-epoch faded marker cloud + a rolling 10-90/25-75 percentile ribbon
+    with a median line. Optional linear/quad/MA trend overlays + seizure-onset
+    vlines. (The default density timeline is built by _build_timeline_density;
+    this is the explicit Scatter view, where seeing individual epochs helps.)
     """
     iso, secs, vals = pts
     label = _label(feature)
@@ -1182,22 +1268,12 @@ def _build_feature_scatter(pts, feature, animal, overlays,
     secs_s = secs[order]
     vals_s = vals[order]
     fig = go.Figure()
-    if view == "scatter":
-        step = _stride(len(secs_s), _MAX_POINTS)
-        fig.add_trace(go.Scattergl(
-            x=iso_s[::step], y=vals_s[::step], mode="markers",
-            marker=dict(size=3, color="#8a8d99", opacity=0.25),
-            name="responses", hoverinfo="x+y"))
-        mode_note = " (markers stride-sampled)" if step > 1 else ""
-    else:
-        fig.add_trace(go.Histogram2d(
-            x=iso_s, y=vals_s, nbinsx=240, nbinsy=80,
-            colorscale="Viridis", zsmooth=False,
-            colorbar=dict(title=dict(text="epochs", font=dict(size=9)),
-                          thickness=10, len=0.7, x=1.005),
-            hovertemplate="%{x}<br>%{y}<br>%{z} epochs<extra></extra>",
-            name="density"))
-        mode_note = " (density)"
+    step = _stride(len(secs_s), _MAX_POINTS)
+    fig.add_trace(go.Scattergl(
+        x=iso_s[::step], y=vals_s[::step], mode="markers",
+        marker=dict(size=3, color="#8a8d99", opacity=0.25),
+        name="responses", hoverinfo="x+y"))
+    mode_note = " (markers stride-sampled)" if step > 1 else ""
     _add_ribbon(fig, secs_s, vals_s, roll_window)
     _add_trend_overlays(fig, iso_s, secs_s, vals_s, overlays)
     n_onsets = _add_onset_lines(fig, events, secs_s, vals_s)
@@ -1208,6 +1284,220 @@ def _build_feature_scatter(pts, feature, animal, overlays,
         height=460, hovermode="closest", showlegend=True,
         legend=dict(font=dict(size=10), orientation="h", y=1.02,
                     yanchor="bottom"))
+    return fig
+
+
+# --------------------------------------------------------------------- #
+#  Density timeline (zoom-rebinned) + onset-aligned heatmap
+# --------------------------------------------------------------------- #
+
+def _plot_key(sel: dict) -> tuple:
+    """Stable signature of a selection -> key into _PLOT_CACHE, so the zoom
+    relayout callback can fetch exactly the arrays the plot was built from."""
+    assert isinstance(sel, dict), "selection must be a dict"
+    return (sel.get("animal") or "", tuple(sorted(sel.get("sessions") or [])),
+            sel.get("feature") or "", sel.get("hours") or 0,
+            sel.get("win_hours") or 0, round(float(sel.get("scroll") or 0), 4),
+            sel.get("roll_window") or 0, _config_key(sel.get("config")))
+
+
+def _relayout_ts(v) -> float | None:
+    """A relayout x-bound (epoch float, or a Plotly date string) -> POSIX
+    timestamp, or None when it can't be parsed."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    dt = _parse_iso(str(v).replace(" ", "T"))
+    return dt.timestamp() if dt is not None else None
+
+
+def _pct_clip(vals, lo=1, hi=99) -> tuple[float, float]:
+    """(low, high) feature bounds at the *lo*/*hi* percentiles, never degenerate
+    -- so empty axis isn't wasted on a few outliers."""
+    assert vals.size > 0, "need values to clip"
+    ylo, yhi = (float(v) for v in np.percentile(vals, [lo, hi]))
+    if yhi <= ylo:
+        ylo, yhi = float(np.min(vals)), float(np.max(vals))
+        if yhi <= ylo:
+            yhi = ylo + 1.0
+    return ylo, yhi
+
+
+def _density_heatmap_trace(secs, vals, x0=None, x1=None):
+    """A go.Heatmap of epoch density over [x0,x1] (default full range) on a
+    fixed _DENSITY_NX x _DENSITY_NY grid. y clipped to the 1-99 pct of the
+    visible points; empty bins transparent. Returns (trace|None, ylo, yhi)."""
+    assert secs.size == vals.size, "secs/vals length mismatch"
+    if secs.size == 0:
+        return None, 0.0, 1.0
+    x_lo = float(secs.min()) if x0 is None else float(x0)
+    x_hi = float(secs.max()) if x1 is None else float(x1)
+    if x_hi <= x_lo:
+        return None, 0.0, 1.0
+    m = (secs >= x_lo) & (secs <= x_hi)
+    vis = vals[m]
+    if vis.size < 2:
+        return None, 0.0, 1.0
+    ylo, yhi = _pct_clip(vis)
+    hist, xe, ye = np.histogram2d(
+        secs[m], vis, bins=[_DENSITY_NX, _DENSITY_NY],
+        range=[[x_lo, x_hi], [ylo, yhi]])
+    z = hist.T
+    z[z == 0] = np.nan                  # transparent empty bins
+    xc = [datetime.fromtimestamp(s).isoformat()
+          for s in (xe[:-1] + xe[1:]) / 2.0]
+    yc = (ye[:-1] + ye[1:]) / 2.0
+    trace = go.Heatmap(
+        x=xc, y=yc, z=z, colorscale="Viridis",
+        colorbar=dict(title=dict(text="epochs", font=dict(size=9)),
+                      thickness=10, len=0.7, x=1.005),
+        hovertemplate="%{x}<br>%{y}<br>%{z} epochs<extra></extra>",
+        name="density")
+    return trace, ylo, yhi
+
+
+def _add_median_line(fig, secs_sorted, vals_sorted, roll_window) -> None:
+    """Just the rolling median (no ribbon) -- the heatmap already shows spread."""
+    try:
+        win = max(11, int(roll_window))
+    except (TypeError, ValueError):
+        win = 301
+    res = _rolling_percentiles(secs_sorted, vals_sorted, win)
+    if res is None:
+        return
+    t_iso, _p10, _p25, p50, _p75, _p90 = res
+    fig.add_trace(go.Scatter(
+        x=t_iso, y=p50, mode="lines", line=dict(color="#5e7ce2", width=2.5),
+        name=f"rolling median (win {win})"))
+
+
+def _timeline_density_fig(secs_s, vals_s, iso_s, feature, animal, overlays,
+                          roll_window, events, x0=None, x1=None) -> go.Figure:
+    """Density heatmap (rebinned to [x0,x1] when given) + median + trend +
+    onset lines. Shared by the initial render and the zoom relayout callback."""
+    assert secs_s.size == vals_s.size, "secs/vals length mismatch"
+    label = _label(feature)
+    fig = go.Figure()
+    trace, _ylo, yhi = _density_heatmap_trace(secs_s, vals_s, x0, x1)
+    note = ""
+    if trace is not None:
+        fig.add_trace(trace)
+    else:
+        note = " · no epochs in view"
+    _add_median_line(fig, secs_s, vals_s, roll_window)
+    _add_trend_overlays(fig, iso_s, secs_s, vals_s, overlays)
+    y_ref = np.array([yhi if trace is not None else
+                      (float(vals_s.max()) if vals_s.size else 0.0)])
+    n_onsets = _add_onset_lines(fig, events, secs_s, y_ref)
+    onset_note = f" · {n_onsets} seizure onset(s)" if n_onsets else ""
+    fig.update_layout(
+        title=f"{label} per evoked response — {animal} (density)"
+              f"{onset_note}{note}",
+        xaxis_title="Recording time", yaxis_title=label, height=460,
+        hovermode="closest", showlegend=True,
+        uirevision=f"{animal}:{feature}",
+        legend=dict(font=dict(size=10), orientation="h", y=1.02,
+                    yanchor="bottom"))
+    if x0 is not None and x1 is not None:
+        fig.update_xaxes(range=[datetime.fromtimestamp(x0).isoformat(),
+                                datetime.fromtimestamp(x1).isoformat()])
+    else:
+        fig.update_xaxes(autorange=True)
+    if trace is not None:
+        fig.update_yaxes(range=[_ylo, yhi])
+    return fig
+
+
+def _build_timeline_density(pts, feature, animal, overlays, roll_window,
+                            events):
+    """Initial full-range density figure + a cache payload the zoom callback
+    refilters in RAM. Returns (figure, payload)."""
+    iso, secs, vals = pts
+    order = np.argsort(secs)
+    iso_s = np.asarray(iso)[order]
+    secs_s = secs[order]
+    vals_s = vals[order]
+    fig = _timeline_density_fig(secs_s, vals_s, iso_s, feature, animal,
+                                overlays, roll_window, events)
+    payload = {"secs": secs_s, "vals": vals_s, "iso": iso_s,
+               "feature": feature, "animal": animal, "overlays": overlays,
+               "roll_window": roll_window, "events": events}
+    return fig, payload
+
+
+def _binned_median(x, y, edges):
+    """Median of *y* in each [edges[i], edges[i+1]) bin (NaN for empties),
+    returned at the bin centres -- a readable trend line over the heatmap."""
+    n = edges.size - 1
+    cx = (edges[:-1] + edges[1:]) / 2.0
+    cy = np.full(n, np.nan)
+    for i in range(n):
+        assert i < 100000, "bin loop runaway"
+        seg = y[(x >= edges[i]) & (x < edges[i + 1])]
+        if seg.size:
+            cy[i] = float(np.median(seg))
+    return cx, cy
+
+
+def _build_onset_aligned(pts, feature, animal, events, lookback_h,
+                         log_time) -> go.Figure:
+    """Heatmap of feature density vs time-BEFORE the nearest upcoming seizure
+    onset, stacked across all of *animal*'s onsets. Each epoch is claimed by
+    the nearest onset that follows it (the one it leads up to), within
+    *lookback_h*; epochs after the last onset or beyond the window are dropped.
+    Nearest-following assignment means clustered seizures never double-count an
+    epoch. Optional log time axis fits seconds-to-hours in one frame."""
+    assert events, "onset-aligned view needs events"
+    _iso, secs, vals = pts
+    assert secs.size == vals.size, "secs/vals length mismatch"
+    onset_ts = np.sort(np.array([e["dt"].timestamp() for e in events], float))
+    lb = float(lookback_h or _ONSET_DEFAULT_LOOKBACK_H)
+    idx = np.searchsorted(onset_ts, secs, side="left")   # nearest following
+    keep = idx < onset_ts.size
+    hours_before = np.full(secs.shape, np.nan)
+    hb = (onset_ts[np.clip(idx, 0, onset_ts.size - 1)] - secs) / 3600.0
+    hours_before[keep] = hb[keep]
+    sel = keep & (hours_before > 0) & (hours_before <= lb)
+    x, y = hours_before[sel], vals[sel]
+    if x.size < 5:
+        return empty_fig(
+            f"Only {int(x.size)} epoch(s) within {lb:g} h before an onset for "
+            f"{animal} — not enough for the onset-aligned view (try a larger "
+            f"lookback).")
+    ylo, yhi = _pct_clip(y)
+    if log_time:
+        x = np.clip(x, 1.0 / 3600.0, None)               # floor at 1 s
+        xe = np.logspace(np.log10(x.min()), np.log10(x.max()),
+                         _DENSITY_NX + 1)
+    else:
+        xe = np.linspace(x.min(), x.max(), _DENSITY_NX + 1)
+    ye = np.linspace(ylo, yhi, _DENSITY_NY + 1)
+    hist, _xe, _ye = np.histogram2d(x, y, bins=[xe, ye])
+    z = hist.T
+    z[z == 0] = np.nan
+    xc = (xe[:-1] + xe[1:]) / 2.0
+    yc = (ye[:-1] + ye[1:]) / 2.0
+    fig = go.Figure(go.Heatmap(
+        x=xc, y=yc, z=z, colorscale="Viridis",
+        colorbar=dict(title=dict(text="epochs", font=dict(size=9)),
+                      thickness=10, len=0.7, x=1.005),
+        hovertemplate="%{x:.3g} h before onset<br>%{y}<br>%{z} epochs"
+                      "<extra></extra>", name="density"))
+    mx, my = _binned_median(x, y, xe)
+    fig.add_trace(go.Scatter(x=mx, y=my, mode="lines",
+                             line=dict(color="#5e7ce2", width=2.5),
+                             name="binned median", connectgaps=False))
+    label = _label(feature)
+    fig.update_layout(
+        title=f"{label} aligned to seizure onset — {animal} "
+              f"({onset_ts.size} onsets · {int(x.size)} epochs ≤{lb:g} h "
+              f"before)",
+        xaxis_title="Hours before onset" + (" (log)" if log_time else ""),
+        yaxis_title=label, height=460, hovermode="closest", showlegend=True,
+        legend=dict(font=dict(size=10), orientation="h", y=1.02,
+                    yanchor="bottom"))
+    fig.update_xaxes(autorange="reversed", type="log" if log_time else "linear")
     return fig
 
 
