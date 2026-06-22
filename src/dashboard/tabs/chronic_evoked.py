@@ -444,9 +444,9 @@ def _configure_card() -> html.Div:
             html.Div([
                 cell(html.Label("Window start (ms, blank=full)",
                                 style=LABEL_STYLE),
-                     _cfg_num("chronic-cfg-win-start", None, step=10), w="0 0 190px"),
+                     _cfg_num("chronic-cfg-win-start", None, step="any"), w="0 0 190px"),
                 cell(html.Label("Window end (ms)", style=LABEL_STYLE),
-                     _cfg_num("chronic-cfg-win-end", None, step=10)),
+                     _cfg_num("chronic-cfg-win-end", None, step="any")),
                 cell(_cfg_check("Baseline (subtract pre-stim mean)",
                                 "chronic-cfg-baseline"), w="0 0 240px", end=True),
             ], style={"display": "flex", "gap": "14px", "flexWrap": "wrap",
