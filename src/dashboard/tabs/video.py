@@ -342,10 +342,28 @@ def _prefetch_chunk_safe(file_path: str, file_id: int) -> None:
                       file_id, e)
 
 
-def _build_csv_file_meta(store, file_id: int, channel: int
-                           ) -> tuple[dict, float, str, "date"]:
+def _as_float(v, default):
+    """Parse *v* to float, returning *default* on blank/invalid/non-positive
+    sentinels handled by the caller."""
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_csv_file_meta(store, file_id: int, channel: int,
+                         cutoff: float | None = None,
+                         auc_threshold: float | None = None,
+                         auc_window: float | None = None,
+                         ) -> tuple[dict, float, str, "date"]:
     """Assemble the file-level meta dict + (fs, animal_id,
     chunk_date) for a BHZ CSV row.
+
+    *cutoff* is the raw-envelope threshold used; *auc_threshold* /
+    *auc_window* the AUC-screen settings -- all recorded per row so the
+    export documents how each event was detected.
 
     Returns ``(file_meta, fs, animal_id, chunk_date)``. Raises
     on missing data so the caller can surface a clean error.
@@ -394,8 +412,10 @@ def _build_csv_file_meta(store, file_id: int, channel: int
     filename = os.path.basename(file_path)
     meta = _bhz_csv.build_file_meta(
         folder=folder, filename=filename,
-        fs=fs, cutoff=0.05, channel=int(channel),
+        fs=fs, cutoff=(cutoff if (cutoff and cutoff > 0) else _BHZ_CUTOFF),
+        channel=int(channel),
         peak_index=None, peak_stamp=None, peak_dt=chunk_dt,
+        auc_threshold=auc_threshold, auc_window=auc_window,
     )
     chunk_date = (chunk_dt.date() if chunk_dt
                    else date.today())
@@ -403,15 +423,19 @@ def _build_csv_file_meta(store, file_id: int, channel: int
 
 
 def _export_partial_csv(store, config: dict, file_id: int,
-                          channel, events: list) -> tuple[int, str]:
+                          channel, events: list,
+                          cutoff=None, auc_threshold=None,
+                          auc_window=None) -> tuple[int, str]:
     """Append the dropped onsets to the official BHZ day CSV right now.
 
     ``bhz_csv.write_event_rows`` tolerates partial events (unset landmarks
     render as ``NaN``), so an EEG-onset-only event writes its ``EventEO``
-    and leaves the rest blank -- usable immediately. Returns
-    ``(n_rows, csv_name)``; raises ``ValueError`` on misconfig / missing
-    data so the caller can surface a clean message. A later full score is
-    replaced when the PI finalizes the day CSV in overwrite mode.
+    and leaves the rest blank -- usable immediately. *cutoff* (raw envelope)
+    and *auc_threshold* / *auc_window* (AUC screen) are the live detector
+    settings, recorded on every row. Returns ``(n_rows, csv_name)``; raises
+    ``ValueError`` on misconfig / missing data so the caller can surface a
+    clean message. A later full score is replaced when the PI finalizes the
+    day CSV in overwrite mode.
     """
     assert events, "events required for partial export"
     bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
@@ -419,8 +443,12 @@ def _export_partial_csv(store, config: dict, file_id: int,
         raise ValueError("BHZ CSV export is disabled in config.")
     if channel is None or channel == "":
         raise ValueError("Pick a channel before exporting.")
+    cut = _as_float(cutoff, _BHZ_CUTOFF)
     meta, fs, animal, chunk_date = _build_csv_file_meta(
-        store, int(file_id), int(channel))
+        store, int(file_id), int(channel),
+        cutoff=cut if cut and cut > 0 else _BHZ_CUTOFF,
+        auc_threshold=_as_float(auc_threshold, None),
+        auc_window=_as_float(auc_window, None))
     csv_path = _bhz_csv.resolve_csv_path(
         bhz_cfg.get("base_dir", ""),
         bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
@@ -4712,10 +4740,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-queue-animal", "value"),
         State("video-ma-pools-view", "data"),
         State("video-ma-pool-cursor", "data"),
+        State("video-ma-cutoff-input", "value"),
+        State("video-ma-auc-threshold-input", "value"),
+        State("video-auc-window-input", "value"),
         prevent_initial_call=True,
     )
     def _partial_export(n_clicks, file_id, events, channel,
-                         animal_value, pools_view, pool_cursor):
+                         animal_value, pools_view, pool_cursor,
+                         cutoff, auc_threshold, auc_window):
         if not n_clicks or not file_id:
             return (no_update,) * 5
         email = current_user_email()
@@ -4729,7 +4761,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     no_update, no_update, no_update, no_update)
         try:
             n_rows, csv_name = _export_partial_csv(
-                store, config, int(file_id), channel, events)
+                store, config, int(file_id), channel, events,
+                cutoff=cutoff, auc_threshold=auc_threshold,
+                auc_window=auc_window)
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             logger.warning("partial CSV export failed: %s", e)
             return (f"Partial export failed: {e}",

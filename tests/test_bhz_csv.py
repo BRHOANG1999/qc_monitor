@@ -42,10 +42,12 @@ class CsvHeader(unittest.TestCase):
 
     def test_header_matches_reference(self):
         """The first 44 columns must be the reference header
-        verbatim. ``EventEO_WallClock`` and ``SoftwareVersion`` are
-        lab-local additions appended at the end, so they're excluded
-        from the reference comparison."""
-        lab_local = ("EventEO_WallClock", "SoftwareVersion")
+        verbatim. ``EventEO_WallClock``, ``AUC_Threshold``,
+        ``AUC_Window_s`` and ``SoftwareVersion`` are lab-local additions
+        appended at the end, so they're excluded from the reference
+        comparison."""
+        lab_local = ("EventEO_WallClock", "AUC_Threshold", "AUC_Window_s",
+                     "SoftwareVersion")
         ref = _ref_header()
         # Fallback path returns our own COLUMNS; strip trailing additions.
         while ref and ref[-1] in lab_local:

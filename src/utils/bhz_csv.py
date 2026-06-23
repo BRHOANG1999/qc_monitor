@@ -65,11 +65,15 @@ COLUMNS: tuple[str, ...] = (
     "Roomlight", "VideoQuality", "VideoComment",
     "BehaviorOnsetComment", "Comment", "Light", "Mode", "Target",
     "scorecomment",
-    # Lab-local trailing additions (after the 44-col reference). Both are
+    # Lab-local trailing additions (after the 44-col reference). All are
     # appended at the END so MATLAB readtable + the first-44 contract are
     # untouched. EventEO_WallClock = the EEG/electrographic onset (EventEO)
     # rendered as an absolute wall-clock datetime, for chronic alignment.
+    # AUC_Threshold / AUC_Window_s = the sliding-window-AUC screen settings
+    # used for this file (the raw-envelope threshold is the Cutoff column);
+    # recording both makes each row self-documenting about how it was detected.
     "EventEO_WallClock",
+    "AUC_Threshold", "AUC_Window_s",
     "SoftwareVersion",
 )
 
@@ -91,6 +95,7 @@ _NUMERIC_COLS: frozenset[str] = frozenset((
     "EventPAs_1", "EventPAe_1", "EventPAs_2", "EventPAe_2",
     "EventPAs_3", "EventPAe_3",
     "Score", "Light",
+    "AUC_Threshold", "AUC_Window_s",
 ))
 
 
@@ -304,12 +309,19 @@ def build_file_meta(*, folder: str, filename: str,
                       peak_stamp: float | None,
                       peak_dt: datetime | None,
                       target: str = "LFP",
+                      auc_threshold: float | None = None,
+                      auc_window: float | None = None,
                       ) -> dict:
     """Assemble the file-level meta dict.
 
     Encapsulates the Peak_Date / Peak_Time split and the
     folder-trailing-slash convention from the reference
     (``U:\\FEBRUARY_2026\\<session>\\`` with the trailing ``\\``).
+
+    ``cutoff`` is the raw-envelope (Hilbert) peak threshold -> the ``Cutoff``
+    column. ``auc_threshold`` / ``auc_window`` are the sliding-window-AUC
+    screen settings; both are file-level, so they repeat on every event row.
+    Left None when no AUC screen was applied (-> NaN cell).
     """
     assert filename, "filename required"
     assert fs > 0, "fs > 0"
@@ -333,6 +345,8 @@ def build_file_meta(*, folder: str, filename: str,
         "Peak_Stop": None,
         "Duration": None,
         "Target": target,
+        "AUC_Threshold": auc_threshold,
+        "AUC_Window_s": auc_window,
     }
 
 
