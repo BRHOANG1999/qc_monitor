@@ -101,6 +101,10 @@ class Store:
         self._migrate_review_state_pi_statuses(conn)
         # Widen the CHECK again for the quick-flag 'needs_scoring' status.
         self._migrate_review_state_add_needs_scoring(conn)
+        # Per-(file, animal) review: add animal_id to review_state +
+        # review_event_log, and a composite-PK file_claim.
+        self._migrate_review_add_animal_id(conn)
+        self._migrate_file_claim_animal(conn)
         # Reap mass_analyze_job rows stuck in 'running' across a
         # restart -- without this they'd never re-progress because
         # the worker that started them no longer exists. Safe to
@@ -276,6 +280,60 @@ class Store:
                 ON review_state(user_email);
             CREATE INDEX IF NOT EXISTS idx_review_state_status
                 ON review_state(status);
+            """
+        )
+
+    def _migrate_review_add_animal_id(self, conn) -> None:
+        """Add the ``animal_id`` column to review_state + review_event_log so
+        review goes per-(file, animal). animal_id is nullable with no CHECK, so
+        a plain ADD COLUMN suffices (no table rebuild). Legacy rows stay NULL =
+        whole-file wildcard. Idempotent across boots.
+        """
+        rs_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(review_state)")}
+        if "animal_id" not in rs_cols:
+            conn.execute(
+                "ALTER TABLE review_state ADD COLUMN animal_id TEXT")
+        # Always ensure the index (new DBs get the column from SCHEMA_SQL but
+        # not the index, which lives here to avoid the executescript ordering
+        # problem on pre-migration DBs).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_review_state_animal "
+            "ON review_state(file_id, animal_id)")
+        log_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(review_event_log)")}
+        if "animal_id" not in log_cols:
+            conn.execute(
+                "ALTER TABLE review_event_log ADD COLUMN animal_id TEXT")
+
+    def _migrate_file_claim_animal(self, conn) -> None:
+        """Rebuild file_claim with a composite ``(file_id, animal_id)`` PK so a
+        recording can be claimed per animal. SQLite can't change a PK in place;
+        detect-and-rebuild only when the column is absent. Legacy claims get
+        animal_id='' (whole-file). Idempotent.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='file_claim'"
+        ).fetchone()
+        if not row or "animal_id" in (row["sql"] or ""):
+            return
+        conn.executescript(
+            """
+            CREATE TABLE file_claim_new (
+                file_id INTEGER NOT NULL REFERENCES processed_files(id),
+                animal_id TEXT NOT NULL DEFAULT '',
+                user_email TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                PRIMARY KEY (file_id, animal_id)
+            );
+            INSERT INTO file_claim_new
+                (file_id, animal_id, user_email, claimed_at)
+            SELECT file_id, '', user_email, claimed_at FROM file_claim;
+            DROP TABLE file_claim;
+            ALTER TABLE file_claim_new RENAME TO file_claim;
+            CREATE INDEX IF NOT EXISTS idx_file_claim_claimed_at
+                ON file_claim(claimed_at);
             """
         )
 
@@ -1625,46 +1683,69 @@ class Store:
     # file. Claimed-only rows still count the file as unreviewed.
     _REVIEW_FINAL_STATUSES = ("no_events", "has_events")
 
-    def get_review_state(self, file_id: int) -> dict | None:
-        """Latest review_state row for *file_id*, any user."""
+    def get_review_state(self, file_id: int,
+                          animal_id: str | None = None) -> dict | None:
+        """Latest review_state row for *file_id*, any user. When *animal_id*
+        is given, the latest among that animal's rows + legacy whole-file
+        (NULL) rows; otherwise the latest row for the file across any animal."""
         assert isinstance(file_id, int), "file_id must be int"
         conn = self._connect()
         try:
-            row = conn.execute(
-                """SELECT * FROM review_state
-                   WHERE file_id = ?
-                   ORDER BY updated_at DESC LIMIT 1""",
-                (file_id,),
-            ).fetchone()
+            if animal_id:
+                row = conn.execute(
+                    """SELECT * FROM review_state
+                       WHERE file_id = ?
+                         AND (animal_id = ? OR animal_id IS NULL)
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id, animal_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM review_state
+                       WHERE file_id = ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id,),
+                ).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
-    def review_statuses_for_files(self, file_ids) -> dict:
+    def review_statuses_for_files(self, file_ids,
+                                   animal_id: str | None = None) -> dict:
         """Latest review status per file_id -> ``{file_id: status}``.
 
         Files with no review_state row are absent from the map. Used by
         the Mass Analyze pool browser to show flagged / done / untouched
-        progress without a query per file.
+        progress without a query per file. When *animal_id* is given, the
+        latest status is computed over that animal's rows + legacy whole-file
+        (NULL) rows, so one animal's review doesn't mask another's.
         """
         ids = [int(f) for f in (file_ids or [])]
         if not ids:
             return {}
         out: dict[int, str] = {}
+        scope = ("" if not animal_id
+                 else " AND (rs.animal_id = ? OR rs.animal_id IS NULL)")
+        sub = ("" if not animal_id
+               else " AND (r2.animal_id = ? OR r2.animal_id IS NULL)")
         conn = self._connect()
         try:
             # Chunk to stay under SQLite's variable limit on big pools.
             for i in range(0, len(ids), 400):
                 chunk = ids[i:i + 400]
                 ph = ",".join("?" * len(chunk))
+                params = list(chunk)
+                if animal_id:
+                    params.append(animal_id)   # outer scope
+                    params.append(animal_id)   # subquery scope
                 rows = conn.execute(
                     f"""SELECT rs.file_id AS fid, rs.status AS status
                         FROM review_state rs
-                        WHERE rs.file_id IN ({ph})
+                        WHERE rs.file_id IN ({ph}){scope}
                           AND rs.id = (SELECT MAX(r2.id)
                                        FROM review_state r2
-                                       WHERE r2.file_id = rs.file_id)""",
-                    chunk,
+                                       WHERE r2.file_id = rs.file_id{sub})""",
+                    params,
                 ).fetchall()
                 for r in rows:
                     out[int(r["fid"])] = r["status"]
@@ -1673,31 +1754,46 @@ class Store:
             conn.close()
 
     def get_review_state_by_user(self, file_id: int,
-                                   user_email: str) -> dict | None:
-        """Latest row for this (file, user) pair. Used by the UI to
-        show whether the current viewer already reviewed this file."""
+                                   user_email: str,
+                                   animal_id: str | None = None
+                                   ) -> dict | None:
+        """Latest row for this (file, user) pair. Used by the UI to show
+        whether the current viewer already reviewed this file. When
+        *animal_id* is given, scoped to that animal's rows + legacy
+        whole-file (NULL) rows."""
         assert isinstance(file_id, int), "file_id must be int"
         if not user_email:
             return None
         conn = self._connect()
         try:
-            row = conn.execute(
-                """SELECT * FROM review_state
-                   WHERE file_id = ? AND user_email = ?
-                   ORDER BY updated_at DESC LIMIT 1""",
-                (file_id, user_email.lower()),
-            ).fetchone()
+            if animal_id:
+                row = conn.execute(
+                    """SELECT * FROM review_state
+                       WHERE file_id = ? AND user_email = ?
+                         AND (animal_id = ? OR animal_id IS NULL)
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id, user_email.lower(), animal_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT * FROM review_state
+                       WHERE file_id = ? AND user_email = ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id, user_email.lower()),
+                ).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
     def insert_review_event(self, file_id: int, user_email: str,
                               action: str,
-                              payload: dict | None = None) -> int:
+                              payload: dict | None = None,
+                              animal_id: str | None = None) -> int:
         """Write to the append-only review_event_log; returns row id.
 
         action ∈ {'claim', 'finish', 'abandon', 'reopen',
-                   'backlog_zero'}; payload is JSON-serialised.
+                   'backlog_zero'}; payload is JSON-serialised. *animal_id*
+        scopes the audit row to one animal (None = whole-file).
         """
         assert isinstance(file_id, int), "file_id must be int"
         assert user_email, "user_email required"
@@ -1707,10 +1803,11 @@ class Store:
         try:
             cur = conn.execute(
                 """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json, at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (file_id, user_email, action, payload_json,
+                    animal_id, at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (file_id, user_email.lower(), action,
-                 json.dumps(payload or {}), now),
+                 json.dumps(payload or {}), (animal_id or None), now),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -1720,12 +1817,16 @@ class Store:
     def mark_review(self, file_id: int, user_email: str,
                      status: str,
                      markers: list[dict] | None = None,
-                     note: str | None = None) -> int:
+                     note: str | None = None,
+                     animal_id: str | None = None) -> int:
         """Atomic: write review_state row + matching event-log entry.
 
         status ∈ {'claimed', 'no_events', 'has_events',
                    'abandoned', 'pending_pi_review',
                    'pi_approved', 'pi_flagged'}.
+
+        *animal_id* is the animal this review is for (per-(file, animal)
+        review). None = a legacy whole-file row (wildcard over every animal).
 
         Returns the review_state row id. Finalising statuses
         (no_events / has_events / pending_pi_review /
@@ -1742,6 +1843,7 @@ class Store:
             f"bad status {status!r}"
         now = datetime.now().isoformat()
         markers_json = json.dumps(markers or [])
+        animal = (animal_id or None)
         log_action = ("claim" if status == "claimed"
                        else "abandon" if status == "abandoned"
                        else "pi_flag" if status == "pi_flagged"
@@ -1752,19 +1854,20 @@ class Store:
             cur = conn.execute(
                 """INSERT INTO review_state
                    (file_id, user_email, status, markers_json,
-                    note, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    note, animal_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (file_id, user_email.lower(), status, markers_json,
-                 note, now, now),
+                 note, animal, now, now),
             )
             conn.execute(
                 """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json, at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (file_id, user_email, action, payload_json,
+                    animal_id, at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (file_id, user_email.lower(), log_action,
                  json.dumps({"status": status,
                               "n_markers": len(markers or [])}),
-                 now),
+                 animal, now),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -1785,23 +1888,26 @@ class Store:
             minutes=self.CLAIM_TTL_MINUTES)
         return cutoff.isoformat()
 
-    def claim_file(self, file_id: int, user_email: str) -> None:
-        """Mark *file_id* as being reviewed by *user_email* (UPSERT --
-        one claim per file). Logs a 'claim' audit event only when this
-        is a genuinely new claim (no prior row, or a different/expired
-        prior claimer) so re-opening the same file doesn't spam
-        review_event_log."""
+    def claim_file(self, file_id: int, user_email: str,
+                    animal_id: str | None = None) -> None:
+        """Mark *file_id* as being reviewed by *user_email* (UPSERT). Claims
+        are per-(file, animal) so two reviewers can hold different animals of
+        one recording; *animal_id* None = a whole-file claim (stored as '').
+        Logs a 'claim' audit event only when this is a genuinely new claim (no
+        prior row, or a different/expired prior claimer) so re-opening the same
+        file doesn't spam review_event_log."""
         assert isinstance(file_id, int), "file_id must be int"
         assert user_email, "user_email required"
         email = user_email.lower()
+        animal = animal_id or ""
         now = datetime.now().isoformat()
         cutoff = self.claim_cutoff_iso()
         conn = self._connect()
         try:
             prior = conn.execute(
                 "SELECT user_email, claimed_at FROM file_claim "
-                "WHERE file_id = ?",
-                (file_id,),
+                "WHERE file_id = ? AND animal_id = ?",
+                (file_id, animal),
             ).fetchone()
             is_new_claim = (
                 prior is None
@@ -1810,33 +1916,41 @@ class Store:
             )
             conn.execute(
                 """INSERT INTO file_claim
-                   (file_id, user_email, claimed_at)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(file_id) DO UPDATE SET
+                   (file_id, animal_id, user_email, claimed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(file_id, animal_id) DO UPDATE SET
                        user_email = excluded.user_email,
                        claimed_at = excluded.claimed_at""",
-                (file_id, email, now),
+                (file_id, animal, email, now),
             )
             if is_new_claim:
                 conn.execute(
                     """INSERT INTO review_event_log
-                       (file_id, user_email, action, payload_json, at)
-                       VALUES (?, ?, 'claim', ?, ?)""",
-                    (file_id, email, json.dumps({}), now),
+                       (file_id, user_email, action, payload_json,
+                        animal_id, at)
+                       VALUES (?, ?, 'claim', ?, ?, ?)""",
+                    (file_id, email, json.dumps({}), (animal or None), now),
                 )
             conn.commit()
         finally:
             conn.close()
 
-    def release_claim(self, file_id: int) -> None:
-        """Drop the claim on *file_id* (called after a successful
-        submit so the row doesn't linger). Best-effort; a missing row
-        is fine."""
+    def release_claim(self, file_id: int,
+                       animal_id: str | None = None) -> None:
+        """Drop the claim on *file_id* (called after a successful submit so the
+        row doesn't linger). When *animal_id* is given, releases only that
+        animal's claim; otherwise releases every claim on the file.
+        Best-effort; a missing row is fine."""
         assert isinstance(file_id, int), "file_id must be int"
         conn = self._connect()
         try:
-            conn.execute(
-                "DELETE FROM file_claim WHERE file_id = ?", (file_id,))
+            if animal_id is None:
+                conn.execute(
+                    "DELETE FROM file_claim WHERE file_id = ?", (file_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM file_claim WHERE file_id = ? "
+                    "AND animal_id = ?", (file_id, animal_id or ""))
             conn.commit()
         finally:
             conn.close()

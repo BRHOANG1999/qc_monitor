@@ -353,6 +353,10 @@ CREATE TABLE IF NOT EXISTS review_state (
                           'needs_scoring')),
     markers_json TEXT,
     note TEXT,
+    -- The animal this review row is for. NULL = legacy/whole-file row
+    -- (written before review went per-animal); treated as a wildcard that
+    -- covers every animal on the file. New rows always carry a concrete id.
+    animal_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -362,6 +366,9 @@ CREATE INDEX IF NOT EXISTS idx_review_state_user
     ON review_state(user_email);
 CREATE INDEX IF NOT EXISTS idx_review_state_status
     ON review_state(status);
+-- NOTE: idx_review_state_animal is created by the _migrate_review_add_animal_id
+-- migration (NOT here) so executescript(SCHEMA_SQL) on a pre-migration DB
+-- doesn't reference the not-yet-added animal_id column.
 
 CREATE TABLE IF NOT EXISTS review_event_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +376,7 @@ CREATE TABLE IF NOT EXISTS review_event_log (
     user_email TEXT NOT NULL,
     action TEXT NOT NULL,
     payload_json TEXT,
+    animal_id TEXT,
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_event_log_at
@@ -383,13 +391,18 @@ CREATE INDEX IF NOT EXISTS idx_review_event_log_user
 -- (see Store.CLAIM_TTL_MINUTES). Kept separate from review_state on
 -- purpose -- review_state is append-only and Mass Analyze excludes on
 -- 'claimed' there, so writing claims into it would permanently hide
--- files. One row per file (PK on file_id); claims UPSERT and expire by
--- timestamp, so no row bloat and no manual cleanup.
+-- files. Claims are per-(file, animal) so two reviewers can hold different
+-- animals of the same multi-animal recording at once; claims UPSERT and
+-- expire by timestamp, so no row bloat and no manual cleanup. animal_id ''
+-- (empty string, not NULL — composite PKs can't span NULLs in SQLite) is the
+-- legacy whole-file claim.
 -- ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS file_claim (
-    file_id INTEGER PRIMARY KEY REFERENCES processed_files(id),
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    animal_id TEXT NOT NULL DEFAULT '',
     user_email TEXT NOT NULL,
-    claimed_at TEXT NOT NULL
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (file_id, animal_id)
 );
 CREATE INDEX IF NOT EXISTS idx_file_claim_claimed_at
     ON file_claim(claimed_at);
