@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from datetime import date, datetime, timedelta
 
@@ -39,7 +40,8 @@ from plotly.subplots import make_subplots
 
 from src.dashboard.components import (
     DARK_TABLE_STYLE, ZEBRA_STRIPE,
-    card as _card, pill as _pill, section_header as _section_header,
+    card as _card, loading_icon, pill as _pill,
+    section_header as _section_header,
 )
 from src.dashboard.data_helpers import (
     channel_map as _get_channel_map,
@@ -833,6 +835,307 @@ def _latest_evoked_from_output(config: dict | None) -> tuple[list[dict], str]:
              latest_dt.strftime(_CHUNK_DT_FMT) if waveforms else "")
     cache["key"], cache["value"] = key, value
     return value
+
+
+# ------------------------------------------------------------------ #
+#  "Last 24 recordings" overlay -- background-computed + cached.
+#  Reading 24 *_evoked.mat (h5py-decoding ~20k-sample evokedData each) is too
+#  heavy for the refresh thread, so a daemon worker builds the per-channel mean
+#  traces off-thread and publishes them under a lock; a poll Interval drives a
+#  "Computing... (n/24)" state. Mirrors chronic_evoked's _kick_warm /
+#  _warm_worker / chronic-warm-poll pattern.
+# ------------------------------------------------------------------ #
+_HIST24_N = 24
+_HIST24_LOCK = threading.Lock()
+# Published atomically by the worker; readers compare sig before use.
+_HIST24_CACHE: dict = {"sig": None, "per_ch": None}
+_HIST24_PROGRESS: dict = {"done": 0, "total": 0, "phase": "idle", "sig": None}
+_HIST24_THREAD = None        # threading.Thread | None
+# Per-file memo: (path, mtime) -> that file's decimated per-channel waveforms.
+# So a window shift (one new recording in, oldest out) only re-reads the ONE
+# new file -- a cold read of all 24 is ~2 min; a single file is a few seconds.
+_HIST24_FILE_CACHE: dict = {}
+_HIST24_FILE_CACHE_MAX = 48
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _hist24_file_set(config: dict | None):
+    """The last _HIST24_N evoked recordings (time-ordered) + a (path, mtime)
+    signature. Cheap enough for the callback thread. Returns ``(sig, files)``
+    with ``files = [(path, dt), ...]`` oldest->newest, or ``(None, [])``."""
+    assert config is None or isinstance(config, dict), "config dict|None"
+    assert _HIST24_N > 0, "_HIST24_N must be positive"
+    ce = (config or {}).get("chronic_evoked", {}) or {}
+    try:
+        from src.utils.evoked_output import (
+            DEFAULT_EVOKED_DIR, list_evoked_files, parse_recording_dt)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("hist24 import failed: %s", e)
+        return None, []
+    evoked_dir = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
+    dated = [(parse_recording_dt(f), f) for f in list_evoked_files(evoked_dir)]
+    dated = [(d, f) for d, f in dated if d is not None]
+    if not dated:
+        return None, []
+    dated.sort(key=lambda t: t[0])                       # oldest -> newest
+    files = [(f, d) for d, f in dated[-_HIST24_N:]]
+    sig = tuple((p, _safe_mtime(p)) for p, _ in files)
+    return sig, files
+
+
+def _set_hist24_progress(done, total, phase, sig) -> None:
+    with _HIST24_LOCK:
+        _HIST24_PROGRESS.update(done=int(done), total=int(total),
+                                phase=phase, sig=sig)
+
+
+def _hist24_file_waveforms(path: str, dt) -> list:
+    """One file's decimated per-channel mean waveforms, memoized by
+    (path, mtime). The heavy h5py decode happens once per recording; a bad
+    file yields []."""
+    assert path, "path required"
+    fkey = (path, _safe_mtime(path))
+    with _HIST24_LOCK:
+        cached = _HIST24_FILE_CACHE.get(fkey)
+    if cached is not None:
+        return cached
+    try:
+        from src.utils.evoked_output import read_file_evoked
+        wfs = _evoked_channels_to_waveforms(read_file_evoked(path), dt)
+    except Exception as e:  # noqa: BLE001 -- skip a bad file, keep going
+        logger.debug("hist24 read failed %s: %s", path, e)
+        wfs = []
+    with _HIST24_LOCK:
+        _HIST24_FILE_CACHE[fkey] = wfs
+        while len(_HIST24_FILE_CACHE) > _HIST24_FILE_CACHE_MAX:
+            _HIST24_FILE_CACHE.pop(next(iter(_HIST24_FILE_CACHE)))
+    return wfs
+
+
+def _hist24_worker(sig, files) -> None:
+    """Daemon: read each (<=24) file (memoized), group decimated per-channel
+    means by channel name, publish atomically. Never raises (mirrors chronic
+    ``_warm_worker``)."""
+    try:
+        n = len(files)
+        per_ch: dict[str, list[dict]] = {}
+        for i, (path, dt) in enumerate(files):
+            assert i < _HIST24_N, "hist24 file loop runaway"
+            _set_hist24_progress(i, n, "reading", sig)
+            wfs = _hist24_file_waveforms(path, dt)
+            for wf in wfs:
+                per_ch.setdefault(wf["channel_name"], []).append({
+                    "time_axis_ms": wf["time_axis_ms"],
+                    "mean_trace": wf["mean_trace"],
+                    "chunk_datetime": wf["chunk_datetime"],
+                    "n_epochs": wf["n_epochs"],
+                })
+        with _HIST24_LOCK:
+            _HIST24_CACHE["sig"], _HIST24_CACHE["per_ch"] = sig, per_ch
+            _HIST24_PROGRESS.update(done=n, total=n, phase="done", sig=sig)
+        logger.info("hist24 overlay built: %d files, %d channels",
+                    n, len(per_ch))
+    except Exception as e:  # noqa: BLE001 -- never crash the daemon
+        logger.warning("hist24 worker failed: %s", e)
+
+
+def _kick_hist24(sig, files) -> bool:
+    """Start the background build unless one is already running (mirrors
+    ``_kick_warm``). A stale in-flight run finishes; the next poll re-kicks."""
+    global _HIST24_THREAD
+    with _HIST24_LOCK:
+        t = _HIST24_THREAD
+        if t is not None and t.is_alive():
+            return False
+        _HIST24_PROGRESS.update(done=0, total=len(files), phase="reading",
+                                sig=sig)
+        th = threading.Thread(target=_hist24_worker, args=(sig, files),
+                              daemon=True, name="overview-hist24")
+        _HIST24_THREAD = th
+        th.start()
+        return True
+
+
+def _hist24_ready(sig):
+    """The cached per-channel data iff it matches *sig*, else None."""
+    with _HIST24_LOCK:
+        if (_HIST24_CACHE["sig"] == sig
+                and _HIST24_CACHE["per_ch"] is not None):
+            return _HIST24_CACHE["per_ch"]
+    return None
+
+
+def _hist24_progress() -> dict:
+    with _HIST24_LOCK:
+        return dict(_HIST24_PROGRESS)
+
+
+def _turbo_ramp(n: int) -> list:
+    """Turbo colors oldest->newest. Local copy of chronic_evoked._time_colors
+    to avoid importing that heavy module for 4 lines."""
+    from plotly.colors import sample_colorscale
+    if n <= 1:
+        return ["#5e7ce2"] * max(1, n)
+    return sample_colorscale("Turbo", [i / (n - 1) for i in range(n)])
+
+
+def _yrange_pad_multi(traces, x0: float, x1: float,
+                      fill_frac: float = 0.8):
+    """Combined y-range (data fills *fill_frac* of the panel) across several
+    ``(time_ms, trace)`` pairs within [x0, x1]; None when <3 finite samples.
+    Same padding math as ``_yrange_pad`` but over the overlay set."""
+    assert traces is not None, "traces required"
+    assert x0 < x1, "x0 < x1"
+    vals: list = []
+    for i, (t, m) in enumerate(traces):
+        assert i < _HIST24_N, "hist24 yrange loop runaway"
+        if not t or not m or len(t) != len(m):
+            continue
+        vals.extend(
+            v for tv, v in zip(t, m)
+            if tv is not None and v is not None and x0 <= tv <= x1
+            and isinstance(v, (int, float)) and v == v)
+    if len(vals) < 3:
+        return None
+    lo, hi = min(vals), max(vals)
+    span = hi - lo
+    if span <= 0:
+        eps = abs(hi) * 0.05 if hi != 0 else 1.0
+        return lo - eps, hi + eps
+    pad = span * (1.0 - fill_frac) / (2.0 * fill_frac)
+    return lo - pad, hi + pad
+
+
+def _hist24_add_channel(fig, ri, ch, recs, stim_x0, stim_x1, ex0, ex1,
+                        n_ch) -> None:
+    """One channel row: overlay each recording's mean (Turbo oldest->newest)
+    in both the stim (-1..1 ms) and evoked windows; combined tight y-range."""
+    assert ri - 1 < n_ch, "row index out of range"
+    assert recs, "recs required"
+    colors = _turbo_ramp(len(recs))
+    for j, rec in enumerate(recs):
+        assert j < _HIST24_N, "hist24 overlay loop runaway"
+        t, m = rec["time_axis_ms"], rec["mean_trace"]
+        if not t or not m:
+            continue
+        for col in (1, 2):
+            fig.add_trace(go.Scatter(
+                x=t, y=m, mode="lines",
+                line=dict(color=colors[j], width=0.6),
+                hoverinfo="skip", showlegend=False), row=ri, col=col)
+    for col in (1, 2):
+        fig.add_vline(x=0, line=dict(color="white", width=0.5, dash="dash"),
+                      row=ri, col=col)
+    fig.update_xaxes(range=[stim_x0, stim_x1], row=ri, col=1)
+    fig.update_xaxes(range=[ex0, ex1], row=ri, col=2)
+    fig.update_yaxes(title_text=ch, title_font_size=10, row=ri, col=1)
+    pairs = [(r["time_axis_ms"], r["mean_trace"]) for r in recs]
+    yl = _yrange_pad_multi(pairs, stim_x0, stim_x1)
+    if yl is not None:
+        fig.update_yaxes(range=list(yl), row=ri, col=1)
+    yr = _yrange_pad_multi(pairs, ex0, ex1)
+    if yr is not None:
+        fig.update_yaxes(range=list(yr), row=ri, col=2)
+    if ri < n_ch:
+        fig.update_xaxes(showticklabels=False, row=ri, col=1)
+        fig.update_xaxes(showticklabels=False, row=ri, col=2)
+
+
+def _hist24_colorbar(fig) -> None:
+    """A Turbo colorbar (oldest->newest) as a trace-less time legend."""
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+        marker=dict(colorscale="Turbo", cmin=0, cmax=1, color=[0],
+                    showscale=True,
+                    colorbar=dict(title=dict(text="rec", font=dict(size=9)),
+                                  tickvals=[0, 1], ticktext=["old", "new"],
+                                  thickness=10, len=0.6, x=1.005))),
+        row=1, col=2)
+
+
+def _hist24_annotations(fig, stim_x0, stim_x1, ex0, ex1, span_lbl) -> None:
+    fig.add_annotation(xref="paper", yref="paper", x=0.04, y=1.01,
+                       xanchor="left", yanchor="bottom",
+                       text=f"Stim window  {stim_x0:g} to {stim_x1:g} ms",
+                       showarrow=False, font=dict(size=10, color="#888"))
+    fig.add_annotation(xref="paper", yref="paper", x=0.22, y=1.01,
+                       xanchor="left", yanchor="bottom",
+                       text=f"Evoked  {ex0:g}–{ex1:g} ms",
+                       showarrow=False, font=dict(size=10, color="#888"))
+    if span_lbl:
+        fig.add_annotation(xref="paper", yref="paper", x=0.985, y=1.01,
+                           xanchor="right", yanchor="bottom", text=span_lbl,
+                           showarrow=False, font=dict(size=9, color="#888"))
+
+
+def _build_hist24_overlay(per_ch: dict, config: dict | None) -> list:
+    """Per-channel overlay of the last 24 recordings' mean traces (stim window
+    + evoked window), Turbo-colored oldest->newest. Returns the Graph children
+    (reuses the latest-evoked grid geometry)."""
+    assert isinstance(per_ch, dict), "per_ch must be a dict"
+    if not per_ch:
+        return [html.Div()]
+    fa_cfg = (config or {}).get("feature_analysis", {}) or {}
+    ex0 = float(fa_cfg.get("analysis_start_ms", 2.0))
+    ex1 = float(fa_cfg.get("analysis_end_ms", 200.0))
+    stim_x0, stim_x1 = -1.0, 1.0
+    channels = sorted(per_ch.keys())
+    n_ch = len(channels)
+    fig = make_subplots(
+        rows=n_ch, cols=2, column_widths=[0.16, 0.84], shared_xaxes=False,
+        subplot_titles=None, vertical_spacing=0.08, horizontal_spacing=0.035)
+    span_lbl = ""
+    for ri, ch in enumerate(channels, 1):
+        recs = per_ch[ch]
+        _hist24_add_channel(fig, ri, ch, recs, stim_x0, stim_x1, ex0, ex1,
+                            n_ch)
+        if recs and not span_lbl:
+            span_lbl = (f"{recs[0]['chunk_datetime'][:16]} → "
+                        f"{recs[-1]['chunk_datetime'][:16]}")
+    fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
+    fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=2)
+    _hist24_colorbar(fig)
+    fig.update_layout(
+        title=dict(text="Latest Evoked — last 24 recordings (oldest→newest)",
+                   font=dict(size=11), x=0.5, xanchor="center", y=0.985,
+                   yanchor="top"),
+        autosize=True, margin=dict(l=42, r=130, t=44, b=32), showlegend=False)
+    _hist24_annotations(fig, stim_x0, stim_x1, ex0, ex1, span_lbl)
+    return [dcc.Graph(
+        figure=fig, responsive=True,
+        style={"marginTop": "4px", "height": "58vh",
+               "minHeight": f"{max(420, 108 * n_ch)}px",
+               "maxHeight": "780px"})]
+
+
+def _hist24_placeholder(prog: dict):
+    """Spinner + 'Computing... (done/total)' loading state for the overlay."""
+    done = int(prog.get("done") or 0)
+    total = int(prog.get("total") or _HIST24_N)
+    return html.Div(
+        loading_icon(f"Computing last-24 overlay… ({done}/{total})"),
+        style={"display": "flex", "alignItems": "center",
+               "justifyContent": "center", "minHeight": "300px"})
+
+
+def _hist24_render(config: dict | None):
+    """``(children, poll_disabled)`` for the Last-24 mode. Cache hit -> overlay
+    + poll off; miss -> kick the worker, show 'Computing...' + poll on."""
+    sig, files = _hist24_file_set(config)
+    if sig is None:
+        return [html.Div("No evoked recordings found.",
+                         style={"color": "#888", "padding": "12px"})], True
+    per_ch = _hist24_ready(sig)
+    if per_ch is not None:
+        return _build_hist24_overlay(per_ch, config), True
+    _kick_hist24(sig, files)
+    return [_hist24_placeholder(_hist24_progress())], False
 
 
 def _build_overview_thumbnail(store: Store, config: dict | None,
@@ -1859,6 +2162,7 @@ def _overview_tab(store: Store, config: dict | None = None):
                 {"label": " Mean", "value": "mean"},
                 {"label": " Mean ± SEM", "value": "sem"},
                 {"label": " Overlay all files", "value": "overlay"},
+                {"label": " Last 24 recordings", "value": "hist24"},
             ],
             value="mean",
             inline=True,
@@ -1869,6 +2173,9 @@ def _overview_tab(store: Store, config: dict | None = None):
     ], style={"marginTop": "16px", "marginBottom": "4px"})
     waveform_thumbnail = html.Div([
         trace_mode_radio,
+        # Polls only while the Last-24 background read is in flight; the
+        # thumbnail callback flips its `disabled` once the cache is ready.
+        dcc.Interval(id="overview-hist24-poll", interval=1200, disabled=True),
         html.Div(
             _build_overview_thumbnail(store, config, session_dir, "mean"),
             id="overview-thumbnail",
@@ -2276,19 +2583,26 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         )
 
     # Thumbnail has its own callback because the radio adds an
-    # additional Input. Re-renders on either trigger; the figure
-    # is cheap enough (5 channels × 138 files in overlay) that we
-    # don't bother caching.
+    # additional Input. Re-renders on either trigger; the mean/sem/overlay
+    # figures are cheap and synchronous. The "Last 24 recordings" mode reads
+    # 24 .mat files off-thread (see _hist24_render): a cache miss kicks the
+    # worker, shows a 'Computing...' placeholder, and enables the poll Interval
+    # so the count advances; once ready, the overlay renders and the poll stops.
     @app.callback(
         Output("overview-thumbnail", "children"),
+        Output("overview-hist24-poll", "disabled"),
         Input("overview-trace-mode", "value"),
         Input("refresh-trigger", "data"),
+        Input("overview-hist24-poll", "n_intervals"),
     )
-    def refresh_overview_thumbnail(trace_mode, _n):
+    def refresh_overview_thumbnail(trace_mode, _n, _poll):
+        mode = trace_mode or "mean"
+        if mode == "hist24":
+            return _hist24_render(config)
         sessions = store.get_sessions()
         session_dir = sessions[0]["session_dir"] if sessions else ""
         return _build_overview_thumbnail(
-            store, config, session_dir, trace_mode or "mean")
+            store, config, session_dir, mode), True
 
     @app.callback(
         Output("snapshot-expanded", "data"),
