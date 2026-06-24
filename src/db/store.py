@@ -2139,6 +2139,57 @@ class Store:
                 out.append(dict(r))
         return out
 
+    def flagged_files(self, *, statuses: tuple = ("needs_scoring",),
+                       limit: int = 500) -> list[dict]:
+        """Files whose LATEST review_state status is in *statuses* (default the
+        ``needs_scoring`` EEG-onset flag pool), newest recording first,
+        cross-animal -- for a "which files were flagged" listing.
+
+        Each dict: ``{file_id, session_dir, file_path, chunk_datetime,
+        duration_sec, user_email, status, note, updated_at, animal, events}``.
+        ``animal`` is resolved from the session's channel naming; ``events`` is
+        the deserialised markers list (carrying EO_sec / BO_sec / racine / ...).
+        """
+        from src.utils.animal import split_animal_electrode, is_animal_channel
+        assert statuses, "statuses required"
+        assert isinstance(limit, int) and limit > 0, "limit > 0"
+        placeholders = ",".join("?" for _ in statuses)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""SELECT pf.id AS file_id, pf.session_dir, pf.file_path,
+                           pf.chunk_datetime, pf.duration_sec,
+                           rs.user_email, rs.status, rs.note,
+                           rs.updated_at, rs.markers_json
+                    FROM processed_files pf
+                    JOIN review_state rs ON rs.file_id = pf.id
+                    WHERE rs.status IN ({placeholders})
+                      AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
+                                   WHERE rs2.file_id = pf.id)
+                    ORDER BY pf.chunk_datetime DESC
+                    LIMIT ?""",
+                (*statuses, int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                events = json.loads(r["markers_json"] or "[]")
+            except json.JSONDecodeError:
+                events = []
+            names = self._channel_names_for_session(r["session_dir"])
+            animal = ""
+            for n in names:
+                if isinstance(n, str) and is_animal_channel(n):
+                    animal, _ = split_animal_electrode(n)
+                    break
+            d = dict(r)
+            d["events"] = events
+            d["animal"] = animal
+            out.append(d)
+        return out
+
     def get_review_queue(self, animal_ids: list[str],
                           user_email: str,
                           limit: int = 100,
@@ -3486,6 +3537,7 @@ class Store:
                     "n_pending_pi": 0,
                     "n_approved": 0,
                     "n_flagged": 0,
+                    "n_needs_scoring": 0,
                     "created_window": 0,
                     "approved_window": 0,
                     "last_activity_at": "",
@@ -3499,6 +3551,10 @@ class Store:
                     slot["n_approved"] += 1
                 if status == "pi_flagged":
                     slot["n_flagged"] += 1
+                # The quick-flag / EEG-onset pool (latest status
+                # needs_scoring) -- otherwise it falls into no bucket.
+                if status == "needs_scoring":
+                    slot["n_needs_scoring"] += 1
                 # Rate windows.
                 if (chunk_dt and chunk_dt >= cutoff_iso):
                     slot["created_window"] += 1

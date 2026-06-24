@@ -64,6 +64,32 @@ def _fmt_age(chunk_dt_str: str | None) -> str:
     return f"{age_days:.1f} d ago"
 
 
+def _fmt_dt(chunk_dt_str: str | None) -> str:
+    """Recording chunk timestamp -> 'YYYY-MM-DD HH:MM', else the raw value."""
+    if not chunk_dt_str:
+        return "—"
+    try:
+        return datetime.strptime(
+            chunk_dt_str, "%Y_%m_%d__%H_%M_%S").strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return chunk_dt_str
+
+
+# Landmark fields a flagged event can carry (seconds), with the abbreviation
+# shown in the table. EO = EEG/electrographic onset; BO = behavioural onset.
+_LANDMARKS = (("EO_sec", "EO"), ("LAS_sec", "LAS"), ("BO_sec", "BO"),
+              ("PID_sec", "PID"), ("BB_sec", "BB"))
+
+
+def _landmark_summary(events: list) -> tuple[str, object]:
+    """(present-landmarks string, max racine) across a file's marker events."""
+    present = [abbr for key, abbr in _LANDMARKS
+               if any((e or {}).get(key) is not None for e in events)]
+    racines = [e.get("racine") for e in events
+               if isinstance((e or {}).get("racine"), (int, float))]
+    return ", ".join(present), (max(racines) if racines else "—")
+
+
 def layout(store: Store, config: dict | None = None):
     email = current_user_email()
     if not _is_pi(config or {}, email):
@@ -121,6 +147,27 @@ def layout(store: Store, config: dict | None = None):
                          else "— unassigned —",
         })
 
+    # --- Flagged files (needs scoring / EEG onset) --------------- #
+    try:
+        flagged = store.flagged_files(statuses=("needs_scoring",), limit=500)
+    except Exception as e:  # noqa: BLE001 -- never break the tab
+        logger.warning("flagged_files failed: %s", e)
+        flagged = []
+    flagged_rows = []
+    for f in flagged:
+        events = f.get("events") or []
+        landmarks, max_racine = _landmark_summary(events)
+        flagged_rows.append({
+            "animal": f.get("animal") or "—",
+            "date": _fmt_dt(f.get("chunk_datetime")),
+            "n_events": len(events),
+            "landmarks": landmarks or "—",
+            "racine": max_racine,
+            "flagged_by": f.get("user_email") or "—",
+            "when": (f.get("updated_at") or "")[:16].replace("T", " "),
+            "note": f.get("note") or "",
+        })
+
     # --- Per-user throughput (last 7 days) ----------------------- #
     throughput = store.review_user_throughput(days=7)
     user_rows = []
@@ -173,6 +220,33 @@ def layout(store: Store, config: dict | None = None):
                 {"if": {"filter_query": '{flag} = "🟠 warn"'},
                  "backgroundColor": "rgba(255, 161, 90, 0.08)"},
             ],
+            export_format="csv",
+        ),
+
+        html.H4(f"Flagged for scoring — EEG onset  ({len(flagged_rows)})",
+                style={"color": "#cfd0d6", "marginTop": "24px",
+                        "marginBottom": "4px", "fontSize": "14px"}),
+        html.Div("Files quick-flagged or partial-exported with an EEG onset "
+                 "(EO), awaiting full scoring. Landmarks present per file: "
+                 "EO=EEG onset, BO=behavioural onset, LAS, PID, BB.",
+                 style={"color": "#888", "fontSize": "12px",
+                        "marginBottom": "8px", "maxWidth": "640px"}),
+        dash_table.DataTable(
+            data=flagged_rows,
+            columns=[
+                {"name": "Animal", "id": "animal"},
+                {"name": "Recording", "id": "date"},
+                {"name": "Events", "id": "n_events", "type": "numeric"},
+                {"name": "Landmarks", "id": "landmarks"},
+                {"name": "Max racine", "id": "racine"},
+                {"name": "Flagged by", "id": "flagged_by"},
+                {"name": "When", "id": "when"},
+                {"name": "Note", "id": "note"},
+            ],
+            page_size=25,
+            sort_action="native",
+            filter_action="native",
+            **DARK_TABLE_STYLE,
             export_format="csv",
         ),
 

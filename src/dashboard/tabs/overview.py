@@ -2405,6 +2405,7 @@ def _build_behavioral_seizure_status_card(store):
     total_approved = sum(r["approved_window"] for r in rows)
     total_queue = sum(r["n_queue"] for r in rows)
     total_pending = sum(r["n_pending_pi"] for r in rows)
+    total_flagged = sum(r.get("n_needs_scoring", 0) for r in rows)
     rate_delta = total_created - total_approved
     rate_per_day = rate_delta / 7.0
     if rate_per_day > 5:
@@ -2443,8 +2444,11 @@ def _build_behavioral_seizure_status_card(store):
                        style={"color": "#cfd0d6"}),
             html.Span(f"{total_queue} in queue  ·  ",
                        style={"color": "#cfd0d6"}),
-            html.Span(f"{total_pending} pending PI",
+            html.Span(f"{total_pending} pending PI  ·  ",
                        style={"color": "#cfd0d6"}),
+            html.Span(f"{total_flagged} flagged",
+                       style={"color": "#ff9f0a" if total_flagged
+                              else "#cfd0d6"}),
         ], style={"fontSize": "12px",
                    "marginTop": "2px"}),
         html.Div(verdict_text,
@@ -2506,6 +2510,19 @@ def _build_behavioral_seizure_status_card(store):
                                       "fontWeight": "600"}),
                 ]),
                 html.Div([
+                    html.Span("flagged",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(f"{r.get('n_needs_scoring', 0)}",
+                              style={"color": "#ff9f0a"
+                                     if r.get("n_needs_scoring")
+                                     else "#cfd0d6",
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+                html.Div([
                     html.Span("7 d net",
                                style={"color": "#888",
                                        "fontSize": "10px",
@@ -2518,7 +2535,7 @@ def _build_behavioral_seizure_status_card(store):
                 ]),
             ], style={"display": "grid",
                        "gridTemplateColumns":
-                           "repeat(4, 1fr)",
+                           "repeat(5, 1fr)",
                        "gap": "8px",
                        "marginBottom": "4px"}),
             html.Div(
@@ -2536,7 +2553,7 @@ def _build_behavioral_seizure_status_card(store):
         cells,
         style={"display": "grid",
                 "gridTemplateColumns":
-                    "repeat(auto-fit, minmax(260px, 1fr))",
+                    "repeat(auto-fit, minmax(300px, 1fr))",
                 "gap": "8px",
                 "padding": "12px 14px"})
     return html.Div([header, grid],
