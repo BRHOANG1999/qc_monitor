@@ -2230,11 +2230,13 @@ class Store:
                    JOIN review_state rs ON rs.file_id = pf.id
                    WHERE sc.channel_names LIKE ?
                      AND rs.status = 'needs_scoring'
-                     AND rs.updated_at = (
-                       SELECT MAX(rs2.updated_at) FROM review_state rs2
-                       WHERE rs2.file_id = pf.id)
+                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
+                     AND rs.id = (
+                       SELECT MAX(rs2.id) FROM review_state rs2
+                       WHERE rs2.file_id = pf.id
+                         AND (rs2.animal_id = ? OR rs2.animal_id IS NULL))
                    ORDER BY pf.chunk_datetime ASC""",
-                (f'%"{animal_id}%',),
+                (f'%"{animal_id}%', animal_id, animal_id),
             ).fetchall()
         finally:
             conn.close()
@@ -2274,12 +2276,15 @@ class Store:
                 f"""SELECT pf.id AS file_id, pf.session_dir, pf.file_path,
                            pf.chunk_datetime, pf.duration_sec,
                            rs.user_email, rs.status, rs.note,
-                           rs.updated_at, rs.markers_json
+                           rs.updated_at, rs.markers_json, rs.animal_id
                     FROM processed_files pf
                     JOIN review_state rs ON rs.file_id = pf.id
                     WHERE rs.status IN ({placeholders})
                       AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
-                                   WHERE rs2.file_id = pf.id)
+                                   WHERE rs2.file_id = pf.id
+                                     AND (rs2.animal_id = rs.animal_id
+                                          OR (rs2.animal_id IS NULL
+                                              AND rs.animal_id IS NULL)))
                     ORDER BY pf.chunk_datetime DESC
                     LIMIT ?""",
                 (*statuses, int(limit)),
@@ -2292,12 +2297,14 @@ class Store:
                 events = json.loads(r["markers_json"] or "[]")
             except json.JSONDecodeError:
                 events = []
-            names = self._channel_names_for_session(r["session_dir"])
-            animal = ""
-            for n in names:
-                if isinstance(n, str) and is_animal_channel(n):
-                    animal, _ = split_animal_electrode(n)
-                    break
+            # Prefer the stored animal; fall back to the first animal channel
+            # for legacy whole-file (NULL) rows.
+            animal = r["animal_id"] or ""
+            if not animal:
+                for n in self._channel_names_for_session(r["session_dir"]):
+                    if isinstance(n, str) and is_animal_channel(n):
+                        animal, _ = split_animal_electrode(n)
+                        break
             d = dict(r)
             d["events"] = events
             d["animal"] = animal
@@ -3077,16 +3084,27 @@ class Store:
         finally:
             conn.close()
 
-    def validated_events_for_file(self, file_id: int) -> list:
-        """PI-approved markers (the training ground truth) for one file."""
+    def validated_events_for_file(self, file_id: int,
+                                   animal_id: str | None = None) -> list:
+        """PI-approved markers (the training ground truth) for one file. When
+        *animal_id* is given, that animal's approved row (or a legacy whole-file
+        NULL row); otherwise the latest approved row for the file."""
         assert file_id is not None, "file_id required"
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT markers_json FROM review_state "
-                "WHERE file_id=? AND status='pi_approved' "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (int(file_id),)).fetchone()
+            if animal_id:
+                row = conn.execute(
+                    "SELECT markers_json FROM review_state "
+                    "WHERE file_id=? AND status='pi_approved' "
+                    "AND (animal_id=? OR animal_id IS NULL) "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (int(file_id), animal_id)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT markers_json FROM review_state "
+                    "WHERE file_id=? AND status='pi_approved' "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (int(file_id),)).fetchone()
         finally:
             conn.close()
         if row:
@@ -3593,30 +3611,39 @@ class Store:
             if since_iso:
                 extra_where = " AND pf.chunk_datetime >= ?"
                 params.append(since_iso)
+            # Per (file, animal): a file finalised for animal A must still
+            # count as unreviewed for animal B. done_animals aggregates the
+            # animals (COALESCE NULL -> '') with a terminal row; '' is a legacy
+            # whole-file finalisation that covers everyone.
             rows = conn.execute(
                 f"""SELECT pf.id, pf.chunk_datetime,
-                            sc.channel_names, sc.eeg_channels
+                            sc.channel_names, sc.eeg_channels,
+                            (SELECT GROUP_CONCAT(COALESCE(rs.animal_id, ''))
+                             FROM review_state rs
+                             WHERE rs.file_id = pf.id
+                               AND rs.status IN ('no_events', 'has_events')
+                            ) AS done_animals
                     FROM processed_files pf
                     JOIN session_config sc
                       ON sc.session_dir = pf.session_dir
                     WHERE pf.has_video = 1
                       AND sc.channel_names IS NOT NULL
-                      AND sc.eeg_channels IS NOT NULL
-                      AND NOT EXISTS (
-                        SELECT 1 FROM review_state rs
-                        WHERE rs.file_id = pf.id
-                          AND rs.status IN ('no_events',
-                                             'has_events')
-                      ){extra_where}""",
+                      AND sc.eeg_channels IS NOT NULL{extra_where}""",
                 params,
             ).fetchall()
         finally:
             conn.close()
         by_animal: dict[str, dict] = {}
         for r in rows:
+            done = set((r["done_animals"] or "").split(",")) \
+                if r["done_animals"] else set()
+            if "" in done:
+                continue                      # legacy whole-file finalisation
             animals = self._animal_ids_for_config(
                 r["channel_names"], r["eeg_channels"])
             for a in animals:
+                if a in done:
+                    continue                  # this animal already finalised
                 slot = by_animal.setdefault(a, {
                     "animal_id": a,
                     "n_unreviewed": 0,
@@ -3665,17 +3692,7 @@ class Store:
             rows = conn.execute(
                 """SELECT pf.id AS file_id,
                           pf.session_dir, pf.chunk_datetime,
-                          sc.channel_names, sc.eeg_channels,
-                          (
-                            SELECT status FROM review_state rs
-                            WHERE rs.file_id = pf.id
-                            ORDER BY rs.updated_at DESC LIMIT 1
-                          ) AS latest_status,
-                          (
-                            SELECT updated_at FROM review_state rs
-                            WHERE rs.file_id = pf.id
-                            ORDER BY rs.updated_at DESC LIMIT 1
-                          ) AS latest_updated_at
+                          sc.channel_names, sc.eeg_channels
                    FROM processed_files pf
                    JOIN session_config sc
                      ON sc.session_dir = pf.session_dir
@@ -3683,8 +3700,24 @@ class Store:
                      AND sc.channel_names IS NOT NULL
                      AND sc.eeg_channels IS NOT NULL"""
             ).fetchall()
+            # All review rows for those files, so the latest status can be
+            # resolved per (file, animal) rather than per file.
+            rev = conn.execute(
+                """SELECT rs.file_id, rs.animal_id, rs.status,
+                          rs.updated_at
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   JOIN session_config sc
+                     ON sc.session_dir = pf.session_dir
+                   WHERE pf.has_video = 1
+                     AND sc.eeg_channels IS NOT NULL"""
+            ).fetchall()
         finally:
             conn.close()
+        # Index review rows by file for a per-(file, animal) latest lookup.
+        rev_by_file: dict[int, list] = {}
+        for rr in rev:
+            rev_by_file.setdefault(int(rr["file_id"]), []).append(rr)
         # Aggregate per animal.
         per_animal: dict[str, dict] = {}
         max_iter = len(rows) + 1
@@ -3692,10 +3725,17 @@ class Store:
             assert i < max_iter, "row scan runaway"
             animals = self._animal_ids_for_config(
                 r["channel_names"], r["eeg_channels"])
-            status = r["latest_status"]
             chunk_dt = r["chunk_datetime"] or ""
-            updated_at = r["latest_updated_at"] or ""
+            file_rows = rev_by_file.get(int(r["file_id"]), [])
             for a in animals:
+                # Latest review row for THIS animal (or a legacy NULL
+                # whole-file row), by updated_at.
+                cand = [rr for rr in file_rows
+                        if rr["animal_id"] == a or rr["animal_id"] is None]
+                latest = max(cand, key=lambda rr: rr["updated_at"] or "",
+                             default=None)
+                status = latest["status"] if latest else None
+                updated_at = (latest["updated_at"] or "") if latest else ""
                 slot = per_animal.setdefault(a, {
                     "animal_id": a,
                     "n_queue": 0,

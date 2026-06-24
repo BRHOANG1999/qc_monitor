@@ -318,10 +318,14 @@ def pending_files_for_animal(store, animal_id: str,
     """
     assert isinstance(animal_id, str) and animal_id, \
         "animal_id required"
+    # Per-(file, animal) review: a file already reviewed for ANOTHER animal is
+    # still eligible for THIS animal's screen, so the review/claim gates are
+    # scoped to *animal_id* (NULL / '' legacy rows are whole-file wildcards).
     review_gate = "" if include_reviewed else """
                  AND NOT EXISTS (
                    SELECT 1 FROM review_state rs
                    WHERE rs.file_id = pf.id
+                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
@@ -335,10 +339,12 @@ def pending_files_for_animal(store, animal_id: str,
                  AND NOT EXISTS (
                    SELECT 1 FROM file_claim fc
                    WHERE fc.file_id = pf.id
+                     AND (fc.animal_id = ? OR fc.animal_id = '')
                      AND fc.claimed_at >= ?
                  )"""
     params = ([f'%"{animal_id}%']
-              + ([] if include_reviewed else [store.claim_cutoff_iso()]))
+              + ([] if include_reviewed
+                 else [animal_id, animal_id, store.claim_cutoff_iso()]))
     with store.connection() as conn:
         rows = conn.execute(
             f"""SELECT DISTINCT pf.id AS file_id,
