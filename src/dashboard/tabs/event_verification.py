@@ -676,16 +676,20 @@ def _format_chunk_dt(raw: str | None) -> str:
 
 
 def _pending_table_rows(store, rows: list[dict]) -> list[dict]:
-    """One DataTable record per pending file. ``id`` is the file_id so
-    native selection (selected_row_ids) survives sort + pagination."""
+    """One DataTable record per pending (file, animal). ``id`` is the
+    review_state state_id (unique per (file, animal)) so native selection
+    (selected_row_ids) survives sort + pagination AND distinguishes the
+    animals of a shared recording. ``file_id`` is carried for "Open >"."""
     out: list[dict] = []
     max_iter = len(rows) + 1
     for i, r in enumerate(rows):
         assert i < max_iter, "row scan runaway"
-        fid = int(r["file_id"])
+        animal = r.get("animal_id") or _animal_for_session(
+            store, r["session_dir"])
         out.append({
-            "id": fid,
-            "animal": _animal_for_session(store, r["session_dir"]),
+            "id": int(r["state_id"]),
+            "file_id": int(r["file_id"]),
+            "animal": animal,
             "date": _format_chunk_dt(r.get("chunk_datetime")),
             "n_events": len(r.get("events") or []),
             "submitter": r.get("user_email") or "-",
@@ -802,10 +806,14 @@ def register_callbacks(app, store, config: dict) -> None:
         if (not active_cell
                 or active_cell.get("column_id") != "view"):
             return no_update, no_update, no_update
-        fid = active_cell.get("row_id")
-        if fid is None:
+        # row_id is the review_state state_id (one per (file, animal)); map
+        # it back to the file_id to open in Video Review.
+        sid = active_cell.get("row_id")
+        if sid is None:
             return no_update, no_update, no_update
-        file_id = int(fid)
+        file_id = store._file_id_for_state(int(sid))
+        if file_id is None:
+            return no_update, no_update, no_update
         with store.connection() as conn:
             row = conn.execute(
                 "SELECT session_dir, duration_sec "
@@ -1488,7 +1496,7 @@ def _fetch_approved_rows(store) -> list[dict]:
     events list."""
     with store.connection() as conn:
         rows = conn.execute(
-            """SELECT rs.id AS state_id, rs.file_id,
+            """SELECT rs.id AS state_id, rs.file_id, rs.animal_id,
                       rs.user_email, rs.markers_json,
                       pf.file_path, pf.session_dir,
                       pf.chunk_datetime, pf.sampling_rate
@@ -1513,9 +1521,12 @@ def _fetch_approved_rows(store) -> list[dict]:
 
 def _animal_and_date(store, row: dict
                        ) -> tuple[str, datetime | None]:
-    """Resolve (animal_prefix, chunk_datetime) for a row."""
-    session_dir = row.get("session_dir") or ""
-    animal = _animal_for_session(store, session_dir)
+    """Resolve (animal, chunk_datetime) for a pi_approved row. Prefer the
+    review row's stored animal_id (the animal actually scored); fall back to
+    the session's first animal channel only for legacy whole-file (NULL) rows
+    — fixing the old multi-animal mis-filing."""
+    animal = row.get("animal_id") or _animal_for_session(
+        store, row.get("session_dir") or "")
     chunk_dt = None
     raw = row.get("chunk_datetime") or ""
     try:

@@ -2518,8 +2518,11 @@ class Store:
         assert isinstance(limit, int) and limit > 0, "limit > 0"
         conn = self._connect()
         try:
+            # Only the LATEST row per (file, animal) -- so a (file, animal)
+            # that was pending but later approved/flagged doesn't linger as a
+            # phantom pending card. One card per pending (file, animal).
             rows = conn.execute(
-                """SELECT rs.id AS state_id, rs.file_id,
+                """SELECT rs.id AS state_id, rs.file_id, rs.animal_id,
                           rs.user_email, rs.status,
                           rs.markers_json, rs.note,
                           rs.created_at AS submitted_at,
@@ -2530,6 +2533,11 @@ class Store:
                    JOIN processed_files pf
                      ON pf.id = rs.file_id
                    WHERE rs.status = 'pending_pi_review'
+                     AND rs.id = (SELECT MAX(r2.id) FROM review_state r2
+                                  WHERE r2.file_id = rs.file_id
+                                    AND (r2.animal_id = rs.animal_id
+                                         OR (r2.animal_id IS NULL
+                                             AND rs.animal_id IS NULL)))
                    ORDER BY rs.created_at ASC, rs.id ASC
                    LIMIT ?""",
                 (limit * 4,),  # over-fetch; animal filter prunes
@@ -2543,10 +2551,17 @@ class Store:
             except json.JSONDecodeError:
                 events = []
             if animal_id:
-                names = self._channel_names_for_session(
-                    r["session_dir"])
-                if not self._session_has_animal(names, animal_id):
-                    continue
+                # Prefer the stored animal_id; fall back to the session
+                # channel check for legacy whole-file (NULL) rows.
+                row_animal = r["animal_id"]
+                if row_animal:
+                    if row_animal != animal_id:
+                        continue
+                else:
+                    names = self._channel_names_for_session(
+                        r["session_dir"])
+                    if not self._session_has_animal(names, animal_id):
+                        continue
             d = dict(r)
             d["events"] = events
             out.append(d)
@@ -2589,26 +2604,38 @@ class Store:
     def pi_approve(self, file_id: int, pi_email: str,
                      *,
                      events_override: list[dict] | None = None,
+                     state_id: int | None = None,
                      ) -> int:
-        """Move a file from ``pending_pi_review`` to ``pi_approved``.
+        """Move a (file, animal) from ``pending_pi_review`` to ``pi_approved``.
 
-        When the PI nudges or removes events inline, pass the new
-        list as ``events_override``; the original undergrad
-        markers are captured in the audit row's payload_json so
-        the pre-PI version stays queryable.
+        Pass *state_id* (the review_state row id, from pi_pending_files) to
+        target one animal's pending row exactly -- the multi-animal-safe path.
+        Without it, the latest pending row for the file is used (legacy /
+        single-animal). When the PI nudges or removes events inline, pass the
+        new list as ``events_override``; the original undergrad markers are
+        captured in the audit row's payload_json.
         """
         assert isinstance(file_id, int), "file_id must be int"
         assert pi_email, "pi_email required"
         now = datetime.now().isoformat()
         conn = self._connect()
         try:
-            row = conn.execute(
-                """SELECT id, markers_json FROM review_state
-                   WHERE file_id = ?
-                     AND status = 'pending_pi_review'
-                   ORDER BY updated_at DESC LIMIT 1""",
-                (file_id,),
-            ).fetchone()
+            if state_id is not None:
+                row = conn.execute(
+                    """SELECT id, file_id, animal_id, markers_json
+                       FROM review_state
+                       WHERE id = ? AND status = 'pending_pi_review'""",
+                    (int(state_id),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT id, file_id, animal_id, markers_json
+                       FROM review_state
+                       WHERE file_id = ?
+                         AND status = 'pending_pi_review'
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id,),
+                ).fetchone()
             if not row:
                 return 0
             pre_edit = row["markers_json"]
@@ -2636,10 +2663,11 @@ class Store:
                 payload["pre_edit_markers_json"] = pre_edit
             conn.execute(
                 """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json, at)
-                   VALUES (?, ?, 'pi_approve', ?, ?)""",
-                (file_id, pi_email.lower(),
-                 json.dumps(payload), now),
+                   (file_id, user_email, action, payload_json,
+                    animal_id, at)
+                   VALUES (?, ?, 'pi_approve', ?, ?, ?)""",
+                (int(row["file_id"]), pi_email.lower(),
+                 json.dumps(payload), row["animal_id"], now),
             )
             conn.commit()
             return int(row["id"])
@@ -3275,14 +3303,26 @@ class Store:
         finally:
             conn.close()
 
+    def _file_id_for_state(self, state_id: int) -> int | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT file_id FROM review_state WHERE id = ?",
+                (int(state_id),)).fetchone()
+            return int(row["file_id"]) if row else None
+        finally:
+            conn.close()
+
     def pi_flag(self, file_id: int, pi_email: str,
                   *, note: str,
-                  event_indices: list[int] | None = None) -> int:
-        """Send a file back to the undergrad's queue with a note.
+                  event_indices: list[int] | None = None,
+                  state_id: int | None = None) -> int:
+        """Send a (file, animal) back to the undergrad's queue with a note.
 
-        ``note`` shows up on the queue card. ``event_indices``
-        marks WHICH events the PI wants re-checked; an empty list
-        means the whole file needs a second look.
+        Pass *state_id* to target one animal's row exactly (multi-animal-safe);
+        without it the latest pending/approved row for the file is used.
+        ``note`` shows up on the queue card. ``event_indices`` marks WHICH
+        events the PI wants re-checked; an empty list = the whole file.
         """
         assert isinstance(file_id, int), "file_id must be int"
         assert pi_email, "pi_email required"
@@ -3290,14 +3330,21 @@ class Store:
         now = datetime.now().isoformat()
         conn = self._connect()
         try:
-            row = conn.execute(
-                """SELECT id FROM review_state
-                   WHERE file_id = ?
-                     AND status IN ('pending_pi_review',
-                                     'pi_approved')
-                   ORDER BY updated_at DESC LIMIT 1""",
-                (file_id,),
-            ).fetchone()
+            if state_id is not None:
+                row = conn.execute(
+                    """SELECT id, file_id, animal_id FROM review_state
+                       WHERE id = ? AND status IN ('pending_pi_review',
+                                                    'pi_approved')""",
+                    (int(state_id),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT id, file_id, animal_id FROM review_state
+                       WHERE file_id = ?
+                         AND status IN ('pending_pi_review', 'pi_approved')
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (file_id,),
+                ).fetchone()
             if not row:
                 return 0
             conn.execute(
@@ -3308,97 +3355,83 @@ class Store:
             )
             conn.execute(
                 """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json, at)
-                   VALUES (?, ?, 'pi_flag', ?, ?)""",
-                (file_id, pi_email.lower(),
+                   (file_id, user_email, action, payload_json,
+                    animal_id, at)
+                   VALUES (?, ?, 'pi_flag', ?, ?, ?)""",
+                (int(row["file_id"]), pi_email.lower(),
                  json.dumps({"note": note,
                               "event_indices":
                                   list(event_indices or [])}),
-                 now),
+                 row["animal_id"], now),
             )
             conn.commit()
             return int(row["id"])
         finally:
             conn.close()
 
-    def pi_bulk_approve(self, file_ids: list[int],
+    def pi_bulk_approve(self, state_ids: list[int],
                           pi_email: str) -> int:
-        """Approve many files; emits one ``pi_bulk_approve`` row
-        in addition to a per-file ``pi_approve`` entry each.
+        """Approve many pending (file, animal) rows by review_state id; emits
+        one ``pi_bulk_approve`` summary row plus a per-row ``pi_approve`` each.
         """
-        assert isinstance(file_ids, list), "file_ids must be list"
+        assert isinstance(state_ids, list), "state_ids must be list"
         assert pi_email, "pi_email required"
-        max_iter = 1024
+        max_iter = 4096
         n_done = 0
-        for i, fid in enumerate(file_ids):
+        for i, sid in enumerate(state_ids):
             assert i < max_iter, "bulk loop runaway"
-            if self.pi_approve(int(fid), pi_email):
+            if self.pi_approve(0, pi_email, state_id=int(sid)):
                 n_done += 1
-        if n_done:
-            self.insert_review_event(
-                int(file_ids[0]), pi_email,
-                "pi_bulk_approve",
-                {"file_ids": [int(f) for f in file_ids],
-                 "n_approved": n_done},
-            )
+        if n_done and state_ids:
+            fid = self._file_id_for_state(int(state_ids[0]))
+            if fid:
+                self.insert_review_event(
+                    fid, pi_email, "pi_bulk_approve",
+                    {"state_ids": [int(s) for s in state_ids],
+                     "n_approved": n_done})
         return n_done
 
     def pi_approve_all_pending(self, pi_email: str,
                                  *, animal_id: str | None = None) -> int:
-        """Approve EVERY file currently in ``pending_pi_review`` (not just a
-        table page). Used by the PI's "Approve all pending" so the finalize
-        CSV covers every file, regardless of pagination/selection.
+        """Approve EVERY pending (file, animal) currently in
+        ``pending_pi_review`` (not just a table page), optionally narrowed to
+        one *animal_id*. Used by the PI's "Approve all pending".
         """
         assert pi_email, "pi_email required"
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                """SELECT rs.file_id, pf.session_dir
-                   FROM review_state rs
-                   JOIN processed_files pf ON pf.id = rs.file_id
-                   WHERE rs.status = 'pending_pi_review'
-                     AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
-                                  WHERE rs2.file_id = rs.file_id)
-                   ORDER BY rs.id ASC""").fetchall()
-        finally:
-            conn.close()
-        file_ids: list[int] = []
-        for r in rows:
-            if animal_id:
-                names = self._channel_names_for_session(r["session_dir"])
-                if not self._session_has_animal(names, animal_id):
-                    continue
-            file_ids.append(int(r["file_id"]))
+        rows = self.pi_pending_files(animal_id=animal_id, limit=100000)
+        state_ids = [int(r["state_id"]) for r in rows]
         n_done = 0
-        for i, fid in enumerate(file_ids):
+        for i, sid in enumerate(state_ids):
             assert i < 100000, "approve-all loop runaway"
-            if self.pi_approve(fid, pi_email):
+            if self.pi_approve(0, pi_email, state_id=sid):
                 n_done += 1
-        if n_done:
-            self.insert_review_event(
-                file_ids[0], pi_email, "pi_bulk_approve",
-                {"file_ids": file_ids, "n_approved": n_done,
-                 "scope": "all_pending"})
+        if n_done and state_ids:
+            fid = self._file_id_for_state(state_ids[0])
+            if fid:
+                self.insert_review_event(
+                    fid, pi_email, "pi_bulk_approve",
+                    {"n_approved": n_done, "scope": "all_pending",
+                     "animal_id": animal_id})
         return n_done
 
-    def pi_bulk_flag(self, file_ids: list[int], pi_email: str,
+    def pi_bulk_flag(self, state_ids: list[int], pi_email: str,
                        *, note: str) -> int:
-        """Flag many files with a shared note."""
-        assert isinstance(file_ids, list), "file_ids must be list"
+        """Flag many pending (file, animal) rows by review_state id."""
+        assert isinstance(state_ids, list), "state_ids must be list"
         assert pi_email, "pi_email required"
-        max_iter = 1024
+        max_iter = 4096
         n_done = 0
-        for i, fid in enumerate(file_ids):
+        for i, sid in enumerate(state_ids):
             assert i < max_iter, "bulk loop runaway"
-            if self.pi_flag(int(fid), pi_email, note=note):
+            if self.pi_flag(0, pi_email, note=note, state_id=int(sid)):
                 n_done += 1
-        if n_done:
-            self.insert_review_event(
-                int(file_ids[0]), pi_email,
-                "pi_bulk_flag",
-                {"file_ids": [int(f) for f in file_ids],
-                 "n_flagged": n_done, "note": note},
-            )
+        if n_done and state_ids:
+            fid = self._file_id_for_state(int(state_ids[0]))
+            if fid:
+                self.insert_review_event(
+                    fid, pi_email, "pi_bulk_flag",
+                    {"state_ids": [int(s) for s in state_ids],
+                     "n_flagged": n_done, "note": note})
         return n_done
 
     def get_adjacent_files(self, file_id: int,
