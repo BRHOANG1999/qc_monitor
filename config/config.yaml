@@ -252,6 +252,19 @@ review_queue:
     weekday: 4   # 0=Mon ... 4=Fri
     hour: 17
 
+# Automatic per-animal review-queue filter. A background sweep (rides the
+# mass_analyze worker) screens each enabled animal's pending files; a file
+# crossing NONE of that animal's active thresholds is auto-marked
+# pending_pi_review (the PI still rubber-stamps it into the CSV no-event path).
+# Thresholds are set per animal in the Event Verification tab (Auto-filter
+# panel). Reuses the feature_analysis stim-blank window + the 150s min peak
+# distance from the Mass Analyze screen.
+auto_filter:
+  enabled: true
+  sweep_interval_sec: 300
+  # Used as the review author when a config has no updated_by.
+  system_email: hoang392@umn.edu
+
 # Training tab: students blind-re-score PI-approved recordings and get an
 # agreement score vs the validated answer. Reuses review_queue.pi_emails
 # for the PI roster / advance gate.

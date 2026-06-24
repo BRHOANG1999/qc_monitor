@@ -81,6 +81,8 @@ def layout(store: Store, config: dict | None = None):
         # Screen-comparison benchmark: run both screens over the
         # animal's human-labeled files and compare TP/FP/TN/FN.
         _screen_compare_panel(store),
+        # Per-animal auto-filter thresholds (background sweep).
+        _auto_filter_panel(store),
         # Bulk-action bar.
         html.Div([
             html.Button(
@@ -228,6 +230,119 @@ def _btn_style(*, accent: bool = False, warning: bool = False,
         base["background"] = "#262638"
         base["color"] = "#cfd0d6"
     return base
+
+
+# --------------------------------------------------------------- #
+# Per-animal auto-filter thresholds
+# --------------------------------------------------------------- #
+
+_AF_NUM = {"width": "92px", "background": "#262638", "color": "#f0f0f5",
+           "border": "1px solid rgba(255,255,255,0.15)",
+           "borderRadius": "4px", "padding": "4px 6px", "fontSize": "12px"}
+_AF_LAB = {"color": "#a0a0b0", "fontSize": "12px"}
+_AF_COLUMNS = [
+    {"name": "Animal", "id": "animal_id"},
+    {"name": "Envelope", "id": "peak_cutoff"},
+    {"name": "AUC", "id": "auc_threshold"},
+    {"name": "Win(s)", "id": "auc_window_sec"},
+    {"name": "Elec", "id": "electrode"},
+    {"name": "Screens", "id": "screen_mode"},
+    {"name": "On", "id": "enabled"},
+    {"name": "Auto-cleared", "id": "auto_cleared", "type": "numeric"},
+    {"name": "Updated by", "id": "updated_by"},
+    {"name": "Updated", "id": "updated_at"},
+]
+
+
+def _af_table_rows(store) -> list[dict]:
+    """Saved per-animal auto-filter configs + each one's auto-cleared count."""
+    out = []
+    for c in store.list_animal_screen_configs():
+        out.append({
+            "animal_id": c["animal_id"],
+            "peak_cutoff": c.get("peak_cutoff"),
+            "auc_threshold": c.get("auc_threshold"),
+            "auc_window_sec": c.get("auc_window_sec"),
+            "electrode": c.get("electrode"),
+            "screen_mode": c.get("screen_mode"),
+            "enabled": "yes" if c.get("enabled") else "no",
+            "auto_cleared": store.count_auto_filter_cleared(c["animal_id"]),
+            "updated_by": c.get("updated_by") or "",
+            "updated_at": (c.get("updated_at") or "")[:16].replace("T", " "),
+        })
+    return out
+
+
+def _auto_filter_panel(store) -> html.Details:
+    """PI sets a per-animal envelope/AUC threshold + which screens apply; a
+    background sweep auto-clears pending files that cross none of them."""
+    animals = sorted(store.list_all_animals())
+    dd = {"width": "150px"}
+    return html.Details([
+        html.Summary("⚙  Per-animal auto-filter thresholds",
+                     style={"cursor": "pointer", "fontWeight": "600",
+                            "color": "#cfd0d6", "fontSize": "13px",
+                            "padding": "6px 0"}),
+        html.Div(
+            "Set a raw-envelope cutoff and/or AUC threshold per animal. A "
+            "background sweep marks any of that animal's pending files that "
+            "cross NONE of the active screens as pending_pi_review (you still "
+            "rubber-stamp them below). 'Both' = keep if it crosses EITHER "
+            "screen. Animals with no saved+enabled threshold are never "
+            "auto-filtered.",
+            style={"color": "#8a8d99", "fontSize": "11px",
+                   "margin": "4px 0 10px", "maxWidth": "760px"}),
+        html.Div([
+            html.Span("Animal:", style=_AF_LAB),
+            dcc.Dropdown(id="evtv-af-animal",
+                         options=[{"label": a, "value": a} for a in animals],
+                         style=dd, className="dark-dropdown"),
+            html.Span("Envelope cutoff:", style=_AF_LAB),
+            dcc.Input(id="evtv-af-cutoff", type="number", step="any",
+                      style=_AF_NUM),
+            html.Span("AUC thresh:", style=_AF_LAB),
+            dcc.Input(id="evtv-af-auc-thr", type="number", step="any",
+                      style=_AF_NUM),
+            html.Span("AUC win (s):", style=_AF_LAB),
+            dcc.Input(id="evtv-af-auc-win", type="number", value=5,
+                      step="any", style=_AF_NUM),
+            html.Span("Electrode:", style=_AF_LAB),
+            dcc.Dropdown(id="evtv-af-electrode", options=_ELECTRODE_OPTIONS,
+                         value=0, style={"width": "78px"},
+                         className="dark-dropdown"),
+        ], style={"display": "flex", "alignItems": "center", "gap": "6px",
+                  "flexWrap": "wrap", "marginBottom": "8px"}),
+        html.Div([
+            html.Span("Screens:", style=_AF_LAB),
+            dcc.RadioItems(id="evtv-af-mode",
+                           options=[{"label": " Both (OR)", "value": "both"},
+                                    {"label": " Envelope", "value": "envelope"},
+                                    {"label": " AUC", "value": "auc"}],
+                           value="both", inline=True,
+                           labelStyle={"color": "#ddd", "fontSize": "12px",
+                                       "marginRight": "12px"},
+                           inputStyle={"marginRight": "4px"}),
+            dcc.Checklist(id="evtv-af-enabled",
+                          options=[{"label": " Enabled", "value": "on"}],
+                          value=["on"], style={"display": "inline-block"},
+                          labelStyle={"color": "#ddd", "fontSize": "12px"}),
+            html.Button("Save", id="evtv-af-save-btn", n_clicks=0,
+                        style=_btn_style(accent=True)),
+            html.Button("Sweep now", id="evtv-af-sweep-btn", n_clicks=0,
+                        style=_btn_style(secondary=True)),
+            html.Span(id="evtv-af-status",
+                      style={"color": "#a0a0b0", "fontSize": "12px",
+                             "marginLeft": "8px"}),
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px",
+                  "flexWrap": "wrap", "marginBottom": "10px"}),
+        dash_table.DataTable(
+            id="evtv-af-table", columns=_AF_COLUMNS,
+            data=_af_table_rows(store), page_size=10, sort_action="native",
+            style_as_list_view=True, **DARK_TABLE_STYLE,
+            style_data_conditional=[ZEBRA_STRIPE]),
+    ], style={"border": "1px solid rgba(255,255,255,0.08)",
+              "borderRadius": "6px", "padding": "8px 12px",
+              "marginBottom": "16px"})
 
 
 # --------------------------------------------------------------- #
@@ -790,6 +905,88 @@ def register_callbacks(app, store, config: dict) -> None:
         rows = store.pi_pending_files(limit=500)
         return (_pending_table_rows(store, rows), [], msg,
                 _pending_signature(rows))
+
+    # ---- Per-animal auto-filter thresholds ---- #
+    @app.callback(
+        Output("evtv-af-cutoff", "value"),
+        Output("evtv-af-auc-thr", "value"),
+        Output("evtv-af-auc-win", "value"),
+        Output("evtv-af-electrode", "value"),
+        Output("evtv-af-mode", "value"),
+        Output("evtv-af-enabled", "value"),
+        Input("evtv-af-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _af_load(animal):
+        if not animal:
+            return None, None, 5, 0, "both", ["on"]
+        cfg = store.get_animal_screen_config(animal) or {}
+        return (cfg.get("peak_cutoff"), cfg.get("auc_threshold"),
+                cfg.get("auc_window_sec") or 5, cfg.get("electrode") or 0,
+                cfg.get("screen_mode") or "both",
+                (["on"] if cfg.get("enabled", 1) else []))
+
+    @app.callback(
+        Output("evtv-af-status", "children"),
+        Output("evtv-af-table", "data"),
+        Input("evtv-af-save-btn", "n_clicks"),
+        Input("evtv-af-sweep-btn", "n_clicks"),
+        State("evtv-af-animal", "value"),
+        State("evtv-af-cutoff", "value"),
+        State("evtv-af-auc-thr", "value"),
+        State("evtv-af-auc-win", "value"),
+        State("evtv-af-electrode", "value"),
+        State("evtv-af-mode", "value"),
+        State("evtv-af-enabled", "value"),
+        prevent_initial_call=True,
+    )
+    def _af_save_or_sweep(_s, _w, animal, cutoff, auc_thr, auc_win,
+                          electrode, mode, enabled):
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return "PI only.", no_update
+        if not animal:
+            return "Pick an animal first.", no_update
+        trig = callback_context.triggered_id
+        mode = mode or "both"
+        need_env = mode in ("both", "envelope")
+        need_auc = mode in ("both", "auc")
+        if trig == "evtv-af-save-btn":
+            has_env = cutoff not in (None, "")
+            has_auc = auc_thr not in (None, "")
+            if (mode == "envelope" and not has_env) or \
+               (mode == "auc" and not has_auc) or \
+               (mode == "both" and not has_env and not has_auc):
+                return ("Set a threshold for the chosen screen(s).", no_update)
+            store.upsert_animal_screen_config(
+                animal, peak_cutoff=cutoff, auc_threshold=auc_thr,
+                auc_window_sec=auc_win, electrode=int(electrode or 0),
+                screen_mode=mode, enabled=("on" in (enabled or [])),
+                updated_by=email)
+            _mass_analyze.kick_auto_screen_for_animal(store, animal)
+            msg = (f"Saved {animal} — sweeping its backlog in the "
+                   f"background…")
+        elif trig == "evtv-af-sweep-btn":
+            r = _mass_analyze.auto_screen_for_animal(store, animal)
+            if r.get("reason"):
+                msg = f"{animal}: {r['reason'].replace('_', ' ')}."
+            else:
+                msg = (f"{animal}: cleared {r['n_cleared']}, kept "
+                       f"{r['n_kept']}, errors {r['n_error']}.")
+        else:
+            return no_update, no_update
+        return msg, _af_table_rows(store)
+
+    @app.callback(
+        Output("evtv-af-table", "data", allow_duplicate=True),
+        Input("refresh-trigger", "data"),
+        prevent_initial_call=True,
+    )
+    def _af_refresh_table(_n):
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return no_update
+        return _af_table_rows(store)
 
     # Click a row's "Open >" cell -> hand the recording to Video
     # Review via the same lfp-to-video-bridge the LFP Browser uses

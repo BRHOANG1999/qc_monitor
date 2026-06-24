@@ -1193,6 +1193,168 @@ def commit_threshold(store, animal_id: str, cutoff: float,
 
 
 # --------------------------------------------------------------- #
+# Automatic per-animal threshold filter (animal_screen_config)
+# --------------------------------------------------------------- #
+
+def active_screens(cfg: dict) -> set:
+    """Which screens are BOTH selected by screen_mode AND have usable
+    thresholds. 'both' = OR(envelope, auc), but degrades gracefully: a 'both'
+    config with only peak_cutoff set -> {'envelope'}. Empty set => no usable
+    threshold => the animal is never auto-filtered."""
+    assert isinstance(cfg, dict), "cfg must be dict"
+    mode = cfg.get("screen_mode") or "both"
+    has_env = cfg.get("peak_cutoff") not in (None, 0)
+    has_auc = (cfg.get("auc_threshold") not in (None, 0)
+               and cfg.get("auc_window_sec") not in (None, 0))
+    out: set = set()
+    if mode in ("both", "envelope") and has_env:
+        out.add("envelope")
+    if mode in ("both", "auc") and has_auc:
+        out.add("auc")
+    return out
+
+
+def screen_file_verdict(store, file_id: int, session_dir: str,
+                        animal_id: str, cfg: dict,
+                        *, min_peak_dist_sec: float =
+                            DEFAULT_MIN_PEAK_DIST_SEC) -> tuple:
+    """('keep'|'clear', details). KEEP if the file crosses ANY active screen
+    (lands in a pool); CLEAR only if every active screen reads zero. On ANY
+    compute error -> ('keep', ...) -- never auto-clear on error (safety)."""
+    assert isinstance(file_id, int), "file_id must be int"
+    assert isinstance(cfg, dict), "cfg must be dict"
+    screens = active_screens(cfg)
+    if not screens:
+        return ("keep", {"reason": "no_usable_threshold"})
+    ch = animal_channel_index(store, session_dir, animal_id,
+                              int(cfg.get("electrode") or 0))
+    env_pos = auc_pos = False
+    try:
+        if "envelope" in screens:
+            env_pos = get_or_compute_peak_count(
+                store, file_id, ch, float(cfg["peak_cutoff"]),
+                min_peak_dist_sec=min_peak_dist_sec).n_peaks > 0
+        if "auc" in screens:
+            auc_pos = get_or_compute_auc_count(
+                store, file_id, ch, float(cfg["auc_threshold"]),
+                float(cfg["auc_window_sec"]),
+                min_peak_dist_sec=min_peak_dist_sec).n_events > 0
+    except Exception as e:  # noqa: BLE001 -- keep on error, never auto-clear
+        logger.warning("screen verdict file=%s ch=%s failed: %s",
+                       file_id, ch, e)
+        return ("keep", {"reason": "error"})
+    crossed = env_pos or auc_pos
+    return (("keep" if crossed else "clear"),
+            {"channel": ch, "env_pos": env_pos, "auc_pos": auc_pos,
+             "screens": sorted(screens)})
+
+
+def _apply_auto_clear(store, file_id, email, animal_id, det, cfg) -> bool:
+    """Write the pending_pi_review row + auto_filter_clear audit. True on ok."""
+    try:
+        store.mark_review(
+            file_id, email, "pending_pi_review", markers=[],
+            note=f"Auto-filter: no events at {animal_id} thresholds",
+            animal_id=animal_id)
+        store.insert_review_event(
+            file_id, email, "auto_filter_clear",
+            {"animal_id": animal_id, "channel": det.get("channel"),
+             "screens": det.get("screens"),
+             "peak_cutoff": cfg.get("peak_cutoff"),
+             "auc_threshold": cfg.get("auc_threshold"),
+             "auc_window_sec": cfg.get("auc_window_sec")},
+            animal_id=animal_id)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auto_filter mark file=%s: %s", file_id, e)
+        return False
+
+
+def auto_screen_for_animal(store, animal_id: str, cfg: dict | None = None,
+                           *, system_email: str | None = None,
+                           min_peak_dist_sec: float =
+                               DEFAULT_MIN_PEAK_DIST_SEC) -> dict:
+    """Sweep one animal's pending pool: clear (-> pending_pi_review on the
+    (file, animal) row + an auto_filter_clear event) every file whose active
+    screens all read zero; crossers are left in the queue. Per-(file, animal)
+    review means each animal's slice is independent -- no multi-animal guard.
+    Returns {n_cleared, n_kept, n_skipped, n_error, file_ids_cleared}."""
+    assert isinstance(animal_id, str) and animal_id, "animal_id required"
+    if cfg is None:
+        cfg = store.get_animal_screen_config(animal_id)
+    if not cfg or not cfg.get("enabled"):
+        return {"n_cleared": 0, "n_kept": 0, "n_skipped": 0, "n_error": 0,
+                "file_ids_cleared": [], "reason": "disabled"}
+    if not active_screens(cfg):
+        return {"n_cleared": 0, "n_kept": 0, "n_skipped": 0, "n_error": 0,
+                "file_ids_cleared": [], "reason": "no_usable_threshold"}
+    email = (system_email or cfg.get("updated_by")
+             or "auto-filter@system").lower()
+    files = pending_files_for_animal(store, animal_id)
+    cleared: list = []
+    n_kept = n_skip = n_err = 0
+    max_iter = len(files) + 1
+    for i, f in enumerate(files):
+        assert i < max_iter, "auto_screen loop runaway"
+        fid, sdir = int(f["file_id"]), f["session_dir"]
+        verdict, det = screen_file_verdict(
+            store, fid, sdir, animal_id, cfg,
+            min_peak_dist_sec=min_peak_dist_sec)
+        if det.get("reason") == "error":
+            n_err += 1
+            continue
+        if verdict != "clear":
+            n_kept += 1
+            continue
+        if _apply_auto_clear(store, fid, email, animal_id, det, cfg):
+            cleared.append(fid)
+        else:
+            n_skip += 1
+    return {"n_cleared": len(cleared), "n_kept": n_kept,
+            "n_skipped": n_skip, "n_error": n_err,
+            "file_ids_cleared": cleared}
+
+
+def kick_auto_screen_for_animal(store, animal_id: str) -> None:
+    """Fire a one-shot backlog sweep for one animal off the request thread
+    (daemon), so a Save callback returns instantly."""
+    assert isinstance(animal_id, str) and animal_id, "animal_id required"
+
+    def _run():
+        try:
+            auto_screen_for_animal(store, animal_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("kick auto_screen animal=%s failed", animal_id)
+    threading.Thread(target=_run, daemon=True,
+                     name=f"qc-autofilter-{animal_id}").start()
+
+
+def _run_auto_filter_sweep(store) -> dict:
+    """Sweep every enabled animal_screen_config. Bounded, single-threaded
+    inside the worker loop; idempotent (pending_files_for_animal excludes
+    already-cleared files)."""
+    try:
+        configs = store.list_animal_screen_configs(enabled_only=True)
+    except Exception:  # noqa: BLE001 -- table may be missing on a brand-new DB
+        return {"animals": 0, "n_cleared": 0}
+    totals = {"animals": 0, "n_cleared": 0}
+    max_iter = len(configs) + 1
+    for i, cfg in enumerate(configs):
+        assert i < max_iter, "sweep loop runaway"
+        try:
+            r = auto_screen_for_animal(store, cfg["animal_id"], cfg)
+            totals["animals"] += 1
+            totals["n_cleared"] += r["n_cleared"]
+        except Exception:  # noqa: BLE001
+            logger.exception("auto_filter sweep animal=%s failed",
+                             cfg.get("animal_id"))
+    if totals["n_cleared"]:
+        logger.info("auto_filter sweep cleared %d files across %d animals",
+                    totals["n_cleared"], totals["animals"])
+    return totals
+
+
+# --------------------------------------------------------------- #
 # Screen-comparison benchmark (two screens vs human labels)
 # --------------------------------------------------------------- #
 
@@ -1371,6 +1533,11 @@ _worker_lock = threading.Lock()
 _wake = threading.Event()
 
 
+# Background auto-filter sweep: set from config.auto_filter in start_worker.
+_AUTO_FILTER_ENABLED = True
+_AUTO_FILTER_INTERVAL = 300.0
+
+
 def start_worker(store, config: dict) -> None:
     """Spawn the daemon. Idempotent. Mirrors
     ``assignments.start_warmer`` / ``event_clip.start_worker``."""
@@ -1388,6 +1555,15 @@ def start_worker(store, config: dict) -> None:
         _SCAN_WORKERS = max(1, int(cfg.get("scan_workers", 4)))
     except (TypeError, ValueError):
         _SCAN_WORKERS = 4
+    # Auto-filter sweep cadence (rides this same daemon).
+    af = (config or {}).get("auto_filter", {}) or {}
+    global _AUTO_FILTER_ENABLED, _AUTO_FILTER_INTERVAL
+    _AUTO_FILTER_ENABLED = af.get("enabled", True) is not False
+    try:
+        _AUTO_FILTER_INTERVAL = max(30.0,
+                                    float(af.get("sweep_interval_sec", 300)))
+    except (TypeError, ValueError):
+        _AUTO_FILTER_INTERVAL = 300.0
     if cfg.get("enabled") is False:  # explicit disable only
         logger.info("mass_analyze worker disabled in config")
         return
@@ -1408,6 +1584,7 @@ def _worker_loop(store) -> None:
     interval = 2.0
     max_iter = 10 ** 9
     i = 0
+    last_sweep = 0.0
     while True:
         assert i < max_iter, "worker loop runaway"
         i += 1
@@ -1430,6 +1607,14 @@ def _worker_loop(store) -> None:
                 ).fetchone()
             if brow is not None:
                 run_screen_benchmark(store, int(brow["id"]))
+                continue
+            # Low-priority background auto-filter sweep (interactive scans
+            # above drain first). Runs every _AUTO_FILTER_INTERVAL seconds.
+            now = time.monotonic()
+            if (_AUTO_FILTER_ENABLED
+                    and now - last_sweep >= _AUTO_FILTER_INTERVAL):
+                last_sweep = now
+                _run_auto_filter_sweep(store)
                 continue
             _wake.wait(timeout=interval)
             _wake.clear()

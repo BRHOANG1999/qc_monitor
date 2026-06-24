@@ -466,6 +466,28 @@ CREATE INDEX IF NOT EXISTS idx_envelope_auc_cache_lookup
     ON envelope_auc_cache(file_id, channel, auc_threshold, window_sec);
 
 -- ----------------------------------------------------------------------
+-- animal_screen_config: the PI's per-animal auto-filter thresholds. A
+-- background sweep screens each enabled animal's pending files; a file
+-- crossing NONE of that animal's active thresholds is auto-marked
+-- pending_pi_review (the PI still rubber-stamps it). screen_mode picks
+-- which screens are active: 'both' = OR(envelope, auc). peak_cutoff is the
+-- raw-envelope (Hilbert) threshold; auc_threshold/auc_window_sec the
+-- sliding-window-AUC screen. NULL threshold = that screen unset.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS animal_screen_config (
+    animal_id      TEXT PRIMARY KEY,
+    peak_cutoff    REAL,
+    auc_threshold  REAL,
+    auc_window_sec REAL,
+    electrode      INTEGER NOT NULL DEFAULT 0,
+    screen_mode    TEXT NOT NULL DEFAULT 'both'
+        CHECK(screen_mode IN ('both', 'envelope', 'auc')),
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    updated_by     TEXT,
+    updated_at     TEXT
+);
+
+-- ----------------------------------------------------------------------
 -- mass_analyze_job: background scan queue + progress for the PI's
 -- Mass Analyze panel. One row per (PI, animal, cutoff) run; the panel
 -- polls scanned_files / n_zero_peaks / n_with_peaks for live progress.

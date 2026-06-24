@@ -2311,6 +2311,102 @@ class Store:
             out.append(d)
         return out
 
+    # ------------------------------------------------------------------ #
+    #  Per-animal auto-filter thresholds (animal_screen_config)
+    # ------------------------------------------------------------------ #
+
+    def upsert_animal_screen_config(
+            self, animal_id: str, *,
+            peak_cutoff: float | None,
+            auc_threshold: float | None,
+            auc_window_sec: float | None,
+            electrode: int,
+            screen_mode: str,
+            enabled: bool,
+            updated_by: str) -> None:
+        """Insert or replace one animal's auto-filter threshold config."""
+        assert isinstance(animal_id, str) and animal_id, "animal_id required"
+        assert screen_mode in ("both", "envelope", "auc"), "bad screen_mode"
+
+        def _f(v):
+            return float(v) if v not in (None, "") else None
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO animal_screen_config
+                   (animal_id, peak_cutoff, auc_threshold, auc_window_sec,
+                    electrode, screen_mode, enabled, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(animal_id) DO UPDATE SET
+                       peak_cutoff=excluded.peak_cutoff,
+                       auc_threshold=excluded.auc_threshold,
+                       auc_window_sec=excluded.auc_window_sec,
+                       electrode=excluded.electrode,
+                       screen_mode=excluded.screen_mode,
+                       enabled=excluded.enabled,
+                       updated_by=excluded.updated_by,
+                       updated_at=excluded.updated_at""",
+                (animal_id, _f(peak_cutoff), _f(auc_threshold),
+                 _f(auc_window_sec), int(electrode or 0), screen_mode,
+                 1 if enabled else 0, (updated_by or "").lower(), now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_animal_screen_config(self, animal_id: str) -> dict | None:
+        """One animal's auto-filter config, or None."""
+        assert isinstance(animal_id, str) and animal_id, "animal_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM animal_screen_config WHERE animal_id = ?",
+                (animal_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_animal_screen_configs(self, *, enabled_only: bool = False
+                                    ) -> list[dict]:
+        """All per-animal auto-filter configs, by animal_id."""
+        where = " WHERE enabled = 1" if enabled_only else ""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT * FROM animal_screen_config{where} "
+                "ORDER BY animal_id").fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def set_animal_screen_enabled(self, animal_id: str,
+                                   enabled: bool) -> None:
+        assert isinstance(animal_id, str) and animal_id, "animal_id required"
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE animal_screen_config SET enabled=?, updated_at=? "
+                "WHERE animal_id=?",
+                (1 if enabled else 0, datetime.now().isoformat(), animal_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def count_auto_filter_cleared(self, animal_id: str) -> int:
+        """How many files this animal's auto-filter has cleared (audit log)."""
+        assert isinstance(animal_id, str) and animal_id, "animal_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM review_event_log
+                   WHERE action = 'auto_filter_clear'
+                     AND animal_id = ?""",
+                (animal_id,)).fetchone()
+            return int(row["n"]) if row else 0
+        finally:
+            conn.close()
+
     def get_review_queue(self, animal_ids: list[str],
                           user_email: str,
                           limit: int = 100,
