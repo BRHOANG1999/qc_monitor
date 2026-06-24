@@ -3555,9 +3555,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("kbd-event", "data"),
         Input("kbd-undo-button", "n_clicks"),
         State("kbd-undo", "data"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _hotkey_undo(ev, _click, undo):
+    def _hotkey_undo(ev, _click, undo, picker_value):
         trig = callback_context.triggered_id
         if trig == "kbd-event":
             if not ev or ev.get("action") not in ("undo", "revert"):
@@ -3573,7 +3574,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update, no_update, None, no_update
         file_id = int(undo["file_id"])
         email = current_user_email() or "anon"
-        ok = store.reopen_review(file_id, email)
+        ok = store.reopen_review(
+            file_id, email, animal_id=_ma_animal_from_picker(picker_value))
         if not ok:
             return no_update, no_update, None, no_update
         sd = _session_dir_for_file(store, file_id)
@@ -3615,13 +3617,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-events-store", "data",
                 allow_duplicate=True),
         Input("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _reset_events_on_file_change(file_id):
+    def _reset_events_on_file_change(file_id, picker_value):
         if not file_id:
             return []
         try:
-            latest = store.get_review_state(int(file_id))
+            latest = store.get_review_state(
+                int(file_id),
+                animal_id=_ma_animal_from_picker(picker_value))
         except Exception:
             latest = None
         if latest and latest.get("status") == "needs_scoring":
@@ -3884,15 +3889,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-claim-sink", "data"),
         Input("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _claim_on_load(file_id):
+    def _claim_on_load(file_id, picker_value):
         if not file_id:
             return no_update
         email = current_user_email()
         if email:
             try:
-                store.claim_file(int(file_id), email)
+                store.claim_file(
+                    int(file_id), email,
+                    animal_id=_ma_animal_from_picker(picker_value))
             except Exception as e:
                 logger.warning("claim_file failed: %s", e)
         return no_update
@@ -4265,21 +4273,23 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-review-note", "value"),
         Output("video-review-status", "children"),
         Input("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _reset_review_panel(file_id):
+    def _reset_review_panel(file_id, picker_value):
         if not file_id:
             return [], None, "", ""
         email = current_user_email() or ""
+        animal = _ma_animal_from_picker(picker_value)
         # Quick-flagged file: resume in events mode so the draft
         # events (prefilled by _reset_events_on_file_change) show.
-        latest = store.get_review_state(int(file_id))
+        latest = store.get_review_state(int(file_id), animal_id=animal)
         if latest and latest.get("status") == "needs_scoring":
             return ([], "has_events", latest.get("note") or "",
                     "Resuming quick-flagged events -- finish "
                     "scoring each, then Mark recording done.")
         existing = store.get_review_state_by_user(int(file_id),
-                                                     email)
+                                                     email, animal_id=animal)
         if existing and existing["status"] in (
                 "no_events", "has_events"):
             badge = f"✓ You marked this " \
@@ -4287,8 +4297,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      f"on {existing['updated_at'][:16]}."
             return ([], existing["status"], existing.get("note") or "",
                     badge)
-        # Any other user already finalised it?
-        other = store.get_review_state(int(file_id))
+        # Any other user already finalised it (for this animal)?
+        other = store.get_review_state(int(file_id), animal_id=animal)
         if other and other["status"] in (
                 "no_events", "has_events") and (
                 other["user_email"] != email.lower()):
@@ -4578,20 +4588,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Verification tab. This is the second-layer safety net
         # the lab asked for.
         markers_payload = events if decision == "has_events" else None
+        animal = _ma_animal_from_picker(animal_value)
         try:
             store.mark_review(
                 int(file_id), email, "pending_pi_review",
                 markers=markers_payload,
                 note=(note or None),
+                animal_id=animal,
             )
         except Exception as e:
             logger.warning("mark_review failed: %s", e)
             return (f"Save failed: {e}", *nop[1:])
-        # Submitted -> drop the soft-claim so the row doesn't linger
-        # (the file is now excluded from queues by its pending_pi_review
-        # status anyway; this just keeps file_claim tidy).
+        # Submitted -> drop this animal's soft-claim so the row doesn't linger
+        # (the file is now excluded from this animal's queue by its
+        # pending_pi_review status anyway; this just keeps file_claim tidy).
         try:
-            store.release_claim(int(file_id))
+            store.release_claim(int(file_id), animal_id=animal)
         except Exception as e:
             logger.warning("release_claim failed: %s", e)
         from datetime import datetime as _dt
@@ -4685,17 +4697,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             d = dict(e)
             d["draft"] = True
             drafts.append(d)
+        animal = _ma_animal_from_picker(animal_value)
         try:
             store.mark_review(
                 int(file_id), email, "needs_scoring",
                 markers=drafts,
-                note="Quick-flagged: needs full scoring.")
+                note="Quick-flagged: needs full scoring.",
+                animal_id=animal)
         except Exception as e:
             logger.warning("quick-flag mark_review failed: %s", e)
             return (f"Quick-flag failed: {e}",
                     no_update, no_update, no_update, no_update)
         try:
-            store.release_claim(int(file_id))
+            store.release_claim(int(file_id), animal_id=animal)
         except Exception as e:
             logger.warning("release_claim failed: %s", e)
         from datetime import datetime as _dt
@@ -4771,12 +4785,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Keep the file flagged: drafts + needs_scoring (same pool as the
         # quick-flag path), with a note recording the preliminary export.
         drafts = [{**e, "draft": True} for e in events]
+        animal = _ma_animal_from_picker(animal_value)
         try:
             store.mark_review(
                 int(file_id), email, "needs_scoring", markers=drafts,
                 note=f"Partial CSV exported (EEG onset) to {csv_name}; "
-                     "needs full scoring.")
-            store.release_claim(int(file_id))
+                     "needs full scoring.", animal_id=animal)
+            store.release_claim(int(file_id), animal_id=animal)
         except Exception as e:
             logger.warning("partial-export mark_review failed: %s", e)
             return (f"Exported to {csv_name} but flagging failed: {e}",
@@ -6698,9 +6713,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Input("video-ma-pool-cursor", "data"),
         State("video-ma-pools-view", "data"),
+        State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
-    def _render_pool_status(cursor, pools):
+    def _render_pool_status(cursor, pools, picker_value):
         if not cursor or not isinstance(cursor, dict):
             return no_update
         active = cursor.get("active")
@@ -6718,7 +6734,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         file_ids = [_fid(e) for e in files]
         try:
-            statuses = store.review_statuses_for_files(file_ids)
+            statuses = store.review_statuses_for_files(
+                file_ids,
+                animal_id=_ma_animal_from_picker(picker_value))
         except Exception:
             statuses = {}
         flagged = sum(1 for f in file_ids

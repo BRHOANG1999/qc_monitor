@@ -2341,19 +2341,29 @@ class Store:
             ["sc.channel_names LIKE ?"] * len(animal_ids)
         )
         like_args = [f'%"{a}%' for a in animal_ids]
+        anim_args = list(animal_ids)
+        anim_ph = ",".join(["?"] * len(animal_ids))
         email_l = (user_email or "").lower()
         claim_cutoff = self.claim_cutoff_iso()
         extra_where = ""
         if since_iso:
             extra_where = " AND pf.chunk_datetime >= ?"
-        # Params are appended in the EXACT order their ? placeholders
-        # appear in the SQL below. (A prior version appended since_iso
-        # before user_email, which transposed the two whenever a
-        # since_iso floor was supplied.)
+        # Per-(file, animal) review: each review_state / file_claim NOT EXISTS
+        # is scoped to the requested animal(s) so reviewing animal A never
+        # drops animal B from the queue. A legacy whole-file row (review
+        # animal_id IS NULL, claim animal_id = '') is a wildcard that still
+        # hides the file for everyone. The reviewer picker is single-select,
+        # so animal_ids is one animal in practice.
+        #
+        # Params are appended in the EXACT order their ? placeholders appear in
+        # the SQL below.
         params: list = list(like_args)        # {like_clauses}
-        params.append(email_l)                # rs2.user_email = ?
-        params.append(email_l)                # fc.user_email != ?
-        params.append(claim_cutoff)           # fc.claimed_at >= ?
+        params += anim_args                    # rs animal scope (#1)
+        params.append(email_l)                 # rs2.user_email = ?
+        params += anim_args                    # rs2 animal scope (#2)
+        params.append(email_l)                 # fc.user_email != ?
+        params.append(claim_cutoff)            # fc.claimed_at >= ?
+        params += anim_args                    # fc animal scope (#3)
         if since_iso:
             params.append(since_iso)          # {extra_where}
         # Over-fetch a little so the post-filter (rejecting rows
@@ -2370,20 +2380,17 @@ class Store:
               ON sc.session_dir = pf.session_dir
             WHERE pf.has_video = 1
               AND ({like_clauses})
-              -- A file is OUT of the queue once it's been
-              -- finalised by anyone (legacy no_events /
-              -- has_events) OR submitted to the PI
-              -- (pending_pi_review, pi_approved). pi_flagged
-              -- INTENTIONALLY does NOT appear here: the PI's
-              -- "send back for re-review" puts the file back
-              -- in the undergrad's queue. The pi_flagged row's
-              -- note is surfaced by the queue-card renderer.
-              -- 'needs_scoring' is a quick-flagged file parked in the
-              -- separate "Needs scoring" pool; hide it from the FIFO
-              -- queue for everyone until it's fully scored.
+              -- A file is OUT of the queue once the requested animal has been
+              -- finalised by anyone (legacy no_events / has_events) OR
+              -- submitted to the PI (pending_pi_review, pi_approved).
+              -- pi_flagged INTENTIONALLY does NOT appear here: the PI's
+              -- "send back for re-review" puts the file back in the
+              -- undergrad's queue. 'needs_scoring' is a quick-flagged file
+              -- parked in the separate pool; hide it for that animal.
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs
                 WHERE rs.file_id = pf.id
+                  AND (rs.animal_id IN ({anim_ph}) OR rs.animal_id IS NULL)
                   AND rs.status IN ('no_events', 'has_events',
                                      'pending_pi_review',
                                      'pi_approved', 'needs_scoring')
@@ -2392,19 +2399,21 @@ class Store:
                 SELECT 1 FROM review_state rs2
                 WHERE rs2.file_id = pf.id
                   AND rs2.user_email = ?
+                  AND (rs2.animal_id IN ({anim_ph}) OR rs2.animal_id IS NULL)
                   AND rs2.status IN ('no_events', 'has_events',
                                       'pending_pi_review',
                                       'pi_approved')
               )
-              -- Soft-claim: hide a recording another reviewer is
-              -- actively reviewing (claimed within the TTL). The
-              -- reviewer's OWN claim stays visible so they can resume;
-              -- expired claims (claimed_at < cutoff) don't hide it.
+              -- Soft-claim: hide a recording another reviewer is actively
+              -- reviewing FOR THIS ANIMAL (claimed within the TTL). A legacy
+              -- whole-file claim (animal_id = '') hides it regardless. The
+              -- reviewer's OWN claim stays visible so they can resume.
               AND NOT EXISTS (
                 SELECT 1 FROM file_claim fc
                 WHERE fc.file_id = pf.id
                   AND fc.user_email != ?
                   AND fc.claimed_at >= ?
+                  AND (fc.animal_id IN ({anim_ph}) OR fc.animal_id = '')
               )
               {extra_where}
             ORDER BY pf.chunk_datetime ASC
@@ -3446,10 +3455,12 @@ class Store:
         finally:
             conn.close()
 
-    def reopen_review(self, file_id: int, user_email: str) -> bool:
+    def reopen_review(self, file_id: int, user_email: str,
+                       animal_id: str | None = None) -> bool:
         """Flip the most recent ``no_events`` / ``has_events`` row
-        for this (file, user) pair to ``abandoned`` and append a
-        ``reopen`` audit entry.
+        for this (file, user[, animal]) to ``abandoned`` and append a
+        ``reopen`` audit entry. When *animal_id* is given, scoped to that
+        animal's rows + legacy whole-file (NULL) rows.
 
         Powers the Undo toast in Video Review. The queue filter
         treats ``abandoned`` rows as un-finalised, so the file
@@ -3461,14 +3472,19 @@ class Store:
         assert isinstance(file_id, int), "file_id must be int"
         assert user_email, "user_email required"
         now = datetime.now().isoformat()
+        scope = ("" if not animal_id
+                 else " AND (animal_id = ? OR animal_id IS NULL)")
         conn = self._connect()
         try:
+            sel_params = [file_id, user_email.lower()]
+            if animal_id:
+                sel_params.append(animal_id)
             row = conn.execute(
-                """SELECT id, status FROM review_state
-                   WHERE file_id = ? AND user_email = ?
-                     AND status IN ('no_events', 'has_events')
-                   ORDER BY updated_at DESC LIMIT 1""",
-                (file_id, user_email.lower()),
+                f"""SELECT id, status FROM review_state
+                    WHERE file_id = ? AND user_email = ?
+                      AND status IN ('no_events', 'has_events'){scope}
+                    ORDER BY updated_at DESC LIMIT 1""",
+                sel_params,
             ).fetchone()
             if not row:
                 return False
@@ -3479,10 +3495,12 @@ class Store:
             )
             conn.execute(
                 """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json, at)
-                   VALUES (?, ?, 'reopen', ?, ?)""",
+                   (file_id, user_email, action, payload_json,
+                    animal_id, at)
+                   VALUES (?, ?, 'reopen', ?, ?, ?)""",
                 (file_id, user_email.lower(),
-                 json.dumps({"from_status": row["status"]}), now),
+                 json.dumps({"from_status": row["status"]}),
+                 (animal_id or None), now),
             )
             conn.commit()
             return True
