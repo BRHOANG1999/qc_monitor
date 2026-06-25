@@ -626,6 +626,58 @@ def _decimated_lfp(file_path: str, channel: int,
     return t, display, duration, n_blanked
 
 
+def _mmss(sec) -> str:
+    """Seconds -> ``mm:ss`` (or ``h:mm:ss`` past an hour). Guards
+    None/negative/non-finite to ``00:00`` so callers never crash."""
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        return "00:00"
+    if not np.isfinite(s) or s < 0:
+        return "00:00"
+    s = int(round(s))
+    h, rem = divmod(s, 3600)
+    m, ss = divmod(rem, 60)
+    return f"{h}:{m:02d}:{ss:02d}" if h else f"{m:02d}:{ss:02d}"
+
+
+def _fmt_time(sec) -> str:
+    """Readable time: raw seconds AND mm:ss side by side, e.g.
+    ``"123.4 s · 02:03"`` -- so long recordings stay interpretable."""
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        s = 0.0
+    if not np.isfinite(s):
+        s = 0.0
+    return f"{s:.1f} s · {_mmss(s)}"
+
+
+def _apply_mmss_xaxis(fig: go.Figure, t_max: float) -> None:
+    """Relabel a seconds x-axis with ~8 nice mm:ss ticks across
+    ``[0, t_max]``. Data stays in seconds (cursor/seek math untouched);
+    only the tick *labels* change. No-op for tiny/invalid spans."""
+    assert fig is not None, "fig required"
+    try:
+        span = float(t_max)
+    except (TypeError, ValueError):
+        return
+    if not np.isfinite(span) or span <= 0:
+        return
+    # "Nice" step: 1/2/5 x 10^k closest to span/8, min 1 s.
+    raw = span / 8.0
+    mag = 10.0 ** np.floor(np.log10(max(raw, 1e-9)))
+    for mult in (1.0, 2.0, 5.0, 10.0):
+        step = mult * mag
+        if step >= raw:
+            break
+    step = max(1.0, step)
+    n_ticks = int(span // step) + 1
+    vals = [i * step for i in range(n_ticks + 1) if i * step <= span + step]
+    fig.update_xaxes(tickmode="array", tickvals=vals,
+                      ticktext=[_mmss(v) for v in vals])
+
+
 def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
                        uirevision: str | None = None) -> go.Figure:
     fig = go.Figure()
@@ -658,7 +710,7 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         # It changes when the file/channel changes, so a new recording
         # resets to full view.
         uirevision=uirevision,
-        xaxis=dict(title="Time (s)", showgrid=True,
+        xaxis=dict(title="Time (mm:ss)", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
         yaxis=dict(title="μV", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
@@ -670,6 +722,10 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         showlegend=False,
         hovermode="x unified",
     )
+    # mm:ss tick labels so long recordings stay readable; hover still
+    # shows exact seconds via the per-trace hovertemplate.
+    if t is not None and len(t):
+        _apply_mmss_xaxis(fig, float(t[-1]))
     return fig
 
 
@@ -1038,7 +1094,9 @@ def _style_overlay(fig, start_ms: float, end_ms: float, n_added: int) -> None:
     assert n_added >= 1, "need at least one overlay trace"
     fig.update_layout(
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
-        height=180, margin=dict(l=60, r=20, t=24, b=40),
+        # autosize (no fixed height): the dcc.Graph is responsive and
+        # fills its container, so the pop-out can be resized freely.
+        autosize=True, margin=dict(l=60, r=20, t=24, b=40),
         title=dict(
             text=(f"Stim overlay · last {n_added} epochs · "
                   f"{start_ms:g}..{end_ms:g} ms"),
@@ -2130,6 +2188,13 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Span(id="video-lfp-status",
                           style={"color": "#888", "fontSize": "11px",
                                  "marginLeft": "12px"}),
+                # Live playhead: current time / total duration, each shown
+                # as raw seconds AND mm:ss. Updated clientside off the
+                # 10 Hz currentTime poll (text only -- cheap).
+                html.Span(id="video-playhead-readout",
+                          style={"color": "#ff9f0a", "fontSize": "11px",
+                                 "marginLeft": "12px",
+                                 "fontVariantNumeric": "tabular-nums"}),
                 # Mode toggle: Seek (click the trace -> the video jumps
                 # there) vs Zoom (drag a box to zoom). Default Seek.
                 html.Span("Mode:",
@@ -2603,14 +2668,48 @@ def layout(store: Store, bridge: dict | None = None):
             # the current stim + the previous 10, faded by recency so you
             # can watch the stim-locked shape drift. Driven by the
             # clientside throttle below (rebuilds only on stim crossing).
-            dcc.Graph(
-                id="video-overlay-graph",
-                figure=_empty_lfp_fig(
-                    "Play the video to see the stim overlay — the current "
-                    "stim's trace plus the last 10, faded by recency."),
-                config={"displayModeBar": False, "displaylogo": False},
-                style={"marginTop": "6px"},
-            ),
+            html.Div([
+                # Header toolbar: title + trace-count + collapse + pop-out.
+                html.Div([
+                    html.Span("Stim overlay",
+                              style={"color": "#cfd0d6", "fontSize": "12px",
+                                     "fontWeight": "600"}),
+                    html.Span([
+                        html.Label("Traces",
+                                    style={"color": "#9a9aa8",
+                                           "fontSize": "11px",
+                                           "marginRight": "5px"}),
+                        dcc.Input(
+                            id="video-overlay-ntraces-input",
+                            type="number", min=1, max=100, step=1, value=10,
+                            style={"backgroundColor": "#262638",
+                                    "color": "#f0f0f5", "width": "60px"}),
+                    ], style={"display": "flex", "alignItems": "center",
+                               "marginLeft": "auto", "marginRight": "8px"}),
+                    html.Button("▾", id="video-overlay-collapse-btn",
+                                 className="qc-overlay-iconbtn",
+                                 title="Collapse / expand the overlay"),
+                    html.Button("⤢", id="video-overlay-pip-btn",
+                                 className="qc-overlay-iconbtn",
+                                 title="Pop out (drag the header to move, "
+                                       "drag a corner to resize)"),
+                ], className="qc-overlay-header"),
+                html.Div(
+                    dcc.Graph(
+                        id="video-overlay-graph",
+                        figure=_empty_lfp_fig(
+                            "Play the video to see the stim overlay — the "
+                            "current stim's trace plus the last 10, faded "
+                            "by recency."),
+                        responsive=True,
+                        style={"height": "100%", "width": "100%"},
+                        config={"displayModeBar": False,
+                                 "displaylogo": False},
+                    ),
+                    id="video-overlay-body",
+                    style={"height": "190px"},
+                ),
+            ], id="video-overlay-panel", className="qc-overlay-panel"),
         ], className="video-lfp-col",
            style={"marginTop": "0", "gridArea": "lfp",
                    "minWidth": "0"}),
@@ -2917,15 +3016,6 @@ def layout(store: Store, bridge: dict | None = None):
                                "fontSize": "14px", "fontWeight": "700",
                                "marginRight": "10px"}),
                     button(
-                        "Flag for scoring",
-                        "video-review-quickflag-btn",
-                        variant="secondary",
-                        title="Fast first pass: save the event "
-                              "timestamps you dropped (no type / Racine "
-                              "needed) and park the file in the 'Needs "
-                              "scoring' pool to finish later.",
-                        style={"marginRight": "10px"}),
-                    button(
                         "EEG onset → CSV + flag",
                         "video-review-partial-btn",
                         variant="secondary",
@@ -2996,6 +3086,10 @@ def layout(store: Store, bridge: dict | None = None):
         # most once per stim crossing, not at the 10 Hz playback cadence.
         dcc.Store(id="video-stim-times", data=[]),
         dcc.Store(id="video-overlay-stim-idx", data=-1),
+        # Overlay panel UI state: collapsed body, and popped-out (floating)
+        # toggled by the header buttons, mirrored to DOM classes by JS.
+        dcc.Store(id="video-overlay-collapsed", data=False),
+        dcc.Store(id="video-overlay-pip", data=False),
         # P1-4 predictive prefetch: a slow tick (2 s) drives a
         # background warm of the next-in-queue file's chunk so
         # pressing J / mark-done feels instant. State stores the
@@ -4871,89 +4965,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return (badge, [], None, "",
                 next_session, next_file, undo_payload, no_update)
 
-    # ---- Quick-flag: save bare events, park in "Needs scoring" ---- #
-    # Fast first pass. Saves whatever events the reviewer dropped (even
-    # just an EO timestamp -- no type / landmarks / Racine) under the
-    # 'needs_scoring' status, bypassing the completeness gate, and
-    # advances. The file leaves the FIFO queue and shows up in the
-    # per-animal "Needs scoring" pool to finish later.
-    @app.callback(
-        Output("video-review-status", "children",
-                allow_duplicate=True),
-        Output("video-events-store", "data",
-                allow_duplicate=True),
-        Output("video-session-dropdown", "value",
-                allow_duplicate=True),
-        Output("video-file-dropdown", "value",
-                allow_duplicate=True),
-        Output("video-ma-pool-cursor", "data",
-                allow_duplicate=True),
-        Input("video-review-quickflag-btn", "n_clicks"),
-        State("video-file-dropdown", "value"),
-        State("video-events-store", "data"),
-        State("video-queue-animal", "value"),
-        State("video-ma-pools-view", "data"),
-        State("video-ma-pool-cursor", "data"),
-        prevent_initial_call=True,
-    )
-    def _quick_flag(n_clicks, file_id, events, animal_value,
-                     pools_view, pool_cursor):
-        if not n_clicks or not file_id:
-            return (no_update,) * 5
-        email = current_user_email()
-        if not email:
-            return ("Not signed in -- can't quick-flag.",
-                    no_update, no_update, no_update, no_update)
-        events = list(events or [])
-        # At least one dropped timestamp is required -- otherwise this
-        # is just "no events", which the normal Save handles.
-        has_any = any(
-            e.get("EO_sec") not in (None, "") for e in events)
-        if not has_any:
-            return ("Drop at least one event onset (EO) before "
-                     "quick-flagging.", no_update, no_update,
-                    no_update, no_update)
-        # Tag each as a draft so the second pass knows it's unfinished.
-        drafts = []
-        for e in events:
-            d = dict(e)
-            d["draft"] = True
-            drafts.append(d)
-        animal = _ma_animal_from_picker(animal_value)
-        try:
-            store.mark_review(
-                int(file_id), email, "needs_scoring",
-                markers=drafts,
-                note="Quick-flagged: needs full scoring.",
-                animal_id=animal)
-        except Exception as e:
-            logger.warning("quick-flag mark_review failed: %s", e)
-            return (f"Quick-flag failed: {e}",
-                    no_update, no_update, no_update, no_update)
-        try:
-            store.release_claim(int(file_id), animal_id=animal)
-        except Exception as e:
-            logger.warning("release_claim failed: %s", e)
-        from datetime import datetime as _dt
-        n_ev = len(drafts)
-        badge = (f"Flagged {n_ev} event"
-                  f"{'' if n_ev == 1 else 's'} for scoring at "
-                  f"{_dt.now().strftime('%H:%M')}  ·  in 'Needs "
-                  "scoring' pool.")
-        # Pool is primary when browsing it: advance to the next POOL
-        # file; else fall back to the FIFO queue.
-        pooled = _next_in_pool(store, pools_view, pool_cursor,
-                                 int(file_id))
-        if pooled is not None:
-            p_session, p_file, new_cursor = pooled
-            return (badge, [], p_session, p_file, new_cursor)
-        next_session, next_file = _resolve_next_in_queue(
-            store, animal_value, int(file_id), email,
-            queue_limit=queue_limit)
-        if next_file is None:
-            return (badge, [], no_update, no_update, no_update)
-        return (badge, [], next_session, next_file, no_update)
-
     # "EEG onset -> CSV + flag": write a preliminary CSV row now (partial
     # events tolerated) AND keep the file in the Needs-scoring pool, so an
     # early EEG-onset read is usable immediately without shelving the file
@@ -5360,7 +5371,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if notch and notch > 0: filt_bits.append(f"Notch={notch}")
         if smooth_ms and smooth_ms > 0:
             filt_bits.append(f"Smooth={smooth_ms:g}ms")
-        status_bits = [f"{duration:.1f}s", f"{len(t):,} display points"]
+        status_bits = [_fmt_time(duration), f"{len(t):,} display points"]
         if is_stim_copy:
             status_bits.append("stim-copy channel · not blanked")
         elif show_raw:
@@ -5604,7 +5615,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             plot_bgcolor="#13131f", paper_bgcolor="#13131f",
             height=180,
             margin=dict(l=60, r=20, t=10, b=40),
-            xaxis=dict(title="Time (s)", showgrid=True,
+            xaxis=dict(title="Time (mm:ss)", showgrid=True,
                         gridcolor="rgba(255,255,255,0.05)",
                         zeroline=False, color="#cfd0d6"),
             yaxis=dict(title=feature_label, showgrid=True,
@@ -5620,6 +5631,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 line=dict(color="#ff9f0a", width=2),
             )],
         )
+        # mm:ss tick labels (data stays in seconds for the cursor).
+        _t_all = ok_t + art_t
+        if _t_all:
+            _apply_mmss_xaxis(fig, max(_t_all))
         bits = [f"{len(ok_t) + len(art_t)} epochs",
                  f"{len(art_t)} artifact"]
         if applied_bits:
@@ -5947,7 +5962,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # navigate back to the moment they were commenting on.
         ts_prefix = ""
         if isinstance(current_time, (int, float)) and current_time > 0:
-            ts_prefix = f"[t={current_time:.2f}s] "
+            ts_prefix = f"[t={current_time:.2f}s / {_mmss(current_time)}] "
         body = ts_prefix + note.strip()
 
         email = current_user_email() or "unknown"
@@ -6001,16 +6016,77 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-overlay-stim-idx", "data"),
         Input("video-llwin-start-input", "value"),
         Input("video-llwin-end-input", "value"),
+        Input("video-overlay-ntraces-input", "value"),
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
     )
-    def _update_overlay(stim_idx, ll_start_ms, ll_end_ms, file_id, channel):
+    def _update_overlay(stim_idx, ll_start_ms, ll_end_ms, n_traces,
+                         file_id, channel):
         if not file_id:
             return _empty_lfp_fig(
                 "Pick a recording above to see the stim overlay.")
+        try:
+            n_prev = int(n_traces) if n_traces is not None else 10
+        except (TypeError, ValueError):
+            n_prev = 10
+        n_prev = max(1, min(100, n_prev))
         s, e = _ll_window_ms(ll_start_ms, ll_end_ms)
         return _render_overlay(store, int(file_id), channel,
-                                stim_idx, (s, e))
+                                stim_idx, (s, e), n_prev=n_prev)
+
+    # Overlay collapse: button flips the Store; the Store mirrors to a DOM
+    # class via the qcOverlay helper (assets/overlay_panel.js).
+    app.clientside_callback(
+        """
+        function(n, state) {
+            if (!n) { return window.dash_clientside.no_update; }
+            return !state;
+        }
+        """,
+        Output("video-overlay-collapsed", "data"),
+        Input("video-overlay-collapse-btn", "n_clicks"),
+        State("video-overlay-collapsed", "data"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(on) {
+            if (window.qcOverlay && window.qcOverlay.applyCollapsed) {
+                window.qcOverlay.applyCollapsed(!!on);
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-overlay-collapsed", "id"),  # write-only sink
+        Input("video-overlay-collapsed", "data"),
+    )
+
+    # Overlay pop-out: same flip + DOM-mirror pattern. applyPip toggles the
+    # floating class and lazily wires header drag.
+    app.clientside_callback(
+        """
+        function(n, state) {
+            if (!n) { return window.dash_clientside.no_update; }
+            return !state;
+        }
+        """,
+        Output("video-overlay-pip", "data"),
+        Input("video-overlay-pip-btn", "n_clicks"),
+        State("video-overlay-pip", "data"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(on) {
+            if (window.qcOverlay && window.qcOverlay.applyPip) {
+                window.qcOverlay.applyPip(!!on);
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-overlay-pip", "id"),  # write-only sink
+        Input("video-overlay-pip", "data"),
+    )
 
     # ================================================================== #
     #  Clientside time-locking
@@ -6029,6 +6105,42 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         """,
         Output("video-current-time", "data"),
         Input("video-time-tick", "n_intervals"),
+    )
+
+    # 1-time. Live playhead readout. Map the video's currentTime to LFP
+    #     time (same BHZ ratio) and show current / total, each as raw
+    #     seconds AND mm:ss, so long recordings stay interpretable.
+    app.clientside_callback(
+        """
+        function(currentTime, lfpDur) {
+            function mmss(s) {
+                if (s === null || s === undefined || !isFinite(s)
+                        || s < 0) { s = 0; }
+                s = Math.round(s);
+                var h = Math.floor(s / 3600);
+                var m = Math.floor((s % 3600) / 60);
+                var ss = s % 60;
+                var pad = function(n){ return (n < 10 ? '0' : '') + n; };
+                return (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(ss);
+            }
+            function fmt(s) {
+                if (s === null || s === undefined || !isFinite(s)
+                        || s < 0) { s = 0; }
+                return s.toFixed(1) + ' s · ' + mmss(s);
+            }
+            var lfpT = currentTime;
+            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (v && isFinite(v.duration) && v.duration > 0
+                    && lfpDur && lfpDur > 0) {
+                lfpT = currentTime * (lfpDur / v.duration);
+            }
+            var dur = (lfpDur && lfpDur > 0) ? lfpDur : 0;
+            return fmt(lfpT) + '  /  ' + fmt(dur);
+        }
+        """,
+        Output("video-playhead-readout", "children"),
+        Input("video-current-time", "data"),
+        State("video-lfp-duration", "data"),
     )
 
     # 1-stim. Stim-overlay throttle. Map the playhead to LFP time with the

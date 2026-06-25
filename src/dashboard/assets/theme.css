@@ -388,6 +388,72 @@ button:focus-visible {
 .qc-pip-grid:hover {
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
 }
+
+/* --- Stim overlay panel (collapse + draggable/resizable pop-out) --- */
+/* assets/overlay_panel.js toggles .qc-overlay-collapsed and
+   .qc-overlay-pip on #video-overlay-panel from Dash clientside
+   callbacks. Docked: a normal block under the feature trace. Popped:
+   floats fixed, resizable, header is the drag handle. */
+.qc-overlay-panel {
+    margin-top: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.02);
+}
+.qc-overlay-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    user-select: none;
+}
+.qc-overlay-iconbtn {
+    background: transparent;
+    color: #cfd0d6;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 7px;
+}
+.qc-overlay-iconbtn:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+/* Collapsed: hide the graph body; rotate the collapse chevron. */
+.qc-overlay-collapsed #video-overlay-body {
+    display: none;
+}
+.qc-overlay-collapsed #video-overlay-collapse-btn {
+    transform: rotate(-90deg);
+}
+/* Popped out: float fixed, resizable from the bottom-right corner.
+   Pinned top-right so it doesn't collide with the video PiP (bottom-
+   right). The header becomes the move handle. */
+.qc-overlay-pip {
+    position: fixed !important;
+    top: 80px;
+    right: 18px;
+    width: 520px;
+    height: 300px;
+    z-index: 9999;
+    resize: both;
+    overflow: auto;
+    padding: 0;
+    background: rgba(10, 10, 20, 0.96);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    border: 2px solid var(--accent, #5e7ce2);
+    border-radius: 10px;
+}
+.qc-overlay-pip .qc-overlay-header {
+    cursor: move;
+}
+.qc-overlay-pip #video-overlay-body {
+    height: calc(100% - 32px);
+}
+
 /* In-PiP Dock button. Hidden in normal grid view, absolutely
    positioned at the top-right of the floating frame so the
    reviewer can dismiss without reaching for the refresh bar
