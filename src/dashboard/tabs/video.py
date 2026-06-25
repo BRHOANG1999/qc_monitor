@@ -1383,15 +1383,17 @@ def _details_card(summary_text: str, content,
     return html.Details([
         html.Summary(summary_children, style={
             "cursor": "pointer", "userSelect": "none",
-            "padding": "8px 12px", "listStyle": "none",
+            "padding": "8px 8px", "listStyle": "none",
             "borderRadius": "6px",
         }),
-        html.Div(content, style={"padding": "0 6px 6px 6px"}),
+        html.Div(content, style={"padding": "0 8px 8px 8px"}),
     ], open=open_default, className="qc-expandable", style={
-        "background": "rgba(255,255,255,0.02)",
-        "border": "1px solid rgba(255,255,255,0.06)",
-        "borderRadius": "6px",
-        "marginTop": "10px", "marginBottom": "10px",
+        # Borderless + no fill (NN/g: borders should be functional, not
+        # decorative; whitespace-first). The +/- marker + the summary
+        # hover carry the affordance; whitespace separates stacked cards.
+        # A thin divider keeps adjacent expanders distinguishable.
+        "borderBottom": "1px solid rgba(255,255,255,0.06)",
+        "marginTop": "8px", "marginBottom": "8px",
     })
 
 
@@ -1735,11 +1737,9 @@ def _video_mass_analyze_panel() -> html.Details:
         ]),
     ], open=False, className="qc-expandable",
        style={"padding": "0",
-               "background": "#13131f",
-               "border":
-                   "1px solid rgba(255,255,255,0.06)",
-               "borderRadius": "8px",
-               "marginTop": "10px",
+               # Matches the borderless _details_card treatment.
+               "borderBottom": "1px solid rgba(255,255,255,0.06)",
+               "marginTop": "0",
                "marginBottom": "16px"})
 
 
@@ -1955,8 +1955,8 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Div(id="video-queue-progress",
                           style={"display": "flex",
                                   "alignItems": "center",
-                                  "gap": "12px",
-                                  "padding": "4px 6px 6px",
+                                  "gap": "8px",
+                                  "padding": "8px 2px",
                                   "color": "#a0a0b0",
                                   "fontSize": "11px"}),
                 # One-at-a-time browse card (Track F of the
@@ -1970,13 +1970,13 @@ def layout(store: Store, bridge: dict | None = None):
                     html.Div(id="video-queue-card-title",
                               style={"color": "#a0a0b0",
                                       "fontSize": "11px",
-                                      "marginBottom": "6px"}),
+                                      "marginBottom": "8px"}),
                     # Slim hint shown when no animal is picked / the queue
                     # is empty -- the navigator below is hidden then, so
                     # there's no cavernous empty band.
                     html.Div(id="video-queue-empty",
                               style={"color": "#888", "fontSize": "12px",
-                                      "padding": "4px 2px"}),
+                                      "padding": "8px 2px"}),
                     # Compact control strip: ◀ [recording] ▶ [Load].
                     # Hidden until there's an actual queue.
                     html.Div([
@@ -2006,7 +2006,7 @@ def layout(store: Store, bridge: dict | None = None):
                         ], style={"display": "flex",
                                    "alignItems": "center",
                                    "gap": "8px",
-                                   "padding": "6px 8px",
+                                   "padding": "8px",
                                    "maxWidth": "620px",
                                    "background": "#13131f",
                                    "border":
