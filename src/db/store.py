@@ -57,6 +57,9 @@ class Store:
         }
         if "user_email" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN user_email TEXT")
+        # Return-to-context notes: JSON snapshot of the review state.
+        if "context" not in existing_ann_cols:
+            conn.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
         # Two-screen comparison rollout: add the AUC-screen columns to an
         # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
         # columns to a table already on disk, so ALTER them in.
@@ -1685,16 +1688,23 @@ class Store:
                        category: str = "observation",
                        session_dir: str | None = None,
                        file_id: int | None = None,
-                       user_email: str | None = None) -> int:
-        """Insert a user annotation / note and return its id."""
+                       user_email: str | None = None,
+                       context: str | None = None) -> int:
+        """Insert a user annotation / note and return its id.
+
+        ``context`` is an optional JSON string snapshotting the review
+        state (animal/file/channel/feature/window/video position) so the
+        note can later restore that exact context.
+        """
         assert isinstance(timestamp, str), "timestamp must be a string"
         assert isinstance(note, str) and note.strip(), "note must be a non-empty string"
         conn = self._connect()
         try:
             cursor = conn.execute(
                 """INSERT INTO annotations
-                   (timestamp, created_at, session_dir, file_id, note, category, user_email)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, created_at, session_dir, file_id, note,
+                    category, user_email, context)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     timestamp,
                     datetime.now().isoformat(),
@@ -1703,6 +1713,7 @@ class Store:
                     note,
                     category,
                     user_email,
+                    context,
                 ),
             )
             conn.commit()

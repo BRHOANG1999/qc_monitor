@@ -5981,7 +5981,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         p["data"][0]["y"] = y_p
         return p
 
-    # ---- Note save (unchanged) ---- #
+    # ---- Note save: capture the full review context for restore ---- #
     @app.callback(
         Output("video-note-status", "children"),
         Output("video-note-history", "children", allow_duplicate=True),
@@ -5990,9 +5990,23 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-file-dropdown", "value"),
         State("video-note-input", "value"),
         State("video-current-time", "data"),
+        # Review context snapshot -- restored when the note is clicked.
+        State("video-channel-dropdown", "value"),
+        State("video-analysis-feature", "value"),
+        State("video-threshold-input", "value"),
+        State("video-llwin-start-input", "value"),
+        State("video-llwin-end-input", "value"),
+        State("video-queue-animal", "value"),
+        State("video-filter-hp", "value"),
+        State("video-filter-lp", "value"),
+        State("video-filter-notch", "value"),
+        State("video-filter-smooth", "value"),
+        State("video-lfp-duration", "data"),
         prevent_initial_call=True,
     )
-    def _save_note(n_clicks, file_id, note, current_time):
+    def _save_note(n_clicks, file_id, note, current_time,
+                    channel, feature, threshold, ll_start, ll_end,
+                    animal, hp, lp, notch, smooth, lfp_dur):
         if not n_clicks:
             return no_update, no_update, no_update
         if not file_id:
@@ -6011,6 +6025,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         email = current_user_email() or "unknown"
         session_dir = _session_dir_for_file(store, file_id)
+        context = json.dumps({
+            "session_dir": session_dir,
+            "file_id": file_id,
+            "channel": channel,
+            "feature": feature,
+            "threshold": threshold,
+            "ll_start": ll_start,
+            "ll_end": ll_end,
+            "animal": animal,
+            "hp": hp, "lp": lp, "notch": notch, "smooth": smooth,
+            "video_time": (float(current_time)
+                            if isinstance(current_time, (int, float))
+                            else 0.0),
+            "lfp_dur": (float(lfp_dur)
+                         if isinstance(lfp_dur, (int, float)) else 0.0),
+        })
         try:
             ann_id = store.add_annotation(
                 timestamp=datetime.now().isoformat(),
@@ -6019,6 +6049,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 session_dir=session_dir,
                 file_id=file_id,
                 user_email=email,
+                context=context,
             )
         except Exception as e:
             logger.error("video_review annotation save failed: %s", e, exc_info=True)
@@ -6031,6 +6062,61 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _render_history(store, file_id),
             "",
         )
+
+    # ---- Note click -> restore the saved review context ---- #
+    # Reuses the LFP-Browser bridge (session->file->channel cascade) +
+    # pending-seek (now supports a direct video_time) to jump back to the
+    # exact state, and sets the feature / threshold / window / animal.
+    @app.callback(
+        Output("lfp-to-video-bridge", "data", allow_duplicate=True),
+        Output("pending-seek", "data", allow_duplicate=True),
+        Output("video-analysis-feature", "value", allow_duplicate=True),
+        Output("video-threshold-input", "value", allow_duplicate=True),
+        Output("video-llwin-start-input", "value", allow_duplicate=True),
+        Output("video-llwin-end-input", "value", allow_duplicate=True),
+        Output("video-queue-animal", "value", allow_duplicate=True),
+        Output("video-note-status", "children", allow_duplicate=True),
+        Input({"type": "video-note-item", "ann_id": ALL}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _restore_note_context(n_list):
+        nope = (no_update,) * 8
+        if not n_list or not any(n_list):
+            return nope
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return nope
+        ann_id = trig.get("ann_id")
+        try:
+            with store.connection() as conn:
+                row = conn.execute(
+                    "SELECT context FROM annotations WHERE id = ?",
+                    (ann_id,)).fetchone()
+            ctx = json.loads(row["context"]) if row and row["context"] else None
+        except Exception as e:
+            logger.warning("Note restore load failed id=%s: %s", ann_id, e)
+            ctx = None
+        if not ctx:
+            return nope
+        seq = int(datetime.now().timestamp() * 1000)
+        bridge = {
+            "session_dir": ctx.get("session_dir"),
+            "file_id": ctx.get("file_id"),
+            "channel": ctx.get("channel"),
+            "hp": ctx.get("hp") or 0, "lp": ctx.get("lp") or 0,
+            "notch": ctx.get("notch") or 0, "smooth": ctx.get("smooth") or 0,
+            "start_sec": 0.0, "lfp_dur": ctx.get("lfp_dur") or 0.0,
+            "seq": seq,
+        }
+        pending = {"video_time": ctx.get("video_time") or 0.0, "seq": seq}
+
+        def _or(v):
+            return v if v is not None else no_update
+        msg = html.Span("↩ Restored the note's review context.",
+                         style={"color": "#30d158"})
+        return (bridge, pending, _or(ctx.get("feature")),
+                _or(ctx.get("threshold")), _or(ctx.get("ll_start")),
+                _or(ctx.get("ll_end")), _or(ctx.get("animal")), msg)
 
     # ================================================================== #
     #  Stim overlay (oscilloscope persistence view)
@@ -6242,8 +6328,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     app.clientside_callback(
         """
         function(_n, pending) {
-            if (!pending || pending.start_sec === null
-                    || pending.start_sec === undefined) {
+            var hasVideoT = pending && pending.video_time !== null
+                    && pending.video_time !== undefined;
+            var hasStart = pending && pending.start_sec !== null
+                    && pending.start_sec !== undefined;
+            if (!pending || (!hasVideoT && !hasStart)) {
                 return window.dash_clientside.no_update;
             }
             const v = document.getElementById('""" + VIDEO_DOM_ID + """');
@@ -6251,10 +6340,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     || v.readyState < 1) {
                 return window.dash_clientside.no_update;
             }
-            var target = pending.start_sec;
-            if (pending.lfp_dur && pending.lfp_dur > 0) {
-                target = pending.start_sec
-                        * (v.duration / pending.lfp_dur);
+            var target;
+            if (hasVideoT) {
+                // Note-restore: seek the video to the exact container time
+                // it was at when the note was saved (frame-exact -- no
+                // stretch, since it's the same file/clock).
+                target = pending.video_time;
+            } else {
+                // LFP Browser hand-off: LFP seconds -> video via BHZ ratio.
+                target = pending.start_sec;
+                if (pending.lfp_dur && pending.lfp_dur > 0) {
+                    target = pending.start_sec
+                            * (v.duration / pending.lfp_dur);
+                }
             }
             if (target < 0) target = 0;
             if (target > v.duration) target = v.duration;
@@ -7353,7 +7451,7 @@ def _render_history(store: Store, file_id: int):
     try:
         with store.connection() as conn:
             rows = conn.execute(
-                """SELECT timestamp, user_email, note
+                """SELECT id, timestamp, user_email, note, context
                    FROM annotations
                    WHERE file_id = ? AND category = 'video_review'
                    ORDER BY timestamp DESC LIMIT 50""",
@@ -7364,13 +7462,30 @@ def _render_history(store: Store, file_id: int):
 
     if not rows:
         return html.Span("No video-review notes yet for this file.")
-    return html.Ul([
-        html.Li([
-            html.Span(f"{(r['timestamp'] or '')[:19]} ",
-                      style={"color": "#6c6c80"}),
-            html.Span(f"{r['user_email'] or 'unknown'}: ",
-                      style={"color": "#5e7ce2"}),
-            html.Span(r["note"], style={"color": "#a0a0b0"}),
-        ], style={"marginBottom": "4px"})
-        for r in rows
-    ], style={"paddingLeft": "16px"})
+    return html.Ul([_history_item(r) for r in rows],
+                    style={"paddingLeft": "16px"})
+
+
+def _history_item(r):
+    """One note row. When the note carries a saved review context, the
+    text is a clickable button that restores that exact state (animal,
+    file, channel, feature, window, video position)."""
+    meta = [
+        html.Span(f"{(r['timestamp'] or '')[:19]} ",
+                  style={"color": "#6c6c80"}),
+        html.Span(f"{r['user_email'] or 'unknown'}: ",
+                  style={"color": "#5e7ce2"}),
+    ]
+    has_ctx = bool(r["context"])
+    if has_ctx:
+        note_el = html.Button(
+            ["↩ ", r["note"]],
+            id={"type": "video-note-item", "ann_id": int(r["id"])},
+            className="qc-note-restore",
+            title="Jump back to the review state saved with this note "
+                  "(animal, recording, channel, feature, window, video "
+                  "position).",
+            n_clicks=0)
+    else:
+        note_el = html.Span(r["note"], style={"color": "#a0a0b0"})
+    return html.Li(meta + [note_el], style={"marginBottom": "4px"})

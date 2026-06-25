@@ -289,7 +289,11 @@ CREATE TABLE IF NOT EXISTS annotations (
     session_dir TEXT,
     file_id INTEGER,
     note TEXT NOT NULL,
-    category TEXT DEFAULT 'observation'
+    category TEXT DEFAULT 'observation',
+    -- JSON blob of the review context active when the note was saved
+    -- (animal, file, channel, feature, window, video position) so a
+    -- reviewer can click a note to jump back to that exact state.
+    context TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_annotations_ts ON annotations(timestamp);

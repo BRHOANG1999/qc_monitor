@@ -454,6 +454,22 @@ button:focus-visible {
     height: calc(100% - 32px);
 }
 
+/* Clickable review note: click to restore its saved context. */
+.qc-note-restore {
+    background: transparent;
+    border: none;
+    border-bottom: 1px dotted rgba(94, 124, 226, 0.5);
+    color: #a0a0b0;
+    cursor: pointer;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+}
+.qc-note-restore:hover {
+    color: #cfd0d6;
+    border-bottom-color: var(--accent, #5e7ce2);
+}
+
 /* In-PiP Dock button. Hidden in normal grid view, absolutely
    positioned at the top-right of the floating frame so the
    reviewer can dismiss without reaching for the refresh bar
