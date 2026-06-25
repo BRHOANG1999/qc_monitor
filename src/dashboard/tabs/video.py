@@ -4420,16 +4420,30 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         """
         function(_a, _b, _c) {
             var ctx = window.dash_clientside.callback_context;
+            var nu = window.dash_clientside.no_update;
             if (!ctx || !ctx.triggered || !ctx.triggered.length) {
-                return window.dash_clientside.no_update;
+                return [nu, nu, nu, nu];
             }
             var id = ctx.triggered[0].prop_id.split('.')[0];
-            if (id === 'video-layout-bigvideo') return 'layout-bigvideo';
-            if (id === 'video-layout-biglfp') return 'layout-biglfp';
-            return 'layout-5050';
+            var grid = 'layout-5050', active = 'video-layout-5050';
+            if (id === 'video-layout-bigvideo') {
+                grid = 'layout-bigvideo'; active = 'video-layout-bigvideo';
+            } else if (id === 'video-layout-biglfp') {
+                grid = 'layout-biglfp'; active = 'video-layout-biglfp';
+            }
+            // Reflect the active preset on the buttons (Nielsen #1:
+            // visibility of system status) -- the clicked one gets .active.
+            var cls = function(b){
+                return 'video-layout-btn' + (b === active ? ' active' : '');
+            };
+            return [grid, cls('video-layout-bigvideo'),
+                    cls('video-layout-5050'), cls('video-layout-biglfp')];
         }
         """,
         Output("video-step2-grid", "className"),
+        Output("video-layout-bigvideo", "className"),
+        Output("video-layout-5050", "className"),
+        Output("video-layout-biglfp", "className"),
         Input("video-layout-bigvideo", "n_clicks"),
         Input("video-layout-5050", "n_clicks"),
         Input("video-layout-biglfp", "n_clicks"),

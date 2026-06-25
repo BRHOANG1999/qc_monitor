@@ -404,7 +404,7 @@ def create_app(config: dict, store: Store) -> Dash:
                         "minHeight": "80vh"}),
 
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
-                     disabled=True),  # auto-refresh OFF by default
+                     disabled=False),  # auto-refresh ON by default
         html.Div([
             _kbd.kbd_help_hint(),
             html.Button("Focus", id="focus-toggle-btn",
@@ -455,7 +455,7 @@ def create_app(config: dict, store: Store) -> Dash:
                              "marginRight": SPACE_3}),
             dcc.Checklist(id="auto-refresh-toggle",
                           options=[{"label": " Auto", "value": True}],
-                          value=[], inline=True,
+                          value=[True], inline=True,  # auto-refresh ON
                           style={"display": "inline-block",
                                  "marginRight": SPACE_2},
                           labelStyle={"color": COLOR_TEXT_SECONDARY,

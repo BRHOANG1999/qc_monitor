@@ -717,6 +717,14 @@ details.qc-expandable:hover {
     background: rgba(94, 124, 226, 0.15);
     border-color: #5e7ce2;
 }
+/* Active layout preset -- a clear selected state (visibility of system
+   status) so it reads as a segmented control, not 3 identical buttons. */
+.video-layout-btn.active {
+    background: var(--accent, #5e7ce2);
+    border-color: var(--accent, #5e7ce2);
+    color: #ffffff;
+    font-weight: 600;
+}
 
 /* --- Fullscreen video with LFP/Hilbert as a bottom-right PiP card --- */
 /* The Step-2 grid is the fullscreen element. In fullscreen the video
