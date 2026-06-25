@@ -60,6 +60,12 @@ class Store:
         # Return-to-context notes: JSON snapshot of the review state.
         if "context" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN context TEXT")
+        # Externally-synced notes (operator log): stable de-dup key.
+        if "source_key" not in existing_ann_cols:
+            conn.execute("ALTER TABLE annotations ADD COLUMN source_key TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_annotations_source_key ON annotations(source_key)")
         # Two-screen comparison rollout: add the AUC-screen columns to an
         # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
         # columns to a table already on disk, so ALTER them in.
@@ -1718,6 +1724,45 @@ class Store:
             )
             conn.commit()
             return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def upsert_synced_note(self, source_key: str, timestamp: str,
+                           note: str, category: str,
+                           session_dir: str | None = None,
+                           file_id: int | None = None,
+                           user_email: str | None = None,
+                           context: str | None = None) -> bool:
+        """Idempotently insert/refresh an externally-synced note keyed by
+        ``source_key`` (e.g. an operator-log row). Re-running the sync
+        updates the file link / fields rather than duplicating. Returns
+        True if a row was inserted (new), False if it already existed.
+        """
+        assert isinstance(source_key, str) and source_key, "source_key required"
+        assert isinstance(note, str) and note.strip(), "note must be non-empty"
+        conn = self._connect()
+        try:
+            existed = conn.execute(
+                "SELECT 1 FROM annotations WHERE source_key = ?",
+                (source_key,)).fetchone() is not None
+            conn.execute(
+                """INSERT INTO annotations
+                   (timestamp, created_at, session_dir, file_id, note,
+                    category, user_email, context, source_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                     timestamp=excluded.timestamp,
+                     session_dir=excluded.session_dir,
+                     file_id=excluded.file_id,
+                     note=excluded.note,
+                     category=excluded.category,
+                     user_email=excluded.user_email,
+                     context=excluded.context""",
+                (timestamp, datetime.now().isoformat(), session_dir,
+                 file_id, note, category, user_email, context, source_key),
+            )
+            conn.commit()
+            return not existed
         finally:
             conn.close()
 

@@ -7451,33 +7451,43 @@ def _render_history(store: Store, file_id: int):
     try:
         with store.connection() as conn:
             rows = conn.execute(
-                """SELECT id, timestamp, user_email, note, context
+                """SELECT id, timestamp, user_email, note, context, category
                    FROM annotations
-                   WHERE file_id = ? AND category = 'video_review'
-                   ORDER BY timestamp DESC LIMIT 50""",
+                   WHERE file_id = ?
+                     AND category IN ('video_review', 'operator_log')
+                   ORDER BY timestamp DESC LIMIT 80""",
                 (file_id,),
             ).fetchall()
     except sqlite3.OperationalError:
         rows = []
 
     if not rows:
-        return html.Span("No video-review notes yet for this file.")
+        return html.Span("No notes yet for this file.")
     return html.Ul([_history_item(r) for r in rows],
                     style={"paddingLeft": "16px"})
 
 
 def _history_item(r):
-    """One note row. When the note carries a saved review context, the
-    text is a clickable button that restores that exact state (animal,
-    file, channel, feature, window, video position)."""
+    """One note row. Review notes with a saved context render as a
+    clickable button that restores that exact state; operator-log notes
+    (synced from the KMrecorder sheet) render read-only with a badge."""
+    is_oplog = r["category"] == "operator_log"
     meta = [
         html.Span(f"{(r['timestamp'] or '')[:19]} ",
                   style={"color": "#6c6c80"}),
         html.Span(f"{r['user_email'] or 'unknown'}: ",
                   style={"color": "#5e7ce2"}),
     ]
-    has_ctx = bool(r["context"])
-    if has_ctx:
+    if is_oplog:
+        badge = html.Span("operator log ", style={
+            "color": "#ff9f0a", "fontSize": "10px",
+            "border": "1px solid rgba(255,159,10,0.4)",
+            "borderRadius": "4px", "padding": "0 4px",
+            "marginRight": "4px"})
+        return html.Li(meta + [badge, html.Span(
+            r["note"], style={"color": "#a0a0b0"})],
+            style={"marginBottom": "4px"})
+    if r["context"]:
         note_el = html.Button(
             ["↩ ", r["note"]],
             id={"type": "video-note-item", "ann_id": int(r["id"])},

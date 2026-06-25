@@ -20,6 +20,7 @@ from src.dashboard.tabs import video as tabs_video
 from src.dashboard.tabs import surgeries as tabs_surgeries
 from src.dashboard.tabs import maintenance as tabs_maintenance
 from src.dashboard.tabs import data_log_xref as tabs_data_log_xref
+from src.dashboard.tabs import operator_log as tabs_operator_log
 from src.dashboard.tabs import activity_log as tabs_activity_log
 from src.dashboard.tabs import alerts as tabs_alerts
 from src.dashboard.tabs import annotations as tabs_annotations
@@ -124,6 +125,7 @@ NAV_GROUPS = [
         {"id": "surgeries", "label": "Surgeries"},
         {"id": "maintenance", "label": "Maintenance"},
         {"id": "data_log_xref", "label": "Data log diff"},
+        {"id": "operator_log", "label": "Operator log"},
     ]},
     {"id": "system", "label": "System", "subs": [
         {"id": "jobs_monitor", "label": "Jobs"},
@@ -251,6 +253,10 @@ def create_app(config: dict, store: Store) -> Dash:
     # Video Review picker never blocks on the Sheets API in any
     # render path. Idempotent across reloads.
     _assignments.start_warmer(config)
+    # Sync the KMrecorder operator-log sheet into annotations on its own
+    # clock (daemon thread). Idempotent; no-op when disabled in config.
+    from src.utils import operator_log as _operator_log
+    _operator_log.start_warmer(config, store)
     # Spawn the PI verification event-clip extractor worker.
     # Daemon thread that drains event_clip_job 'pending' rows
     # via ffmpeg. Idempotent across reloads.
@@ -1111,6 +1117,8 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_maintenance.layout(store, config))
             elif tab == "data_log_xref":
                 return _enable_persistence(tabs_data_log_xref.layout(store, config))
+            elif tab == "operator_log":
+                return _enable_persistence(tabs_operator_log.layout(store, config))
             elif tab == "review_status":
                 from src.dashboard.tabs import review_status as tabs_review_status
                 return _enable_persistence(
@@ -1171,6 +1179,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_surgeries.register_callbacks(app, store, config)
     tabs_maintenance.register_callbacks(app, store, config)
     tabs_data_log_xref.register_callbacks(app, store, config)
+    tabs_operator_log.register_callbacks(app, store, config)
     tabs_alerts.register_callbacks(app, store, config)
     tabs_signal_quality.register_callbacks(app, store, config)
     tabs_stim.register_callbacks(app, store, config)

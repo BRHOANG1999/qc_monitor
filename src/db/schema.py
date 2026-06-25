@@ -293,10 +293,16 @@ CREATE TABLE IF NOT EXISTS annotations (
     -- JSON blob of the review context active when the note was saved
     -- (animal, file, channel, feature, window, video position) so a
     -- reviewer can click a note to jump back to that exact state.
-    context TEXT
+    context TEXT,
+    -- Stable de-dup key for externally-synced rows (e.g. the KMrecorder
+    -- operator log). NULL for hand-written notes. SQLite treats NULLs as
+    -- distinct, so the UNIQUE index below only constrains synced rows.
+    source_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_annotations_ts ON annotations(timestamp);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_annotations_source_key
+    ON annotations(source_key);
 
 -- System health snapshots
 CREATE TABLE IF NOT EXISTS system_health (

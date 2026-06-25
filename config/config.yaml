@@ -199,6 +199,15 @@ data_log_xref:
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   sheet_id: 1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0
   tab_name: Sessions
+# KMrecorder operator notes log -> synced into annotations (operator_log).
+# tab_name MUST match the worksheet tab label that holds the Date / Time /
+# Session_Filename / Note_Text / Operator columns (the gid=1159523324 tab).
+operator_log:
+  enabled: true
+  refresh_minutes: 15
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  sheet_id: 1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0
+  tab_name: Notes
 notifications:
   state_file: data/notification_state.json
   eod_digest:
