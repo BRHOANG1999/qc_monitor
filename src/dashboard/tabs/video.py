@@ -27,6 +27,7 @@ from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 from collections import OrderedDict
 from threading import RLock
 from dash import (Input, Output, State, dcc, html, no_update,
@@ -1053,58 +1054,80 @@ def _render_evoked_line_length(store, file_id: int, channel: int | None,
     return (fig, status)
 
 
-def _overlay_rgba(alpha: float) -> str:
-    """Recency colour for the stim overlay: the line-length yellow
-    (#ffd60a) at the given opacity. Newest trace -> alpha 1.0."""
-    return f"rgba(255,214,10,{max(0.0, min(1.0, alpha)):.3f})"
-
-
-def _add_overlay_traces(fig, sig, fs, stim_times, idx, win, n_prev) -> int:
-    """Add the current stim's windowed segment + up to ``n_prev`` previous
-    ones to ``fig``, oldest faded -> newest opaque. Returns how many were
-    actually drawn (segments whose window fell off the recording skipped)."""
-    members = list(range(max(0, idx - n_prev), idx + 1))  # oldest->newest
-    k = len(members)
+def _overlay_segments(sig, fs, stim_times, idx, win, n_prev):
+    """``(kept_idx, t_ms, segs)``: the current stim + up to ``n_prev`` prior
+    windowed segments, all the same fixed length (so they stack into a
+    heatmap). Out-of-bounds windows are skipped. Oldest -> newest order."""
+    members = list(range(max(0, idx - n_prev), idx + 1))
     n = sig.shape[0]
-    added = 0
-    for j, i in enumerate(members):
-        center = float(stim_times[i])
-        i0 = int(round((center + win[0]) * fs))
-        i1 = int(round((center + win[1]) * fs))
-        if i0 < 0 or i1 > n or (i1 - i0) < 2:
+    length = int(round((win[1] - win[0]) * fs))
+    if length < 2:
+        return [], None, []
+    t_ms = (np.arange(length) / fs * 1000.0) + win[0] * 1000.0
+    kept, segs = [], []
+    for i in members:
+        i0 = int(round((float(stim_times[i]) + win[0]) * fs))
+        i1 = i0 + length
+        if i0 < 0 or i1 > n:
             continue
-        seg = sig[i0:i1]
-        t_ms = np.arange(seg.shape[0]) / fs * 1000.0 + win[0] * 1000.0
+        kept.append(i)
+        segs.append(sig[i0:i1])
+    return kept, t_ms, segs
+
+
+def _add_overlay_lines(fig, kept, t_ms, segs, idx) -> None:
+    """Overlay each segment as a line, oldest->newest coloured by a Turbo
+    hue ramp (newest brightest + thicker) -- distinguishable where the old
+    alpha ramp wasn't."""
+    assert len(kept) == len(segs), "kept/segs length mismatch"
+    k = len(kept)
+    colors = (sample_colorscale("Turbo", [j / (k - 1) for j in range(k)])
+              if k > 1 else ["#ffd60a"])
+    for j, i in enumerate(kept):
         newest = (i == idx)
-        alpha = 0.12 + 0.88 * (j / max(1, k - 1))
         fig.add_trace(go.Scatter(
-            x=t_ms, y=seg, mode="lines",
-            line=dict(color=_overlay_rgba(alpha),
-                       width=2.0 if newest else 1.0),
-            name=f"stim @ {center:.2f}s" if newest else "",
+            x=t_ms, y=segs[j], mode="lines",
+            line=dict(color=colors[j], width=2.6 if newest else 1.1),
+            name=(f"current (stim #{i + 1})" if newest
+                  else f"stim #{i + 1}"),
             showlegend=False,
-            hoverinfo="skip" if not newest else "x+y",
+            hoverinfo="x+y" if newest else "skip",
         ))
-        added += 1
-    return added
 
 
-def _style_overlay(fig, start_ms: float, end_ms: float, n_added: int) -> None:
+def _add_overlay_heatmap(fig, kept, t_ms, segs) -> None:
+    """ERP-image: one row per stim (newest on top), x = ms, colour = µV.
+    Scales to many epochs where overlaid lines would clutter."""
+    assert len(kept) == len(segs), "kept/segs length mismatch"
+    z = np.asarray(segs, dtype=np.float64)  # rows oldest..newest (bottom..top)
+    fig.add_trace(go.Heatmap(
+        x=t_ms, y=[f"#{i + 1}" for i in kept], z=z,
+        colorscale="RdBu_r", zmid=0.0,
+        colorbar=dict(title="µV", thickness=10),
+        hovertemplate=("%{x:.2f} ms · stim %{y}<br>"
+                        "%{z:.1f} µV<extra></extra>"),
+    ))
+
+
+def _style_overlay(fig, start_ms, end_ms, n_added, mode="lines") -> None:
     """Dark-theme the stim-overlay figure and mark the stim onset (0 ms)."""
     assert n_added >= 1, "need at least one overlay trace"
+    assert mode in ("lines", "heatmap"), "bad overlay mode"
+    label = "heatmap" if mode == "heatmap" else "overlay"
+    y_title = "stim #" if mode == "heatmap" else "μV"
     fig.update_layout(
         plot_bgcolor="#13131f", paper_bgcolor="#13131f",
         # autosize (no fixed height): the dcc.Graph is responsive and
         # fills its container, so the pop-out can be resized freely.
         autosize=True, margin=dict(l=60, r=20, t=24, b=40),
         title=dict(
-            text=(f"Stim overlay · last {n_added} epochs · "
+            text=(f"Stim {label} · last {n_added} epochs · "
                   f"{start_ms:g}..{end_ms:g} ms"),
             font=dict(size=11, color="#cfd0d6"), x=0.01, y=0.97),
         xaxis=dict(title="ms from stim", showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
                     zeroline=False, color="#cfd0d6"),
-        yaxis=dict(title="μV", showgrid=True,
+        yaxis=dict(title=y_title, showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
                     zeroline=False, color="#cfd0d6"),
         showlegend=False,
@@ -1116,9 +1139,10 @@ def _style_overlay(fig, start_ms: float, end_ms: float, n_added: int) -> None:
 
 def _render_overlay(store, file_id: int, channel: int | None,
                      stim_idx, win_ms: tuple[float, float],
-                     n_prev: int = 10):
-    """Oscilloscope persistence figure: the current stim's windowed trace
-    plus the previous ``n_prev``, faded by recency. ``stim_idx`` is the
+                     n_prev: int = 10, mode: str = "lines"):
+    """Stim overlay: the current stim's windowed trace + the previous
+    ``n_prev``. ``mode='lines'`` colours them by a recency hue ramp;
+    ``mode='heatmap'`` stacks them as an ERP-image. ``stim_idx`` is the
     nearest stim at/before the playhead (clientside-computed)."""
     assert isinstance(file_id, int), "file_id must be int"
     assert n_prev >= 1, "n_prev must be positive"
@@ -1146,12 +1170,16 @@ def _render_overlay(store, file_id: int, channel: int | None,
                         file_id, channel, e)
         return _empty_lfp_fig(f"Couldn't load LFP: {e}")
     win = (start_ms / 1000.0, end_ms / 1000.0)
-    fig = go.Figure()
-    n_added = _add_overlay_traces(fig, sig, fs, stim_times, idx, win, n_prev)
-    if n_added == 0:
+    kept, t_ms, segs = _overlay_segments(sig, fs, stim_times, idx, win, n_prev)
+    if not kept:
         return _empty_lfp_fig(
             "Window too short for this sample rate — widen it.")
-    _style_overlay(fig, start_ms, end_ms, n_added)
+    fig = go.Figure()
+    if mode == "heatmap":
+        _add_overlay_heatmap(fig, kept, t_ms, segs)
+    else:
+        _add_overlay_lines(fig, kept, t_ms, segs, idx)
+    _style_overlay(fig, start_ms, end_ms, len(kept), mode)
     return fig
 
 
@@ -2188,10 +2216,17 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Span(id="video-lfp-status",
                           style={"color": "#888", "fontSize": "11px",
                                  "marginLeft": "12px"}),
-                # Live playhead: current time / total duration, each shown
-                # as raw seconds AND mm:ss. Updated clientside off the
-                # 10 Hz currentTime poll (text only -- cheap).
+                # Live playhead: shows BOTH clocks -- the video player's
+                # container time and the LFP-estimated time. They differ
+                # because the 5 fps video drops frames, so the video clock
+                # runs short; the LFP time is an endpoint-stretch ESTIMATE
+                # (not frame-exact). Updated clientside off the 10 Hz poll.
                 html.Span(id="video-playhead-readout",
+                          title="The video player shows its container "
+                                "clock. 'LFP≈' is the dropped-frame-"
+                                "adjusted estimate (linear endpoint "
+                                "stretch -- not frame-exact). Recording "
+                                "length is LFP ground truth.",
                           style={"color": "#ff9f0a", "fontSize": "11px",
                                  "marginLeft": "12px",
                                  "fontVariantNumeric": "tabular-nums"}),
@@ -2674,6 +2709,15 @@ def layout(store: Store, bridge: dict | None = None):
                     html.Span("Stim overlay",
                               style={"color": "#cfd0d6", "fontSize": "12px",
                                      "fontWeight": "600"}),
+                    dcc.RadioItems(
+                        id="video-overlay-mode",
+                        options=[{"label": " Lines", "value": "lines"},
+                                  {"label": " Heatmap", "value": "heatmap"}],
+                        value="lines", inline=True,
+                        style={"color": "#cfd0d6", "fontSize": "11px",
+                               "marginLeft": "12px"},
+                        inputStyle={"marginRight": "3px",
+                                     "marginLeft": "8px"}),
                     html.Span([
                         html.Label("Traces",
                                     style={"color": "#9a9aa8",
@@ -6017,11 +6061,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-llwin-start-input", "value"),
         Input("video-llwin-end-input", "value"),
         Input("video-overlay-ntraces-input", "value"),
+        Input("video-overlay-mode", "value"),
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
     )
     def _update_overlay(stim_idx, ll_start_ms, ll_end_ms, n_traces,
-                         file_id, channel):
+                         mode, file_id, channel):
         if not file_id:
             return _empty_lfp_fig(
                 "Pick a recording above to see the stim overlay.")
@@ -6030,9 +6075,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except (TypeError, ValueError):
             n_prev = 10
         n_prev = max(1, min(100, n_prev))
+        mode = mode if mode in ("lines", "heatmap") else "lines"
         s, e = _ll_window_ms(ll_start_ms, ll_end_ms)
         return _render_overlay(store, int(file_id), channel,
-                                stim_idx, (s, e), n_prev=n_prev)
+                                stim_idx, (s, e), n_prev=n_prev, mode=mode)
 
     # Overlay collapse: button flips the Store; the Store mirrors to a DOM
     # class via the qcOverlay helper (assets/overlay_panel.js).
@@ -6107,9 +6153,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-time-tick", "n_intervals"),
     )
 
-    # 1-time. Live playhead readout. Map the video's currentTime to LFP
-    #     time (same BHZ ratio) and show current / total, each as raw
-    #     seconds AND mm:ss, so long recordings stay interpretable.
+    # 1-time. Live playhead readout. Shows BOTH clocks honestly: the
+    #     video's container time AND the LFP estimate (endpoint stretch
+    #     lfp_t = currentTime * lfp_dur / video_dur). They diverge because
+    #     the 5 fps video drops frames, so 'LFP≈' is flagged as an estimate
+    #     -- not frame-exact.
     app.clientside_callback(
         """
         function(currentTime, lfpDur) {
@@ -6123,19 +6171,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 var pad = function(n){ return (n < 10 ? '0' : '') + n; };
                 return (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(ss);
             }
-            function fmt(s) {
-                if (s === null || s === undefined || !isFinite(s)
-                        || s < 0) { s = 0; }
-                return s.toFixed(1) + ' s · ' + mmss(s);
-            }
-            var lfpT = currentTime;
+            var vt = (currentTime && currentTime > 0) ? currentTime : 0;
+            var lfpT = vt;
             var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            var stretched = false;
             if (v && isFinite(v.duration) && v.duration > 0
                     && lfpDur && lfpDur > 0) {
-                lfpT = currentTime * (lfpDur / v.duration);
+                lfpT = vt * (lfpDur / v.duration);
+                stretched = (Math.abs(lfpT - vt) > 0.5);
             }
             var dur = (lfpDur && lfpDur > 0) ? lfpDur : 0;
-            return fmt(lfpT) + '  /  ' + fmt(dur);
+            var lfpLabel = stretched
+                ? ('LFP≈' + mmss(lfpT) + ' (est)')
+                : ('LFP ' + mmss(lfpT));
+            return 'video ' + mmss(vt) + ' · ' + lfpLabel
+                   + ' / ' + mmss(dur);
         }
         """,
         Output("video-playhead-readout", "children"),
