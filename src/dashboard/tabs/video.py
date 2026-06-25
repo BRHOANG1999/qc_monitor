@@ -1899,29 +1899,16 @@ def layout(store: Store, bridge: dict | None = None):
                       "show up oldest first (FIFO) so the backlog "
                       "clears from the front — work top to bottom."),
 
-        # Step 1 body lives in ONE readable column (~760px), not the full
-        # window width. Design rationale (NN/g): full-bleed cards act as
-        # "false floors" and over-wide rows hurt scannability; a single
-        # constrained column with consistent spacing groups the controls
-        # by proximity and removes the orphaned blank space that the old
-        # picker|queue two-column left behind.
+        # Step 1 is a COMPACT full-width strip (animal · queue chips ·
+        # browse · Load) so it stays short and the video (Step 2) rises
+        # up. The secondary actions sit in a responsive grid BELOW --
+        # which also moves Mass Analyze out of the lead pick position
+        # (it's a batch pre-screen tool, not part of picking *this*
+        # recording). NN/g grounding: one-level progressive disclosure,
+        # a grid that fills the width, and common-region grouping that
+        # separates "browse the queue" from "other tools".
         html.Div([
-        # --- Mass Analyze (optional, collapsed by default) ----------- #
-        # Hilbert envelope thresholding pre-screen. Lets the
-        # undergrad sweep a cutoff and auto-clear zero-peak files
-        # before they start manually scoring the rest. Same
-        # underlying job/cache as the PI Mass Analyze in
-        # Event Verification, just scoped to assigned animals.
-        _video_mass_analyze_panel(),
-
-        # --- My queue picker ----------------------------------------- #
-        # Card-style row: animal picker on left, queue list on the
-        # right. The queue items are buttons keyed by file_id; one
-        # callback handles all of them via pattern-matching IDs and
-        # writes the chosen file's session_dir + file_id back into
-        # the existing dropdowns so every downstream callback keeps
-        # working unchanged.
-        html.Div([
+            # Animal picker
             html.Div([
                 html.Label("Animal you're reviewing",
                             style=LABEL_STYLE,
@@ -1940,166 +1927,138 @@ def layout(store: Store, bridge: dict | None = None):
                           style={"color": "#a0a0b0",
                                   "fontSize": "11px",
                                   "marginTop": "4px"}),
-            ], style={"maxWidth": "320px", "marginBottom": "16px"}),
+            ], style={"flex": "0 0 240px"}),
+            # Queue: title/chips + current-recording browse strip
             html.Div([
-                html.Label("Queue (oldest first · FIFO)",
-                            style=LABEL_STYLE,
-                            title="Recordings for the chosen animal "
-                                   "that nobody has finished yet. "
-                                   "Oldest at the top so you clear "
-                                   "the backlog from the front. "
-                                   "Click one to load it."),
-                # Progress + motivation strip (P1-1). Rendered by
-                # _render_queue_progress; mirrors Linear's sprint
-                # progress + Duolingo's streak surface.
-                html.Div(id="video-queue-progress",
-                          style={"display": "flex",
-                                  "alignItems": "center",
-                                  "gap": "8px",
-                                  "padding": "8px 2px",
-                                  "color": "#a0a0b0",
-                                  "fontSize": "11px"}),
-                # One-at-a-time browse card (Track F of the
-                # UX polish plan). Replaces the scrollable
-                # button list with prev/next arrows + Load.
-                # The full list still lives below behind a
-                # "Show all timestamps" expander so J/K cycle
-                # + the active-file highlight have something
-                # to attach to.
                 html.Div([
-                    html.Div(id="video-queue-card-title",
-                              style={"color": "#a0a0b0",
-                                      "fontSize": "11px",
-                                      "marginBottom": "8px"}),
-                    # Slim hint shown when no animal is picked / the queue
-                    # is empty -- the navigator below is hidden then, so
-                    # there's no cavernous empty band.
-                    html.Div(id="video-queue-empty",
-                              style={"color": "#888", "fontSize": "12px",
-                                      "padding": "8px 2px"}),
-                    # Compact control strip: ◀ [recording] ▶ [Load].
-                    # Hidden until there's an actual queue.
+                    html.Span("Queue (oldest first · FIFO)",
+                               style=LABEL_STYLE,
+                               title="Recordings for the chosen animal "
+                                      "that nobody has finished yet. "
+                                      "Oldest first."),
+                    # Progress + streak chips (rendered by
+                    # _render_queue_progress).
+                    html.Div(id="video-queue-progress",
+                              style={"display": "flex",
+                                      "alignItems": "center",
+                                      "gap": "8px"}),
+                ], style={"display": "flex", "alignItems": "center",
+                           "gap": "10px", "flexWrap": "wrap",
+                           "marginBottom": "6px"}),
+                html.Div(id="video-queue-card-title",
+                          style={"color": "#a0a0b0", "fontSize": "11px",
+                                  "marginBottom": "6px"}),
+                # Slim hint when no animal / empty queue (navigator hidden).
+                html.Div(id="video-queue-empty",
+                          style={"color": "#888", "fontSize": "12px"}),
+                # Compact browse strip: ◀ [recording] ▶ [Load].
+                html.Div([
                     html.Div([
-                        html.Div([
-                            html.Button(
-                                "◀",
-                                id="video-queue-prev-btn",
-                                n_clicks=0,
-                                title="Browse to the next-newer "
-                                       "recording (no load yet).",
-                                className="video-queue-arrow"),
-                            html.Div(id="video-queue-card-body",
-                                      style={"flex": "1",
-                                              "padding": "0 10px",
-                                              "textAlign": "center"}),
-                            html.Button(
-                                "▶",
-                                id="video-queue-next-btn",
-                                n_clicks=0,
-                                title="Browse to the next-older "
-                                       "recording (no load yet).",
-                                className="video-queue-arrow"),
-                            button(
-                                "Load this recording",
-                                "video-queue-load-btn",
-                                variant="primary", icon_name="video"),
-                        ], style={"display": "flex",
-                                   "alignItems": "center",
-                                   "gap": "8px",
-                                   "padding": "8px",
-                                   "maxWidth": "620px",
-                                   "background": "#13131f",
-                                   "border":
-                                       "1px solid rgba(255,255,255,0.06)",
-                                   "borderRadius": "6px"}),
-                        html.Span(id="video-queue-card-position",
-                                   style={"color": "#a0a0b0",
-                                           "fontSize": "11px",
-                                           "marginTop": "4px",
-                                           "display": "inline-block"}),
-                    ], id="video-queue-nav-wrap"),
-                    _details_card(
-                        "Show all timestamps",
-                        summary_sub="full FIFO list -- click "
-                                     "any item to load it",
-                        open_default=False,
-                        content=html.Div(id="video-queue-list",
-                                  style={"maxHeight": "220px",
-                                          "overflowY": "auto",
-                                          "background": "#13131f",
-                                          "border":
-                                              "1px solid rgba(255,255,255,0.06)",
-                                          "borderRadius": "6px",
-                                          "padding": "4px"}),
-                    ),
-                    # Quick-flag pool: files parked for full scoring.
-                    _details_card(
-                        "Needs scoring",
-                        summary_sub="quick-flagged files -- click to "
-                                     "finish scoring",
-                        open_default=False,
-                        content=html.Div(
-                            id="video-needs-scoring-list",
-                            style={"maxHeight": "220px",
-                                    "overflowY": "auto",
-                                    "background": "#13131f",
-                                    "border":
-                                        "1px solid rgba(240,180,41,0.25)",
-                                    "borderRadius": "6px",
-                                    "padding": "4px"}),
-                    ),
-                    dcc.Store(id="video-queue-position", data=0),
-                ], id="video-queue-card"),
-            ]),
-        ], style={"marginBottom": "10px"}),
+                        html.Button(
+                            "◀", id="video-queue-prev-btn", n_clicks=0,
+                            title="Browse to the next-newer recording "
+                                   "(no load yet).",
+                            className="video-queue-arrow"),
+                        html.Div(id="video-queue-card-body",
+                                  style={"flex": "1", "padding": "0 10px",
+                                          "textAlign": "center"}),
+                        html.Button(
+                            "▶", id="video-queue-next-btn", n_clicks=0,
+                            title="Browse to the next-older recording "
+                                   "(no load yet).",
+                            className="video-queue-arrow"),
+                        button("Load this recording",
+                               "video-queue-load-btn",
+                               variant="primary", icon_name="video"),
+                    ], style={"display": "flex", "alignItems": "center",
+                               "gap": "8px", "padding": "8px",
+                               "background": "#13131f",
+                               "border": "1px solid rgba(255,255,255,0.06)",
+                               "borderRadius": "6px"}),
+                    html.Span(id="video-queue-card-position",
+                               style={"color": "#a0a0b0", "fontSize": "11px",
+                                       "marginTop": "4px",
+                                       "display": "inline-block"}),
+                ], id="video-queue-nav-wrap"),
+            ], style={"flex": "1", "minWidth": "320px",
+                       "maxWidth": "640px"}),
+        ], style={"display": "flex", "gap": "24px",
+                   "alignItems": "flex-start", "flexWrap": "wrap",
+                   "marginBottom": "16px"}),
 
-        # --- Advanced: free-form pickers (preserves legacy IDs) ----- #
-        _details_card(
-            "Pick any recording manually",
-            summary_sub="bypass the queue and choose any session/file/"
-                         "channel directly",
-            open_default=False,
-            content=html.Div([
-            html.Div([
-                html.Label("Session", style=LABEL_STYLE,
-                            title="A session is a continuous run of "
-                                   "recording with one animal."),
-                dcc.Dropdown(
-                    id="video-session-dropdown",
-                    options=session_options,
-                    value=default_session,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "2", "minWidth": "260px"}),
-            html.Div([
-                html.Label("File (chunk)", style=LABEL_STYLE,
-                            title="Each chunk is roughly one hour of "
-                                   "recording, named with its start "
-                                   "timestamp."),
-                dcc.Dropdown(
-                    id="video-file-dropdown",
-                    options=[],
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "3", "minWidth": "320px"}),
-            html.Div([
-                html.Label("Brain channel", style=LABEL_STYLE,
-                            title="Which electrode contact to display "
-                                   "the LFP trace for."),
-                dcc.Dropdown(
-                    id="video-channel-dropdown",
-                    options=[],
-                    value=0,
-                    style=DROPDOWN_STYLE,
-                    className="dark-dropdown",
-                ),
-            ], style={"flex": "1", "minWidth": "180px"}),
-        ], style={"display": "flex", "gap": "16px", "marginBottom": "8px",
-                  "flexWrap": "wrap"}),
-        ),
-        ], style={"maxWidth": "760px"}),
+        # Secondary tools -- a responsive grid that fills the width.
+        # Mass Analyze lives here (a batch tool), grouped with the full
+        # list, the needs-scoring pool, and the manual picker.
+        html.Div([
+            _details_card(
+                "Show all timestamps",
+                summary_sub="full FIFO list -- click any item to load it",
+                open_default=False,
+                content=html.Div(id="video-queue-list",
+                          style={"maxHeight": "220px", "overflowY": "auto",
+                                  "background": "#13131f",
+                                  "border":
+                                      "1px solid rgba(255,255,255,0.06)",
+                                  "borderRadius": "6px", "padding": "4px"}),
+            ),
+            _details_card(
+                "Needs scoring",
+                summary_sub="quick-flagged files -- click to finish scoring",
+                open_default=False,
+                content=html.Div(
+                    id="video-needs-scoring-list",
+                    style={"maxHeight": "220px", "overflowY": "auto",
+                            "background": "#13131f",
+                            "border": "1px solid rgba(240,180,41,0.25)",
+                            "borderRadius": "6px", "padding": "4px"}),
+            ),
+            _details_card(
+                "Pick any recording manually",
+                summary_sub="bypass the queue -- choose session/file/channel",
+                open_default=False,
+                content=html.Div([
+                    html.Div([
+                        html.Label("Session", style=LABEL_STYLE,
+                                    title="A session is a continuous run of "
+                                           "recording with one animal."),
+                        dcc.Dropdown(
+                            id="video-session-dropdown",
+                            options=session_options,
+                            value=default_session,
+                            style=DROPDOWN_STYLE,
+                            className="dark-dropdown"),
+                    ], style={"flex": "2", "minWidth": "200px"}),
+                    html.Div([
+                        html.Label("File (chunk)", style=LABEL_STYLE,
+                                    title="Each chunk is roughly one hour of "
+                                           "recording, named with its start "
+                                           "timestamp."),
+                        dcc.Dropdown(
+                            id="video-file-dropdown", options=[],
+                            style=DROPDOWN_STYLE,
+                            className="dark-dropdown"),
+                    ], style={"flex": "3", "minWidth": "220px"}),
+                    html.Div([
+                        html.Label("Brain channel", style=LABEL_STYLE,
+                                    title="Which electrode contact to "
+                                           "display the LFP trace for."),
+                        dcc.Dropdown(
+                            id="video-channel-dropdown", options=[],
+                            value=0, style=DROPDOWN_STYLE,
+                            className="dark-dropdown"),
+                    ], style={"flex": "1", "minWidth": "160px"}),
+                ], style={"display": "flex", "gap": "16px",
+                           "flexWrap": "wrap"}),
+            ),
+            # Bulk pre-screen (Hilbert thresholding) -- a batch tool
+            # scoped to the animal picked above, NOT part of picking one
+            # recording. Same job/cache as the PI Mass Analyze.
+            _video_mass_analyze_panel(),
+        ], style={"display": "grid",
+                   "gridTemplateColumns":
+                       "repeat(auto-fit, minmax(320px, 1fr))",
+                   "gap": "4px 20px", "alignItems": "start"}),
+        dcc.Store(id="video-queue-position", data=0),
 
         # --- Step 2: watch ---------------------------------------------- #
         _step_header("2", "Watch",
