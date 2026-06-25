@@ -2540,7 +2540,11 @@ def layout(store: Store, bridge: dict | None = None):
                             style={"backgroundColor": "#262638",
                                     "color": "#f0f0f5", "width": "70px"}),
                     ], style={"display": "flex", "alignItems": "center"}),
-                ], style={"flex": "0 0 200px"}),
+                ], id="video-llwin-group",
+                   # Hidden unless the Line length feature is selected
+                   # (toggled by _toggle_llwin_group). Default feature is
+                   # 'hilbert', so start hidden.
+                   style={"flex": "0 0 200px", "display": "none"}),
                 # Remove false-positive candidate peaks (the pink
                 # triangles). When the mode is on, clicking a triangle
                 # rejects it (persisted per file); Undo restores the
@@ -5434,6 +5438,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "smooth": smooth_ms}
         return (fig, " · ".join(status_bits), new_state,
                 float(duration), tok)
+
+    # ---- Show the line-length window only when that feature is plotted ----
+    @app.callback(
+        Output("video-llwin-group", "style"),
+        Input("video-analysis-feature", "value"),
+    )
+    def _toggle_llwin_group(feature):
+        base = {"flex": "0 0 200px"}
+        if feature == "line_length":
+            return base
+        return {**base, "display": "none"}
 
     # ---- Time-locked analysis trace (feature vs time) ----
     @app.callback(
