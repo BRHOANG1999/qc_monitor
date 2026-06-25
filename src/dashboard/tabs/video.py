@@ -1366,9 +1366,9 @@ def _details_card(summary_text: str, content,
     """Lightweight ``html.Details`` wrapper used to hide advanced
     controls behind a click. Keeps the default view friendly.
     """
+    # No leading icon -- the +/- marker (theme.css) already signals that
+    # the card expands, so an extra "sliders" glyph just adds clutter.
     summary_children: list = [
-        icon("sliders", size=12, color=COLOR_TEXT_TERTIARY,
-             style={"marginRight": SPACE_2}),
         html.Span(summary_text, style={
             "color": "#cfd0d6", "fontSize": "12px",
             "fontWeight": "600",
@@ -1999,7 +1999,9 @@ def layout(store: Store, bridge: dict | None = None):
                                     "fontSize": "12px"}),
                     ], style={"display": "flex",
                                "alignItems": "center",
-                               "padding": "8px 6px",
+                               "gap": "6px",
+                               "padding": "6px 8px",
+                               "maxWidth": "560px",
                                "background": "#13131f",
                                "border":
                                    "1px solid rgba(255,255,255,0.06)",
