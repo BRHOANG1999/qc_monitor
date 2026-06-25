@@ -2682,6 +2682,10 @@ def layout(store: Store, bridge: dict | None = None):
                         value="lines", inline=True,
                         style={"color": "#ffffff", "fontSize": "11px",
                                "marginLeft": "12px"},
+                        # labelStyle colours the actual option text (the
+                        # container `style` doesn't reach the <label>s).
+                        labelStyle={"color": "#ffffff",
+                                     "marginRight": "10px"},
                         inputStyle={"marginRight": "3px",
                                      "marginLeft": "8px"}),
                     html.Span([

@@ -569,6 +569,14 @@ button:focus-visible {
     display: none !important;
 }
 
+/* Stim-overlay mode toggle (Lines / Heatmap): force white label text so
+   it's legible on the dark overlay header (beats any global label rule). */
+#video-overlay-mode,
+#video-overlay-mode label,
+#video-overlay-mode span {
+    color: #ffffff !important;
+}
+
 /* Queue browse arrows (◀ ▶) in Video Review Step 1. */
 .video-queue-arrow {
     background: transparent;
