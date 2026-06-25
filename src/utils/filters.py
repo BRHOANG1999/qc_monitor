@@ -101,6 +101,44 @@ def epoch_band_power(signal: np.ndarray, fs: float, stim_times,
     return np.asarray(times), np.asarray(powers)
 
 
+def _window_line_length(signal: np.ndarray, fs: float, n: int,
+                         center_sec: float,
+                         win: tuple[float, float]) -> float | None:
+    """Line length ``sum(|diff(seg)|)`` over ``[center+win0, center+win1]``
+    seconds (``win0`` may be negative). None when the window falls outside
+    the signal or has < 2 samples (``diff`` needs at least two points)."""
+    i0 = int(round((center_sec + win[0]) * fs))
+    i1 = int(round((center_sec + win[1]) * fs))
+    if i0 < 0 or i1 > n or (i1 - i0) < 2:
+        return None
+    seg = signal[i0:i1]
+    if not np.all(np.isfinite(seg)):
+        seg = np.nan_to_num(seg)
+    return float(np.sum(np.abs(np.diff(seg))))
+
+
+def epoch_line_length(signal: np.ndarray, fs: float, stim_times,
+                       win: tuple[float, float],
+                       max_epochs: int = 5000):
+    """Per-stim line length over ``[onset+win0, onset+win1]`` s (``win0``
+    may be negative). Returns ``(times, lengths)`` numpy arrays for the
+    epochs whose window is fully in-bounds. A tight stim-locked window
+    (e.g. -1..1 ms) tracks stim-onset instability.
+    """
+    assert win[1] > win[0], "win end must exceed start"
+    signal = np.asarray(signal, dtype=np.float64)
+    n = signal.shape[0]
+    times: list[float] = []
+    vals: list[float] = []
+    for s in np.asarray(stim_times, dtype=np.float64)[:max_epochs]:
+        v = _window_line_length(signal, fs, n, float(s), win)
+        if v is None:
+            continue
+        times.append(float(s))
+        vals.append(v)
+    return np.asarray(times), np.asarray(vals)
+
+
 def epoch_band_ratio_db(signal: np.ndarray, fs: float, stim_times,
                          lo: float, hi: float,
                          pre_win: tuple[float, float],

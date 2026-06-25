@@ -59,7 +59,7 @@ from src.utils.decimate import (
 )
 from src.utils.filters import (
     apply_filter, compute_psd, band_power, SLOW_GAMMA_BAND,
-    epoch_band_power, epoch_band_ratio_db)
+    epoch_band_power, epoch_band_ratio_db, epoch_line_length)
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
@@ -924,6 +924,177 @@ def _render_evoked_band_power(store, file_id: int, channel: int | None,
     status = (f"Slow gamma {lo:g}-{hi:g} Hz · per stim epoch "
               f"({win_sec * 1000:.0f} ms window) · {len(times)} epochs")
     return (fig, status)
+
+
+def _ll_window_ms(start_ms, end_ms) -> tuple[float, float]:
+    """Coerce the two line-length-window inputs to ``(start, end)`` ms,
+    defaulting to the -1..1 ms stim-onset window when blank/invalid
+    (``dcc.Input`` hands us ``None`` while the user is mid-type)."""
+    try:
+        s = float(start_ms) if start_ms is not None else -1.0
+    except (TypeError, ValueError):
+        s = -1.0
+    try:
+        e = float(end_ms) if end_ms is not None else 1.0
+    except (TypeError, ValueError):
+        e = 1.0
+    return s, e
+
+
+def _render_evoked_line_length(store, file_id: int, channel: int | None,
+                                win_ms: tuple[float, float]) -> tuple:
+    """(figure, status) for per-stim line length over a user window (ms).
+
+    Line length = sum of |sample-to-sample diff| inside ``[onset+start,
+    onset+end]`` ms. Computed live from the raw epoch, so the window is
+    fully adjustable -- a tight stim-locked window (e.g. -1..1 ms) tracks
+    stim-onset instability. Replaces the old full-epoch DB ``line_length``.
+    """
+    assert isinstance(file_id, int), "file_id must be int"
+    assert len(win_ms) == 2, "win_ms must be (start, end)"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig(
+            "Pick a brain channel (Step 1) first."), "")
+    start_ms, end_ms = float(win_ms[0]), float(win_ms[1])
+    if end_ms <= start_ms:
+        return (_empty_lfp_fig(
+            "Line-length window end must be greater than start."), "")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return (_empty_lfp_fig(
+            "No stim epochs on this file — line length needs "
+            "stimulation onsets."), "")
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Line-length load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    win = (start_ms / 1000.0, end_ms / 1000.0)
+    times, vals = epoch_line_length(sig, fs, stim_times, win)
+    if len(times) == 0:
+        return (_empty_lfp_fig(
+            "No usable stim epochs — the window is too short for this "
+            "sample rate, or fell off the recording. Try a wider window."),
+                "")
+    fig = _build_lfp_figure(
+        np.asarray(times), np.asarray(vals),
+        f"Line length ({start_ms:g}..{end_ms:g} ms, per stim)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].mode = "markers+lines"
+    fig.data[0].line.color = "#ffd60a"
+    fig.data[0].marker = dict(size=5, color="#ffd60a")
+    fig.data[0].hovertemplate = (
+        "stim @ t=%{x:.2f}s<br>line length=%{y:.3g}<extra></extra>")
+    fig.layout.yaxis.title = "line length (μV)"
+    status = (f"Line length · {start_ms:g}..{end_ms:g} ms window · "
+              f"{len(times)} epochs @ {int(fs)} Hz")
+    return (fig, status)
+
+
+def _overlay_rgba(alpha: float) -> str:
+    """Recency colour for the stim overlay: the line-length yellow
+    (#ffd60a) at the given opacity. Newest trace -> alpha 1.0."""
+    return f"rgba(255,214,10,{max(0.0, min(1.0, alpha)):.3f})"
+
+
+def _add_overlay_traces(fig, sig, fs, stim_times, idx, win, n_prev) -> int:
+    """Add the current stim's windowed segment + up to ``n_prev`` previous
+    ones to ``fig``, oldest faded -> newest opaque. Returns how many were
+    actually drawn (segments whose window fell off the recording skipped)."""
+    members = list(range(max(0, idx - n_prev), idx + 1))  # oldest->newest
+    k = len(members)
+    n = sig.shape[0]
+    added = 0
+    for j, i in enumerate(members):
+        center = float(stim_times[i])
+        i0 = int(round((center + win[0]) * fs))
+        i1 = int(round((center + win[1]) * fs))
+        if i0 < 0 or i1 > n or (i1 - i0) < 2:
+            continue
+        seg = sig[i0:i1]
+        t_ms = np.arange(seg.shape[0]) / fs * 1000.0 + win[0] * 1000.0
+        newest = (i == idx)
+        alpha = 0.12 + 0.88 * (j / max(1, k - 1))
+        fig.add_trace(go.Scatter(
+            x=t_ms, y=seg, mode="lines",
+            line=dict(color=_overlay_rgba(alpha),
+                       width=2.0 if newest else 1.0),
+            name=f"stim @ {center:.2f}s" if newest else "",
+            showlegend=False,
+            hoverinfo="skip" if not newest else "x+y",
+        ))
+        added += 1
+    return added
+
+
+def _style_overlay(fig, start_ms: float, end_ms: float, n_added: int) -> None:
+    """Dark-theme the stim-overlay figure and mark the stim onset (0 ms)."""
+    assert n_added >= 1, "need at least one overlay trace"
+    fig.update_layout(
+        plot_bgcolor="#13131f", paper_bgcolor="#13131f",
+        height=180, margin=dict(l=60, r=20, t=24, b=40),
+        title=dict(
+            text=(f"Stim overlay · last {n_added} epochs · "
+                  f"{start_ms:g}..{end_ms:g} ms"),
+            font=dict(size=11, color="#cfd0d6"), x=0.01, y=0.97),
+        xaxis=dict(title="ms from stim", showgrid=True,
+                    gridcolor="rgba(255,255,255,0.05)",
+                    zeroline=False, color="#cfd0d6"),
+        yaxis=dict(title="μV", showgrid=True,
+                    gridcolor="rgba(255,255,255,0.05)",
+                    zeroline=False, color="#cfd0d6"),
+        showlegend=False,
+    )
+    if start_ms <= 0 <= end_ms:
+        fig.add_vline(x=0, line=dict(color="#ff9f0a", width=1.5,
+                                      dash="dot"))
+
+
+def _render_overlay(store, file_id: int, channel: int | None,
+                     stim_idx, win_ms: tuple[float, float],
+                     n_prev: int = 10):
+    """Oscilloscope persistence figure: the current stim's windowed trace
+    plus the previous ``n_prev``, faded by recency. ``stim_idx`` is the
+    nearest stim at/before the playhead (clientside-computed)."""
+    assert isinstance(file_id, int), "file_id must be int"
+    assert n_prev >= 1, "n_prev must be positive"
+    if channel is None:
+        return _empty_lfp_fig("Pick a brain channel (Step 1) first.")
+    if stim_idx is None or int(stim_idx) < 0:
+        return _empty_lfp_fig("Waiting for the first stim…")
+    start_ms, end_ms = float(win_ms[0]), float(win_ms[1])
+    if end_ms <= start_ms:
+        return _empty_lfp_fig(
+            "Line-length window end must be greater than start.")
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return _empty_lfp_fig("File not found in DB.")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return _empty_lfp_fig("No stim epochs on this file.")
+    idx = min(int(stim_idx), len(stim_times) - 1)
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Overlay load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return _empty_lfp_fig(f"Couldn't load LFP: {e}")
+    win = (start_ms / 1000.0, end_ms / 1000.0)
+    fig = go.Figure()
+    n_added = _add_overlay_traces(fig, sig, fs, stim_times, idx, win, n_prev)
+    if n_added == 0:
+        return _empty_lfp_fig(
+            "Window too short for this sample rate — widen it.")
+    _style_overlay(fig, start_ms, end_ms, n_added)
+    return fig
 
 
 def _render_evoked_band_ratio(store, file_id: int, channel: int | None,
@@ -2161,7 +2332,7 @@ def layout(store: Store, bridge: dict | None = None):
                             {"label": "Slow gamma induced "
                                        "(30-50 Hz, post vs baseline dB)",
                                 "value": "slow_gamma_induced"},
-                            {"label": "Line length (per-event)",
+                            {"label": "Line length (live windowed)",
                                 "value": "line_length"},
                             {"label": "Log(AUC) — area under the curve",
                                 "value": "log_auc"},
@@ -2239,6 +2410,36 @@ def layout(store: Store, bridge: dict | None = None):
                         style={"backgroundColor": "#262638",
                                 "color": "#f0f0f5", "width": "80px"}),
                 ], style={"flex": "0 0 130px"}),
+                # Line-length window (only meaningful for the Line length
+                # feature, and drives the stim-overlay below): the start
+                # and end (ms, relative to stim onset) of the window the
+                # line length is measured over. A tight window like
+                # -1..1 ms tracks stim-onset instability. NB: this is a
+                # live computation and intentionally differs from the old
+                # full-epoch DB line_length column.
+                html.Div([
+                    html.Label("Line-length window (ms)", style=LABEL_STYLE,
+                                title="For the 'Line length' feature (and "
+                                       "the stim overlay): the start/end in "
+                                       "ms, relative to each stim onset, "
+                                       "that line length is measured over. "
+                                       "A tight -1..1 ms window tracks "
+                                       "stim-onset instability."),
+                    html.Div([
+                        dcc.Input(
+                            id="video-llwin-start-input",
+                            type="number", step="any", value=-1,
+                            style={"backgroundColor": "#262638",
+                                    "color": "#f0f0f5", "width": "70px"}),
+                        html.Span("to", style={"color": "#9a9aa8",
+                                                "margin": "0 6px"}),
+                        dcc.Input(
+                            id="video-llwin-end-input",
+                            type="number", step="any", value=1,
+                            style={"backgroundColor": "#262638",
+                                    "color": "#f0f0f5", "width": "70px"}),
+                    ], style={"display": "flex", "alignItems": "center"}),
+                ], style={"flex": "0 0 200px"}),
                 # Remove false-positive candidate peaks (the pink
                 # triangles). When the mode is on, clicking a triangle
                 # rejects it (persisted per file); Undo restores the
@@ -2396,6 +2597,19 @@ def layout(store: Store, bridge: dict | None = None):
                         "scrollZoom": True,
                     },
                 ),
+            ),
+            # Stim overlay (oscilloscope persistence view): during
+            # playback shows the raw trace in the line-length window for
+            # the current stim + the previous 10, faded by recency so you
+            # can watch the stim-locked shape drift. Driven by the
+            # clientside throttle below (rebuilds only on stim crossing).
+            dcc.Graph(
+                id="video-overlay-graph",
+                figure=_empty_lfp_fig(
+                    "Play the video to see the stim overlay — the current "
+                    "stim's trace plus the last 10, faded by recency."),
+                config={"displayModeBar": False, "displaylogo": False},
+                style={"marginTop": "6px"},
             ),
         ], className="video-lfp-col",
            style={"marginTop": "0", "gridArea": "lfp",
@@ -2774,6 +2988,14 @@ def layout(store: Store, bridge: dict | None = None):
         # the callback no-ops. Cheap.
         dcc.Interval(id="video-time-tick", interval=100, n_intervals=0),
         dcc.Store(id="video-current-time", data=0.0),
+        # Stim overlay support. `video-stim-times` holds this file's stim
+        # onsets (LFP seconds) so the clientside throttle can find the
+        # nearest stim at/before the playhead without a server round-trip.
+        # `video-overlay-stim-idx` is that nearest-stim index, pushed only
+        # when it changes -- so the server rebuilds the overlay figure at
+        # most once per stim crossing, not at the 10 Hz playback cadence.
+        dcc.Store(id="video-stim-times", data=[]),
+        dcc.Store(id="video-overlay-stim-idx", data=-1),
         # P1-4 predictive prefetch: a slow tick (2 s) drives a
         # background warm of the next-in-queue file's chunk so
         # pressing J / mark-done feels instant. State stores the
@@ -5178,6 +5400,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-blank-raw", "value"),
         Input("video-rejected-version", "data"),
         Input("video-auc-window-input", "value"),
+        Input("video-llwin-start-input", "value"),
+        Input("video-llwin-end-input", "value"),
         State("video-analysis-smooth", "value"),
         State("video-analysis-rollwin", "value"),
         State("video-analysis-postproc", "value"),
@@ -5185,7 +5409,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _update_analysis(file_id, feature, _n_apply,
                           channel, ma_cutoff, blank_raw, _rej_ver,
-                          auc_window,
+                          auc_window, ll_start_ms, ll_end_ms,
                           smooth_sec, rollwin, postproc, events):
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
@@ -5193,7 +5417,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # an identical hilbert status).
         fig, status = _compute_analysis(
             file_id, feature, channel, ma_cutoff, blank_raw,
-            auc_window, smooth_sec, rollwin, postproc)
+            auc_window, ll_start_ms, ll_end_ms,
+            smooth_sec, rollwin, postproc)
         # Draw flagged onsets on every Hilbert rebuild, not only on
         # events-store changes.
         _inject_landmarks(fig, events)
@@ -5201,7 +5426,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     def _compute_analysis(file_id, feature,
                            channel, ma_cutoff, blank_raw,
-                           auc_window,
+                           auc_window, ll_start_ms, ll_end_ms,
                            smooth_sec, rollwin, postproc):
         if not file_id:
             return (_empty_lfp_fig(
@@ -5260,6 +5485,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 cutoff=cutoff,
                 show_raw="raw" in (blank_raw or []),
             )
+        # Line length -- computed live over a user window (ms), so it no
+        # longer reads the precomputed DB column. Drives the stim overlay.
+        if feature == "line_length":
+            s, e = _ll_window_ms(ll_start_ms, ll_end_ms)
+            return _render_evoked_line_length(
+                store, int(file_id), channel, (s, e))
         try:
             rows = store.query_evoked_features(int(file_id))
         except Exception as e:
@@ -5743,6 +5974,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         )
 
     # ================================================================== #
+    #  Stim overlay (oscilloscope persistence view)
+    # ================================================================== #
+
+    # Publish this file's stim onsets (LFP seconds) so the clientside
+    # throttle can find the nearest stim without a server round-trip.
+    @app.callback(
+        Output("video-stim-times", "data"),
+        Input("video-file-dropdown", "value"),
+    )
+    def _publish_stim_times(file_id):
+        if not file_id:
+            return []
+        try:
+            st = _stim_times_for_file(store, int(file_id))
+        except Exception as e:
+            logger.warning("Stim-times publish failed file=%s: %s",
+                            file_id, e)
+            return []
+        return [] if st is None else np.asarray(st).tolist()
+
+    # Rebuild the overlay only when the nearest-stim index changes (≤ once
+    # per stim crossing) or when the line-length window is edited.
+    @app.callback(
+        Output("video-overlay-graph", "figure"),
+        Input("video-overlay-stim-idx", "data"),
+        Input("video-llwin-start-input", "value"),
+        Input("video-llwin-end-input", "value"),
+        State("video-file-dropdown", "value"),
+        State("video-channel-dropdown", "value"),
+    )
+    def _update_overlay(stim_idx, ll_start_ms, ll_end_ms, file_id, channel):
+        if not file_id:
+            return _empty_lfp_fig(
+                "Pick a recording above to see the stim overlay.")
+        s, e = _ll_window_ms(ll_start_ms, ll_end_ms)
+        return _render_overlay(store, int(file_id), channel,
+                                stim_idx, (s, e))
+
+    # ================================================================== #
     #  Clientside time-locking
     # ================================================================== #
 
@@ -5759,6 +6029,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         """,
         Output("video-current-time", "data"),
         Input("video-time-tick", "n_intervals"),
+    )
+
+    # 1-stim. Stim-overlay throttle. Map the playhead to LFP time with the
+    #     same BHZ ratio (lfp_t = currentTime * lfp_dur / video_dur), find
+    #     the nearest stim at/before it, and push that index ONLY when it
+    #     changes -- so the server rebuilds the overlay at most once per
+    #     stim crossing, not at the 10 Hz playback cadence. Returns
+    #     no_update before the first stim (idx stays -1).
+    app.clientside_callback(
+        """
+        function(currentTime, stimTimes, lfpDur, lastIdx) {
+            if (!stimTimes || !stimTimes.length) {
+                return window.dash_clientside.no_update;
+            }
+            if (currentTime === null || currentTime === undefined) {
+                return window.dash_clientside.no_update;
+            }
+            var lfpT = currentTime;
+            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (v && isFinite(v.duration) && v.duration > 0
+                    && lfpDur && lfpDur > 0) {
+                lfpT = currentTime * (lfpDur / v.duration);
+            }
+            var idx = -1;
+            for (var i = 0; i < stimTimes.length; i++) {
+                if (stimTimes[i] <= lfpT) { idx = i; } else { break; }
+            }
+            if (idx === lastIdx) {
+                return window.dash_clientside.no_update;
+            }
+            return idx;
+        }
+        """,
+        Output("video-overlay-stim-idx", "data"),
+        Input("video-current-time", "data"),
+        State("video-stim-times", "data"),
+        State("video-lfp-duration", "data"),
+        State("video-overlay-stim-idx", "data"),
+        prevent_initial_call=True,
     )
 
     # 1a. Pending-seek consumer. When the LFP Browser's "View video"
