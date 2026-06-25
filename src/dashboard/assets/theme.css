@@ -569,6 +569,24 @@ button:focus-visible {
     display: none !important;
 }
 
+/* Queue browse arrows (◀ ▶) in Video Review Step 1. */
+.video-queue-arrow {
+    background: transparent;
+    color: #cfd0d6;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 5px;
+    padding: 4px 11px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    transition: background 0.12s ease, border-color 0.12s ease;
+}
+.video-queue-arrow:hover {
+    background: rgba(94, 124, 226, 0.18);
+    border-color: #5e7ce2;
+    color: #ffffff;
+}
+
 /* --- Collapsible <details> affordance (ALL collapsibles) --- */
 /* Every <details> in the app shows a boxed "+" when collapsed (click to
    expand) and a "-" (minus) when open (click to collapse), so it's always

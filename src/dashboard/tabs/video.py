@@ -1964,60 +1964,53 @@ def layout(store: Store, bridge: dict | None = None):
                               style={"color": "#a0a0b0",
                                       "fontSize": "11px",
                                       "marginBottom": "6px"}),
+                    # Slim hint shown when no animal is picked / the queue
+                    # is empty -- the navigator below is hidden then, so
+                    # there's no cavernous empty band.
+                    html.Div(id="video-queue-empty",
+                              style={"color": "#888", "fontSize": "12px",
+                                      "padding": "4px 2px"}),
+                    # Compact control strip: ◀ [recording] ▶ [Load].
+                    # Hidden until there's an actual queue.
                     html.Div([
-                        html.Button(
-                            "◀",
-                            id="video-queue-prev-btn",
-                            n_clicks=0,
-                            title="Browse to the next-newer "
-                                   "recording (no load yet).",
-                            style={"background": "transparent",
-                                    "color": "#cfd0d6",
-                                    "border": "1px solid "
-                                               "rgba(255,255,255,0.15)",
-                                    "borderRadius": "5px",
-                                    "padding": "4px 10px",
-                                    "cursor": "pointer",
-                                    "fontSize": "12px"}),
-                        html.Div(id="video-queue-card-body",
-                                  style={"flex": "1",
-                                          "padding": "0 10px",
-                                          "textAlign": "center"}),
-                        html.Button(
-                            "▶",
-                            id="video-queue-next-btn",
-                            n_clicks=0,
-                            title="Browse to the next-older "
-                                   "recording (no load yet).",
-                            style={"background": "transparent",
-                                    "color": "#cfd0d6",
-                                    "border": "1px solid "
-                                               "rgba(255,255,255,0.15)",
-                                    "borderRadius": "5px",
-                                    "padding": "4px 10px",
-                                    "cursor": "pointer",
-                                    "fontSize": "12px"}),
-                    ], style={"display": "flex",
-                               "alignItems": "center",
-                               "gap": "6px",
-                               "padding": "6px 8px",
-                               "maxWidth": "560px",
-                               "background": "#13131f",
-                               "border":
-                                   "1px solid rgba(255,255,255,0.06)",
-                               "borderRadius": "6px"}),
-                    html.Div([
-                        button(
-                            "Load this recording",
-                            "video-queue-load-btn",
-                            variant="primary", icon_name="video",
-                            style={"marginRight": "10px"}),
+                        html.Div([
+                            html.Button(
+                                "◀",
+                                id="video-queue-prev-btn",
+                                n_clicks=0,
+                                title="Browse to the next-newer "
+                                       "recording (no load yet).",
+                                className="video-queue-arrow"),
+                            html.Div(id="video-queue-card-body",
+                                      style={"flex": "1",
+                                              "padding": "0 10px",
+                                              "textAlign": "center"}),
+                            html.Button(
+                                "▶",
+                                id="video-queue-next-btn",
+                                n_clicks=0,
+                                title="Browse to the next-older "
+                                       "recording (no load yet).",
+                                className="video-queue-arrow"),
+                            button(
+                                "Load this recording",
+                                "video-queue-load-btn",
+                                variant="primary", icon_name="video"),
+                        ], style={"display": "flex",
+                                   "alignItems": "center",
+                                   "gap": "8px",
+                                   "padding": "6px 8px",
+                                   "maxWidth": "620px",
+                                   "background": "#13131f",
+                                   "border":
+                                       "1px solid rgba(255,255,255,0.06)",
+                                   "borderRadius": "6px"}),
                         html.Span(id="video-queue-card-position",
                                    style={"color": "#a0a0b0",
-                                           "fontSize": "11px"}),
-                    ], style={"display": "flex",
-                               "alignItems": "center",
-                               "marginTop": "6px"}),
+                                           "fontSize": "11px",
+                                           "marginTop": "4px",
+                                           "display": "inline-block"}),
+                    ], id="video-queue-nav-wrap"),
                     _details_card(
                         "Show all timestamps",
                         summary_sub="full FIFO list -- click "
@@ -3391,25 +3384,30 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 heat_color = "#ff453a"
             elif days >= warn_age_days:
                 heat_color = "#ff9f0a"
+        def _chip(text, color="#cfd0d6", bg="rgba(255,255,255,0.06)"):
+            return html.Span(text, style={
+                "background": bg, "color": color,
+                "padding": "2px 9px", "borderRadius": "11px",
+                "fontSize": "11px", "fontWeight": "600",
+                "whiteSpace": "nowrap"})
+
         chips: list = [
-            html.Span(f"Today: {done_today} reviewed",
-                       style={"color": "#f0f0f5",
-                               "fontWeight": "600"}),
-            html.Span("·"),
-            html.Span(
-                (f"Streak: {streak} sessions"
-                 if streak else "Streak: -- "),
-                style={"color": ("#30d158" if streak >= 2
-                                  else "#a0a0b0")}),
+            _chip(f"Today · {done_today} reviewed", color="#f0f0f5"),
+            _chip((f"Streak · {streak} sessions" if streak
+                   else "Streak · --"),
+                  color=("#30d158" if streak >= 2 else "#a0a0b0"),
+                  bg=("rgba(48,209,88,0.12)" if streak >= 2
+                      else "rgba(255,255,255,0.06)")),
         ]
         if n_waiting:
-            chips.append(html.Span("·"))
-            chips.append(html.Span(f"{n_waiting} waiting",
-                                     style={"color": "#a0a0b0"}))
+            chips.append(_chip(f"{n_waiting} waiting"))
         if oldest_label:
-            chips.append(html.Span("·"))
-            chips.append(html.Span(oldest_label,
-                                     style={"color": heat_color}))
+            chips.append(_chip(
+                oldest_label, color=heat_color,
+                bg=("rgba(255,69,58,0.12)" if heat_color == "#ff453a"
+                    else "rgba(255,159,10,0.12)"
+                    if heat_color == "#ff9f0a"
+                    else "rgba(255,255,255,0.06)")))
         return chips
 
     # ---- Track F: one-at-a-time queue card ---- #
@@ -3424,27 +3422,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-queue-card-position", "children"),
         Output("video-queue-position", "data",
                 allow_duplicate=True),
+        Output("video-queue-nav-wrap", "style"),
+        Output("video-queue-empty", "children"),
         Input("video-queue-animal", "value"),
         Input("video-queue-position", "data"),
         Input("refresh-trigger", "data"),
         prevent_initial_call="initial_duplicate",
     )
     def _render_queue_card(animal_value, position, _refresh):
+        # nav-wrap visibility: hidden (slim hint instead) until there's a
+        # queue to browse; shown once we have rows.
+        _HIDE = {"display": "none"}
+        _SHOW = {}
+        hint = "Pick an animal above to load your queue."
         if not animal_value:
-            return ("",
-                    html.Div("Pick an animal above to see "
-                              "your queue.",
-                              style={"color": "#888",
-                                      "fontSize": "12px"}),
-                    "", no_update)
+            return ("", "", "", no_update, _HIDE, hint)
         animal_ids = _animal_ids_from_picker(animal_value)
         if not animal_ids:
-            return ("",
-                    html.Div("Pick an animal above to see "
-                              "your queue.",
-                              style={"color": "#888",
-                                      "fontSize": "12px"}),
-                    "", no_update)
+            return ("", "", "", no_update, _HIDE, hint)
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
         rows = store.get_review_queue(animal_ids, email,
@@ -3452,20 +3447,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                         since_iso=floor)
         animal_label = animal_ids[0]
         if not rows:
-            title = (f"Queue (FIFO · 0 unreviewed for "
-                      f"{animal_label})")
-            return (title,
-                    html.Div([
-                        html.Div("🎉  You're all caught up!",
-                                  style={"color": "#00CC96",
-                                          "fontWeight": "600",
-                                          "fontSize": "13px"}),
-                        html.Div("No unreviewed recordings.",
-                                  style={"color": "#888",
-                                          "fontSize": "11px",
-                                          "marginTop": "2px"}),
-                    ]),
-                    "", 0)
+            caught_up = html.Div([
+                html.Span("🎉  All caught up — ",
+                           style={"color": "#00CC96",
+                                   "fontWeight": "600"}),
+                html.Span(f"no unreviewed recordings for {animal_label}.",
+                           style={"color": "#888"}),
+            ], style={"fontSize": "12px"})
+            return ("", "", "", 0, _HIDE, caught_up)
         total = len(rows)
         clamped = max(0, min(int(position or 0), total - 1))
         row = rows[clamped]
@@ -3520,8 +3509,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # If we clamped, write the clamped position back so
         # the next prev/next click is from a valid base.
         if clamped != (position or 0):
-            return (title, body, position_str, clamped)
-        return (title, body, position_str, no_update)
+            return (title, body, position_str, clamped, _SHOW, "")
+        return (title, body, position_str, no_update, _SHOW, "")
 
     @app.callback(
         Output("video-queue-position", "data",
