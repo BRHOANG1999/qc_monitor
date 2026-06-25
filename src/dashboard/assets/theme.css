@@ -410,23 +410,23 @@ button:focus-visible {
 }
 .qc-overlay-iconbtn {
     background: transparent;
-    color: #cfd0d6;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.25);
     border-radius: 5px;
     cursor: pointer;
-    font-size: 13px;
+    font-size: 14px;
+    font-weight: 700;
     line-height: 1;
-    padding: 2px 7px;
+    padding: 2px 8px;
 }
 .qc-overlay-iconbtn:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(94, 124, 226, 0.18);
+    border-color: #5e7ce2;
 }
-/* Collapsed: hide the graph body; rotate the collapse chevron. */
+/* Collapsed: hide the graph body. The collapse button shows "+" (expand)
+   vs "-" (collapse), set by applyCollapsed in overlay_panel.js. */
 .qc-overlay-collapsed #video-overlay-body {
     display: none;
-}
-.qc-overlay-collapsed #video-overlay-collapse-btn {
-    transform: rotate(-90deg);
 }
 /* Popped out: float fixed, resizable from the bottom-right corner.
    Pinned top-right so it doesn't collide with the video PiP (bottom-
@@ -569,41 +569,52 @@ button:focus-visible {
     display: none !important;
 }
 
-/* --- Expandable <details> cards: make the affordance obvious --- */
+/* --- Collapsible <details> affordance (ALL collapsibles) --- */
+/* Every <details> in the app shows a boxed "+" when collapsed (click to
+   expand) and a "-" (minus) when open (click to collapse), so it's always
+   obvious the block opens. Applies whether or not it has .qc-expandable. */
+details > summary {
+    position: relative;
+    cursor: pointer;
+    padding-right: 30px;   /* room for the +/- marker */
+}
+/* hide the browser's default disclosure triangle; we draw our own */
+details > summary::-webkit-details-marker { display: none; }
+details > summary::marker { content: ""; }
+details > summary::after {
+    content: "+";
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    text-align: center;
+    font-size: 15px;
+    font-weight: 700;
+    color: #cfd0d6;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 4px;
+    transition: color 0.15s ease, border-color 0.15s ease,
+                background 0.15s ease;
+}
+/* "-" (minus sign, U+2212) when expanded. */
+details[open] > summary::after {
+    content: "\2212";
+}
+details > summary:hover::after {
+    color: #ffffff;
+    border-color: #5e7ce2;
+    background: rgba(94, 124, 226, 0.18);
+}
+/* .qc-expandable adds the card chrome (border lights up on hover). */
 details.qc-expandable {
     transition: border-color 0.15s ease;
 }
-details.qc-expandable > summary {
-    position: relative;
-    padding-right: 36px !important;   /* room for the chevron */
-}
-/* hide the browser's default disclosure triangle; we draw our own */
-details.qc-expandable > summary::-webkit-details-marker { display: none; }
-details.qc-expandable > summary::marker { content: ""; }
-/* CSS chevron: a rotated square corner. Points RIGHT when collapsed. */
-details.qc-expandable > summary::after {
-    content: "";
-    position: absolute;
-    right: 14px;
-    top: 50%;
-    width: 7px;
-    height: 7px;
-    border-right: 2px solid #9aa0b5;
-    border-bottom: 2px solid #9aa0b5;
-    transform: translateY(-65%) rotate(-45deg);
-    transition: transform 0.18s ease, border-color 0.15s ease;
-}
-/* Points DOWN when expanded. */
-details.qc-expandable[open] > summary::after {
-    transform: translateY(-30%) rotate(45deg);
-}
-/* Hover lights up the row + chevron + card border so it reads as a
-   clickable control, not static text. */
+details.qc-expandable > summary { padding-right: 36px !important; }
 details.qc-expandable > summary:hover {
     background: rgba(94, 124, 226, 0.12) !important;
-}
-details.qc-expandable > summary:hover::after {
-    border-color: #5e7ce2;
 }
 details.qc-expandable:hover {
     border-color: rgba(94, 124, 226, 0.35) !important;

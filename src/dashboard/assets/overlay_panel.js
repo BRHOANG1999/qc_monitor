@@ -38,12 +38,15 @@
         var p = panel();
         if (!p) { return; }
         var body = document.getElementById(BODY_ID);
+        var btn = document.getElementById('video-overlay-collapse-btn');
         if (on) {
             p.classList.add(COLLAPSED_CLASS);
         } else {
             p.classList.remove(COLLAPSED_CLASS);
             if (body) { nudgeResize(); }  // re-render at full width
         }
+        // "+" = collapsed (click to expand), U+2212 minus = expanded.
+        if (btn) { btn.textContent = on ? '+' : '−'; }
     }
 
     // Header drag-to-move. Wired once; ignores mousedowns that start on

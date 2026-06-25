@@ -2735,9 +2735,12 @@ def layout(store: Store, bridge: dict | None = None):
                                     "color": "#f0f0f5", "width": "60px"}),
                     ], style={"display": "flex", "alignItems": "center",
                                "marginLeft": "auto", "marginRight": "8px"}),
-                    html.Button("▾", id="video-overlay-collapse-btn",
+                    # "+" = collapsed (click to expand), "-" = expanded
+                    # (click to collapse). Set by applyCollapsed in JS;
+                    # starts "+" since the overlay is collapsed by default.
+                    html.Button("+", id="video-overlay-collapse-btn",
                                  className="qc-overlay-iconbtn",
-                                 title="Collapse / expand the overlay"),
+                                 title="Expand / collapse the overlay"),
                     html.Button("⤢", id="video-overlay-pip-btn",
                                  className="qc-overlay-iconbtn",
                                  title="Pop out (drag the header to move, "
@@ -2758,7 +2761,10 @@ def layout(store: Store, bridge: dict | None = None):
                     id="video-overlay-body",
                     style={"height": "190px"},
                 ),
-            ], id="video-overlay-panel", className="qc-overlay-panel"),
+            ], id="video-overlay-panel",
+               # Collapsed by default (class also set so there's no flash
+               # before the clientside mirror runs).
+               className="qc-overlay-panel qc-overlay-collapsed"),
         ], className="video-lfp-col",
            style={"marginTop": "0", "gridArea": "lfp",
                    "minWidth": "0"}),
@@ -3137,7 +3143,7 @@ def layout(store: Store, bridge: dict | None = None):
         dcc.Store(id="video-overlay-stim-idx", data=-1),
         # Overlay panel UI state: collapsed body, and popped-out (floating)
         # toggled by the header buttons, mirrored to DOM classes by JS.
-        dcc.Store(id="video-overlay-collapsed", data=False),
+        dcc.Store(id="video-overlay-collapsed", data=True),
         dcc.Store(id="video-overlay-pip", data=False),
         # P1-4 predictive prefetch: a slow tick (2 s) drives a
         # background warm of the next-in-queue file's chunk so
