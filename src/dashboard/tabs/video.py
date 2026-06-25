@@ -1123,13 +1123,14 @@ def _style_overlay(fig, start_ms, end_ms, n_added, mode="lines") -> None:
         title=dict(
             text=(f"Stim {label} · last {n_added} epochs · "
                   f"{start_ms:g}..{end_ms:g} ms"),
-            font=dict(size=11, color="#cfd0d6"), x=0.01, y=0.97),
+            font=dict(size=11, color="#ffffff"), x=0.01, y=0.97),
+        font=dict(color="#ffffff"),
         xaxis=dict(title="ms from stim", showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False, color="#cfd0d6"),
+                    zeroline=False, color="#ffffff"),
         yaxis=dict(title=y_title, showgrid=True,
                     gridcolor="rgba(255,255,255,0.05)",
-                    zeroline=False, color="#cfd0d6"),
+                    zeroline=False, color="#ffffff"),
         showlegend=False,
     )
     if start_ms <= 0 <= end_ms:
@@ -2707,20 +2708,20 @@ def layout(store: Store, bridge: dict | None = None):
                 # Header toolbar: title + trace-count + collapse + pop-out.
                 html.Div([
                     html.Span("Stim overlay",
-                              style={"color": "#cfd0d6", "fontSize": "12px",
+                              style={"color": "#ffffff", "fontSize": "12px",
                                      "fontWeight": "600"}),
                     dcc.RadioItems(
                         id="video-overlay-mode",
                         options=[{"label": " Lines", "value": "lines"},
                                   {"label": " Heatmap", "value": "heatmap"}],
                         value="lines", inline=True,
-                        style={"color": "#cfd0d6", "fontSize": "11px",
+                        style={"color": "#ffffff", "fontSize": "11px",
                                "marginLeft": "12px"},
                         inputStyle={"marginRight": "3px",
                                      "marginLeft": "8px"}),
                     html.Span([
                         html.Label("Traces",
-                                    style={"color": "#9a9aa8",
+                                    style={"color": "#ffffff",
                                            "fontSize": "11px",
                                            "marginRight": "5px"}),
                         dcc.Input(
