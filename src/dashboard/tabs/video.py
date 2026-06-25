@@ -1899,6 +1899,13 @@ def layout(store: Store, bridge: dict | None = None):
                       "show up oldest first (FIFO) so the backlog "
                       "clears from the front — work top to bottom."),
 
+        # Step 1 body lives in ONE readable column (~760px), not the full
+        # window width. Design rationale (NN/g): full-bleed cards act as
+        # "false floors" and over-wide rows hurt scannability; a single
+        # constrained column with consistent spacing groups the controls
+        # by proximity and removes the orphaned blank space that the old
+        # picker|queue two-column left behind.
+        html.Div([
         # --- Mass Analyze (optional, collapsed by default) ----------- #
         # Hilbert envelope thresholding pre-screen. Lets the
         # undergrad sweep a cutoff and auto-clear zero-peak files
@@ -1933,7 +1940,7 @@ def layout(store: Store, bridge: dict | None = None):
                           style={"color": "#a0a0b0",
                                   "fontSize": "11px",
                                   "marginTop": "4px"}),
-            ], style={"flex": "0 0 280px"}),
+            ], style={"maxWidth": "320px", "marginBottom": "16px"}),
             html.Div([
                 html.Label("Queue (oldest first · FIFO)",
                             style=LABEL_STYLE,
@@ -2043,9 +2050,8 @@ def layout(store: Store, bridge: dict | None = None):
                     ),
                     dcc.Store(id="video-queue-position", data=0),
                 ], id="video-queue-card"),
-            ], style={"flex": "1", "minWidth": "320px"}),
-        ], style={"display": "flex", "gap": "16px",
-                   "marginBottom": "10px", "flexWrap": "wrap"}),
+            ]),
+        ], style={"marginBottom": "10px"}),
 
         # --- Advanced: free-form pickers (preserves legacy IDs) ----- #
         _details_card(
@@ -2093,6 +2099,7 @@ def layout(store: Store, bridge: dict | None = None):
         ], style={"display": "flex", "gap": "16px", "marginBottom": "8px",
                   "flexWrap": "wrap"}),
         ),
+        ], style={"maxWidth": "760px"}),
 
         # --- Step 2: watch ---------------------------------------------- #
         _step_header("2", "Watch",
