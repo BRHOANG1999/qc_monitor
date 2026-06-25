@@ -28,6 +28,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, State, callback_context, dcc, html
 from plotly.subplots import make_subplots
 
+from src.dashboard import file_browser as _fb
 from src.dashboard.components import DROPDOWN_STYLE, LABEL_STYLE, loading_icon
 from src.dashboard.data_helpers import empty_fig, load_config
 from src.db.store import Store
@@ -60,6 +61,9 @@ _SMOOTH_STYLE = {"backgroundColor": "#262638", "color": "#f0f0f5",
 _LOAD_BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#5e7ce2",
                    "color": "white", "border": "none", "fontWeight": "700",
                    "borderRadius": "6px", "cursor": "pointer"}
+_BROWSE_BTN_STYLE = {"width": "100%", "padding": "8px", "background": "#2a2d3a",
+                     "color": "#cfd0d6", "border": "1px solid #3a3d4a",
+                     "borderRadius": "6px", "cursor": "pointer"}
 
 
 def _session_label(rec: dict) -> str:
@@ -160,6 +164,16 @@ def layout(store: Store, default: str | None = None):
             ], style={"flex": "0 0 110px"}),
             html.Div([
                 html.Label(" ", style=LABEL_STYLE),
+                html.Button("📂 Browse…", id="wf-fb-open", n_clicks=0,
+                            style=_BROWSE_BTN_STYLE,
+                            title="Browse the server filesystem and pick a "
+                                  "folder (its *_evoked.mat become the "
+                                  "Recording list) or specific .mat files — "
+                                  "instead of the configured evokedOutput "
+                                  "folder."),
+            ], style={"flex": "0 0 110px"}),
+            html.Div([
+                html.Label(" ", style=LABEL_STYLE),
                 html.Button("▶ Load", id="waveform-load-btn", n_clicks=0,
                             style=_LOAD_BTN_STYLE,
                             title="Read the selected recording from "
@@ -169,6 +183,7 @@ def layout(store: Store, default: str | None = None):
             ], style={"flex": "0 0 110px"}),
         ], style={"display": "flex", "gap": "16px", "marginBottom": "8px",
                   "flexWrap": "wrap", "alignItems": "flex-end"}),
+        _fb.modal("wf"),
         html.Div(id="waveform-status",
                  style={"color": "#8a8d99", "fontSize": "11px",
                         "minHeight": "14px", "marginBottom": "6px"}),
@@ -191,6 +206,37 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     global _EVOKED_DIR
     ce_cfg = (config or {}).get("chronic_evoked", {}) or {}
     _EVOKED_DIR = ce_cfg.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
+
+    # File browser: pick a folder (its *_evoked.mat fill the Recording list)
+    # or specific .mat files, instead of the configured evokedOutput folder.
+    _fb.register(app, "wf", open_btn_id="wf-fb-open", exts=(".mat",),
+                 initial_path=_EVOKED_DIR)
+
+    @app.callback(
+        Output("waveform-file-dropdown", "options", allow_duplicate=True),
+        Output("waveform-file-dropdown", "value", allow_duplicate=True),
+        Output("waveform-status", "children", allow_duplicate=True),
+        Input("wf-fb-result", "data"),
+        prevent_initial_call=True,
+    )
+    def _wf_browse_pick(result):
+        from dash import no_update
+        if not result:
+            return no_update, no_update, no_update
+        if result.get("path"):
+            mats = _fb.list_dir(result["path"], exts=(".mat",))["files"]
+            opts = [{"label": os.path.basename(f), "value": f} for f in mats]
+            if not opts:
+                return [], None, (f"No .mat files in {result['path']}.")
+            return (opts, opts[0]["value"],
+                    f"{len(opts)} .mat in {os.path.basename(result['path'])} "
+                    f"— pick one + ▶ Load.")
+        files = result.get("files") or []
+        opts = [{"label": os.path.basename(f), "value": f} for f in files]
+        if not opts:
+            return no_update, no_update, no_update
+        return (opts, opts[0]["value"],
+                f"{len(opts)} file(s) selected — ▶ Load.")
 
     @app.callback(
         Output("waveform-session-dropdown", "options"),
