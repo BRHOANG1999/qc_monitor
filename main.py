@@ -245,18 +245,27 @@ def main():
             logger.error("Main loop error: %s", e, exc_info=True)
             time.sleep(poll_interval)
 
-    # Cleanup: kill any orphaned MATLAB subprocesses (Windows only --
-    # the daemon's production host. On other platforms the dispatcher
-    # is exercised under tests with a stubbed matlab_bridge, so there
-    # is nothing to reap.)
+    # Cleanup: reap only MATLAB subprocesses THIS daemon spawned (its own
+    # descendants). A blanket `taskkill /F /IM MATLAB.exe` would also kill the
+    # user's interactive MATLAB session -- including a running Chronic Evoked
+    # analysis -- so we must never match by image name. (Windows only -- the
+    # daemon's production host. On other platforms the dispatcher is exercised
+    # under tests with a stubbed matlab_bridge, so there is nothing to reap.)
     if sys.platform == "win32":
-        logger.info("Cleaning up MATLAB subprocesses...")
+        logger.info("Reaping orphaned MATLAB subprocesses spawned by this daemon...")
         try:
-            import subprocess
-            subprocess.run(["taskkill", "/F", "/IM", "MATLAB.exe"],
-                           capture_output=True, timeout=10)
-        except Exception:
-            pass
+            me = psutil.Process()
+            killed = 0
+            for child in me.children(recursive=True):
+                try:
+                    if "matlab" in child.name().lower():
+                        child.kill()
+                        killed += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            logger.info("Reaped %d MATLAB subprocess(es)", killed)
+        except Exception as e:
+            logger.error("MATLAB reap failed: %s", e)
     logger.info("QC Monitor stopped")
 
 
