@@ -844,6 +844,17 @@ def create_app(config: dict, store: Store) -> Dash:
         prevent_initial_call=True,
     )
 
+    # D hotkey -> save the current decision (events or not) + advance.
+    # The keyboard path for has-events files (N only does no-events).
+    app.clientside_callback(
+        _kbd.SAVE_DECISION_JS,
+        Output("video-review-save-btn", "n_clicks",
+                allow_duplicate=True),
+        Input("kbd-event", "data"),
+        State("video-review-save-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
     # Space / arrows / slash -- pure DOM side effects on the
     # <video> element + the note textarea. Writes nothing into
     # Dash state, hence the sink Output.

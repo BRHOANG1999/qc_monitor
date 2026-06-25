@@ -87,6 +87,9 @@ SHORTCUTS: tuple[Shortcut, ...] = (
               "Mark no events + go to next", "Decision"),
     Shortcut("e", "events_mode",
               "Switch to 'events seen'", "Decision"),
+    Shortcut("d", "save_decision",
+              "Save this decision (events or not) + go to next",
+              "Decision"),
     Shortcut("u", "undo",
               "Undo the last decision (8 s window)", "Decision"),
     Shortcut("r", "revert",
@@ -466,6 +469,21 @@ function (ev) {
         return window.dash_clientside.no_update;
     }
     return 'has_events';
+}
+"""
+
+
+# D hotkey -> save the CURRENT decision (whatever the radio shows --
+# events seen or not) by bumping the Save button, then _save_review
+# auto-advances. Unlike N, it does not force 'no_events', so it's the
+# keyboard path for the has-events case. Validation still runs server-
+# side (e.g. has-events needs at least one marker).
+SAVE_DECISION_JS = """
+function (ev, curClicks) {
+    if (!ev || ev.action !== 'save_decision') {
+        return window.dash_clientside.no_update;
+    }
+    return (curClicks || 0) + 1;
 }
 """
 

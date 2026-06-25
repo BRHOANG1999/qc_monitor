@@ -2104,11 +2104,16 @@ def layout(store: Store, bridge: dict | None = None):
         ], style={"display": "flex", "alignItems": "center",
                    "gap": "8px", "flexWrap": "wrap",
                    "padding": "8px 12px", "marginBottom": "10px",
+                   # Sticky so it stays visible while scrolling down to
+                   # score (Nielsen #5/#6: recognition over recall; you
+                   # never lose track of which file you're marking done).
+                   "position": "sticky", "top": "0", "zIndex": 60,
                    # Quiet chrome: neutral surface + accent left edge.
                    "background": COLOR_SURFACE_1,
                    "border": f"1px solid {COLOR_DIVIDER}",
                    "borderLeft": f"3px solid {COLOR_ACCENT}",
-                   "borderRadius": RADIUS_MD}),
+                   "borderRadius": RADIUS_MD,
+                   "boxShadow": "0 2px 8px rgba(0,0,0,0.35)"}),
 
         # --- Layout presets: resize the video / LFP split ---------- #
         html.Div([
@@ -2192,25 +2197,14 @@ def layout(store: Store, bridge: dict | None = None):
                           style={"color": "#ff9f0a", "fontSize": "11px",
                                  "marginLeft": "12px",
                                  "fontVariantNumeric": "tabular-nums"}),
-                # Mode toggle: Seek (click the trace -> the video jumps
-                # there) vs Zoom (drag a box to zoom). Default Seek.
-                html.Span("Mode:",
-                          style={"color": "#a0a0b0", "fontSize": "11px",
-                                 "marginLeft": "auto",
-                                 "marginRight": "6px"}),
-                dcc.RadioItems(
-                    id="video-lfp-mode",
-                    options=[
-                        {"label": " Seek (click)", "value": "seek"},
-                        {"label": " Zoom (drag)", "value": "zoom"},
-                    ],
-                    value="seek", inline=True,
-                    inputStyle={"marginRight": "3px"},
-                    labelStyle={"marginRight": "10px",
-                                 "color": "#cfd0d6",
-                                 "fontSize": "11px",
-                                 "cursor": "pointer"},
-                ),
+                # Modeless interaction (no Seek/Zoom toggle): click the
+                # trace to seek the video, scroll to zoom, drag to pan,
+                # double-click to reset. Removing the mode kills the classic
+                # "I'm in the wrong mode" error (Raskin: modes cause
+                # mistakes).
+                html.Span("Click to seek · scroll to zoom · drag to pan",
+                          style={"color": "#9a9aa8", "fontSize": "11px",
+                                 "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center",
                       "flexWrap": "wrap",
                       "marginBottom": "8px"}),
@@ -2868,9 +2862,10 @@ def layout(store: Store, bridge: dict | None = None):
         # ids stay (video-note-input, video-note-save-btn) so the
         # existing save callbacks keep working without changes.
         _details_card(
-            "Add an optional note about this video",
-            summary_sub="free-text reminder for yourself or the next "
-                         "reviewer. Most files don't need one.",
+            "Timestamped note — jump back here later",
+            summary_sub="saved with the playback time + full review "
+                         "context; click it in the history to return to "
+                         "this exact spot. Separate from your decision note.",
             open_default=False,
             content=html.Div([
                 dcc.Textarea(
@@ -2986,7 +2981,8 @@ def layout(store: Store, bridge: dict | None = None):
                            "backgroundColor":
                                "rgba(255,255,255,0.02)"}),
                 html.Div([
-                    html.Label("Optional note (max 280 chars)",
+                    html.Label("Note saved with your decision "
+                                "(max 280 chars)",
                                 style=LABEL_STYLE),
                     dcc.Textarea(
                         id="video-review-note",
@@ -5794,11 +5790,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
 
     # 5. Click an epoch on the analysis trace -> seek the video.
-    #    Gated on Seek mode so zoom-dragging it doesn't also seek.
+    #    Modeless: a click always seeks (drag pans, so it can't double as
+    #    a zoom-drag that also seeks).
     app.clientside_callback(
         """
-        function(clickData, lfp_dur, mode) {
-            if (mode !== 'seek') { return ''; }
+        function(clickData, lfp_dur) {
             if (!clickData || !clickData.points || !clickData.points.length) {
                 return '';
             }
@@ -5821,7 +5817,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-seek-sink", "children", allow_duplicate=True),
         Input("video-analysis-trace", "clickData"),
         State("video-lfp-duration", "data"),
-        State("video-lfp-mode", "value"),
         prevent_initial_call=True,
     )
 
@@ -5832,10 +5827,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # re-trigger the zoom re-decimate).
     app.clientside_callback(
         """
-        function(mode, _figA, _figB) {
-            // 'pan' (not false) for Seek: a drag pans a hair instead of
-            // zooming, because Plotly.js doesn't reliably honor false.
-            var want = (mode === 'zoom') ? 'zoom' : 'pan';
+        function(_figA, _figB) {
+            // Modeless: always 'pan' so a drag pans (click still seeks,
+            // scroll still zooms). Re-applied after every figure rebuild
+            // so channel/feature/zoom redraws keep the pan dragmode.
+            var want = 'pan';
             ['video-lfp-trace', 'video-analysis-trace'].forEach(function(id) {
                 var gd = document.getElementById(id);
                 if (!gd || !gd._fullLayout) { return; }
@@ -5847,7 +5843,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         }
         """,
         Output("video-fs-sink", "children", allow_duplicate=True),
-        Input("video-lfp-mode", "value"),
         Input("video-lfp-trace", "figure"),
         Input("video-analysis-trace", "figure"),
         prevent_initial_call=True,
@@ -6446,11 +6441,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     # 3. Click on the LFP trace -> seek the video to that x value.
     #    Inverse mapping: video_t = x * (video_duration / lfp_duration).
-    #    Gated on the "On click" mode so zoom/place-onset don't also seek.
+    #    Modeless: a click always seeks (drag pans rather than zoom-box).
     app.clientside_callback(
         """
-        function(clickData, lfp_dur, mode) {
-            if (mode !== 'seek') { return ''; }
+        function(clickData, lfp_dur) {
             if (!clickData || !clickData.points || !clickData.points.length) {
                 return '';
             }
@@ -6475,7 +6469,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-seek-sink", "children"),
         Input("video-lfp-trace", "clickData"),
         State("video-lfp-duration", "data"),
-        State("video-lfp-mode", "value"),
     )
 
     # =================================================================== #
