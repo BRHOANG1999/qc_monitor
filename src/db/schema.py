@@ -296,13 +296,14 @@ CREATE TABLE IF NOT EXISTS annotations (
     context TEXT,
     -- Stable de-dup key for externally-synced rows (e.g. the KMrecorder
     -- operator log). NULL for hand-written notes. SQLite treats NULLs as
-    -- distinct, so the UNIQUE index below only constrains synced rows.
+    -- distinct, so its UNIQUE index only constrains synced rows. NOTE: the
+    -- index is created in Store._init_db AFTER the column-add migration --
+    -- it must NOT live here, because on an existing DB this CREATE TABLE
+    -- is a no-op and an index here would reference a not-yet-added column.
     source_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_annotations_ts ON annotations(timestamp);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_annotations_source_key
-    ON annotations(source_key);
 
 -- System health snapshots
 CREATE TABLE IF NOT EXISTS system_health (

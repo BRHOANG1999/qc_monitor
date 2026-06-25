@@ -63,9 +63,13 @@ class Store:
         # Externally-synced notes (operator log): stable de-dup key.
         if "source_key" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN source_key TEXT")
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS "
-                "idx_annotations_source_key ON annotations(source_key)")
+        # Create the UNIQUE index unconditionally here (NOT in SCHEMA_SQL):
+        # SCHEMA_SQL runs before this migration, so on an existing DB the
+        # column may not exist yet when executescript runs. Doing it here,
+        # after the ALTER, is safe for both fresh and migrated DBs.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_annotations_source_key ON annotations(source_key)")
         # Two-screen comparison rollout: add the AUC-screen columns to an
         # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
         # columns to a table already on disk, so ALTER them in.
