@@ -27,6 +27,7 @@ import threading
 from dash import (Input, Output, State, dcc, html, no_update, ALL,
                    callback_context)
 
+from src.dashboard import activity as _activity
 from src.dashboard.auth import current_user_email
 from src.dashboard.components import (
     button, empty_state, LABEL_STYLE, card)
@@ -1081,6 +1082,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update
         prog = store.get_training_progress(email)
         store.advance_student(email, int(prog.get("unlocked_stage", 1)) + 1)
+        _activity.track(store, "training", "advance_student", email)
         return int(refresh or 0) + 1
 
     # ---- PI reset: send a student back to start / a stage ---- #
@@ -1110,6 +1112,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 stage = int(val or 1)
                 break
         store.reset_student(email, stage)
+        _activity.track(store, "training", "reset_student", email,
+                        {"stage": stage})
         return int(refresh or 0) + 1
 
     # ---- Practice library: auto-catalog past scored events ---- #

@@ -260,6 +260,27 @@ CREATE TABLE IF NOT EXISTS processing_log (
 
 CREATE INDEX IF NOT EXISTS idx_proclog_ts ON processing_log(timestamp);
 
+-- ----------------------------------------------------------------------
+-- user_activity: per-user "who did what when" across the dashboard. Filled
+-- ONLY for actions not already audited elsewhere (analysis tabs, file
+-- browser, CSV finalize, auto-filter, training PI actions, tab navigation);
+-- the User Activity tab UNIONs this with review_event_log + training_attempt
+-- so the feed is complete without double-logging already-audited verbs.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS user_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    area       TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    target     TEXT,
+    detail_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_user_activity_user
+    ON user_activity(user_email, at);
+CREATE INDEX IF NOT EXISTS idx_user_activity_at
+    ON user_activity(at);
+
 -- User annotations / notes
 CREATE TABLE IF NOT EXISTS annotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

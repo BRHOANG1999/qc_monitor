@@ -693,6 +693,10 @@ def register_callbacks(app, store, config: dict) -> None:
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
+        from src.dashboard import activity as _activity
+        _activity.track(store, "chronic_evoked",
+                        callback_context.triggered_id or "plot", animal,
+                        {"feature": feature})
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
         sess = sessions or None
         sel = {"animal": animal, "sessions": sess, "hours": hours,

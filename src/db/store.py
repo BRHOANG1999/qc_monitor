@@ -1552,6 +1552,132 @@ class Store:
             conn.close()
 
     # ------------------------------------------------------------------ #
+    #  Per-user activity (user_activity + the unified feed)
+    # ------------------------------------------------------------------ #
+
+    def log_user_activity(self, user_email: str, area: str, action: str,
+                          target: str | None = None,
+                          detail: dict | None = None) -> None:
+        """Record one user action (gaps not already in review_event_log /
+        training_attempt). Best-effort: never raises into a callback."""
+        if not user_email or not area or not action:
+            return
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO user_activity
+                       (user_email, at, area, action, target, detail_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (user_email.lower(), datetime.now().isoformat(),
+                     str(area), str(action),
+                     (str(target) if target is not None else None),
+                     (json.dumps(detail) if detail else None)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 -- activity logging is best-effort
+            logger.debug("log_user_activity failed: %s", e)
+
+    # The unified feed normalises three sources to one shape. Built once as a
+    # subquery and filtered by the caller. review_event_log/training_attempt
+    # are folded in so already-audited verbs aren't re-logged into
+    # user_activity (no double-counting).
+    _FEED_UNION = """
+        SELECT user_email, at, area, action, target, detail FROM (
+            SELECT user_email, at, area, action, target,
+                   detail_json AS detail
+            FROM user_activity
+            UNION ALL
+            SELECT user_email, at AS at, 'review' AS area, action,
+                   COALESCE(animal_id, CAST(file_id AS TEXT)) AS target,
+                   payload_json AS detail
+            FROM review_event_log
+            UNION ALL
+            SELECT student_email AS user_email, created_at AS at,
+                   'training' AS area, 'submit_score' AS action,
+                   CAST(stage AS TEXT) AS target,
+                   breakdown_json AS detail
+            FROM training_attempt
+        )
+    """
+
+    def unified_user_feed(self, *, user_email: str | None = None,
+                          area: str | None = None,
+                          since_iso: str | None = None,
+                          limit: int = 500) -> list[dict]:
+        """Merged who-did-what-when across user_activity + review_event_log +
+        training_attempt, newest first. Optional user / area / since filters."""
+        assert isinstance(limit, int) and limit > 0, "limit > 0"
+        conds: list[str] = []
+        params: list = []
+        if user_email:
+            conds.append("user_email = ?")
+            params.append(user_email.lower())
+        if area:
+            conds.append("area = ?")
+            params.append(area)
+        if since_iso:
+            conds.append("at >= ?")
+            params.append(since_iso)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        params.append(limit)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""SELECT * FROM ({self._FEED_UNION}) {where}
+                    ORDER BY at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def active_users(self, window_min: int = 15) -> list[dict]:
+        """Users seen within *window_min* minutes + their most-recent action.
+        Presence reuses users.last_seen_at (refreshed on every request)."""
+        assert isinstance(window_min, int) and window_min > 0, "window_min > 0"
+        cutoff = (datetime.now()
+                  - timedelta(minutes=window_min)).isoformat()
+        conn = self._connect()
+        try:
+            users = conn.execute(
+                """SELECT email, role, last_seen_at FROM users
+                   WHERE last_seen_at >= ? ORDER BY last_seen_at DESC""",
+                (cutoff,),
+            ).fetchall()
+            out: list[dict] = []
+            for u in users:
+                last = conn.execute(
+                    f"""SELECT area, action, target, at
+                        FROM ({self._FEED_UNION})
+                        WHERE user_email = ? ORDER BY at DESC LIMIT 1""",
+                    (u["email"],),
+                ).fetchone()
+                d = dict(u)
+                d["last_area"] = last["area"] if last else None
+                d["last_action"] = last["action"] if last else None
+                d["last_target"] = last["target"] if last else None
+                d["last_at"] = last["at"] if last else None
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+    def distinct_activity_users(self) -> list[str]:
+        """Distinct emails that appear anywhere in the unified feed."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT DISTINCT user_email FROM ({self._FEED_UNION}) "
+                "ORDER BY user_email"
+            ).fetchall()
+            return [r["user_email"] for r in rows if r["user_email"]]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
     #  annotations
     # ------------------------------------------------------------------ #
 

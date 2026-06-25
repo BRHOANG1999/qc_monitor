@@ -131,6 +131,7 @@ NAV_GROUPS = [
         {"id": "review_status", "label": "Review status"},
         {"id": "event_verification",
           "label": "Event Verification"},
+        {"id": "user_activity", "label": "User activity"},
         {"id": "activity_log", "label": "Activity log"},
         {"id": "alerts", "label": "Alerts"},
         {"id": "settings", "label": "Settings"},
@@ -1052,6 +1053,9 @@ def create_app(config: dict, store: Store) -> Dash:
     )
     def render_tab(tab, session_hint, video_bridge):
         try:
+            # Per-user navigation tracking (User Activity tab + presence).
+            from src.dashboard import activity as _activity
+            _activity.track(store, "nav", "view_tab", tab)
             if tab == "overview":
                 return _enable_persistence(tabs_overview.layout(store, config))
             elif tab == "waveforms":
@@ -1115,6 +1119,10 @@ def create_app(config: dict, store: Store) -> Dash:
                 from src.dashboard.tabs import event_verification as tabs_evtv
                 return _enable_persistence(
                     tabs_evtv.layout(store, config))
+            elif tab == "user_activity":
+                from src.dashboard.tabs import user_activity as tabs_ua
+                return _enable_persistence(
+                    tabs_ua.layout(store, config))
         except Exception as e:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
@@ -1184,6 +1192,9 @@ def create_app(config: dict, store: Store) -> Dash:
     # so the legacy bootstrap path stays minimal.
     from src.dashboard.tabs import event_verification as _tabs_evtv
     _tabs_evtv.register_callbacks(app, store, config)
+    # User Activity tab (PI/mentor-gated).
+    from src.dashboard.tabs import user_activity as _tabs_ua
+    _tabs_ua.register_callbacks(app, store, config)
 
     # Opt-in dev diagnostic: with suppress_callback_exceptions=True a
     # callback wired to an id that no layout produces fails *silently*
@@ -1251,6 +1262,11 @@ def _known_component_ids(store: Store, config: dict) -> set:
     try:
         from src.dashboard.tabs import event_verification as _ev
         tab_layouts.append(_ev.layout)
+    except Exception:
+        pass
+    try:
+        from src.dashboard.tabs import user_activity as _ua
+        tab_layouts.append(_ua.layout)
     except Exception:
         pass
     for fn in tab_layouts:

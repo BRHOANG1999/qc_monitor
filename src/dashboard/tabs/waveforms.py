@@ -223,6 +223,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         from dash import no_update
         if not result:
             return no_update, no_update, no_update
+        from src.dashboard import activity as _activity
+        _activity.track(store, "file_browser",
+                        "pick_folder" if result.get("path") else "pick_files",
+                        result.get("path") or
+                        f"{len(result.get('files') or [])} files")
         if result.get("path"):
             mats = _fb.list_dir(result["path"], exts=(".mat",))["files"]
             opts = [{"label": os.path.basename(f), "value": f} for f in mats]
@@ -277,6 +282,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return (empty_fig("Pick animal / session / recording, then ▶ Load",
                               height=400),
                     "Nothing selected.")
+        if triggered == "waveform-load-btn":
+            from src.dashboard import activity as _activity
+            _activity.track(store, "waveforms", "load",
+                            os.path.basename(file_path))
         try:
             channels = _read_recording(file_path)
         except Exception as e:  # noqa: BLE001 -- surface, never crash the UI

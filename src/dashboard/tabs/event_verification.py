@@ -25,6 +25,7 @@ from dash import Input, Output, State, callback_context
 from dash import dash_table, dcc, html, no_update
 
 from src.db.store import Store
+from src.dashboard import activity as _activity
 from src.dashboard.auth import current_user_email
 from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE
 from src.dashboard.tabs.review_status import _is_pi
@@ -964,10 +965,14 @@ def register_callbacks(app, store, config: dict) -> None:
                 screen_mode=mode, enabled=("on" in (enabled or [])),
                 updated_by=email)
             _mass_analyze.kick_auto_screen_for_animal(store, animal)
+            _activity.track(store, "event_verification", "autofilter_save",
+                            animal, {"screen_mode": mode})
             msg = (f"Saved {animal} — sweeping its backlog in the "
                    f"background…")
         elif trig == "evtv-af-sweep-btn":
             r = _mass_analyze.auto_screen_for_animal(store, animal)
+            _activity.track(store, "event_verification", "autofilter_sweep",
+                            animal, {"n_cleared": r.get("n_cleared")})
             if r.get("reason"):
                 msg = f"{animal}: {r['reason'].replace('_', ' ')}."
             else:
@@ -1062,6 +1067,8 @@ def register_callbacks(app, store, config: dict) -> None:
                 logger.exception("Finalize (append) failed")
                 return (f"Finalize failed: {e}",
                          None, no_update)
+            _activity.track(store, "event_verification", "finalize_csv",
+                            "append")
             return (summary, None, no_update)
         # Overwrite mode: dry-run + maybe modal.
         try:
