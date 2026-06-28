@@ -70,6 +70,17 @@ class Store:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_annotations_source_key ON annotations(source_key)")
+        # Wavelet band-power features: add the columns to existing
+        # evoked_features tables (CREATE TABLE IF NOT EXISTS won't).
+        existing_ef_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(evoked_features)")
+        }
+        for _wcol in ("wavelet_power_slow_gamma", "wavelet_power_gamma",
+                       "wavelet_power_high_gamma"):
+            if _wcol not in existing_ef_cols:
+                conn.execute(
+                    f"ALTER TABLE evoked_features ADD COLUMN {_wcol} REAL")
         # Two-screen comparison rollout: add the AUC-screen columns to an
         # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
         # columns to a table already on disk, so ALTER them in.
@@ -718,6 +729,8 @@ class Store:
         "template_correlation", "pca_recon_error", "variance",
         "autocorrelation", "ac_width", "exp_fit_a", "sum_power_low",
         "freq_moment_low", "sum_power_high", "freq_moment_high",
+        "wavelet_power_slow_gamma", "wavelet_power_gamma",
+        "wavelet_power_high_gamma",
         "is_artifact", "is_ictal",
     )
 

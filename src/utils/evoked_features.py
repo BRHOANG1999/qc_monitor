@@ -27,12 +27,24 @@ _HIGH_SUM_BAND = (256.0, 1024.0)
 _MOMENT_HIGH_BAND = (64.0, 256.0)
 _EPS = 1e-10
 
+# Per-epoch Morlet-wavelet band power. Gamma-and-up only: the evoked
+# window is short (<=~200 ms), so lower bands aren't resolvable by a
+# faithful CWT. The MATLAB pipeline (run_pipeline.m) computes the same
+# columns for the DB path; this Python copy feeds the chronic sidecar.
+_WAVELET_BANDS = {
+    "wavelet_power_slow_gamma": (30.0, 50.0),
+    "wavelet_power_gamma": (50.0, 100.0),
+    "wavelet_power_high_gamma": (100.0, 200.0),
+}
+
 CHEAP_COLUMNS = [
     "line_length", "log_auc", "peak_amplitude", "trough_amplitude",
     "peak_to_trough", "rms_amplitude", "variance", "peak_latency_ms",
     "trough_latency_ms", "max_slope", "max_slope_time_ms", "early_area",
     "late_area", "early_late_ratio", "autocorrelation", "sum_power_low",
     "freq_moment_low", "sum_power_high", "freq_moment_high",
+    "wavelet_power_slow_gamma", "wavelet_power_gamma",
+    "wavelet_power_high_gamma",
 ]
 EXPENSIVE_COLUMNS = [
     "recovery_tau", "recovery_slope", "template_correlation",
@@ -301,7 +313,17 @@ def compute_cheap(traces, time_ms, fs: float) -> dict:
         "autocorrelation": autocorrelation(a),
     }
     out.update(spectral(a, fs))
+    out.update(wavelet(a, fs))
     return out
+
+
+def wavelet(traces, fs: float) -> dict:
+    """Per-epoch mean Morlet-wavelet power in the gamma bands
+    (``_WAVELET_BANDS``). Thin wrapper over ``wavelet.epoch_wavelet_features``;
+    kept import-local so a missing PyWavelets only breaks this feature."""
+    a = _check(traces)
+    from src.utils.wavelet import epoch_wavelet_features
+    return epoch_wavelet_features(a, fs, _WAVELET_BANDS)
 
 
 # --------------------------------------------------------------------- #

@@ -43,6 +43,10 @@ _FEATURE_MAP: dict[str, str] = {
     "Freq_Moment_Low": "freq_moment_low",
     "Sum_Power_High": "sum_power_high",
     "Freq_Moment_High": "freq_moment_high",
+    # Morlet-wavelet band power (run_pipeline.m computes these via cwt).
+    "Wavelet_Power_Slow_Gamma": "wavelet_power_slow_gamma",
+    "Wavelet_Power_Gamma": "wavelet_power_gamma",
+    "Wavelet_Power_High_Gamma": "wavelet_power_high_gamma",
 }
 
 

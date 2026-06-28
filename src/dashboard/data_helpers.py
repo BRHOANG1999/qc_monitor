@@ -88,7 +88,9 @@ EVOKED_FEATURE_COLS: list[str] = [
     "recovery_slope", "template_correlation", "pca_recon_error",
     "variance", "autocorrelation", "ac_width", "exp_fit_a",
     "sum_power_low", "freq_moment_low", "sum_power_high",
-    "freq_moment_high", "is_artifact", "is_ictal", "epoch_time_sec",
+    "freq_moment_high", "wavelet_power_slow_gamma",
+    "wavelet_power_gamma", "wavelet_power_high_gamma",
+    "is_artifact", "is_ictal", "epoch_time_sec",
 ]
 
 # Human-readable labels for the columns above. Keys match
@@ -115,6 +117,9 @@ EVOKED_FEATURE_LABELS: dict[str, str] = {
     "freq_moment_low": "Freq Moment Low",
     "sum_power_high": "Sum Power High",
     "freq_moment_high": "Freq Moment High",
+    "wavelet_power_slow_gamma": "Wavelet Power Slow Gamma",
+    "wavelet_power_gamma": "Wavelet Power Gamma",
+    "wavelet_power_high_gamma": "Wavelet Power High Gamma",
     "is_artifact": "Is Artifact", "is_ictal": "Is Ictal",
     "epoch_time_sec": "Epoch Time (sec)",
 }

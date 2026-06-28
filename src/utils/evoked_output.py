@@ -156,7 +156,8 @@ def list_animals(evoked_dir: str) -> list[str]:
 # the derived features with their source so the chronic view can read them
 # WITHOUT re-reading the heavy traces or warming the sqlite cache -- and it
 # doubles as the on-disk export. Bump the version if the row schema changes.
-_FEATURE_SIDECAR_VERSION = "1"
+# v2: added wavelet_power_{slow_gamma,gamma,high_gamma} columns.
+_FEATURE_SIDECAR_VERSION = "2"
 
 
 def feature_sidecar_path(mat_path: str, animal: str) -> str:

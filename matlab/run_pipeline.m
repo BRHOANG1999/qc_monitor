@@ -216,6 +216,45 @@ function run_pipeline(input_file, output_json, config_json)
                             end
                             result.num_features = length(ALL_FEATURES);
                             fprintf('[PIPELINE] Features: %d x %d epochs\n', length(ALL_FEATURES), n_epochs);
+
+                            % --- Wavelet band power (Morlet CWT) ---
+                            % Per-epoch mean |CWT|^2 in the gamma bands.
+                            % Mirrors src/utils/wavelet.py (chronic sidecar
+                            % path) so the DB + sidecar agree. Needs the
+                            % Wavelet Toolbox; NaN-fills cleanly if absent.
+                            WAV_BANDS = {'Wavelet_Power_Slow_Gamma', 30, 50; ...
+                                'Wavelet_Power_Gamma', 50, 100; ...
+                                'Wavelet_Power_High_Gamma', 100, 200};
+                            have_wav = (exist('cwt', 'file') == 2) && ...
+                                license('test', 'Wavelet_Toolbox');
+                            for wbi = 1:size(WAV_BANDS, 1)
+                                wfn = WAV_BANDS{wbi, 1};
+                                wlo = WAV_BANDS{wbi, 2}; whi = WAV_BANDS{wbi, 3};
+                                wvals = NaN(1, n_epochs);
+                                if have_wav
+                                    try
+                                        for ep = 1:size(a_traces, 2)
+                                            col = a_traces(:, ep);
+                                            col(~isfinite(col)) = 0;
+                                            [cfs, frq] = cwt(col, fs, 'amor');
+                                            pw = abs(cfs).^2;
+                                            m = (frq >= wlo) & (frq <= whi);
+                                            if any(m)
+                                                wvals(ep) = mean(mean(pw(m, :), 1));
+                                            else
+                                                wvals(ep) = 0;
+                                            end
+                                        end
+                                    catch
+                                        wvals = NaN(1, n_epochs);
+                                    end
+                                end
+                                result.features.(wfn) = wvals;
+                            end
+                            result.num_features = result.num_features + size(WAV_BANDS, 1);
+                            if ~have_wav
+                                fprintf('[PIPELINE] Wavelet Toolbox unavailable; wavelet features NaN.\n');
+                            end
                         catch e
                             fprintf('[PIPELINE] Features failed: %s\n', e.message);
                         end
