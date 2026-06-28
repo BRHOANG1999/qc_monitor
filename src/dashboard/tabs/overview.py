@@ -2456,9 +2456,28 @@ def _build_behavioral_seizure_status_card(store):
                           "fontWeight": "600",
                           "fontSize": "12px",
                           "marginTop": "6px"}),
+        # Cards <-> Charts view toggle (the body below swaps on change).
+        dcc.RadioItems(
+            id="bsz-view-toggle",
+            options=[{"label": " Cards", "value": "cards"},
+                      {"label": " Charts", "value": "charts"}],
+            value="cards", inline=True,
+            style={"marginTop": "8px", "fontSize": "11px"},
+            labelStyle={"color": "#cfd0d6", "marginRight": "14px",
+                         "cursor": "pointer"},
+            inputStyle={"marginRight": "4px"}),
     ], style={"padding": "12px 14px",
                "borderBottom": f"1px solid {COLOR_DIVIDER}"})
-    # Per-animal table.
+    # Body: cards by default; the callback swaps it to charts on toggle.
+    body = html.Div(_bsz_cards(rows), id="overview-bsz-body")
+    return html.Div([header, body],
+                     style={"background": COLOR_SURFACE_1,
+                             "border": f"1px solid {COLOR_DIVIDER}",
+                             "borderRadius": RADIUS_MD})
+
+
+def _bsz_cards(rows):
+    """Per-animal stat cards (the default 'Cards' view)."""
     cells = []
     for r in rows:
         delta = (r["created_window"]
@@ -2549,18 +2568,60 @@ def _build_behavioral_seizure_status_card(store):
                    "border": f"1px solid {COLOR_DIVIDER}",
                    "borderRadius": RADIUS_SM,
                    "borderLeft": f"3px solid {delta_color}"}))
-    grid = html.Div(
+    return html.Div(
         cells,
         style={"display": "grid",
                 "gridTemplateColumns":
                     "repeat(auto-fit, minmax(300px, 1fr))",
                 "gap": "8px",
                 "padding": "12px 14px"})
-    return html.Div([header, grid],
-                      style={"background": COLOR_SURFACE_1,
-                              "border":
-                                  f"1px solid {COLOR_DIVIDER}",
-                              "borderRadius": RADIUS_MD})
+
+
+def _bsz_charts(rows):
+    """Per-animal donut charts (the 'Charts' view) -- one donut per animal
+    showing its review-status composition (queue / pending PI / approved /
+    flagged), with the total in the centre. Colours match the cards."""
+    labels = ["queue", "pending PI", "approved", "flagged"]
+    colors = ["#8a8a99", "#5e7ce2", "#30d158", "#ff9f0a"]
+    n = len(rows)
+    cols = min(n, 5) if n else 1
+    n_rows = (n + cols - 1) // cols
+    specs = [[{"type": "domain"} for _ in range(cols)]
+             for _ in range(n_rows)]
+    fig = make_subplots(
+        rows=n_rows, cols=cols, specs=specs,
+        subplot_titles=[r["animal_id"] for r in rows],
+        vertical_spacing=0.14, horizontal_spacing=0.03)
+    for i, r in enumerate(rows):
+        rr, cc = i // cols + 1, i % cols + 1
+        vals = [r["n_queue"], r["n_pending_pi"], r["n_approved"],
+                r.get("n_needs_scoring", 0)]
+        fig.add_trace(go.Pie(
+            labels=labels, values=vals, sort=False, hole=0.58,
+            marker=dict(colors=colors,
+                         line=dict(color="#13131f", width=1)),
+            textinfo="percent", textfont=dict(size=9),
+            hovertemplate="%{label}: %{value} (%{percent})<extra></extra>",
+            showlegend=(i == 0)), rr, cc)
+        dom = fig.data[-1].domain
+        fig.add_annotation(
+            x=(dom.x[0] + dom.x[1]) / 2, y=(dom.y[0] + dom.y[1]) / 2,
+            text=f"<b>{sum(vals):,}</b>", showarrow=False,
+            font=dict(size=13, color="#f0f0f5"))
+    for ann in fig.layout.annotations[:n]:   # animal-id subplot titles
+        ann.font.size = 12
+        ann.font.color = "#f0f0f5"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=130 + 170 * n_rows,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.08,
+                     xanchor="center", x=0.5, font=dict(size=10),
+                     bgcolor="rgba(0,0,0,0)"),
+        font=dict(color="#cfd0d6"))
+    return dcc.Graph(
+        figure=fig, config={"displayModeBar": False},
+        style={"padding": "8px 6px"})
 
 
 
@@ -2576,6 +2637,19 @@ def layout(store: Store, config: dict | None = None):
 def register_callbacks(app, store: Store, config: dict) -> None:
     """Wire the Overview tab's six callbacks (fine-grained refresh,
     thumbnail, snapshot size + src, home-grid Open buttons)."""
+
+    # Behavioral-seizure status: swap the body between the per-animal
+    # cards and the per-animal donut charts on the Cards/Charts toggle.
+    @app.callback(
+        Output("overview-bsz-body", "children"),
+        Input("bsz-view-toggle", "value"),
+        prevent_initial_call=True,
+    )
+    def _bsz_view(view):
+        rows = store.behavioral_seizure_status_per_animal(days=7)
+        if not rows:
+            return no_update
+        return _bsz_charts(rows) if view == "charts" else _bsz_cards(rows)
 
     # Fine-grained refresh: replace just the volatile Overview cards +
     # queue children instead of re-rendering the whole tab. Eliminates
