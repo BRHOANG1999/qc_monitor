@@ -61,6 +61,7 @@ from src.utils.decimate import (
 from src.utils.filters import (
     apply_filter, compute_psd, band_power, SLOW_GAMMA_BAND,
     epoch_band_power, epoch_band_ratio_db, epoch_line_length)
+from src.utils import wavelet as _wav
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
@@ -980,6 +981,164 @@ def _render_evoked_band_power(store, file_id: int, channel: int | None,
     fig.layout.yaxis.title = "evoked band power (μV²)"
     status = (f"Slow gamma {lo:g}-{hi:g} Hz · per stim epoch "
               f"({win_sec * 1000:.0f} ms window) · {len(times)} epochs")
+    return (fig, status)
+
+
+def _render_wavelet_band_power(store, file_id: int, channel: int | None,
+                                lo: float, hi: float,
+                                blank_pre_ms: float = -5.0,
+                                blank_post_ms: float = 15.0,
+                                show_raw: bool = False) -> tuple:
+    """(figure, status): continuous Morlet-WAVELET band power vs time --
+    the transient-aware sibling of ``_render_band_power_trace`` (which uses
+    the analytic envelope). Same stim-blanking + display decimation."""
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig(
+            "Pick a brain channel (Step 1) to see wavelet power."), "")
+    session_dir = _session_dir_for_file(store, file_id)
+    stim_copy = _stim_copy_channels(store, session_dir)
+    do_blank = (int(channel) not in stim_copy) and (not show_raw)
+    stim_times = (_stim_times_for_file(store, file_id)
+                   if do_blank else np.asarray([], dtype=np.float64))
+    try:
+        series, fs, _ = _get_blanked_series(
+            file_path, int(channel), stim_times, blank_pre_ms, blank_post_ms)
+    except Exception as e:
+        logger.warning("Wavelet power load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    power, work_fs = _wav.wavelet_band_power(
+        np.asarray(series, dtype=np.float64), fs, lo, hi)
+    if power.size == 0:
+        return (_empty_lfp_fig("Window too short for a wavelet transform."),
+                "")
+    target_bins = choose_target_bins(len(power)) or 4000
+    t, display, _decim = envelope(power, work_fs, target_bins, t_start=0.0)
+    fig = _build_lfp_figure(
+        t, display, f"Wavelet power ({lo:g}-{hi:g} Hz)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].line.color = "#ffd60a"
+    fig.data[0].hovertemplate = (
+        "t=%{x:.2f}s<br>power=%{y:.3g}<extra></extra>")
+    fig.layout.yaxis.title = "wavelet power (μV²)"
+    status = (f"Wavelet {lo:g}-{hi:g} Hz · continuous · "
+              f"{len(power) / work_fs:.1f} s @ {int(work_fs)} Hz (decimated)")
+    return (fig, status)
+
+
+def _render_wavelet_evoked_band_power(store, file_id: int,
+                                       channel: int | None,
+                                       lo: float, hi: float,
+                                       win_sec: float = _EVOKED_GAMMA_WIN_SEC
+                                       ) -> tuple:
+    """(figure, status): per-stim wavelet band power -- the wavelet sibling
+    of ``_render_evoked_band_power`` (PSD-based). One point per epoch."""
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig("Pick a brain channel (Step 1) first."), "")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return (_empty_lfp_fig(
+            "No stim epochs on this file — wavelet evoked power needs "
+            "stimulation onsets."), "")
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Wavelet evoked load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    times, vals = _wav.epoch_wavelet_band_power(
+        sig, fs, stim_times, lo, hi, (0.0, float(win_sec)))
+    if len(times) == 0:
+        return (_empty_lfp_fig(
+            "No usable stim epochs (windows fell off the recording)."), "")
+    fig = _build_lfp_figure(
+        np.asarray(times), np.asarray(vals),
+        f"Wavelet power ({lo:g}-{hi:g} Hz, per stim)",
+        uirevision=f"{file_id}:{channel}")
+    fig.data[0].mode = "markers+lines"
+    fig.data[0].line.color = "#ffd60a"
+    fig.data[0].marker = dict(size=5, color="#ffd60a")
+    fig.data[0].hovertemplate = (
+        "stim @ t=%{x:.2f}s<br>power=%{y:.3g}<extra></extra>")
+    fig.layout.yaxis.title = "wavelet evoked power (μV²)"
+    status = (f"Wavelet {lo:g}-{hi:g} Hz · per stim epoch "
+              f"({win_sec * 1000:.0f} ms window) · {len(times)} epochs")
+    return (fig, status)
+
+
+def _render_wavelet_scalogram(store, file_id: int, channel: int | None,
+                               win: tuple[float, float] = (-0.025, 0.200)
+                               ) -> tuple:
+    """(figure, status): mean stim-locked scalogram -- the average Morlet
+    time-frequency response across stim epochs (an ERSP-style heatmap,
+    freq x ms). Shows what frequencies the stim evokes and when."""
+    assert isinstance(file_id, int), "file_id must be int"
+    file_path = _file_path_for_id(store, file_id)
+    if not file_path:
+        return (_empty_lfp_fig("File not found in DB."), "")
+    if channel is None:
+        return (_empty_lfp_fig("Pick a brain channel (Step 1) first."), "")
+    stim_times = _stim_times_for_file(store, file_id)
+    if stim_times is None or len(stim_times) == 0:
+        return (_empty_lfp_fig(
+            "No stim epochs — the scalogram is stim-locked."), "")
+    try:
+        chunk = get_chunk(file_path)
+        sig = np.asarray(chunk.signal[:, int(channel)], dtype=np.float64)
+        fs = float(chunk.fs)
+    except Exception as e:
+        logger.warning("Wavelet scalogram load failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
+    n = sig.shape[0]
+    length = int(round((win[1] - win[0]) * fs))
+    fmax = min(300.0, fs / 2.0)
+    acc = None
+    freqs = times = None
+    n_used = 0
+    for s in np.asarray(stim_times, dtype=np.float64)[:300]:
+        i0 = int(round((float(s) + win[0]) * fs))
+        i1 = i0 + length
+        if i0 < 0 or i1 > n:
+            continue
+        freqs, times, power = _wav.scalogram(
+            sig[i0:i1], fs, fmin=10.0, fmax=fmax, n_freqs=48)
+        if freqs.size == 0:
+            continue
+        if acc is None or acc.shape == power.shape:
+            acc = power if acc is None else acc + power
+            n_used += 1
+    if acc is None or n_used == 0:
+        return (_empty_lfp_fig(
+            "No usable stim epochs for the scalogram."), "")
+    mean_power = acc / n_used
+    z = 10.0 * np.log10(mean_power + 1e-12)
+    t_ms = (times - times[0]) * 1000.0 + win[0] * 1000.0
+    fig = go.Figure(go.Heatmap(
+        x=t_ms, y=freqs, z=z, colorscale="Turbo",
+        colorbar=dict(title="dB", thickness=10),
+        hovertemplate="%{x:.1f}ms · %{y:.0f}Hz · %{z:.1f}dB<extra></extra>"))
+    fig.add_vline(x=0, line=dict(color="#ffffff", width=1.5, dash="dot"))
+    fig.update_layout(
+        plot_bgcolor="#13131f", paper_bgcolor="#13131f", height=300,
+        margin=dict(l=60, r=20, t=24, b=40),
+        title=dict(text=f"Mean stim-locked scalogram · {n_used} epochs",
+                    font=dict(size=11, color="#ffffff"), x=0.01, y=0.97),
+        xaxis=dict(title="ms from stim", color="#ffffff"),
+        yaxis=dict(title="Hz", type="log", color="#ffffff"),
+        font=dict(color="#ffffff"))
+    status = (f"Mean scalogram · {n_used} epochs · "
+              f"{win[0] * 1000:.0f}..{win[1] * 1000:.0f} ms")
     return (fig, status)
 
 
@@ -2416,6 +2575,15 @@ def layout(store: Store, bridge: dict | None = None):
                             {"label": "Slow gamma induced "
                                        "(30-50 Hz, post vs baseline dB)",
                                 "value": "slow_gamma_induced"},
+                            {"label": "Wavelet power "
+                                       "(slow γ 30-50 Hz, continuous)",
+                                "value": "wavelet_sg_power"},
+                            {"label": "Wavelet power "
+                                       "(slow γ 30-50 Hz, per stim)",
+                                "value": "wavelet_sg_evoked"},
+                            {"label": "Wavelet scalogram "
+                                       "(mean stim-locked heatmap)",
+                                "value": "wavelet_scalogram"},
                             {"label": "Line length (live windowed)",
                                 "value": "line_length"},
                             {"label": "Log(AUC) — area under the curve",
@@ -5540,6 +5708,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         float(post_ms[1]) / 1000.0)
             return _render_evoked_band_ratio(
                 store, int(file_id), channel, lo, hi, pre_win, post_win)
+        # Wavelet (Morlet CWT) variants -- transient-aware siblings of the
+        # slow-gamma options above. All live-computed (no DB column).
+        if feature == "wavelet_sg_power":
+            lo, hi = SLOW_GAMMA_BAND
+            return _render_wavelet_band_power(
+                store, int(file_id), channel, lo, hi,
+                blank_pre_ms=blank_pre_ms, blank_post_ms=blank_post_ms,
+                show_raw="raw" in (blank_raw or []))
+        if feature == "wavelet_sg_evoked":
+            lo, hi = SLOW_GAMMA_BAND
+            return _render_wavelet_evoked_band_power(
+                store, int(file_id), channel, lo, hi)
+        if feature == "wavelet_scalogram":
+            return _render_wavelet_scalogram(store, int(file_id), channel)
         # Hilbert envelope (BHZ default). Continuous-time trace
         # rather than per-epoch scatter; 1:1 with tay_preprocess.m.
         if feature == "hilbert":

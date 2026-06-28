@@ -187,6 +187,20 @@ def layout(store: Store, default: str | None = None):
                 ),
             ], style={"flex": "0 0 90px"}),
             html.Div([
+                html.Label("Scalogram", style=LABEL_STYLE,
+                            title="Morlet wavelet time-frequency heatmap "
+                                  "of the VISIBLE window (recomputes on "
+                                  "zoom). Resolves transient bursts that "
+                                  "the PSD averages out."),
+                dcc.Checklist(
+                    id="lfp-show-scalogram",
+                    options=[{"label": " Show", "value": "on"}],
+                    value=[],
+                    style={"paddingTop": "6px"},
+                    labelStyle={"color": "white"},
+                ),
+            ], style={"flex": "0 0 110px"}),
+            html.Div([
                 html.Label(" ", style=LABEL_STYLE),
                 html.Button("Apply", id="lfp-apply-filter-btn",
                             n_clicks=0,
@@ -210,7 +224,7 @@ def layout(store: Store, default: str | None = None):
         # uses the same settings without re-reading the inputs.
         dcc.Store(id="lfp-filter-state",
                   data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0,
-                        "show_psd": False}),
+                        "show_psd": False, "show_scalo": False}),
 
         dcc.Graph(id="lfp-plot",
                   figure=empty_fig(
@@ -235,6 +249,15 @@ def layout(store: Store, default: str | None = None):
                           "Toggle 'Show PSD' and click Apply",
                           height=280)),
             id="lfp-psd-row",
+            style={"display": "none", "marginTop": "12px"},
+        ),
+
+        html.Div(
+            dcc.Graph(id="lfp-scalogram-plot",
+                      figure=empty_fig(
+                          "Toggle 'Show Scalogram' and click Apply",
+                          height=300)),
+            id="lfp-scalogram-row",
             style={"display": "none", "marginTop": "12px"},
         ),
     ])
@@ -492,6 +515,54 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             patch["data"][ch]["y"] = y_p
         return patch
 
+    # ---- Wavelet scalogram of the VISIBLE window (recompute on zoom) ----
+    # The CWT is bounded (decimated + capped window) so re-running it on
+    # every load/apply/zoom is cheap. Lives in its own callback rather than
+    # threading two more outputs through load_lfp's many return paths.
+    @app.callback(
+        Output("lfp-scalogram-plot", "figure"),
+        Output("lfp-scalogram-row", "style"),
+        Input("lfp-show-scalogram", "value"),
+        Input("lfp-apply-filter-btn", "n_clicks"),
+        Input("lfp-load-btn", "n_clicks"),
+        Input("lfp-plot", "relayoutData"),
+        State("lfp-session-dropdown", "value"),
+        State("lfp-file-dropdown", "value"),
+        State("lfp-filter-hp", "value"),
+        State("lfp-filter-lp", "value"),
+        State("lfp-filter-notch", "value"),
+        State("lfp-filter-smooth", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_scalogram(show_scalo, _n_apply, _n_load, relayout,
+                           session_dir, file_path, hp, lp, notch, smooth_ms):
+        hidden = {"display": "none", "marginTop": "12px"}
+        if not show_scalo or not file_path:
+            return no_update, hidden
+        try:
+            chunk = get_chunk(file_path)
+        except Exception as e:
+            return (empty_fig(f"Error: {e}", height=300),
+                    {"display": "block", "marginTop": "12px"})
+        fs = chunk.fs
+        signal = get_filtered(file_path, chunk.signal, fs,
+                               highpass=hp, lowpass=lp,
+                               notch=notch, smoothing_ms=smooth_ms)
+        n_samples, n_ch = signal.shape
+        x0, x1, is_reset = parse_relayout(relayout) if relayout \
+            else (None, None, False)
+        if (x0 is not None or x1 is not None) and not is_reset:
+            lo, hi = window_slice(n_samples, fs, x0, x1)
+        else:
+            lo, hi = 0, n_samples
+        if hi <= lo:
+            return no_update, {"display": "block", "marginTop": "12px"}
+        info_for = _channel_info_fn(store, session_dir, chunk)
+        fig = _build_scalogram_figure(
+            signal, fs, n_ch, info_for,
+            _filter_label(hp, lp, notch, smooth_ms), lo, hi)
+        return fig, {"display": "block", "marginTop": "12px"}
+
     @app.callback(
         Output("lfp-file-dropdown", "options"),
         Input("lfp-session-dropdown", "value"),
@@ -617,3 +688,56 @@ def _build_psd_figure(signal, fs, n_ch, info_for, filt_label):
         showlegend=False,
     )
     return psd_fig
+
+
+# Cap the per-channel CWT window so a full-file scalogram stays tractable.
+_SCALO_MAX_SEC = 60.0
+
+
+def _build_scalogram_figure(signal, fs, n_ch, info_for, filt_label,
+                            lo: int, hi: int):
+    """One Morlet-CWT scalogram subplot per channel over samples
+    ``[lo, hi]`` -- time (s) x log-Hz heatmap, colour = power (dB). The
+    window is capped to ``_SCALO_MAX_SEC`` so a full-file view stays fast;
+    zoom the LFP to recompute on a tighter window. Slow-gamma band shaded."""
+    import numpy as np
+    from src.utils import wavelet as _wav
+
+    cap = int(_SCALO_MAX_SEC * fs)
+    capped = (hi - lo) > cap
+    if capped:
+        hi = lo + cap
+    fmax = min(500.0, fs / 2.0)
+    t0 = lo / fs
+    fig = make_subplots(rows=n_ch, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06)
+    for ch in range(n_ch):
+        info = info_for(ch)
+        freqs, times, power = _wav.scalogram(
+            signal[lo:hi, ch], fs, fmin=2.0, fmax=fmax, n_freqs=64)
+        if freqs.size == 0:
+            continue
+        z = 10.0 * np.log10(power + 1e-12)
+        fig.add_trace(go.Heatmap(
+            x=times + t0, y=freqs, z=z, colorscale="Turbo",
+            showscale=(ch == 0),
+            colorbar=dict(title="dB", len=0.85, thickness=10),
+            hovertemplate="%{x:.2f}s · %{y:.0f}Hz · %{z:.1f}dB<extra></extra>",
+        ), row=ch + 1, col=1)
+        fig.update_yaxes(type="log", title_text=info["name"],
+                          row=ch + 1, col=1,
+                          title_font=dict(size=9, color="#aaa"),
+                          tickfont=dict(size=8))
+        sg_lo, sg_hi = SLOW_GAMMA_BAND
+        fig.add_hrect(y0=sg_lo, y1=min(sg_hi, fmax), row=ch + 1, col=1,
+                      line_width=0, fillcolor="#bf5af2", opacity=0.0,
+                      annotation_text="slow γ", annotation_position="top left",
+                      annotation_font_size=8, annotation_font_color="#bf5af2")
+    fig.update_xaxes(title_text="Time (sec)", row=n_ch, col=1)
+    win_s = (hi - lo) / fs
+    title = f"Wavelet scalogram ({win_s:.1f} s window) -- {filt_label}"
+    if capped:
+        title += f"  ·  capped at {_SCALO_MAX_SEC:.0f}s; zoom to refine"
+    fig.update_layout(title=title, height=max(300, n_ch * 200),
+                      showlegend=False)
+    return fig
