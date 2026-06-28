@@ -81,6 +81,16 @@ class Store:
             if _wcol not in existing_ef_cols:
                 conn.execute(
                     f"ALTER TABLE evoked_features ADD COLUMN {_wcol} REAL")
+        # Batch wavelet QC: per-channel CWT band power on chunk_qc.
+        existing_cq_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(chunk_qc)")
+        }
+        for _wcol in ("slow_gamma_wavelet_power", "gamma_wavelet_power",
+                       "high_gamma_wavelet_power"):
+            if _wcol not in existing_cq_cols:
+                conn.execute(
+                    f"ALTER TABLE chunk_qc ADD COLUMN {_wcol} REAL")
         # Two-screen comparison rollout: add the AUC-screen columns to an
         # existing mass_analyze_job. CREATE TABLE IF NOT EXISTS won't add
         # columns to a table already on disk, so ALTER them in.
@@ -657,8 +667,11 @@ class Store:
                     rms_amplitude, line_noise_power, line_noise_ratio,
                     artifact_pct, has_nan, has_inf, has_clipping, flat_line_pct, dc_offset,
                     delta_power, theta_power, alpha_power, beta_power, gamma_power,
-                    high_gamma_power, total_power, computed_at, version_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    high_gamma_power, total_power,
+                    slow_gamma_wavelet_power, gamma_wavelet_power,
+                    high_gamma_wavelet_power,
+                    computed_at, version_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     file_id, channel, channel_name, channel_role,
                     metrics.get("rms_amplitude"),
@@ -677,6 +690,9 @@ class Store:
                     metrics.get("gamma_power"),
                     metrics.get("high_gamma_power"),
                     metrics.get("total_power"),
+                    metrics.get("slow_gamma_wavelet_power"),
+                    metrics.get("gamma_wavelet_power"),
+                    metrics.get("high_gamma_wavelet_power"),
                     datetime.now().isoformat(),
                     version_id,
                 ),

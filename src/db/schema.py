@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS chunk_qc (
     gamma_power REAL,
     high_gamma_power REAL,
     total_power REAL,
+    slow_gamma_wavelet_power REAL,
+    gamma_wavelet_power REAL,
+    high_gamma_wavelet_power REAL,
     computed_at TEXT NOT NULL,
     version_id INTEGER REFERENCES settings_versions(id),
     UNIQUE(file_id, channel, version_id)

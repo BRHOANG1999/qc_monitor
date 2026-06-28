@@ -35,6 +35,7 @@ from src.utils.mat_loader import ChunkData, load_mat
 from src.utils.session_config import SessionConfig, discover_from_session_dir
 from src.analyzers.qc_basic import analyze_basic_qc
 from src.analyzers.spectral import analyze_spectral
+from src.analyzers.wavelet import analyze_wavelet
 from src.analyzers.artifact import analyze_artifact
 from src.analyzers.stim_qc import analyze_stim_report
 from src.analyzers.video_qc import analyze_video
@@ -193,6 +194,19 @@ class Dispatcher:
         spectral_results = analyze_spectral(chunk, line_noise_freq=60.0)
         timings["spectral"] = time.time() - t
 
+        # Wavelet band power: the heaviest Tier-1 step (per-channel CWT), so
+        # it's gated. Mirrors spectral but captures transient burst power.
+        wavelet_results: list[dict] = []
+        if self.config.get("wavelet_qc", {}).get("enabled", True):
+            t = time.time()
+            try:
+                wavelet_results = analyze_wavelet(chunk)
+            except Exception as e:   # never let it break Tier 1
+                logger.warning("wavelet QC failed for %s: %s",
+                                os.path.basename(new_file.path), e)
+                wavelet_results = []
+            timings["wavelet"] = time.time() - t
+
         t = time.time()
         artifact_results = self._compute_artifact_results(
             chunk, sess_cfg, art_cfg,
@@ -203,6 +217,7 @@ class Dispatcher:
         self._write_chunk_qc_rows(
             file_id, chunk, sess_cfg, version_id,
             basic_results, spectral_results, artifact_results,
+            wavelet_results,
         )
         timings["db_store"] = time.time() - t
 
@@ -255,9 +270,11 @@ class Dispatcher:
                               version_id: int | None,
                               basic_results: list[dict],
                               spectral_results: list[dict],
-                              artifact_results: list[dict]) -> None:
-        """Merge the three analyzer outputs per channel and write a
-        single chunk_qc row each."""
+                              artifact_results: list[dict],
+                              wavelet_results: list[dict] | None = None) -> None:
+        """Merge the analyzer outputs per channel and write a single
+        chunk_qc row each."""
+        wavelet_results = wavelet_results or []
         for ch in range(chunk.num_channels):
             metrics: dict = {}
             if ch < len(basic_results):
@@ -266,6 +283,8 @@ class Dispatcher:
                 metrics.update(spectral_results[ch])
             if ch < len(artifact_results):
                 metrics.update(artifact_results[ch])
+            if ch < len(wavelet_results):
+                metrics.update(wavelet_results[ch])
 
             ch_name = (sess_cfg.channel_names[ch]
                         if ch < len(sess_cfg.channel_names) else f"Ch{ch}")

@@ -76,6 +76,10 @@ artifact:
   fixed_threshold: 500.0
   mad_k: 4.0
   merge_gap_sec: 2.0
+# Tier-1 wavelet band power (Morlet CWT). The heaviest per-file analyzer
+# (per-channel CWT on a centre window) -- set enabled:false to skip it.
+wavelet_qc:
+  enabled: true
 video_qc:
   enabled: true
   alert_on_critical: true
