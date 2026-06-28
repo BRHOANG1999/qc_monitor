@@ -1360,6 +1360,35 @@ def _step_header(number: str, title: str, sub: str | None = None):
     return html.Div([head], style={"marginBottom": "8px"})
 
 
+def _panel_header(title: str, sub: str | None = None):
+    """Un-numbered sub-section header for panels WITHIN a stage (e.g. the
+    brain-feature trace or the scoring controls inside 'Review & score').
+
+    Deliberately subordinate to the numbered ``_step_header`` -- a small
+    accent bar instead of a number badge -- so the IA reads as two stages
+    (pick -> review&score), not a false 1-2-3-4 pipeline. The watch /
+    analyze / score work happens concurrently, so those panels aren't
+    sequential steps.
+    """
+    head = html.Div([
+        html.Span(style={"display": "inline-block", "width": "3px",
+                          "height": "14px", "borderRadius": "2px",
+                          "background": COLOR_ACCENT, "marginRight": "9px",
+                          "flexShrink": "0"}),
+        html.Span(title, style={"color": "#cfd0d6", "fontSize": "13px",
+                                 "fontWeight": "600"}),
+    ], style={"display": "flex", "alignItems": "center",
+               "marginTop": "10px"})
+    if sub:
+        return html.Div([
+            head,
+            html.Div(sub, style={"color": "#888", "fontSize": "11px",
+                                  "marginLeft": "12px", "marginTop": "2px",
+                                  "marginBottom": "6px"}),
+        ], style={"marginBottom": "6px"})
+    return html.Div([head], style={"marginBottom": "8px"})
+
+
 def _details_card(summary_text: str, content,
                    summary_sub: str | None = None,
                    open_default: bool = False):
@@ -2061,10 +2090,10 @@ def layout(store: Store, bridge: dict | None = None):
         dcc.Store(id="video-queue-position", data=0),
 
         # --- Step 2: watch ---------------------------------------------- #
-        _step_header("2", "Watch",
-                      "Video plays in sync with the LFP and Hilbert "
-                      "envelope on the right. Scroll down to score "
-                      "events; the video pips to the corner."),
+        _step_header("2", "Review & score",
+                      "Watch the video in sync with the LFP/feature traces "
+                      "and score events — you do these together, not in "
+                      "order. The video pips to the corner as you scroll."),
 
         # --- Now-viewing banner + hour stepping ----------------------- #
         # Tells the reviewer exactly which animal / day / hour is loaded
@@ -2255,11 +2284,11 @@ def layout(store: Store, bridge: dict | None = None):
                 html.Div([
                     html.Label("Smooth the LFP (ms)", style=LABEL_STYLE,
                                 title="Gaussian smoothing window in "
-                                       "milliseconds, applied to the LFP "
-                                       "trace ONLY (Step 2). 0 = off. "
-                                       "Distinct from Step 3's "
-                                       "smooth-by-seconds, which smooths "
-                                       "the per-event feature line. "
+                                       "milliseconds, applied to the raw "
+                                       "LFP trace ONLY. 0 = off. "
+                                       "Distinct from the 'Brain feature "
+                                       "over time' smooth-by-seconds, which "
+                                       "smooths the per-event feature line. "
                                        "Helpful for "
                                        "spotting slow rhythms; bad for "
                                        "spotting fast spikes."),
@@ -2345,11 +2374,10 @@ def layout(store: Store, bridge: dict | None = None):
             # x-axis (seconds since chunk start), each point = one stim
             # epoch, y = the chosen evoked feature. Cursor tracks the
             # video the same way the LFP does.
-            _step_header(
-                "3", "Look at a brain feature over time",
-                "Pick a number that gets computed from the brain signal "
-                "for every stim event in the recording. Click a point "
-                "to jump the video to that moment.",
+            _panel_header(
+                "Brain feature over time",
+                "Pick a number computed from the brain signal for every "
+                "stim event. Click a point to jump the video there.",
             ),
             # Top-level row: just the friendly Feature picker + a
             # live status pill. Everything else (smoothing, detrend,
@@ -2557,11 +2585,10 @@ def layout(store: Store, bridge: dict | None = None):
                                     style=LABEL_STYLE,
                                     title="Gaussian smoothing window in "
                                            "seconds, applied to the "
-                                           "per-event feature line ONLY "
-                                           "(Step 3). 0 = off. Distinct "
-                                           "from Step 2's smooth-the-LFP "
-                                           "(ms), which smooths the raw "
-                                           "trace."),
+                                           "per-event feature line ONLY. "
+                                           "0 = off. Distinct from the "
+                                           "'Smooth the LFP (ms)' control, "
+                                           "which smooths the raw trace."),
                         dcc.Input(id="video-analysis-smooth",
                                    type="number", min=0, step=0.5,
                                    value=0,
@@ -2907,8 +2934,8 @@ def layout(store: Store, bridge: dict | None = None):
             # the marker editor below; Mark-done writes the structured
             # event list to review_state AND appends rows to the
             # per-(animal, day) CSV at G:\BHZ\BHZ_CSV_Exports.
-            _step_header(
-                "4", "Score events + mark this recording done",
+            _panel_header(
+                "Score events & finish",
                 "Add seizure events on the LFP and finish each one "
                 "with a Racine score. This finishes the recording "
                 "in your queue."),
