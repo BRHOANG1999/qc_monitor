@@ -7,6 +7,9 @@ psutil>=5.9
 pyyaml>=6.0
 numpy>=1.24
 scipy>=1.11
+# Imported by src/utils/wavelet.py + src/analyzers/wavelet.py for
+# complex-Morlet CWT scalograms and wavelet band power.
+PyWavelets>=1.4
 # Imported by src/utils/mat_loader.py for MATLAB v7.3 (HDF5) files.
 h5py>=3.8
 # Imported by src/analyzers/video_qc.py, src/dashboard/media_routes.py,
