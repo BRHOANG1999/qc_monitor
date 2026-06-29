@@ -220,21 +220,22 @@ def _train_review_panel(store: Store, attempt_id: int):
                         style={"color": "#a0a0b0", "padding": "8px"})
     # Lazy import: the training module pulls heavy LFP-rendering deps.
     from src.dashboard.tabs.training import (
-        _build_figures, _first_animal_channel, _events_table)
+        _build_figures, _first_animal_channel, _channel_for_animal,
+        _events_table)
     file_id = a.get("file_id")
     session_dir = a.get("session_dir")
+    file_path = a.get("file_path")
     # Same animal the student saw in Training: the seizure animal's channel
-    # (not the default recording electrode), so the LFP shown here matches
-    # the validated answer being graded.
+    # (not the default recording electrode), resolved with the filename
+    # fallback so historical CSV examples (no session_config) work too.
     gt_animal = store.validated_seizure_animal_for_file(int(file_id))
-    if gt_animal:
-        from src.utils.mass_analyze import animal_channel_index
-        channel = animal_channel_index(store, session_dir, gt_animal)
+    gt_channel = _channel_for_animal(store, session_dir, gt_animal, file_path)
+    if gt_channel is not None:
+        channel = gt_channel
         validated = store.validated_events_for_file(int(file_id),
                                                     animal_id=gt_animal)
     else:
-        channel = _first_animal_channel(store, session_dir,
-                                        a.get("file_path"))
+        channel = _first_animal_channel(store, session_dir, file_path)
         validated = store.validated_events_for_file(int(file_id))
     lfp, hil, _dur = _build_figures(store, int(file_id), channel, "hilbert")
     try:

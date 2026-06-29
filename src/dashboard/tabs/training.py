@@ -188,6 +188,24 @@ def _first_animal_channel(store: Store, session_dir: str | None,
         _channel_names(store, session_dir, file_path))
 
 
+def _channel_for_animal(store: Store, session_dir: str | None, animal: str,
+                        file_path: str | None = None) -> int | None:
+    """Channel index of *animal*'s electrode, using session_config when known
+    and the FILENAME channel list otherwise. Historical CSV examples have no
+    session_config row, so the DB-only ``animal_channel_index`` would fall
+    back to channel 0 (the wrong animal); this honours the filename fallback
+    so the seizure animal's channel resolves either way. None when no channel
+    parses to *animal*."""
+    if not animal:
+        return None
+    for i, n in enumerate(_channel_names(store, session_dir, file_path)):
+        if isinstance(n, str) and is_animal_channel(n):
+            a, _ = split_animal_electrode(n)
+            if a == animal:
+                return i
+    return None
+
+
 def _channel_animal(store: Store, session_dir: str | None, channel: int,
                     file_path: str | None = None) -> tuple[str, str]:
     """(channel_name, animal_id) for the displayed channel, or ("","") when
@@ -319,9 +337,9 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     # recording channel for negatives / un-attributed approvals so the LFP,
     # the validated ground truth, and the grading all agree on one animal.
     gt_animal = store.validated_seizure_animal_for_file(file_id)
-    if gt_animal:
-        from src.utils.mass_analyze import animal_channel_index
-        channel = animal_channel_index(store, session_dir, gt_animal)
+    gt_channel = _channel_for_animal(store, session_dir, gt_animal, mat_path)
+    if gt_channel is not None:
+        channel = gt_channel
         validated = store.validated_events_for_file(file_id,
                                                      animal_id=gt_animal)
     else:
