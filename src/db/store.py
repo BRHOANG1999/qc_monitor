@@ -3573,7 +3573,30 @@ class Store:
                 if racine > best_racine:
                     best_racine = racine
                     best_animal = r["animal_id"]
-        return best_animal or latest
+        if best_animal or latest:
+            return best_animal or latest
+        # Historical CSV example: it stored the highest-Racine event's animal
+        # (past_events.catalog_examples), so use that when there's no live
+        # pi_approved row.
+        ext = self.external_example_for_file(file_id)
+        return (ext or {}).get("animal") or None
+
+    def external_example_for_file(self, file_id: int) -> dict | None:
+        """The training_external_example metadata (source CSV, recording
+        name/folder, animal, fs, ...) for a file, or None when the file isn't
+        a historical CSV import. Powers the 'CSV source' panel + the channel
+        fallback for imported examples."""
+        assert file_id is not None, "file_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT folder, filename, animal, fs, has_seizure, rep_type, "
+                "rep_racine, source_csv, peak_stamp, created_at "
+                "FROM training_external_example WHERE file_id=?",
+                (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
 
     def _external_markers_for_file(self, file_id: int) -> list:
         conn = self._connect()

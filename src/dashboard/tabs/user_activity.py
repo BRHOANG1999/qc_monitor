@@ -263,6 +263,7 @@ def _train_review_panel(store: Store, attempt_id: int):
         "Onsets:  orange dashed = student   ·   green = validated",
         style={"color": "#a0a0b0", "fontSize": "11px",
                "marginBottom": "6px"})
+    csv_info = _csv_source_block(store.external_example_for_file(int(file_id)))
 
     if int(a.get("stage") or 1) == 1:
         you = ("events present" if answer.get("events_present")
@@ -285,13 +286,51 @@ def _train_review_panel(store: Store, attempt_id: int):
             ], style={"display": "flex", "gap": "16px", "flexWrap": "wrap",
                       "marginTop": "8px"}),
         ])
-    return html.Div([
-        header, legend,
+    children = [header, legend]
+    if csv_info is not None:
+        children.append(csv_info)
+    children += [
         dcc.Graph(figure=lfp, config={"displayModeBar": False}),
         dcc.Graph(figure=hil, config={"displayModeBar": False}),
         compare,
-    ], style={"marginTop": "10px", "padding": "12px",
-              "border": "1px solid #2a2a3a", "borderRadius": "8px"})
+    ]
+    return html.Div(children, style={
+        "marginTop": "10px", "padding": "12px",
+        "border": "1px solid #2a2a3a", "borderRadius": "8px"})
+
+
+def _csv_source_block(ext: dict | None):
+    """The CSV provenance for a historical validated example (source CSV,
+    recording file/folder, animal, validated label). None for live PI-
+    approved examples (no CSV behind them)."""
+    if not ext:
+        return None
+    rep = ext.get("rep_type") or "?"
+    rac = ext.get("rep_racine")
+    fields = [
+        ("Source CSV", ext.get("source_csv")),
+        ("Recording", ext.get("filename")),
+        ("Folder", ext.get("folder")),
+        ("Animal", ext.get("animal")),
+        ("Validated", f"{rep} · Racine {rac}" if rac is not None else None),
+        ("Sampling", f"{ext.get('fs'):.0f} Hz" if ext.get("fs") else None),
+    ]
+    rows = [
+        html.Div([
+            html.Span(f"{k}: ", style={"color": "#8a8a9a"}),
+            html.Span(str(v), style={"color": "#d8d8e0",
+                                     "wordBreak": "break-all"}),
+        ], style={"fontSize": "11px", "marginBottom": "2px"})
+        for k, v in fields if v
+    ]
+    return html.Div([
+        html.Div("CSV source (historical validated example)",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                        "fontWeight": "600", "marginBottom": "4px"}),
+        *rows,
+    ], style={"marginBottom": "8px", "padding": "8px 10px",
+              "background": "#1b1b27", "border": "1px solid #2a2a3a",
+              "borderRadius": "6px"})
 
 
 def layout(store: Store, config: dict | None = None):
