@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 
-from dash import Input, Output, dash_table, dcc, html
+from dash import (ALL, Input, Output, callback_context, dash_table, dcc,
+                  html, no_update)
 
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
@@ -127,6 +129,159 @@ def _feed_rows(store: Store, user: str | None, area: str | None,
     } for r in rows]
 
 
+# --------------------------------------------------------------------- #
+#  Training review: visit the LFPs a student scored, with their answer
+# --------------------------------------------------------------------- #
+
+_REVIEW_BTN_STYLE = {
+    "background": "#0a84ff", "color": "white", "border": "none",
+    "borderRadius": "5px", "padding": "3px 12px", "cursor": "pointer",
+    "fontSize": "12px", "fontWeight": "600"}
+
+
+def _pct_color(pct: float) -> str:
+    return "#30d158" if pct >= 85 else "#ff9f0a" if pct >= 60 else "#ff453a"
+
+
+def _train_attempt_list(store: Store, student: str | None):
+    """A row per training example the student scored (newest first), each with
+    a Review button that opens the LFP + their marks."""
+    if not student:
+        return html.Div("Pick a student to list the recordings they scored.",
+                        style={"color": "#a0a0b0", "fontSize": "13px",
+                               "padding": "8px 2px"})
+    attempts = store.training_attempts_for_student(student, limit=200)
+    if not attempts:
+        return html.Div("No training attempts for this student yet.",
+                        style={"color": "#a0a0b0", "fontSize": "13px",
+                               "padding": "8px 2px"})
+    rows = []
+    for a in attempts:
+        fname = (os.path.basename(a["file_path"]) if a.get("file_path")
+                 else f"file #{a.get('file_id')}")
+        pct = round((a.get("agreement") or 0) * 100)
+        rows.append(html.Div([
+            html.Span(_fmt_when(a.get("created_at")),
+                      style={"width": "150px", "color": "#a0a0b0",
+                             "fontSize": "12px", "flexShrink": "0"}),
+            html.Span(f"Stage {a.get('stage')}",
+                      style={"width": "64px", "color": "#cfd0d6",
+                             "fontSize": "12px", "flexShrink": "0"}),
+            html.Span(fname, title=fname,
+                      style={"flex": "1", "minWidth": "0", "color": "#f0f0f5",
+                             "fontSize": "12px", "overflow": "hidden",
+                             "textOverflow": "ellipsis",
+                             "whiteSpace": "nowrap"}),
+            html.Span(f"{pct}%",
+                      style={"width": "48px", "textAlign": "right",
+                             "color": _pct_color(pct), "fontWeight": "700",
+                             "fontSize": "13px", "flexShrink": "0"}),
+            html.Button("Review",
+                        id={"type": "ua-train-review-btn",
+                            "attempt": int(a["attempt_id"])},
+                        n_clicks=0, style=_REVIEW_BTN_STYLE),
+        ], style={"display": "flex", "alignItems": "center", "gap": "12px",
+                  "padding": "6px 8px",
+                  "borderBottom": "1px solid #2a2a3a"}))
+    return html.Div(rows, style={"maxHeight": "320px", "overflowY": "auto",
+                                  "border": "1px solid #2a2a3a",
+                                  "borderRadius": "6px"})
+
+
+def _onset_seconds(events) -> list[float]:
+    """EO (eye-open onset) seconds from an events list, skipping blanks."""
+    out = []
+    for e in (events or []):
+        t = (e or {}).get("EO_sec")
+        if isinstance(t, (int, float)):
+            out.append(float(t))
+    return out
+
+
+def _overlay_onsets(fig, student_events, validated_events) -> None:
+    """Mark the student's onsets (orange dashed) vs the validated onsets
+    (green) on the LFP figure so the PI sees where the student was off."""
+    try:
+        for t in _onset_seconds(validated_events):
+            fig.add_vline(x=t, line={"color": "#30d158", "width": 1.5})
+        for t in _onset_seconds(student_events):
+            fig.add_vline(x=t, line={"color": "#ff9f0a", "width": 1.5,
+                                     "dash": "dash"})
+    except Exception:  # noqa: BLE001 -- overlay is best-effort
+        pass
+
+
+def _train_review_panel(store: Store, attempt_id: int):
+    """LFP the student saw + their marks (orange) vs validated (green) +
+    the agreement breakdown, for one attempt."""
+    a = store.get_training_attempt(int(attempt_id))
+    if not a:
+        return html.Div("Attempt not found.",
+                        style={"color": "#a0a0b0", "padding": "8px"})
+    # Lazy import: the training module pulls heavy LFP-rendering deps.
+    from src.dashboard.tabs.training import (
+        _build_figures, _first_animal_channel, _events_table)
+    file_id = a.get("file_id")
+    channel = _first_animal_channel(store, a.get("session_dir"),
+                                     a.get("file_path"))
+    lfp, hil, _dur = _build_figures(store, int(file_id), channel, "hilbert")
+    try:
+        answer = json.loads(a.get("submitted_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        answer = {}
+    try:
+        breakdown = json.loads(a.get("breakdown_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        breakdown = {}
+    validated = store.validated_events_for_file(int(file_id))
+    student_events = answer.get("events") or []
+    _overlay_onsets(lfp, student_events, validated)
+
+    pct = round((a.get("agreement") or 0) * 100)
+    fname = (os.path.basename(a["file_path"]) if a.get("file_path")
+             else f"file #{file_id}")
+    header = html.Div([
+        html.Span(f"{pct}%", style={"fontSize": "24px", "fontWeight": "800",
+                                     "color": _pct_color(pct)}),
+        html.Span(f"  {a.get('student_email')}  ·  Stage {a.get('stage')}"
+                  f"  ·  {fname}",
+                  style={"color": "#cfd0d6", "fontSize": "13px"}),
+    ], style={"marginBottom": "6px"})
+    legend = html.Div(
+        "Onsets:  orange dashed = student   ·   green = validated",
+        style={"color": "#a0a0b0", "fontSize": "11px",
+               "marginBottom": "6px"})
+
+    if int(a.get("stage") or 1) == 1:
+        you = ("events present" if answer.get("events_present")
+               else "no events")
+        val = "events present" if validated else "no events"
+        compare = html.Div(f"Student said: {you}   ·   Validated: {val}",
+                           style={"color": "#cfd0d6", "fontSize": "12px",
+                                  "marginTop": "8px"})
+    else:
+        b = breakdown or {}
+        compare = html.Div([
+            html.Div(f"matched {b.get('matched', 0)} · missed "
+                     f"{b.get('missed', 0)} · extra {b.get('false_pos', 0)} "
+                     f"(of {b.get('validated', 0)} validated)",
+                     style={"color": "#cfd0d6", "fontSize": "12px",
+                            "marginTop": "8px"}),
+            html.Div([
+                _events_table(student_events, "Student's answer", "#0a84ff"),
+                _events_table(validated, "Validated answer", "#30d158"),
+            ], style={"display": "flex", "gap": "16px", "flexWrap": "wrap",
+                      "marginTop": "8px"}),
+        ])
+    return html.Div([
+        header, legend,
+        dcc.Graph(figure=lfp, config={"displayModeBar": False}),
+        dcc.Graph(figure=hil, config={"displayModeBar": False}),
+        compare,
+    ], style={"marginTop": "10px", "padding": "12px",
+              "border": "1px solid #2a2a3a", "borderRadius": "8px"})
+
+
 def layout(store: Store, config: dict | None = None):
     email = current_user_email()
     if not _can_view(store, config, email):
@@ -196,6 +351,24 @@ def layout(store: Store, config: dict | None = None):
             page_size=25, sort_action="native", filter_action="native",
             export_format="csv", **DARK_TABLE_STYLE,
             style_data_conditional=[ZEBRA_STRIPE]),
+
+        html.H4("Training review — visit what a student scored",
+                style={"color": "#cfd0d6", "fontSize": "14px",
+                       "marginTop": "26px", "marginBottom": "8px"}),
+        html.Div("Open any recording an undergrad scored in Training, with "
+                 "their onsets/marks overlaid on the LFP against the "
+                 "validated answer.",
+                 style={"color": "#a0a0b0", "fontSize": "12px",
+                        "marginBottom": "10px"}),
+        html.Div([
+            html.Label("Student", style={"color": "#a0a0b0",
+                                         "fontSize": "12px"}),
+            dcc.Dropdown(id="ua-train-student", options=[],
+                         placeholder="Pick a student", style=dd,
+                         className="dark-dropdown"),
+        ], style={"marginBottom": "10px"}),
+        html.Div(id="ua-train-attempts"),
+        dcc.Loading(html.Div(id="ua-train-review"), type="default"),
     ], style={"padding": "20px 24px"})
 
 
@@ -229,3 +402,51 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not _can_view(store, config, email):
             return []
         return _feed_rows(store, user, area, int(hours or 0))
+
+    # ---- Training review ---- #
+    @app.callback(
+        Output("ua-train-student", "options"),
+        Input("user-activity-tick", "n_intervals"),
+        Input("refresh-trigger", "data"),
+    )
+    def _train_students(_t, _r):
+        email = (current_user_email() or "").lower()
+        if not _can_view(store, config, email):
+            return []
+        return [{"label": s, "value": s}
+                for s in store.distinct_training_students()]
+
+    @app.callback(
+        Output("ua-train-attempts", "children"),
+        Output("ua-train-review", "children"),
+        Input("ua-train-student", "value"),
+    )
+    def _train_attempts(student):
+        email = (current_user_email() or "").lower()
+        if not _can_view(store, config, email):
+            return no_update, no_update
+        # New student -> fresh list, clear any open review panel.
+        return _train_attempt_list(store, student), []
+
+    @app.callback(
+        Output("ua-train-review", "children", allow_duplicate=True),
+        Input({"type": "ua-train-review-btn", "attempt": ALL}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _train_review(_clicks):
+        email = (current_user_email() or "").lower()
+        if not _can_view(store, config, email):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict) or trig.get("attempt") is None:
+            return no_update
+        # Ignore the render-time n_clicks=0 firings; only act on a real click.
+        if not any(callback_context.triggered and t["value"]
+                   for t in callback_context.triggered):
+            return no_update
+        try:
+            return _train_review_panel(store, int(trig["attempt"]))
+        except Exception as e:  # noqa: BLE001 -- surface, never crash the tab
+            logger.warning("training review panel failed: %s", e)
+            return html.Div(f"Couldn't load this recording: {e}",
+                            style={"color": "#ff9f0a", "padding": "8px"})

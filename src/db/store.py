@@ -3079,6 +3079,60 @@ class Store:
         finally:
             conn.close()
 
+    def training_attempts_for_student(self, student_email: str,
+                                       limit: int = 200) -> list[dict]:
+        """Every training example a student scored, newest first, with their
+        answer + file metadata. Powers the PI 'review what this student saw'
+        panel: each row is one (LFP, their scoring) pair."""
+        assert student_email, "student_email required"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT ta.id AS attempt_id, ta.stage, ta.file_id,
+                          ta.submitted_json, ta.agreement, ta.breakdown_json,
+                          ta.created_at, pf.file_path, pf.session_dir
+                   FROM training_attempt ta
+                   LEFT JOIN processed_files pf ON pf.id = ta.file_id
+                   WHERE LOWER(ta.student_email) = LOWER(?)
+                   ORDER BY ta.id DESC
+                   LIMIT ?""",
+                (student_email, int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_training_attempt(self, attempt_id: int) -> dict | None:
+        """One training attempt (+ its file metadata) by id, for the PI
+        review panel. None when the id is unknown."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT ta.id AS attempt_id, ta.student_email, ta.stage,
+                          ta.file_id, ta.submitted_json, ta.agreement,
+                          ta.breakdown_json, ta.created_at,
+                          pf.file_path, pf.session_dir
+                   FROM training_attempt ta
+                   LEFT JOIN processed_files pf ON pf.id = ta.file_id
+                   WHERE ta.id = ?""",
+                (int(attempt_id),),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def distinct_training_students(self) -> list[str]:
+        """Emails of students who have at least one training attempt, for the
+        PI review-student picker."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT student_email FROM training_attempt
+                   ORDER BY student_email""").fetchall()
+            return [r["student_email"] for r in rows]
+        finally:
+            conn.close()
+
     def recent_training_scores(self, student_email: str, stage: int,
                                 limit: int = 50) -> list[float]:
         """Agreement scores for (student, stage), CHRONOLOGICAL (oldest
