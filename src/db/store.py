@@ -365,6 +365,9 @@ class Store:
                 r["channel_names"], r["eeg_channels"])
             if not animals:
                 continue
+            # Best-effort: a legacy whole-file flag on a multi-animal file is
+            # pinned to the FIRST animal -- the true animal is unrecoverable
+            # from a NULL row. New reviews are scoped by the scored channel.
             conn.execute(
                 "UPDATE review_state SET animal_id = ? WHERE id = ?",
                 (animals[0], r["rid"]))
@@ -1939,7 +1942,7 @@ class Store:
                 row = conn.execute(
                     """SELECT * FROM review_state
                        WHERE file_id = ?
-                         AND (animal_id = ? OR animal_id IS NULL)
+                         AND animal_id = ?
                        ORDER BY updated_at DESC LIMIT 1""",
                     (file_id, animal_id),
                 ).fetchone()
@@ -1969,9 +1972,9 @@ class Store:
             return {}
         out: dict[int, str] = {}
         scope = ("" if not animal_id
-                 else " AND (rs.animal_id = ? OR rs.animal_id IS NULL)")
+                 else " AND rs.animal_id = ?")
         sub = ("" if not animal_id
-               else " AND (r2.animal_id = ? OR r2.animal_id IS NULL)")
+               else " AND r2.animal_id = ?")
         conn = self._connect()
         try:
             # Chunk to stay under SQLite's variable limit on big pools.
@@ -2014,7 +2017,7 @@ class Store:
                 row = conn.execute(
                     """SELECT * FROM review_state
                        WHERE file_id = ? AND user_email = ?
-                         AND (animal_id = ? OR animal_id IS NULL)
+                         AND animal_id = ?
                        ORDER BY updated_at DESC LIMIT 1""",
                     (file_id, user_email.lower(), animal_id),
                 ).fetchone()
@@ -2474,11 +2477,11 @@ class Store:
                    JOIN review_state rs ON rs.file_id = pf.id
                    WHERE sc.channel_names LIKE ?
                      AND rs.status = 'needs_scoring'
-                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
+                     AND rs.animal_id = ?
                      AND rs.id = (
                        SELECT MAX(rs2.id) FROM review_state rs2
                        WHERE rs2.file_id = pf.id
-                         AND (rs2.animal_id = ? OR rs2.animal_id IS NULL))
+                         AND rs2.animal_id = ?)
                    ORDER BY pf.chunk_datetime ASC""",
                 (f'%"{animal_id}%', animal_id, animal_id),
             ).fetchall()
@@ -2737,7 +2740,7 @@ class Store:
               AND NOT EXISTS (
                 SELECT 1 FROM review_state rs
                 WHERE rs.file_id = pf.id
-                  AND (rs.animal_id IN ({anim_ph}) OR rs.animal_id IS NULL)
+                  AND rs.animal_id IN ({anim_ph})
                   AND rs.status IN ('no_events', 'has_events',
                                      'pending_pi_review',
                                      'pi_approved', 'needs_scoring')
@@ -2746,7 +2749,7 @@ class Store:
                 SELECT 1 FROM review_state rs2
                 WHERE rs2.file_id = pf.id
                   AND rs2.user_email = ?
-                  AND (rs2.animal_id IN ({anim_ph}) OR rs2.animal_id IS NULL)
+                  AND rs2.animal_id IN ({anim_ph})
                   AND rs2.status IN ('no_events', 'has_events',
                                       'pending_pi_review',
                                       'pi_approved')
@@ -2898,23 +2901,50 @@ class Store:
             except json.JSONDecodeError:
                 events = []
             if animal_id:
-                # Prefer the stored animal_id; fall back to the session
-                # channel check for legacy whole-file (NULL) rows.
-                row_animal = r["animal_id"]
-                if row_animal:
-                    if row_animal != animal_id:
-                        continue
-                else:
-                    names = self._channel_names_for_session(
-                        r["session_dir"])
-                    if not self._session_has_animal(names, animal_id):
-                        continue
+                # Strict per-animal: only this animal's rows. Legacy
+                # whole-file (NULL) rows are NOT shown under a specific
+                # animal (the migration backfills them to a concrete
+                # animal; an un-backfilled NULL can't be attributed).
+                if r["animal_id"] != animal_id:
+                    continue
             d = dict(r)
             d["events"] = events
             out.append(d)
             if len(out) >= limit:
                 break
         return out
+
+    def animal_for_file_channel(self, file_id, channel) -> str | None:
+        """Animal id for a file's channel index (its electrode), e.g.
+        'BCH062SLM' -> 'BCH062'; None when the channel isn't an animal
+        channel. Single source of truth for "which animal does this
+        channel belong to" -- used to scope review writes (and the Mass
+        Analyze auto-clear) by the scored channel rather than a picker."""
+        if file_id is None or channel is None:
+            return None
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT sc.channel_names FROM processed_files pf
+                   JOIN session_config sc ON sc.session_dir = pf.session_dir
+                   WHERE pf.id = ?""", (int(file_id),)).fetchone()
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
+        finally:
+            conn.close()
+        if not row or not row["channel_names"]:
+            return None
+        try:
+            names = json.loads(row["channel_names"])
+            ch = int(channel)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        if 0 <= ch < len(names) and is_animal_channel(names[ch]):
+            animal, _ = split_animal_electrode(names[ch])
+            return animal
+        return None
 
     def _channel_names_for_session(self, session_dir: str
                                       ) -> list[str]:
@@ -3436,7 +3466,7 @@ class Store:
                 row = conn.execute(
                     "SELECT markers_json FROM review_state "
                     "WHERE file_id=? AND status='pi_approved' "
-                    "AND (animal_id=? OR animal_id IS NULL) "
+                    "AND animal_id=? "
                     "ORDER BY updated_at DESC LIMIT 1",
                     (int(file_id), animal_id)).fetchone()
             else:
@@ -3864,7 +3894,7 @@ class Store:
         assert user_email, "user_email required"
         now = datetime.now().isoformat()
         scope = ("" if not animal_id
-                 else " AND (animal_id = ? OR animal_id IS NULL)")
+                 else " AND animal_id = ?")
         conn = self._connect()
         try:
             sel_params = [file_id, user_email.lower()]

@@ -313,25 +313,9 @@ def _animal_for_channel(store, file_id, channel) -> str | None:
     'BCH062SLM' -> 'BCH062'), or None when the channel isn't an animal
     channel. This is the PHYSICAL ground truth for which animal an onset
     belongs to -- the onset is dropped on this channel's trace -- so review
-    writes scope by this rather than the queue-navigation picker."""
-    if channel is None or file_id is None:
-        return None
-    try:
-        session_dir = _session_dir_for_file(store, int(file_id))
-        with store.connection() as conn:
-            row = conn.execute(
-                "SELECT channel_names FROM session_config "
-                "WHERE session_dir = ?", (session_dir,)).fetchone()
-        if not row or not row["channel_names"]:
-            return None
-        names = json.loads(row["channel_names"])
-        ch = int(channel)
-        if 0 <= ch < len(names) and is_animal_channel(names[ch]):
-            animal, _ = split_animal_electrode(names[ch])
-            return animal
-    except Exception:  # noqa: BLE001 -- best-effort; None blocks the write
-        return None
-    return None
+    writes + the review panel scope by this rather than the queue picker.
+    Delegates to the shared store helper (single source of truth)."""
+    return store.animal_for_file_channel(file_id, channel)
 
 
 def _pi_flag_note_for_file(store, file_id: int) -> str:
@@ -4851,7 +4835,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                  f"{rec.get('sampled_variance', 0):.2f}  ·  "
                  f"set by {rec.get('user_email', '?')}")
 
-    # ---- Step 4: reset marker store + decision when file changes ---- #
+    # ---- Step 4: reset marker store + decision when the file OR the
+    # scored channel (=> animal) changes ---- #
+    # Scoped by the channel's animal (not the picker) and re-fires on
+    # channel change, so a multi-animal recording shows each animal's own
+    # saved decision/note/markers -- consistent with _rescope_events.
     @app.callback(
         Output("video-review-marker-store", "data",
                 allow_duplicate=True),
@@ -4860,14 +4848,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-review-note", "value"),
         Output("video-review-status", "children"),
         Input("video-file-dropdown", "value"),
-        State("video-queue-animal", "value"),
+        Input("video-channel-dropdown", "value"),
         prevent_initial_call=True,
     )
-    def _reset_review_panel(file_id, picker_value):
+    def _reset_review_panel(file_id, channel):
         if not file_id:
             return [], None, "", ""
         email = current_user_email() or ""
-        animal = _ma_animal_from_picker(picker_value)
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            # Non-animal channel (e.g. stim copy): nothing to scope to.
+            return [], None, "", "Pick an animal's brain channel."
         # Quick-flagged file: resume in events mode so the draft
         # events (prefilled by _reset_events_on_file_change) show.
         latest = store.get_review_state(int(file_id), animal_id=animal)

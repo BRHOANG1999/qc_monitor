@@ -100,7 +100,8 @@ def test_quick_flag_excluded_from_queue_and_pending(tmp_path):
     assert any(r["id"] == 1 for r in q0)
 
     store.mark_review(1, "u@lab", "needs_scoring",
-                       markers=[{"EO_sec": 12.0, "draft": True}])
+                       markers=[{"EO_sec": 12.0, "draft": True}],
+                       animal_id="BCH001")
 
     # After: gone from the FIFO queue + from MA pending, present in
     # the needs-scoring pool.
@@ -112,6 +113,69 @@ def test_quick_flag_excluded_from_queue_and_pending(tmp_path):
     assert [r["file_id"] for r in ns] == [1]
     drafts = json.loads(ns[0]["markers_json"])
     assert drafts[0]["EO_sec"] == 12.0 and drafts[0]["draft"] is True
+
+
+def _seed_multi_animal_file(store, fid, session_dir="sessM"):
+    """A recording with two animals (BCH062 ch0, BCH061 ch1)."""
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO session_config
+               (session_dir, channel_names, eeg_channels, discovered_at)
+               VALUES (?, ?, ?, '2026-01-01')
+               ON CONFLICT(session_dir) DO NOTHING""",
+            (session_dir, json.dumps(["BCH062SLM", "BCH061SR"]),
+             json.dumps([0, 1])))
+        conn.execute(
+            """INSERT INTO processed_files
+               (id, file_path, session_dir, has_video, chunk_datetime)
+               VALUES (?, ?, ?, 1, '2026_01_01__00_00_00')""",
+            (fid, f"/f/{fid}.mat", session_dir))
+        conn.commit()
+
+
+def test_flags_are_strictly_per_animal(tmp_path):
+    """A flag for one animal must never surface for another (the leak)."""
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    _seed_multi_animal_file(store, 7)
+    # Flag onsets for BCH062 only (the channel-0 electrode).
+    store.mark_review(7, "u@lab", "needs_scoring",
+                       markers=[{"EO_sec": 10.5, "draft": True}],
+                       animal_id="BCH062")
+
+    # Needs-scoring pool: present for BCH062, absent for BCH061.
+    assert [r["file_id"] for r in
+            store.files_needing_scoring_for_animal("BCH062")] == [7]
+    assert store.files_needing_scoring_for_animal("BCH061") == []
+
+    # get_review_state: B's row never returned when querying for A.
+    assert (store.get_review_state(7, animal_id="BCH062") or {}
+            ).get("status") == "needs_scoring"
+    assert store.get_review_state(7, animal_id="BCH061") is None
+
+    # A legacy whole-file (NULL) row leaks to NEITHER specific animal.
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO review_state
+               (file_id, user_email, status, markers_json, animal_id,
+                created_at, updated_at)
+               VALUES (7, 'u@lab', 'needs_scoring', '[]', NULL,
+                       '2026-02-01', '2026-02-01')""")
+        conn.commit()
+    assert store.get_review_state(7, animal_id="BCH061") is None
+    # BCH062's own row is still its latest (the NULL row is invisible).
+    assert (store.get_review_state(7, animal_id="BCH062") or {}
+            ).get("status") == "needs_scoring"
+
+
+def test_animal_for_file_channel(tmp_path):
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    _seed_multi_animal_file(store, 8)
+    assert store.animal_for_file_channel(8, 0) == "BCH062"
+    assert store.animal_for_file_channel(8, 1) == "BCH061"
+    assert store.animal_for_file_channel(8, 9) is None     # out of range
+    assert store.animal_for_file_channel(8, None) is None
 
 
 if __name__ == "__main__":

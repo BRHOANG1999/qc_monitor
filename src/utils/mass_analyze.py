@@ -1169,6 +1169,7 @@ def commit_threshold(store, animal_id: str, cutoff: float,
                 markers=[],
                 note=(f"Mass Analyze auto-clear at "
                        f"cutoff={cutoff:g}"),
+                animal_id=animal_id,
             )
             store.insert_review_event(
                 fid, pi_email, "mass_analyze_clear",
