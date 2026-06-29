@@ -65,6 +65,39 @@ _ONSET_DEFAULT_LOOKBACK_H = 24
 _PLOT_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _PLOT_CACHE_MAX = 4
 
+# Assembled-rows memo: (animal, sessions, recordings, config, warm-gen) ->
+# the concatenated sidecar rows, so lazy section expands + replots of the
+# same selection don't re-read every sidecar from disk. Invalidated when a
+# warm completes (bumps _warm_gen) so freshly-written sidecars are picked up.
+_ROWS_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
+_ROWS_CACHE_MAX = 6
+_warm_gen: dict = {}     # animal -> generation int (bumped per completed warm)
+
+# Per-recording mean-waveform memo for the overlay (the 2nd heavy trace
+# read), keyed (animal, file-basenames). Bounded.
+_MEANS_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
+_MEANS_CACHE_MAX = 4
+
+# evokedOutput glob memoized on the directory's mtime, so a selection /
+# section-expand doesn't re-glob + re-parse every filename each call.
+_FILES_CACHE: dict = {}   # dir -> (dir_mtime, sorted file list)
+
+
+def _list_files_cached() -> list:
+    """``list_evoked_files(_EVOKED_DIR)`` memoized on the folder mtime
+    (which changes whenever a file is added/removed). Cheap re-use across
+    the many call sites that re-globbed the directory on every selection."""
+    try:
+        mtime = os.path.getmtime(_EVOKED_DIR)
+    except OSError:
+        return list_evoked_files(_EVOKED_DIR)
+    hit = _FILES_CACHE.get(_EVOKED_DIR)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    files = list_evoked_files(_EVOKED_DIR)
+    _FILES_CACHE[_EVOKED_DIR] = (mtime, files)
+    return files
+
 # Configured in register_callbacks(); layout() reads them on tab open.
 _EVOKED_DIR = DEFAULT_EVOKED_DIR
 _EXPENSIVE_ENABLED = False
@@ -75,8 +108,9 @@ _EXPENSIVE_ENABLED = False
 _autoloaded: set = set()
 
 
-def _sel_key(animal, sess):
-    return (animal or "", tuple(sorted(sess or [])))
+def _sel_key(animal, sess, recordings=None):
+    return (animal or "", tuple(sorted(sess or [])),
+            tuple(sorted(recordings or [])))
 
 
 def _label(col: str) -> str:
@@ -123,9 +157,11 @@ _warm_lock = threading.Lock()
 
 
 def _kick_warm(animal: str, sessions: list | None = None,
-               cfg_dict: dict | None = None, force: bool = False) -> bool:
+               cfg_dict: dict | None = None, force: bool = False,
+               recordings: list | None = None) -> bool:
     """Start a background sidecar-build for *animal* (optionally just
-    *sessions*) unless one is already running."""
+    *sessions* and/or an explicit *recordings* subset) unless one is
+    already running."""
     if not animal:
         return False
     with _warm_lock:
@@ -134,7 +170,8 @@ def _kick_warm(animal: str, sessions: list | None = None,
             return False
         _warm_progress[animal] = {"done": 0, "total": 0}
         th = threading.Thread(target=_warm_worker,
-                              args=(animal, sessions, cfg_dict, force),
+                              args=(animal, sessions, cfg_dict, force,
+                                    recordings),
                               daemon=True, name=f"chronic-warm-{animal}")
         _warm_threads[animal] = th
         th.start()
@@ -149,14 +186,15 @@ def _set_warm_progress(animal: str, done: int, total: int,
 
 
 def _warm_worker(animal: str, sessions: list | None = None,
-                 cfg_dict: dict | None = None, force: bool = False) -> None:
+                 cfg_dict: dict | None = None, force: bool = False,
+                 recordings: list | None = None) -> None:
     """Build *animal*'s feature sidecars for the selection (default config) or
     recompute its rows into the in-memory store (custom Configure). Reads each
     *_evoked.mat at most once; an existing fresh sidecar is skipped."""
     try:
         cfg = ef.FeatureConfig.from_dict(cfg_dict)
         passthrough = cfg.is_passthrough()
-        files = _selection_files(animal, sessions)
+        files = _selection_files(animal, sessions, recordings)
         n = len(files)
         recompute: list = []
         for i, fp in enumerate(files):
@@ -175,10 +213,13 @@ def _warm_worker(animal: str, sessions: list | None = None,
                 recompute.extend(rows)
         if not passthrough:
             recompute.sort(key=lambda r: r.get("abs_dt") or "")
-            _RECOMPUTE_CACHE[_recompute_key(animal, sessions, cfg_dict)] = \
-                recompute
+            _RECOMPUTE_CACHE[_recompute_key(animal, sessions, cfg_dict,
+                                             recordings)] = recompute
             while len(_RECOMPUTE_CACHE) > _RECOMPUTE_MAX:
                 _RECOMPUTE_CACHE.pop(next(iter(_RECOMPUTE_CACHE)))
+        # New sidecars written -> bump the warm generation so the
+        # assembled-rows memo re-reads them on the next query.
+        _warm_gen[animal] = _warm_gen.get(animal, 0) + 1
         _set_warm_progress(animal, n, n, "", "done")
         logger.info("chronic load %s (sessions=%s, passthrough=%s): %d files",
                     animal, sessions, passthrough, n)
@@ -252,6 +293,26 @@ def _session_options(animal) -> list[dict]:
         return []
 
 
+def _recording_options(animal, sessions) -> list[dict]:
+    """One option per evoked recording within (animal, sessions), labelled by
+    recording datetime, value = file basename. Lets the user load a subset of
+    recordings instead of the whole session. Best-effort; never raises."""
+    if not animal:
+        return []
+    try:
+        opts = []
+        for f in _selection_files(animal, sessions or None):
+            dt = parse_recording_dt(f)
+            label = (dt.strftime("%Y-%m-%d %H:%M") if dt
+                     else os.path.basename(f))
+            if not sessions:        # spanning all -> show the session too
+                label = f"{label}  ·  {parse_session(f)}"
+            opts.append({"label": label, "value": os.path.basename(f)})
+        return opts
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def layout(store):
     """Pickers + trend toggles + two plots, wrapped in dcc.Loading."""
     animals = list_animals(_EVOKED_DIR)
@@ -278,6 +339,17 @@ def layout(store):
                     id="chronic-session-dropdown",
                     options=_session_options(default_animal), value=[],
                     multi=True, placeholder="All sessions",
+                    style=DROPDOWN_STYLE, className="dark-dropdown"),
+            ], style={"flex": "1.4", "minWidth": "220px"}),
+            html.Div([
+                html.Label("Recordings — blank = all", style=LABEL_STYLE,
+                            title="Load only specific recordings within the "
+                                  "chosen session(s) instead of the whole "
+                                  "session. Blank = every recording."),
+                dcc.Dropdown(
+                    id="chronic-recording-dropdown",
+                    options=[], value=[], multi=True,
+                    placeholder="All recordings in session(s)",
                     style=DROPDOWN_STYLE, className="dark-dropdown"),
             ], style={"flex": "1.4", "minWidth": "220px"}),
             html.Div([
@@ -615,6 +687,23 @@ def register_callbacks(app, store, config: dict) -> None:
         clear = callback_context.triggered_id == "chronic-animal-dropdown"
         return _session_options(animal), ([] if clear else no_update)
 
+    # Recording subset options follow the animal+session selection. An
+    # animal/session change clears any stale recording subset so it can't
+    # filter a new selection down to nothing.
+    @app.callback(
+        Output("chronic-recording-dropdown", "options"),
+        Output("chronic-recording-dropdown", "value"),
+        Input("chronic-animal-dropdown", "value"),
+        Input("chronic-session-dropdown", "value"),
+        Input("chronic-refresh-btn", "n_clicks"),
+    )
+    def _recordings(animal, sessions, _clicks):
+        from dash import no_update
+        clear = callback_context.triggered_id in (
+            "chronic-animal-dropdown", "chronic-session-dropdown")
+        return (_recording_options(animal, sessions),
+                ([] if clear else no_update))
+
     # ---- Configure panel: collapse toggle + gather settings ---- #
     @app.callback(
         Output("chronic-configure-wrap", "style"),
@@ -674,6 +763,7 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("chronic-preview-btn", "n_clicks"),
         State("chronic-animal-dropdown", "value"),
         State("chronic-session-dropdown", "value"),
+        State("chronic-recording-dropdown", "value"),
         State("chronic-feature-dropdown", "value"),
         State("chronic-hours-dropdown", "value"),
         State("chronic-trend-toggles", "value"),
@@ -687,9 +777,10 @@ def register_callbacks(app, store, config: dict) -> None:
         State("chronic-onset-logtime", "value"),
         prevent_initial_call=True,
     )
-    def _update(_load, _refresh, _preview, animal, sessions, feature, hours,
-                overlays, event_overlays, view_mode, win_hours, scroll,
-                roll_window, cfg_dict, onset_lookback, onset_logtime):
+    def _update(_load, _refresh, _preview, animal, sessions, recordings,
+                feature, hours, overlays, event_overlays, view_mode,
+                win_hours, scroll, roll_window, cfg_dict, onset_lookback,
+                onset_logtime):
         if not animal:
             return (empty_fig("Select an animal, then ▶ Plot"),
                     "", "", None, True)
@@ -699,12 +790,18 @@ def register_callbacks(app, store, config: dict) -> None:
                         {"feature": feature})
         feature = feature if feature in _FEATURE_COLS else _DEFAULT_FEATURE
         sess = sessions or None
-        sel = {"animal": animal, "sessions": sess, "hours": hours,
-               "win_hours": win_hours, "scroll": scroll, "feature": feature,
-               "roll_window": roll_window, "config": cfg_dict or None}
-        scope = (f"the {len(sessions)} selected session(s)" if sessions
-                 else "all sessions")
-        key = _sel_key(animal, sess)
+        recs = recordings or None
+        sel = {"animal": animal, "sessions": sess, "recordings": recs,
+               "hours": hours, "win_hours": win_hours, "scroll": scroll,
+               "feature": feature, "roll_window": roll_window,
+               "config": cfg_dict or None}
+        if recs:
+            scope = f"{len(recs)} selected recording(s)"
+        elif sessions:
+            scope = f"the {len(sessions)} selected session(s)"
+        else:
+            scope = "all sessions"
+        key = _sel_key(animal, sess, recs)
         # Preview: read just the most recent recording for this selection
         # straight from evokedOutput (no cache, no warm) so the user can
         # confirm there's signal before committing to the full chronic load.
@@ -722,7 +819,7 @@ def register_callbacks(app, store, config: dict) -> None:
         if callback_context.triggered_id == "chronic-refresh-btn":
             _autoloaded.discard(key)
             _autoloaded.add(key)
-            _kick_warm(animal, sess, cfg_dict, force=True)
+            _kick_warm(animal, sess, cfg_dict, force=True, recordings=recs)
             return (empty_fig(f"Reloading {scope} for {animal} from "
                               f"evokedOutput…"),
                     "", f"Reloading {animal} from evokedOutput…", sel, False)
@@ -746,7 +843,7 @@ def register_callbacks(app, store, config: dict) -> None:
                     "", "No evoked data for this selection.", sel, True)
             # First time for this selection -> auto-load it.
             _autoloaded.add(key)
-            _kick_warm(animal, sess, cfg_dict)
+            _kick_warm(animal, sess, cfg_dict, recordings=recs)
             return (empty_fig(f"Loading {scope} for {animal} from "
                               f"evokedOutput…"),
                     "", f"Loading {animal} from evokedOutput…", sel, False)
@@ -848,15 +945,17 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("chronic-export-btn", "n_clicks"),
         State("chronic-animal-dropdown", "value"),
         State("chronic-session-dropdown", "value"),
+        State("chronic-recording-dropdown", "value"),
         State("chronic-config", "data"),
         prevent_initial_call=True,
     )
-    def _export(_n, animal, sessions, cfg_dict):
+    def _export(_n, animal, sessions, recordings, cfg_dict):
         from dash import no_update
         if not animal:
             return no_update, "Pick an animal, then ⬇ Export CSV."
         try:
-            rows, note = _export_rows(animal, sessions or None, cfg_dict)
+            rows, note = _export_rows(animal, sessions or None, cfg_dict,
+                                       recordings or None)
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             return no_update, f"Export failed: {e}"
         if not rows:
@@ -920,10 +1019,11 @@ def _config_key(cfg_dict) -> tuple:
     return tuple(getattr(f, k) for k in f.__dataclass_fields__)
 
 
-def _recompute_key(animal, sessions, cfg_dict) -> tuple:
+def _recompute_key(animal, sessions, cfg_dict, recordings=None) -> tuple:
     """Key for the in-memory custom-config row store (sidecars cover the
     default config; custom Configure settings are transient, kept in RAM)."""
-    return (animal, tuple(sorted(sessions or ())), _config_key(cfg_dict))
+    return (animal, tuple(sorted(sessions or ())),
+            tuple(sorted(recordings or ())), _config_key(cfg_dict))
 
 
 def _filter_by_hours(rows: list, hours) -> list:
@@ -957,6 +1057,10 @@ def _recording_means_for_selection(animal: str, files: list) -> list:
     their traces straight from disk -- the overlay is a lazy section)."""
     if not files:
         return []
+    ck = (animal, tuple(os.path.basename(f) for f in files))
+    hit = _MEANS_CACHE.get(ck)
+    if hit is not None:
+        return hit
     step = max(1, len(files) // _MAX_WAVEFORMS)
     out: list = []
     for fp in files[::step]:
@@ -974,6 +1078,9 @@ def _recording_means_for_selection(animal: str, files: list) -> list:
             out.append({"channel": ch, "rec_dt": rec_iso,
                         "n_epochs": int(tr.shape[0]),
                         "time_axis": t, "mean_trace": m, "std_trace": s})
+    _MEANS_CACHE[ck] = out
+    while len(_MEANS_CACHE) > _MEANS_CACHE_MAX:
+        _MEANS_CACHE.popitem(last=False)
     return out
 
 
@@ -996,18 +1103,29 @@ def _query_for_selection(sel: dict, need_means: bool = True):
     assert animal, "selection animal required"
     hours = sel.get("hours") or None
     sessions = sel.get("sessions") or None
+    recordings = sel.get("recordings") or None
     cfg = ef.FeatureConfig.from_dict(sel.get("config"))
-    files = _selection_files(animal, sessions)
+    files = _selection_files(animal, sessions, recordings)
     if cfg.is_passthrough():
-        rows: list = []
-        for fp in files:
-            sc = read_feature_sidecar(fp, animal)
-            if sc:
-                rows.extend(sc)
-        rows.sort(key=lambda r: r.get("abs_dt") or "")
+        ck = (animal, tuple(sorted(sessions or ())),
+              tuple(sorted(recordings or ())),
+              _warm_gen.get(animal, 0))
+        rows = _ROWS_CACHE.get(ck)
+        if rows is None:
+            rows = []
+            for fp in files:
+                sc = read_feature_sidecar(fp, animal)
+                if sc:
+                    rows.extend(sc)
+            rows.sort(key=lambda r: r.get("abs_dt") or "")
+            if rows:          # don't memo an empty pre-warm result
+                _ROWS_CACHE[ck] = rows
+                while len(_ROWS_CACHE) > _ROWS_CACHE_MAX:
+                    _ROWS_CACHE.popitem(last=False)
     else:
         rows = _RECOMPUTE_CACHE.get(
-            _recompute_key(animal, sessions, sel.get("config"))) or []
+            _recompute_key(animal, sessions, sel.get("config"),
+                            recordings)) or []
     rows = _filter_by_hours(rows, hours)
     means = (_recording_means_for_selection(animal, files)
              if need_means else [])
@@ -1099,7 +1217,7 @@ def _latest_preview_file(animal: str, sessions) -> str | None:
     assert animal, "animal required"
     sset = set(sessions) if sessions else None
     cands: list = []
-    for i, f in enumerate(list_evoked_files(_EVOKED_DIR)):
+    for i, f in enumerate(_list_files_cached()):
         assert i < 1000000, "evoked file scan runaway"
         if animal not in animals_in_filename(f):
             continue
@@ -1164,36 +1282,43 @@ def _build_preview(animal, sessions, feature, cfg_dict, overlays,
 _EXPORT_MAX_COMPUTE = 12
 
 
-def _selection_files(animal: str, sessions) -> list:
-    """evokedOutput files for *animal* (optionally restricted to *sessions*),
-    oldest recording first."""
+def _selection_files(animal: str, sessions, recordings=None) -> list:
+    """evokedOutput files for *animal*, oldest recording first. Optionally
+    restricted to *sessions* and/or an explicit *recordings* subset (file
+    basenames) -- both applied here, before any sidecar/.mat read, so the
+    subset cuts I/O for every load path that funnels through this."""
     assert animal, "animal required"
     sset = set(sessions) if sessions else None
+    rset = set(recordings) if recordings else None
     out: list = []
-    for i, f in enumerate(list_evoked_files(_EVOKED_DIR)):
+    for i, f in enumerate(_list_files_cached()):
         assert i < 1000000, "evoked file scan runaway"
         if animal not in animals_in_filename(f):
             continue
         if sset is not None and parse_session(f) not in sset:
             continue
+        if rset is not None and os.path.basename(f) not in rset:
+            continue
         out.append(f)
     return sorted(out, key=lambda f: parse_recording_dt(f) or datetime.min)
 
 
-def _export_rows(animal: str, sessions, cfg_dict) -> tuple:
+def _export_rows(animal: str, sessions, cfg_dict, recordings=None) -> tuple:
     """Per-epoch feature rows for the selection -> (rows, note).
 
     Cache first (instant when ▶ Plot warmed it). Otherwise sidecar-first per
     file (Preview writes those), computing+writing at most
     ``_EXPORT_MAX_COMPUTE`` missing files so a cold export never hangs.
+    Honours the recording subset so the CSV matches what was loaded.
     """
     assert animal, "animal required"
     cfg = ef.FeatureConfig.from_dict(cfg_dict)
     cached = _query_for_selection({"animal": animal, "sessions": sessions,
+                                   "recordings": recordings,
                                    "config": cfg_dict}, need_means=False)[0]
     if cached:
         return cached, ""
-    files = _selection_files(animal, sessions)
+    files = _selection_files(animal, sessions, recordings)
     rows: list = []
     computed = 0
     skipped = 0
@@ -1344,6 +1469,7 @@ def _plot_key(sel: dict) -> tuple:
     relayout callback can fetch exactly the arrays the plot was built from."""
     assert isinstance(sel, dict), "selection must be a dict"
     return (sel.get("animal") or "", tuple(sorted(sel.get("sessions") or [])),
+            tuple(sorted(sel.get("recordings") or [])),
             sel.get("feature") or "", sel.get("hours") or 0,
             sel.get("win_hours") or 0, round(float(sel.get("scroll") or 0), 4),
             sel.get("roll_window") or 0, _config_key(sel.get("config")))
