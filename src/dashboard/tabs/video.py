@@ -308,6 +308,32 @@ def _ma_animal_from_picker(animal_value: str | None
     return ids[0] if ids else None
 
 
+def _animal_for_channel(store, file_id, channel) -> str | None:
+    """Animal id for the selected LFP channel's electrode (e.g.
+    'BCH062SLM' -> 'BCH062'), or None when the channel isn't an animal
+    channel. This is the PHYSICAL ground truth for which animal an onset
+    belongs to -- the onset is dropped on this channel's trace -- so review
+    writes scope by this rather than the queue-navigation picker."""
+    if channel is None or file_id is None:
+        return None
+    try:
+        session_dir = _session_dir_for_file(store, int(file_id))
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT channel_names FROM session_config "
+                "WHERE session_dir = ?", (session_dir,)).fetchone()
+        if not row or not row["channel_names"]:
+            return None
+        names = json.loads(row["channel_names"])
+        ch = int(channel)
+        if 0 <= ch < len(names) and is_animal_channel(names[ch]):
+            animal, _ = split_animal_electrode(names[ch])
+            return animal
+    except Exception:  # noqa: BLE001 -- best-effort; None blocks the write
+        return None
+    return None
+
+
 def _pi_flag_note_for_file(store, file_id: int) -> str:
     """Return the most-recent ``pi_flag`` note for *file_id* or
     an empty string if there isn't one.
@@ -5125,7 +5151,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Verification tab. This is the second-layer safety net
         # the lab asked for.
         markers_payload = events if decision == "has_events" else None
-        animal = _ma_animal_from_picker(animal_value)
+        # The review is filed against the animal whose channel was scored
+        # (the onsets are on that electrode), NOT the queue picker -- and we
+        # never write a file-wide (animal-less) row.
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            return ("Pick the animal's brain channel (Step 1) before "
+                     "saving — the review is filed per animal, not "
+                     "per file.", *nop[1:])
         try:
             store.mark_review(
                 int(file_id), email, "pending_pi_review",
@@ -5227,6 +5260,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not has_eo:
             return ("Drop at least one EEG onset (EO) before exporting.",
                     no_update, no_update, no_update, no_update)
+        # Both the CSV row AND the needs-scoring flag are scoped to the
+        # scored channel's animal -- one source, never file-wide.
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            return ("Pick the animal's brain channel (Step 1) before "
+                     "exporting — onsets are filed per animal.",
+                    no_update, no_update, no_update, no_update)
         try:
             n_rows, csv_name = _export_partial_csv(
                 store, config, int(file_id), channel, events,
@@ -5239,7 +5279,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Keep the file flagged: drafts + needs_scoring (same pool as the
         # quick-flag path), with a note recording the preliminary export.
         drafts = [{**e, "draft": True} for e in events]
-        animal = _ma_animal_from_picker(animal_value)
         try:
             store.mark_review(
                 int(file_id), email, "needs_scoring", markers=drafts,
