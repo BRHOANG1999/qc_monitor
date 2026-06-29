@@ -387,6 +387,11 @@ video_transcode:
   cache_dir: secrets/avi_mp4_cache
   cache_max_gb: 10
   reencode_timeout_sec: 1800
+  # The lab's behavioral cameras record at ~5 fps but the .avi container
+  # usually MISREPORTS the rate, so the video plays at the wrong speed and
+  # the LFP cursor-sync drifts. Reinterpret every transcode at this rate
+  # (re-encode; stream-copy can't retime). 0/null = trust the .avi metadata.
+  force_fps: 5
 
 # BHZ_DETECTOR-compatible CSV export. Each completed Mark-done
 # in Video Review appends rows here so the lab's downstream

@@ -66,15 +66,28 @@ def _cache_max_gb(config: dict) -> float:
     return float(_cfg(config).get("cache_max_gb", 10))
 
 
+def _force_fps(config: dict) -> float:
+    """Frame rate to reinterpret every transcode at (the .avi metadata is
+    unreliable). Default 5 fps -- the lab's behavioral-camera rate. 0/null
+    trusts the source metadata (and re-enables the stream-copy fast path)."""
+    raw = _cfg(config).get("force_fps", 5)
+    try:
+        return max(0.0, float(raw)) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 5.0
+
+
 def cache_path(avi_path: str, config: dict) -> Path:
     """Content-addressed mp4 cache path for *avi_path* (keyed by path + mtime
-    + size so a re-recorded file re-transcodes)."""
+    + size + forced fps, so a re-recorded file -- or a change to force_fps --
+    re-transcodes instead of serving a stale wrong-rate mp4)."""
     assert avi_path, "avi_path required"
+    fps = _force_fps(config)
     try:
         st = os.stat(avi_path)
-        sig = f"{avi_path}|{int(st.st_mtime)}|{st.st_size}"
+        sig = f"{avi_path}|{int(st.st_mtime)}|{st.st_size}|fps{fps:g}"
     except OSError:
-        sig = avi_path
+        sig = f"{avi_path}|fps{fps:g}"
     h = hashlib.sha1(sig.encode("utf-8", "replace")).hexdigest()[:20]
     return cache_dir(config) / f"{h}.mp4"
 
@@ -152,6 +165,24 @@ def _transcode(avi_path: str, cp: Path, config: dict) -> None:
     cp.parent.mkdir(parents=True, exist_ok=True)
     tmp = cp.with_suffix(".tmp.mp4")
     ffmpeg = _ffmpeg_bin(config)
+    fps = _force_fps(config)
+    if fps > 0:
+        # Forced rate: the .avi's fps metadata is usually wrong, so
+        # reinterpret the frames at *fps* (-r BEFORE -i) and re-encode --
+        # stream-copy can't retime, so there's no fast path here. This makes
+        # the mp4's duration correct so the LFP cursor-sync lines up.
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-r", f"{fps:g}",
+               "-i", avi_path, "-an", "-c:v", "libx264", "-preset",
+               "veryfast", "-crf", "23", "-movflags", "+faststart", str(tmp)]
+        timeout = float(_cfg(config).get("reencode_timeout_sec", 1800))
+        logger.info("transcoding %s @ %g fps -> %s", avi_path, fps, cp)
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=timeout)
+        if res.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            snippet = (res.stderr or "")[-300:]
+            raise RuntimeError(f"ffmpeg exit {res.returncode}: {snippet}")
+        os.replace(tmp, cp)
+        return
     codec = _probe_codec(avi_path, config)
     base = [ffmpeg, "-y", "-loglevel", "error", "-i", avi_path, "-an",
             "-movflags", "+faststart"]

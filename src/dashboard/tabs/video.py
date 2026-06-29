@@ -691,7 +691,8 @@ def _apply_mmss_xaxis(fig: go.Figure, t_max: float) -> None:
 
 
 def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
-                       uirevision: str | None = None) -> go.Figure:
+                       uirevision: str | None = None,
+                       title: str | None = None) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scattergl(
         x=t, y=signal,
@@ -734,6 +735,13 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         showlegend=False,
         hovermode="x unified",
     )
+    # Optional title (e.g. the animal we're looking at) -- needs a little
+    # top margin so it doesn't collide with the trace.
+    if title:
+        fig.update_layout(
+            title=dict(text=title, x=0.5, xanchor="center", y=0.98,
+                       yanchor="top", font=dict(size=12, color="#cfd0d6")),
+            margin=dict(l=60, r=20, t=26, b=40))
     # mm:ss tick labels so long recordings stay readable; hover still
     # shows exact seconds via the per-trace hovertemplate.
     if t is not None and len(t):

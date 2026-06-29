@@ -257,8 +257,13 @@ def _build_figures(store: Store, file_id: int, channel: int,
             file_path, channel,
             stim_times=stim_times if (stim_times is not None
                                        and len(stim_times)) else None)
+        # Name the animal whose LFP this is, right on the trace.
+        _cname, _animal = _channel_animal(store, session_dir, channel,
+                                          file_path)
+        ttl = (f"{_animal} · Ch{channel}" if _animal else f"Ch{channel}")
         lfp = _build_lfp_figure(t, sig, label=f"Ch{channel}",
-                                 uirevision=f"train:{file_id}:{channel}")
+                                 uirevision=f"train:{file_id}:{channel}",
+                                 title=ttl)
     except Exception:
         lfp = _empty_lfp_fig("LFP failed to load.")
         dur = 0.0
