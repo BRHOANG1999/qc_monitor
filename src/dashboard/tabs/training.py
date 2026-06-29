@@ -313,7 +313,20 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     mat_path = _file_path_for_id(store, file_id)
     fname = os.path.basename(mat_path) if mat_path else f"file #{file_id}"
     session_dir = _session_dir_for_file(store, file_id)
-    channel = _first_animal_channel(store, session_dir, mat_path)
+    # Show the channel of the animal whose validated answer carries the
+    # seizure -- on a multi-animal recording the seizure may be on the 2nd
+    # animal, not the default 'recording' electrode. Falls back to the
+    # recording channel for negatives / un-attributed approvals so the LFP,
+    # the validated ground truth, and the grading all agree on one animal.
+    gt_animal = store.validated_seizure_animal_for_file(file_id)
+    if gt_animal:
+        from src.utils.mass_analyze import animal_channel_index
+        channel = animal_channel_index(store, session_dir, gt_animal)
+        validated = store.validated_events_for_file(file_id,
+                                                     animal_id=gt_animal)
+    else:
+        channel = _first_animal_channel(store, session_dir, mat_path)
+        validated = store.validated_events_for_file(file_id)
     chan_name, animal = _channel_animal(store, session_dir, channel, mat_path)
     lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
     # Stamp the measured length so the min-duration gate becomes real for
@@ -321,7 +334,7 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     if lfp_dur:
         store.set_file_duration(file_id, lfp_dur)
     cur = {"file_id": file_id, "channel": channel,
-           "validated": store.validated_events_for_file(file_id),
+           "validated": validated,
            "session_dir": session_dir, "lfp_dur": lfp_dur,
            "filename": fname, "animal": animal, "channel_name": chan_name}
     who = f"{animal} · Ch{channel} {chan_name}" if animal else \

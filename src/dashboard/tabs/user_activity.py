@@ -222,8 +222,20 @@ def _train_review_panel(store: Store, attempt_id: int):
     from src.dashboard.tabs.training import (
         _build_figures, _first_animal_channel, _events_table)
     file_id = a.get("file_id")
-    channel = _first_animal_channel(store, a.get("session_dir"),
-                                     a.get("file_path"))
+    session_dir = a.get("session_dir")
+    # Same animal the student saw in Training: the seizure animal's channel
+    # (not the default recording electrode), so the LFP shown here matches
+    # the validated answer being graded.
+    gt_animal = store.validated_seizure_animal_for_file(int(file_id))
+    if gt_animal:
+        from src.utils.mass_analyze import animal_channel_index
+        channel = animal_channel_index(store, session_dir, gt_animal)
+        validated = store.validated_events_for_file(int(file_id),
+                                                    animal_id=gt_animal)
+    else:
+        channel = _first_animal_channel(store, session_dir,
+                                        a.get("file_path"))
+        validated = store.validated_events_for_file(int(file_id))
     lfp, hil, _dur = _build_figures(store, int(file_id), channel, "hilbert")
     try:
         answer = json.loads(a.get("submitted_json") or "{}")
@@ -233,18 +245,18 @@ def _train_review_panel(store: Store, attempt_id: int):
         breakdown = json.loads(a.get("breakdown_json") or "{}")
     except (json.JSONDecodeError, TypeError):
         breakdown = {}
-    validated = store.validated_events_for_file(int(file_id))
     student_events = answer.get("events") or []
     _overlay_onsets(lfp, student_events, validated)
 
     pct = round((a.get("agreement") or 0) * 100)
     fname = (os.path.basename(a["file_path"]) if a.get("file_path")
              else f"file #{file_id}")
+    who = f"{gt_animal} · Ch{channel}" if gt_animal else f"Ch{channel}"
     header = html.Div([
         html.Span(f"{pct}%", style={"fontSize": "24px", "fontWeight": "800",
                                      "color": _pct_color(pct)}),
         html.Span(f"  {a.get('student_email')}  ·  Stage {a.get('stage')}"
-                  f"  ·  {fname}",
+                  f"  ·  {who}  ·  {fname}",
                   style={"color": "#cfd0d6", "fontSize": "13px"}),
     ], style={"marginBottom": "6px"})
     legend = html.Div(

@@ -3511,8 +3511,8 @@ class Store:
     def validated_events_for_file(self, file_id: int,
                                    animal_id: str | None = None) -> list:
         """PI-approved markers (the training ground truth) for one file. When
-        *animal_id* is given, that animal's approved row (or a legacy whole-file
-        NULL row); otherwise the latest approved row for the file."""
+        *animal_id* is given, strictly that animal's approved row; otherwise
+        the latest approved row for the file across any animal."""
         assert file_id is not None, "file_id required"
         conn = self._connect()
         try:
@@ -3538,6 +3538,42 @@ class Store:
                 return []
         # Fallback: a historical scored example carries the lab's answer.
         return self._external_markers_for_file(file_id)
+
+    def validated_seizure_animal_for_file(self, file_id: int) -> str | None:
+        """The animal whose PI-approved answer for this file carries the
+        seizure (highest-Racine real event), so Training shows THAT animal's
+        channel -- a multi-animal recording's seizure may be on the second
+        animal, not the default 'recording' electrode. Falls back to the
+        latest approved animal, else None (no per-animal approved row)."""
+        assert file_id is not None, "file_id required"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT animal_id, markers_json FROM review_state "
+                "WHERE file_id=? AND status='pi_approved' "
+                "AND animal_id IS NOT NULL "
+                "ORDER BY updated_at DESC",
+                (int(file_id),)).fetchall()
+        finally:
+            conn.close()
+        from src.utils.training import _real_events
+        latest = None
+        best_animal = None
+        best_racine = -1
+        for r in rows:
+            if latest is None:
+                latest = r["animal_id"]          # newest approved animal
+            try:
+                events = json.loads(r["markers_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                events = []
+            real = _real_events(events)
+            if real:
+                racine = max((e.get("racine") or 0) for e in real)
+                if racine > best_racine:
+                    best_racine = racine
+                    best_animal = r["animal_id"]
+        return best_animal or latest
 
     def _external_markers_for_file(self, file_id: int) -> list:
         conn = self._connect()
