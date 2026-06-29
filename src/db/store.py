@@ -3968,7 +3968,8 @@ class Store:
                        key=lambda d: -d["n_unreviewed"])
 
     def behavioral_seizure_status_per_animal(self,
-                                                  days: int = 7
+                                                  days: int = 7,
+                                                  exclude: list[str] | None = None
                                                   ) -> list[dict]:
         """Per-animal pipeline state for the Overview status card.
 
@@ -3992,6 +3993,9 @@ class Store:
         One round-trip; SQL does the join + aggregation.
         """
         assert isinstance(days, int) and days > 0, "days > 0"
+        # Case-insensitive substring exclusions (e.g. drop the 'Randles'
+        # subject from the seizure-status card).
+        excl = [e.lower() for e in (exclude or []) if e]
         cutoff_iso = (datetime.now()
                        - timedelta(days=days)).isoformat()
         conn = self._connect()
@@ -4036,6 +4040,9 @@ class Store:
             assert i < max_iter, "row scan runaway"
             animals = self._animal_ids_for_config(
                 r["channel_names"], r["eeg_channels"])
+            if excl:
+                animals = [a for a in animals
+                            if not any(e in a.lower() for e in excl)]
             chunk_dt = r["chunk_datetime"] or ""
             file_rows = rev_by_file.get(int(r["file_id"]), [])
             for a in animals:

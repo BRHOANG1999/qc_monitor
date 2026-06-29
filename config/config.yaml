@@ -332,6 +332,12 @@ slow_gamma:
 # Features are computed once per recording and stored as JSON sidecars next to
 # each *_evoked.mat (no database); later reads are instant. evoked_output_dir
 # defaults to <stimnet_root>/evokedOutput.
+overview:
+  # Subjects to omit from the behavioral-seizure status card
+  # (case-insensitive substring match). 'Randles' is a non-experimental
+  # subject. Defaults to ["Randles"] even if this key is absent.
+  exclude_animals:
+    - Randles
 chronic_evoked:
   evoked_output_dir: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/evokedOutput
   # Compute the heavy per-epoch features (recovery tau/slope, template

@@ -2131,7 +2131,7 @@ def _overview_tab(store: Store, config: dict | None = None):
     # below breaks it down per animal so the user can spot
     # which animal is the bottleneck.
     bsz_status = html.Div(
-        _build_behavioral_seizure_status_card(store),
+        _build_behavioral_seizure_status_card(store, config),
         id="overview-bsz-status",
         style={"marginBottom": "12px"},
     )
@@ -2380,7 +2380,16 @@ def _overview_tab(store: Store, config: dict | None = None):
     ])
 
 
-def _build_behavioral_seizure_status_card(store):
+def _excluded_animals(config) -> list[str]:
+    """Subjects to omit from the behavioral-seizure status card. Defaults
+    to excluding 'Randles' (a non-experimental subject); overridable via
+    config.overview.exclude_animals."""
+    ov = (config or {}).get("overview", {}) or {}
+    val = ov.get("exclude_animals")
+    return list(val) if isinstance(val, list) else ["Randles"]
+
+
+def _build_behavioral_seizure_status_card(store, config=None):
     """Per-animal behavioral seizure analysis status.
 
     Designed so the user can answer two questions at a glance:
@@ -2390,7 +2399,8 @@ def _build_behavioral_seizure_status_card(store):
     Sorted so animals with the steepest backlog growth float
     to the top.
     """
-    rows = store.behavioral_seizure_status_per_animal(days=7)
+    rows = store.behavioral_seizure_status_per_animal(
+        days=7, exclude=_excluded_animals(config))
     if not rows:
         return html.Div(
             "No animals ingested yet.",
@@ -2646,7 +2656,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _bsz_view(view):
-        rows = store.behavioral_seizure_status_per_animal(days=7)
+        rows = store.behavioral_seizure_status_per_animal(
+            days=7, exclude=_excluded_animals(config))
         if not rows:
             return no_update
         return _bsz_charts(rows) if view == "charts" else _bsz_cards(rows)
