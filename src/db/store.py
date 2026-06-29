@@ -139,6 +139,9 @@ class Store:
         # review_event_log, and a composite-PK file_claim.
         self._migrate_review_add_animal_id(conn)
         self._migrate_file_claim_animal(conn)
+        # Backfill legacy whole-file (animal_id IS NULL) review rows so
+        # they stop matching every animal of a multi-animal recording.
+        self._migrate_review_backfill_animal(conn)
         # Reap mass_analyze_job rows stuck in 'running' across a
         # restart -- without this they'd never re-progress because
         # the worker that started them no longer exists. Safe to
@@ -339,6 +342,32 @@ class Store:
         if "animal_id" not in log_cols:
             conn.execute(
                 "ALTER TABLE review_event_log ADD COLUMN animal_id TEXT")
+
+    def _migrate_review_backfill_animal(self, conn) -> None:
+        """Attribute legacy whole-file review_state rows (animal_id IS NULL)
+        to their file's FIRST animal channel -- the same convention PI-
+        finalize uses for NULL rows -- so a historical flag stops matching
+        EVERY animal of a multi-animal recording. Rows on files with no
+        animal channel are left NULL (can't attribute). Idempotent: once a
+        row has an animal_id it no longer matches the NULL scan."""
+        try:
+            rows = conn.execute(
+                """SELECT rs.id AS rid, sc.channel_names, sc.eeg_channels
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   JOIN session_config sc ON sc.session_dir = pf.session_dir
+                   WHERE rs.animal_id IS NULL"""
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        for r in rows:
+            animals = Store._animal_ids_for_config(
+                r["channel_names"], r["eeg_channels"])
+            if not animals:
+                continue
+            conn.execute(
+                "UPDATE review_state SET animal_id = ? WHERE id = ?",
+                (animals[0], r["rid"]))
 
     def _migrate_file_claim_animal(self, conn) -> None:
         """Rebuild file_claim with a composite ``(file_id, animal_id)`` PK so a
