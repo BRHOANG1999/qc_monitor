@@ -338,6 +338,9 @@ overview:
   # subject. Defaults to ["Randles"] even if this key is absent.
   exclude_animals:
     - Randles
+  # Default count for the "Recent recordings" evoked overlay (the N input
+  # on the card overrides it live). Default 24 if absent.
+  hist_recordings: 24
 chronic_evoked:
   evoked_output_dir: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/evokedOutput
   # Compute the heavy per-epoch features (recovery tau/slope, template

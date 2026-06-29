@@ -845,8 +845,27 @@ def _latest_evoked_from_output(config: dict | None) -> tuple[list[dict], str]:
 #  "Computing... (n/24)" state. Mirrors chronic_evoked's _kick_warm /
 #  _warm_worker / chronic-warm-poll pattern.
 # ------------------------------------------------------------------ #
-_HIST24_N = 24
+_HIST24_N = 24               # default; overridable via UI + config
+_HIST24_MAX = 500            # hard cap (NASA Rule 2 loop bound)
 _HIST24_LOCK = threading.Lock()
+
+
+def _hist24_default_n(config: dict | None) -> int:
+    """Default recording count for the recent-recordings overlay --
+    config.overview.hist_recordings, else _HIST24_N."""
+    ov = (config or {}).get("overview", {}) or {}
+    try:
+        return max(1, min(int(ov.get("hist_recordings", _HIST24_N)),
+                          _HIST24_MAX))
+    except (TypeError, ValueError):
+        return _HIST24_N
+
+
+def _clamp_hist_n(n) -> int:
+    try:
+        return max(1, min(int(n), _HIST24_MAX))
+    except (TypeError, ValueError):
+        return _HIST24_N
 # Published atomically by the worker; readers compare sig before use.
 _HIST24_CACHE: dict = {"sig": None, "per_ch": None}
 _HIST24_PROGRESS: dict = {"done": 0, "total": 0, "phase": "idle", "sig": None}
@@ -865,12 +884,13 @@ def _safe_mtime(path: str) -> float:
         return 0.0
 
 
-def _hist24_file_set(config: dict | None):
-    """The last _HIST24_N evoked recordings (time-ordered) + a (path, mtime)
+def _hist24_file_set(config: dict | None, n: int | None = None):
+    """The last *n* evoked recordings (time-ordered) + a (path, mtime)
     signature. Cheap enough for the callback thread. Returns ``(sig, files)``
-    with ``files = [(path, dt), ...]`` oldest->newest, or ``(None, [])``."""
+    with ``files = [(path, dt), ...]`` oldest->newest, or ``(None, [])``.
+    *n* defaults to the config value (clamped to [1, _HIST24_MAX])."""
     assert config is None or isinstance(config, dict), "config dict|None"
-    assert _HIST24_N > 0, "_HIST24_N must be positive"
+    n = _clamp_hist_n(n if n is not None else _hist24_default_n(config))
     ce = (config or {}).get("chronic_evoked", {}) or {}
     try:
         from src.utils.evoked_output import (
@@ -884,7 +904,7 @@ def _hist24_file_set(config: dict | None):
     if not dated:
         return None, []
     dated.sort(key=lambda t: t[0])                       # oldest -> newest
-    files = [(f, d) for d, f in dated[-_HIST24_N:]]
+    files = [(f, d) for d, f in dated[-n:]]
     sig = tuple((p, _safe_mtime(p)) for p, _ in files)
     return sig, files
 
@@ -926,7 +946,7 @@ def _hist24_worker(sig, files) -> None:
         n = len(files)
         per_ch: dict[str, list[dict]] = {}
         for i, (path, dt) in enumerate(files):
-            assert i < _HIST24_N, "hist24 file loop runaway"
+            assert i < _HIST24_MAX, "hist24 file loop runaway"
             _set_hist24_progress(i, n, "reading", sig)
             wfs = _hist24_file_waveforms(path, dt)
             for wf in wfs:
@@ -994,7 +1014,7 @@ def _yrange_pad_multi(traces, x0: float, x1: float,
     assert x0 < x1, "x0 < x1"
     vals: list = []
     for i, (t, m) in enumerate(traces):
-        assert i < _HIST24_N, "hist24 yrange loop runaway"
+        assert i < _HIST24_MAX, "hist24 yrange loop runaway"
         if not t or not m or len(t) != len(m):
             continue
         vals.extend(
@@ -1020,7 +1040,7 @@ def _hist24_add_channel(fig, ri, ch, recs, stim_x0, stim_x1, ex0, ex1,
     assert recs, "recs required"
     colors = _turbo_ramp(len(recs))
     for j, rec in enumerate(recs):
-        assert j < _HIST24_N, "hist24 overlay loop runaway"
+        assert j < _HIST24_MAX, "hist24 overlay loop runaway"
         t, m = rec["time_axis_ms"], rec["mean_trace"]
         if not t or not m:
             continue
@@ -1101,8 +1121,10 @@ def _build_hist24_overlay(per_ch: dict, config: dict | None) -> list:
     fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=1)
     fig.update_xaxes(title_text="Time (ms)", row=n_ch, col=2)
     _hist24_colorbar(fig)
+    n_recs = max((len(v) for v in per_ch.values()), default=0)
     fig.update_layout(
-        title=dict(text="Latest Evoked — last 24 recordings (oldest→newest)",
+        title=dict(text=f"Latest Evoked — last {n_recs} recordings "
+                        "(oldest→newest)",
                    font=dict(size=11), x=0.5, xanchor="center", y=0.985,
                    yanchor="top"),
         autosize=True, margin=dict(l=42, r=130, t=44, b=32), showlegend=False)
@@ -1124,10 +1146,11 @@ def _hist24_placeholder(prog: dict):
                "justifyContent": "center", "minHeight": "300px"})
 
 
-def _hist24_render(config: dict | None):
-    """``(children, poll_disabled)`` for the Last-24 mode. Cache hit -> overlay
-    + poll off; miss -> kick the worker, show 'Computing...' + poll on."""
-    sig, files = _hist24_file_set(config)
+def _hist24_render(config: dict | None, n: int | None = None):
+    """``(children, poll_disabled)`` for the recent-recordings mode. Cache hit
+    -> overlay + poll off; miss -> kick the worker, show 'Computing...' + poll
+    on. *n* = how many recent recordings to overlay (defaults to config)."""
+    sig, files = _hist24_file_set(config, n)
     if sig is None:
         return [html.Div("No evoked recordings found.",
                          style={"color": "#888", "padding": "12px"})], True
@@ -2162,7 +2185,7 @@ def _overview_tab(store: Store, config: dict | None = None):
                 {"label": " Mean", "value": "mean"},
                 {"label": " Mean ± SEM", "value": "sem"},
                 {"label": " Overlay all files", "value": "overlay"},
-                {"label": " Last 24 recordings", "value": "hist24"},
+                {"label": " Recent recordings", "value": "hist24"},
             ],
             value="mean",
             inline=True,
@@ -2170,6 +2193,17 @@ def _overview_tab(store: Store, config: dict | None = None):
                          "marginRight": "16px"},
             inputStyle={"marginRight": "4px"},
         ),
+        # How many recent recordings the overlay spans (only used in the
+        # 'Recent recordings' mode). Defaults from config.overview.
+        html.Span("  N: ", style={"color": "#888", "fontSize": "12px",
+                                    "marginLeft": "8px"}),
+        dcc.Input(id="overview-hist24-n", type="number", min=1,
+                  max=_HIST24_MAX, step=1, value=_hist24_default_n(config),
+                  debounce=True,
+                  style={"width": "64px", "backgroundColor": "#262638",
+                          "color": "#f0f0f5",
+                          "border": "1px solid #444",
+                          "borderRadius": "4px", "fontSize": "12px"}),
     ], style={"marginTop": "16px", "marginBottom": "4px"})
     waveform_thumbnail = html.Div([
         trace_mode_radio,
@@ -2696,11 +2730,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("overview-trace-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("overview-hist24-poll", "n_intervals"),
+        Input("overview-hist24-n", "value"),
     )
-    def refresh_overview_thumbnail(trace_mode, _n, _poll):
+    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n):
         mode = trace_mode or "mean"
         if mode == "hist24":
-            return _hist24_render(config)
+            return _hist24_render(config, hist_n)
         sessions = store.get_sessions()
         session_dir = sessions[0]["session_dir"] if sessions else ""
         return _build_overview_thumbnail(
