@@ -548,6 +548,11 @@ def render_events_panel() -> html.Div:
         # through Patch-style copy-on-write so the renderer
         # callback below sees the latest snapshot.
         dcc.Store(id="video-events-store", data=[]),
+        # Per-(file, animal) draft stash so switching the scored channel
+        # (=> animal) in a multi-animal recording keeps each animal's
+        # onsets separate within a session. Keyed "<file_id>:<animal>".
+        dcc.Store(id="video-events-by-animal", data={}),
+        dcc.Store(id="video-events-current-key", data=None),
     ])
 
 

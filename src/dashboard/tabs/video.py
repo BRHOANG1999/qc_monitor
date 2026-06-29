@@ -4159,33 +4159,57 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # change in video_events.py.
     _events.register_callbacks(app, store)
 
-    # Reset the events list when the file dropdown changes -- but if
-    # the file was quick-flagged ('needs_scoring'), PREFILL its draft
-    # events so the second pass continues where pass 1 left off.
+    # Re-scope the events draft when the FILE or the scored CHANNEL
+    # (=> animal) changes. Each (file, animal) keeps its own draft: the
+    # outgoing animal's onsets are stashed and the incoming animal's are
+    # restored (from the in-session stash, else prefilled from a saved
+    # 'needs_scoring' draft). So animal A's onsets never bleed into B on a
+    # multi-animal recording. Driven by the channel, matching how reviews
+    # are filed (_animal_for_channel), not the queue picker.
     @app.callback(
-        Output("video-events-store", "data",
-                allow_duplicate=True),
+        Output("video-events-store", "data", allow_duplicate=True),
+        Output("video-events-by-animal", "data"),
+        Output("video-events-current-key", "data"),
         Input("video-file-dropdown", "value"),
-        State("video-queue-animal", "value"),
+        Input("video-channel-dropdown", "value"),
+        State("video-events-store", "data"),
+        State("video-events-by-animal", "data"),
+        State("video-events-current-key", "data"),
         prevent_initial_call=True,
     )
-    def _reset_events_on_file_change(file_id, picker_value):
+    def _rescope_events(file_id, channel, cur_events, by_animal, cur_key):
+        by_animal = dict(by_animal or {})
         if not file_id:
-            return []
-        try:
-            latest = store.get_review_state(
-                int(file_id),
-                animal_id=_ma_animal_from_picker(picker_value))
-        except Exception:
-            latest = None
-        if latest and latest.get("status") == "needs_scoring":
+            return [], by_animal, None
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            # Non-animal channel (e.g. stim copy) -> don't swap; the draft
+            # stays put (it can't be saved without an animal channel).
+            return no_update, no_update, no_update
+        new_key = f"{int(file_id)}:{animal}"
+        if new_key == cur_key:
+            return no_update, no_update, no_update
+        # Stash the outgoing draft under its key.
+        if cur_key:
+            by_animal[cur_key] = list(cur_events or [])
+        # Restore: in-session stash first, else the saved needs_scoring draft.
+        if new_key in by_animal:
+            new_events = by_animal[new_key]
+        else:
+            new_events = []
             try:
-                drafts = json.loads(latest.get("markers_json") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                drafts = []
-            if isinstance(drafts, list) and drafts:
-                return drafts
-        return []
+                latest = store.get_review_state(int(file_id),
+                                                 animal_id=animal)
+            except Exception:
+                latest = None
+            if latest and latest.get("status") == "needs_scoring":
+                try:
+                    drafts = json.loads(latest.get("markers_json") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    drafts = []
+                if isinstance(drafts, list):
+                    new_events = drafts
+        return new_events, by_animal, new_key
 
     # ---- Track D: multi-camera focus selector ---- #
     # The focused-cam index (1-based) lives in video-focus-cam.
