@@ -48,6 +48,12 @@ from src.dashboard.tabs.video import (
     _file_path_for_id, _decimated_lfp, _build_lfp_figure,
     _render_hilbert_trace, _render_auc_trace, _empty_lfp_fig,
     _session_dir_for_file, _stim_times_for_file, _stim_copy_channels)
+# Pure, id-agnostic helpers so Training's scoring matches Video Review's
+# exactly (drop-on-LFP onset capture, Racine 1-8, landmark labels) without
+# touching video_events.py -- Video Review stays untouched.
+from src.dashboard.tabs.video_events import (
+    RACINE_STAGES as _RACINE_STAGES, required_fields as _required_fields,
+    _field_label as _lm_label, _to_lfp_seconds, LANDMARK_COLORS as _LM_COLORS)
 
 logger = logging.getLogger("qc_monitor.dashboard.training")
 
@@ -448,6 +454,11 @@ def _events_table(events: list, title: str, color: str) -> html.Div:
                              style={"fontSize": FONT_SIZE_CAPTION,
                                      "color": COLOR_TEXT_SECONDARY,
                                      "padding": "2px 0"}))
+        note = (e.get("score_comment") or "").strip()
+        if note:
+            rows.append(html.Div(f"“{note}”", style={
+                "fontSize": FONT_SIZE_CAPTION, "color": COLOR_TEXT_TERTIARY,
+                "fontStyle": "italic", "padding": "0 0 2px 12px"}))
     if not rows:
         rows = [html.Div("No events.",
                          style={"fontSize": FONT_SIZE_CAPTION,
@@ -654,6 +665,12 @@ def layout(store: Store, config: dict | None = None):
                                                    #  validated events,
                                                    #  lfp_dur, ...}
         dcc.Store(id="training-events", data=[]),  # student events
+        # Which (event idx, landmark field) the next LFP click will set;
+        # None = a click just seeks the video. Mirrors video-armed-landmark.
+        dcc.Store(id="training-armed-landmark", data=None),
+        # The <video> element's duration, kept fresh by a clientside tick so
+        # "Drop at video time" can scale the playhead to LFP seconds.
+        dcc.Store(id="training-video-duration", data=None),
         dcc.Store(id="training-refresh", data=0),  # bump -> roster/badge
         dcc.Store(id="training-is-pi", data=bool(is_pi)),
 
@@ -782,17 +799,25 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("training-form", "children"),
         Input("training-stage", "value"),
         Input("training-events", "data"),
+        Input("training-armed-landmark", "data"),
     )
-    def _render_form(stage, events):
+    def _render_form(stage, events, armed):
         # The stage-1 detection radio is permanent in the layout (toggled by
         # _toggle_impression), so for stage 1 this form area is empty.
         stage = int(stage or 1)
         if stage == 1:
             return ""
         # Stages 2 / 3: event rows + add button.
-        rows = [_event_row(e, i, stage)
+        banner = []
+        if isinstance(armed, dict) and armed.get("field"):
+            banner = [html.Div(
+                f"Armed: click the LFP or Hilbert trace to set "
+                f"{armed['field']} for Event {int(armed.get('idx', 0)) + 1}.",
+                style={"color": COLOR_ACCENT, "fontSize": FONT_SIZE_CAPTION,
+                       "fontWeight": "600", "marginBottom": SPACE_2})]
+        rows = [_event_row(e, i, stage, armed)
                 for i, e in enumerate(events or [])]
-        return html.Div([
+        return html.Div(banner + [
             html.Div(rows or [html.Div(
                 "No events added. If you think this recording has no "
                 "BHZ, just submit. Otherwise add one.",
@@ -820,6 +845,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _reset_detect(_current):
         return None
 
+    # ---- Disarm any armed landmark when a new example loads ---- #
+    @app.callback(
+        Output("training-armed-landmark", "data", allow_duplicate=True),
+        Input("training-current", "data"),
+        prevent_initial_call=True,
+    )
+    def _disarm_on_load(_current):
+        return None
+
     # ---- Events editor: add / remove / set fields ---- #
     @app.callback(
         Output("training-events", "data", allow_duplicate=True),
@@ -833,7 +867,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         events = list(events or [])
         events.append({"type": "", "racine": None, "EO_sec": None,
                        "LAS_sec": None, "BO_sec": None, "PID_sec": None,
-                       "BB_sec": None})
+                       "BB_sec": None, "score_comment": ""})
         return events
 
     @app.callback(
@@ -856,15 +890,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         events.pop(idx)
         return events
 
+    # Value inputs: type radio + the (ungraded) score-rationale comment.
     @app.callback(
         Output("training-events", "data", allow_duplicate=True),
         Input({"type": "tr-type", "idx": ALL}, "value"),
-        Input({"type": "tr-racine", "idx": ALL}, "value"),
-        Input({"type": "tr-lm", "idx": ALL, "field": ALL}, "value"),
+        Input({"type": "tr-comment", "idx": ALL}, "value"),
         State("training-events", "data"),
         prevent_initial_call=True,
     )
-    def _set_fields(_types, _racines, _lms, events):
+    def _set_text_fields(_types, _comments, events):
         events = list(events or [])
         if not events:
             return no_update
@@ -876,27 +910,148 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 if idx is None or idx < 0 or idx >= len(events):
                     continue
                 val = item.get("value")
-                kind = cid.get("type")
                 ev = dict(events[idx])
-                if kind == "tr-type":
+                if cid.get("type") == "tr-type":
                     new = val or ""
                     if new != (ev.get("type") or ""):
                         ev["type"] = new
+                        events[idx] = ev
                         changed = True
-                elif kind == "tr-racine":
-                    new = int(val) if val not in (None, "") else None
-                    if new != ev.get("racine"):
-                        ev["racine"] = new
+                elif cid.get("type") == "tr-comment":
+                    new = val or ""
+                    if new != (ev.get("score_comment") or ""):
+                        ev["score_comment"] = new
+                        events[idx] = ev
                         changed = True
-                elif kind == "tr-lm":
-                    field = f"{cid.get('field')}_sec"
-                    new = float(val) if val not in (None, "") else None
-                    if new != ev.get(field):
-                        ev[field] = new
-                        changed = True
-                if changed:
-                    events[idx] = ev
         return events if changed else no_update
+
+    # Racine 1-8 buttons (replaces the dropdown -- matches Video Review).
+    @app.callback(
+        Output("training-events", "data", allow_duplicate=True),
+        Input({"type": "tr-racine-btn", "idx": ALL, "stage": ALL},
+              "n_clicks"),
+        State("training-events", "data"),
+        prevent_initial_call=True,
+    )
+    def _tr_racine(_clicks, events):
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx, stage_n = trig.get("idx"), trig.get("stage")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        ev = dict(events[idx])
+        ev["racine"] = int(stage_n)
+        events[idx] = ev
+        return events
+
+    # "Set on plot": arm a landmark so the next LFP click sets it. Clicking
+    # the armed button again disarms. Mirrors video-armed-landmark.
+    @app.callback(
+        Output("training-armed-landmark", "data", allow_duplicate=True),
+        Input({"type": "tr-lm-arm", "idx": ALL, "field": ALL}, "n_clicks"),
+        State("training-armed-landmark", "data"),
+        prevent_initial_call=True,
+    )
+    def _tr_arm(_clicks, armed):
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        want = {"idx": trig.get("idx"), "field": trig.get("field")}
+        if isinstance(armed, dict) and armed.get("idx") == want["idx"] \
+                and armed.get("field") == want["field"]:
+            return None                       # toggle off
+        return want
+
+    # Click the LFP or Hilbert trace -> drop the armed landmark at that x
+    # (LFP seconds, no scaling), then disarm. Coexists with the clientside
+    # seek (different output), so a drop also seeks the video to it.
+    @app.callback(
+        Output("training-events", "data", allow_duplicate=True),
+        Output("training-armed-landmark", "data", allow_duplicate=True),
+        Input("training-lfp", "clickData"),
+        Input("training-hilbert", "clickData"),
+        State("training-armed-landmark", "data"),
+        State("training-events", "data"),
+        prevent_initial_call=True,
+    )
+    def _tr_drop_from_lfp(lfp_click, hil_click, armed, events):
+        if not isinstance(armed, dict) or armed.get("field") is None:
+            return no_update, no_update
+        trig = callback_context.triggered_id
+        click = lfp_click if trig == "training-lfp" else hil_click
+        try:
+            x = float(click["points"][0]["x"])
+        except (TypeError, KeyError, IndexError, ValueError):
+            return no_update, no_update
+        idx = armed.get("idx")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update, None
+        ev = dict(events[idx])
+        ev[f"{armed['field']}_sec"] = round(x, 3)
+        events[idx] = ev
+        return events, None
+
+    # "Drop at video time": capture the playhead, scaled to LFP seconds.
+    @app.callback(
+        Output("training-events", "data", allow_duplicate=True),
+        Input({"type": "tr-lm-drop", "idx": ALL, "field": ALL}, "n_clicks"),
+        State("training-current-time", "data"),
+        State("training-video-duration", "data"),
+        State("training-current", "data"),
+        State("training-events", "data"),
+        prevent_initial_call=True,
+    )
+    def _tr_drop_playhead(_clicks, cur_time, vid_dur, current, events):
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx, field = trig.get("idx"), trig.get("field")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        lfp_dur = (current or {}).get("lfp_dur")
+        t = _to_lfp_seconds(cur_time, vid_dur, lfp_dur)
+        if t is None:
+            return no_update
+        ev = dict(events[idx])
+        ev[f"{field}_sec"] = round(float(t), 3)
+        events[idx] = ev
+        return events
+
+    # "Clear" a landmark time.
+    @app.callback(
+        Output("training-events", "data", allow_duplicate=True),
+        Input({"type": "tr-lm-clear", "idx": ALL, "field": ALL}, "n_clicks"),
+        State("training-events", "data"),
+        prevent_initial_call=True,
+    )
+    def _tr_clear(_clicks, events):
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx, field = trig.get("idx"), trig.get("field")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        ev = dict(events[idx])
+        ev[f"{field}_sec"] = None
+        events[idx] = ev
+        return events
 
     # ---- Submit: grade, persist, reveal feedback ---- #
     @app.callback(
@@ -1328,6 +1483,24 @@ def _register_cursor_sync(app) -> None:
         prevent_initial_call=True,
     )
 
+    # 1b. Keep the <video> duration in a Store so "Drop at video time" can
+    #     scale the playhead to LFP seconds (server-side).
+    app.clientside_callback(
+        """
+        function(_n) {
+            const v = document.getElementById('""" +
+        TRAINING_VIDEO_DOM_ID + """');
+            if (!v || !isFinite(v.duration) || v.duration <= 0) {
+                return window.dash_clientside.no_update;
+            }
+            return v.duration;
+        }
+        """,
+        Output("training-video-duration", "data"),
+        Input("training-time-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+
     # 2. Mirror the current time onto the cursor of each panel.
     for graph_id in ("training-lfp", "training-hilbert"):
         app.clientside_callback(
@@ -1456,54 +1629,110 @@ def _video_children_and_sig(store: Store, config: dict, file_id: int,
             f"{file_id}:{cn}:prep")
 
 
-def _event_row(event: dict, idx: int, stage: int) -> html.Div:
+_MINI_BTN = {"padding": "2px 8px", "fontSize": FONT_SIZE_CAPTION,
+             "borderRadius": RADIUS_SM, "cursor": "pointer",
+             "border": f"1px solid {COLOR_DIVIDER}",
+             "background": COLOR_SURFACE_2, "color": COLOR_TEXT_PRIMARY}
+
+
+def _tr_field_row(idx: int, field: str, event: dict,
+                  armed: dict | None) -> html.Div:
+    """One landmark row: value display + Drop-at-video-time / Set-on-plot /
+    Clear -- the SAME capture interaction as Video Review (no typed time)."""
+    val = event.get(f"{field}_sec")
+    shown = f"{float(val):.2f} s" if val not in (None, "") else "(not set)"
+    is_armed = (isinstance(armed, dict) and armed.get("idx") == idx
+                and armed.get("field") == field)
+    dot = _LM_COLORS.get(field, "#888")
+    return html.Div([
+        html.Span("●", style={"color": dot, "marginRight": "4px"}),
+        html.Span(_lm_label(field).replace(" -- ", " — "),
+                  style={"color": COLOR_TEXT_SECONDARY,
+                          "fontSize": FONT_SIZE_CAPTION, "width": "230px"}),
+        html.Span(shown, style={
+            "fontFamily": "monospace", "fontSize": FONT_SIZE_CAPTION,
+            "color": (COLOR_TEXT_PRIMARY if val not in (None, "")
+                      else COLOR_TEXT_TERTIARY), "width": "84px"}),
+        html.Button("Drop at video time",
+                    id={"type": "tr-lm-drop", "idx": idx, "field": field},
+                    n_clicks=0, style=_MINI_BTN),
+        html.Button("Set on plot",
+                    id={"type": "tr-lm-arm", "idx": idx, "field": field},
+                    n_clicks=0,
+                    style={**_MINI_BTN, **({
+                        "background": COLOR_ACCENT,
+                        "borderColor": COLOR_ACCENT} if is_armed else {})}),
+        html.Button("Clear",
+                    id={"type": "tr-lm-clear", "idx": idx, "field": field},
+                    n_clicks=0, style=_MINI_BTN),
+    ], style={"display": "flex", "alignItems": "center",
+              "gap": SPACE_2, "marginBottom": "4px", "flexWrap": "wrap"})
+
+
+def _tr_racine_row(idx: int, event: dict) -> html.Div:
+    """Racine 1-8 button picker (identical to Video Review), with the stage
+    description on hover and the chosen stage highlighted."""
+    cur = event.get("racine")
+    btns = [html.Span("Racine 1-8:", style={
+        "color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+        "marginRight": SPACE_2})]
+    for stage_n, desc in _RACINE_STAGES:
+        sel = (cur == stage_n)
+        btns.append(html.Button(
+            str(stage_n),
+            id={"type": "tr-racine-btn", "idx": idx, "stage": stage_n},
+            n_clicks=0, title=f"{stage_n} — {desc}",
+            style={**_MINI_BTN, "minWidth": "28px", **({
+                "background": COLOR_ACCENT, "borderColor": COLOR_ACCENT,
+                "fontWeight": "700"} if sel else {})}))
+    return html.Div(btns, style={
+        "display": "flex", "alignItems": "center", "gap": "4px",
+        "flexWrap": "wrap", "marginBottom": "4px"})
+
+
+def _event_row(event: dict, idx: int, stage: int,
+               armed: dict | None = None) -> html.Div:
     type_opts = ([{"label": " LVF", "value": "LVF"},
                   {"label": " HYP", "value": "HYP"}]
                  + ([{"label": " Undefined", "value": "Undefined"}]
                     if stage == 3 else []))
-    controls = [
+    header = html.Div([
         html.Span(f"Event {idx + 1}",
                   style={"fontWeight": "700", "color": COLOR_TEXT_PRIMARY,
-                          "fontSize": FONT_SIZE_BODY,
-                          "marginRight": SPACE_3}),
+                          "fontSize": FONT_SIZE_BODY, "marginRight": SPACE_3}),
         dcc.RadioItems(id={"type": "tr-type", "idx": idx},
                         options=type_opts, value=event.get("type") or None,
                         inline=True,
                         labelStyle={"marginRight": SPACE_3,
                                      "color": COLOR_TEXT_PRIMARY,
                                      "fontSize": FONT_SIZE_CAPTION}),
-        html.Span("Racine", style={"color": COLOR_TEXT_SECONDARY,
-                                     "fontSize": FONT_SIZE_CAPTION,
-                                     "marginRight": SPACE_2}),
-        dcc.Dropdown(id={"type": "tr-racine", "idx": idx},
-                      options=[{"label": str(n), "value": n}
-                               for n in range(1, 9)],
-                      value=event.get("racine"),
-                      style={"width": "70px"}, className="dark-dropdown"),
-    ]
-    lms = _LANDMARKS if stage == 3 else ("EO",)
-    for lm in lms:
-        controls.append(html.Span(
-            lm, style={"color": COLOR_TEXT_SECONDARY,
-                        "fontSize": FONT_SIZE_CAPTION,
-                        "marginLeft": SPACE_2, "marginRight": "2px"}))
-        controls.append(dcc.Input(
-            id={"type": "tr-lm", "idx": idx, "field": lm},
-            type="number", value=event.get(f"{lm}_sec"),
-            placeholder="s", step="any",
-            style={"width": "70px", "backgroundColor": COLOR_SURFACE_2,
-                   "color": COLOR_TEXT_PRIMARY,
+        button("✕", {"type": "tr-remove", "idx": idx}, variant="ghost",
+               style={"marginLeft": "auto", "padding": "2px 8px"}),
+    ], style={"display": "flex", "alignItems": "center",
+              "marginBottom": SPACE_2})
+    # Stage 2 scores the onset only; Stage 3 adds the rest. LAS is dropped
+    # for HYP (no large-amplitude-spiking phase) -- matches required_fields.
+    lms = (("EO",) if stage != 3
+           else tuple(f for f in _LANDMARKS
+                      if f in _required_fields(event) or f == "EO"))
+    rows = [_tr_field_row(idx, lm, event, armed) for lm in lms]
+    return html.Div([
+        header, *rows, _tr_racine_row(idx, event),
+        dcc.Textarea(
+            id={"type": "tr-comment", "idx": idx},
+            value=event.get("score_comment") or "",
+            placeholder="Score rationale — your reasoning for this Racine / "
+                        "what you saw (not graded)",
+            maxLength=512,
+            style={"width": "100%", "minHeight": "44px", "marginTop": "4px",
+                   "background": COLOR_SURFACE_2, "color": COLOR_TEXT_PRIMARY,
                    "border": f"1px solid {COLOR_DIVIDER}",
-                   "borderRadius": RADIUS_SM, "padding": "3px 6px"}))
-    controls.append(button("✕", {"type": "tr-remove", "idx": idx},
-                            variant="ghost",
-                            style={"marginLeft": "auto",
-                                    "padding": "2px 8px"}))
-    return html.Div(controls, style={
-        "display": "flex", "alignItems": "center", "flexWrap": "wrap",
-        "gap": f"{SPACE_2} {SPACE_2}", "padding": f"{SPACE_2} {SPACE_3}",
-        "marginBottom": SPACE_2, "background": COLOR_SURFACE_1,
-        "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_SM})
+                   "borderRadius": RADIUS_SM, "fontSize": FONT_SIZE_CAPTION,
+                   "padding": "4px 6px"}),
+    ], style={"padding": f"{SPACE_2} {SPACE_3}", "marginBottom": SPACE_2,
+              "background": COLOR_SURFACE_1,
+              "border": f"1px solid {COLOR_DIVIDER}",
+              "borderRadius": RADIUS_SM})
 
 
 def _feedback(stage, score, breakdown, answer, validated) -> html.Div:
