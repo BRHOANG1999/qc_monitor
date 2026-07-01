@@ -57,6 +57,28 @@ def health_snapshot(watcher: FileWatcher, store: Store, queue_depth: int,
     }
 
 
+def _serve_waitress(app, host, port, config):
+    """Serve the dashboard with waitress -- a production WSGI server that
+    runs natively on Windows (gunicorn does not) and handles many concurrent
+    users via a fixed thread pool. Enable with ``dashboard.use_waitress: true``
+    and ``pip install waitress``. Falls back to the threaded dev server if
+    waitress isn't installed, so the daemon never fails to serve."""
+    log = logging.getLogger("qc_monitor")
+    try:
+        from waitress import serve
+    except ImportError:
+        log.warning("dashboard.use_waitress is set but 'waitress' isn't "
+                    "installed (pip install waitress) -- falling back to the "
+                    "threaded dev server.")
+        app.run(host=host, port=port, debug=False, use_reloader=False,
+                threaded=True)
+        return
+    threads = int(config.get("dashboard", {}).get("waitress_threads", 8))
+    log.info("Serving dashboard via waitress (%d threads)", threads)
+    # Dash's WSGI app is app.server (the Flask instance).
+    serve(app.server, host=host, port=port, threads=threads)
+
+
 def run_dashboard(config: dict, store: Store):
     """Launch Dash dashboard in a background thread."""
     try:
@@ -67,7 +89,18 @@ def run_dashboard(config: dict, store: Store):
         logging.getLogger("qc_monitor").info("Dashboard serving at http://%s:%s", host, port)
         # Suppress Flask/Werkzeug request logging (the POST spam)
         logging.getLogger("werkzeug").setLevel(logging.ERROR)
-        app.run(host=host, port=port, debug=False, use_reloader=False)
+        # threaded=True: serve each request in its own thread so ONE user's
+        # heavy callback (LFP load / transcode / chronic warm) can't block
+        # everyone else -- without it the dev server is single-threaded and a
+        # second user's connection just times out. Safe here: Store opens a
+        # fresh WAL connection per call with a 30s busy timeout, so concurrent
+        # requests don't hit "database is locked". For heavier multi-user load
+        # prefer a production WSGI server (see _serve_waitress below).
+        if config.get("dashboard", {}).get("use_waitress"):
+            _serve_waitress(app, host, port, config)
+        else:
+            app.run(host=host, port=port, debug=False,
+                    use_reloader=False, threaded=True)
     except ImportError as e:
         logging.getLogger("qc_monitor").warning(
             "Dash not installed (%s). Run: pip install dash plotly", e)

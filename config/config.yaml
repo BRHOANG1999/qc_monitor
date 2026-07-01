@@ -149,6 +149,11 @@ dashboard:
   host: 0.0.0.0
   port: 8050
   refresh_interval_sec: 10
+  # Multi-user serving. The default threaded dev server handles concurrent
+  # users fine for a small lab. For heavier load, set use_waitress: true and
+  # `pip install waitress` (a production WSGI server that runs on Windows).
+  use_waitress: false
+  waitress_threads: 8
 auth:
   enabled: true
   # Identity method: 'cf_access' (Cloudflare Access, default) or
