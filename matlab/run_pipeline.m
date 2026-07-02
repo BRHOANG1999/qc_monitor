@@ -97,52 +97,69 @@ function run_pipeline(input_file, output_json, config_json)
         fprintf('[PIPELINE] StimCopy: [%s], LFP: [%s]\n', ...
             num2str(stim_channels), num2str(lfp_channels));
 
-        % --- Step 2: Build animalConfigs for batchEvokedWorkerFcn ---
-        % Each LFP channel is an "animal" with paired stim channel
-        animalConfigs = [];
-        for i = 1:length(lfp_channels)
-            ac = struct();
-            ac.eegChannel = lfp_channels(i);
-            ac.stimChannel = stim_channels(1);
-            ac.animalID = channel_names{lfp_channels(i)};
-            if isempty(animalConfigs)
-                animalConfigs = ac;
-            else
-                animalConfigs(end+1) = ac;
+        % --- Step 2-3: Evoked analysis (only when there IS a stim channel) ---
+        % A baseline recording with no stimCopy channel legitimately has no
+        % evoked response. Skip the worker (and never index stim_channels(1))
+        % instead of crashing, so the file is marked done, not a MATLAB
+        % failure -- exit_status stays 'success'.
+        has_stim = ~isempty(stim_channels) && ~isempty(lfp_channels);
+        if ~has_stim
+            fprintf(['[PIPELINE] No stimCopy/LFP channel -- baseline ' ...
+                'recording, skipping evoked analysis (not a failure).\n']);
+            worker_result = struct('success', false, 'totalEpochs', 0, ...
+                'outputPath', '', 'statusText', 'no stim channel');
+            result.evoked_success = false;
+            result.num_stimuli = 0;
+            result.num_traces = 0;
+            result.evoked_output_path = '';
+            result.note = 'no stimCopy channel; evoked analysis skipped';
+        else
+            % Each LFP channel is an "animal" with paired stim channel
+            animalConfigs = [];
+            for i = 1:length(lfp_channels)
+                ac = struct();
+                ac.eegChannel = lfp_channels(i);
+                ac.stimChannel = stim_channels(1);
+                ac.animalID = channel_names{lfp_channels(i)};
+                if isempty(animalConfigs)
+                    animalConfigs = ac;
+                else
+                    animalConfigs(end+1) = ac;
+                end
             end
+
+            % Build params struct matching batchEvokedWorkerFcn format
+            evParams = struct();
+            evParams.StartMS = pre_ms;
+            evParams.EndMS = post_ms;
+            evParams.StimulusThreshold = stim_thresh;
+            evParams.MinStimulusDistance = min_stim_dist;
+            evParams.StimPeakRatioMin = stim_peak_ratio_min;
+            evParams.BaselineCorrection = baseline_on;
+            evParams.BaselineWindow = [bl_start, bl_end];
+            evParams.HighPassEnabled = hp_on;
+            evParams.HighPassCutoff = hp_hz;
+            evParams.LowPassEnabled = lp_on;
+            evParams.LowPassCutoff = lp_hz;
+            evParams.NotchFilter50Hz = notch50;
+            evParams.NotchFilter60Hz = notch60;
+            evParams.OutputSuffix = '_evoked';
+
+            evoked_output_dir = fullfile(stimnet_root, 'evokedOutput');
+            if ~exist(evoked_output_dir, 'dir'), mkdir(evoked_output_dir); end
+            evParams.OutputFolder = evoked_output_dir;
+
+            % --- Step 3: Call batchEvokedWorkerFcn (identical to Chronic tab) ---
+            fprintf('[PIPELINE] Running batchEvokedWorkerFcn...\n');
+            worker_result = batchEvokedWorkerFcn(input_file, evParams, animalConfigs, length(animalConfigs));
+
+            result.evoked_success = worker_result.success;
+            result.num_stimuli = 0;
+            result.num_traces = worker_result.totalEpochs;
+            result.evoked_output_path = worker_result.outputPath;
+            fprintf('[PIPELINE] Worker: %s, %d epochs, output: %s\n', ...
+                worker_result.statusText, worker_result.totalEpochs, worker_result.outputPath);
         end
-
-        % Build params struct matching batchEvokedWorkerFcn format
-        evParams = struct();
-        evParams.StartMS = pre_ms;
-        evParams.EndMS = post_ms;
-        evParams.StimulusThreshold = stim_thresh;
-        evParams.MinStimulusDistance = min_stim_dist;
-        evParams.StimPeakRatioMin = stim_peak_ratio_min;
-        evParams.BaselineCorrection = baseline_on;
-        evParams.BaselineWindow = [bl_start, bl_end];
-        evParams.HighPassEnabled = hp_on;
-        evParams.HighPassCutoff = hp_hz;
-        evParams.LowPassEnabled = lp_on;
-        evParams.LowPassCutoff = lp_hz;
-        evParams.NotchFilter50Hz = notch50;
-        evParams.NotchFilter60Hz = notch60;
-        evParams.OutputSuffix = '_evoked';
-
-        evoked_output_dir = fullfile(stimnet_root, 'evokedOutput');
-        if ~exist(evoked_output_dir, 'dir'), mkdir(evoked_output_dir); end
-        evParams.OutputFolder = evoked_output_dir;
-
-        % --- Step 3: Call batchEvokedWorkerFcn (identical to Chronic tab) ---
-        fprintf('[PIPELINE] Running batchEvokedWorkerFcn...\n');
-        worker_result = batchEvokedWorkerFcn(input_file, evParams, animalConfigs, length(animalConfigs));
-
-        result.evoked_success = worker_result.success;
-        result.num_stimuli = 0;
-        result.num_traces = worker_result.totalEpochs;
-        result.evoked_output_path = worker_result.outputPath;
-        fprintf('[PIPELINE] Worker: %s, %d epochs, output: %s\n', ...
-            worker_result.statusText, worker_result.totalEpochs, worker_result.outputPath);
 
         % --- Step 4: Extract waveforms + features from the output ---
         result.per_channel = struct();
@@ -314,10 +331,12 @@ function run_pipeline(input_file, output_json, config_json)
             result.lfp_psd_freqs = f(1:step:end)';
             result.lfp_psd_power = pxx(1:step:end)';
 
-            stim_ch = stim_channels(1);
-            stim_sig = sbuf(:, stim_ch);
-            result.stim_artifact_rms = rms(stim_sig);
-            result.stim_artifact_peak = max(abs(stim_sig));
+            if ~isempty(stim_channels)
+                stim_ch = stim_channels(1);
+                stim_sig = sbuf(:, stim_ch);
+                result.stim_artifact_rms = rms(stim_sig);
+                result.stim_artifact_peak = max(abs(stim_sig));
+            end
         catch e
             fprintf('[PIPELINE] LFP summary failed: %s\n', e.message);
         end

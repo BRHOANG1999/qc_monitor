@@ -1457,6 +1457,20 @@ class Store:
                 return None
         return None
 
+    def requeue_failed_files(self) -> int:
+        """Flip every ``matlab_error`` recording back to ``pending`` so the
+        daemon reprocesses them (e.g. after fixing the MATLAB cause). Returns
+        how many were re-queued."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE processed_files SET status = 'pending' "
+                "WHERE status = 'matlab_error'")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
     def matlab_failed_files(self, hours: int = 168) -> list[dict]:
         """Recordings whose Tier-2 MATLAB step errored (status='matlab_error'),
         newest first, with the MATLAB error_message. Powers the Overview

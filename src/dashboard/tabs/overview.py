@@ -2447,15 +2447,27 @@ def _build_matlab_failed_card(store):
         ], style={"padding": "3px 0",
                   "borderBottom": "1px solid rgba(255,255,255,0.06)"}))
     extra = (f"  (+{len(failed) - 10} more)" if len(failed) > 10 else "")
+    header = html.Div([
+        html.Span(f"⚠ {len(failed)} recording(s) failed MATLAB processing "
+                  f"(last 7 days){extra}",
+                  style={"color": "#ff453a", "fontWeight": "700",
+                         "fontSize": "13px"}),
+        html.Button("↻ Retry all", id="overview-retry-matlab", n_clicks=0,
+                    style={"marginLeft": "auto", "padding": "2px 10px",
+                           "fontSize": "12px", "cursor": "pointer",
+                           "borderRadius": "5px", "color": "#f0f0f5",
+                           "background": "#3a3a4a",
+                           "border": "1px solid #555"}),
+    ], style={"display": "flex", "alignItems": "center",
+              "marginBottom": "6px"})
     return html.Div([
-        html.Div(f"⚠ {len(failed)} recording(s) failed MATLAB processing "
-                 f"(last 7 days){extra}",
-                 style={"color": "#ff453a", "fontWeight": "700",
-                        "fontSize": "13px", "marginBottom": "6px"}),
-        html.Div("These produced no evoked data. Fix the cause, then "
-                 "reprocess (they are not retried automatically).",
+        header,
+        html.Div("These produced no evoked data. Fix the cause, then Retry "
+                 "all to re-queue them (they are not retried automatically).",
                  style={"color": "#a0a0b0", "fontSize": "11px",
                         "marginBottom": "8px"}),
+        html.Div(id="overview-retry-matlab-status",
+                 style={"color": "#30d158", "fontSize": "11px"}),
         *rows,
     ], style={"marginBottom": "12px", "padding": "10px 14px",
               "background": "rgba(255,69,58,0.08)",
@@ -2721,6 +2733,23 @@ def layout(store: Store, config: dict | None = None):
 def register_callbacks(app, store: Store, config: dict) -> None:
     """Wire the Overview tab's six callbacks (fine-grained refresh,
     thumbnail, snapshot size + src, home-grid Open buttons)."""
+
+    # "Retry all" on the failed-MATLAB card: flip matlab_error rows back to
+    # pending so the daemon reprocesses them (after the cause is fixed).
+    @app.callback(
+        Output("overview-retry-matlab-status", "children"),
+        Input("overview-retry-matlab", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _retry_matlab(n):
+        if not n:
+            return no_update
+        try:
+            n_requeued = store.requeue_failed_files()
+        except Exception as e:  # noqa: BLE001
+            return f"Retry failed: {e}"
+        return (f"Re-queued {n_requeued} recording(s) for reprocessing — "
+                "they'll clear as the daemon works through them.")
 
     # Behavioral-seizure status: swap the body between the per-animal
     # cards and the per-animal donut charts on the Cards/Charts toggle.
