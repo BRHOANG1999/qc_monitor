@@ -1535,14 +1535,16 @@ def _finalize_approved_to_csv(store, config: dict,
         if not chunk_dt:
             continue
         bucket.setdefault((animal, chunk_dt.date()), []).append(r)
-    parts: list[str] = []
+    # One structured entry per CSV file written, so the summary can show
+    # exactly WHICH files got what (instead of a giant one-line string).
+    entries: list[dict] = []
+    base_dir = bhz_cfg.get("base_dir", "")
     # One day-row per animal tab: {animal_tab: [day_stat_dict, ...]}.
     rows_by_tab: dict[str, list[dict]] = {}
     for (animal, day), items in sorted(bucket.items()):
         csv_path = _bhz_csv.resolve_csv_path(
-            bhz_cfg.get("base_dir", ""),
-            bhz_cfg.get("filename_template",
-                         "{date}_{animal}.csv"),
+            base_dir,
+            bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
             day, animal,
         )
         rows_by_tab.setdefault(animal, []).append(
@@ -1550,41 +1552,34 @@ def _finalize_approved_to_csv(store, config: dict,
         events_by_fn: dict[str, list[dict]] = {}
         meta_by_fn: dict[str, dict] = {}
         for r in items:
-            file_meta = _file_meta_for_row(store, r,
-                                              bhz_cfg)
+            file_meta = _file_meta_for_row(store, r, bhz_cfg)
             if file_meta is None:
                 continue
             fn = file_meta["filename"]
             meta_by_fn[fn] = file_meta
             events_by_fn[fn] = r.get("events") or []
+        entry = {"csv_name": csv_path.name, "animal": animal, "day": str(day),
+                 "n_recordings": len(events_by_fn)}
         if overwrite:
             diff = _bhz_csv.overwrite_day_csv(
-                csv_path, events_by_fn, meta_by_fn,
-                fs=_pick_fs(items),
-            )
-            parts.append(
-                f"{animal} {day}: "
-                f"+{len(diff.added_filenames)} "
-                f"−{len(diff.removed_filenames)} "
-                f"~{len(diff.modified_filenames)}")
-            if diff.removed_filenames:
-                parts.append(
-                    f"  ⚠ removed rows for: "
-                    f"{', '.join(diff.removed_filenames)}")
+                csv_path, events_by_fn, meta_by_fn, fs=_pick_fs(items))
+            entry.update(added=len(diff.added_filenames),
+                         removed=len(diff.removed_filenames),
+                         modified=len(diff.modified_filenames),
+                         removed_files=list(diff.removed_filenames),
+                         n_rows=0)
         else:
             n_total = 0
             for fn, evs in events_by_fn.items():
                 n_total += _bhz_csv.write_event_rows(
                     csv_path, meta_by_fn[fn], evs,
-                    fs=meta_by_fn[fn].get("fs") or 20000.0,
-                )
-            parts.append(
-                f"{animal} {day}: {n_total} row"
-                f"{'' if n_total == 1 else 's'} appended")
+                    fs=meta_by_fn[fn].get("fs") or 20000.0)
+            entry["n_rows"] = n_total
+        entries.append(entry)
     # Daily Google-Sheet upsert (non-fatal): one row per day in each
     # animal's own tab (MouseID). Merge-update never blanks the lab's
     # hand-filled columns.
-    summary = "  •  ".join(parts)
+    sheet_note = ""
     gs = (config or {}).get("google_sheets", {}) or {}
     if gs.get("enabled") and rows_by_tab:
         try:
@@ -1594,16 +1589,67 @@ def _finalize_approved_to_csv(store, config: dict,
                 rows_by_tab,
                 gs.get("key_columns", ["Date"]),
                 gs.get("column_map"))
-            note = (f"  •  Sheet: {res['updated']} updated, "
-                     f"{res['appended']} appended")
+            sheet_note = (f"Google Sheet: {res['updated']} updated, "
+                          f"{res['appended']} appended")
             if res.get("skipped_tabs"):
-                note += (f" (no tab for: "
-                          f"{', '.join(res['skipped_tabs'])})")
-            summary += note
+                sheet_note += (f" (no tab for: "
+                               f"{', '.join(res['skipped_tabs'])})")
         except Exception as e:
             logger.warning("Google Sheet upsert failed: %s", e)
-            summary += f"  •  Sheet sync FAILED: {e}"
-    return summary
+            sheet_note = f"Google Sheet sync FAILED: {e}"
+    return _finalize_summary_block(base_dir, entries, overwrite, sheet_note)
+
+
+def _finalize_summary_block(base_dir: str, entries: list[dict],
+                             overwrite: bool, sheet_note: str):
+    """A readable 'what got written where' summary: total, the target folder,
+    and one line per CSV file (rows + how many recordings), so the PI can see
+    exactly which files were written."""
+    if not entries:
+        return "Nothing to finalize -- no pi_approved files."
+    total_recs = sum(e["n_recordings"] for e in entries)
+    total_rows = sum(e.get("n_rows", 0) for e in entries)
+    if overwrite:
+        head = (f"✓ Rebuilt {len(entries)} CSV file(s) "
+                f"· {total_recs} recording(s)")
+    else:
+        head = (f"✓ Wrote {total_rows} row(s) from {total_recs} "
+                f"recording(s) into {len(entries)} CSV file(s)")
+    lines = []
+    for e in entries:
+        if overwrite:
+            detail = (f"+{e['added']} −{e['removed']} ~{e['modified']} "
+                      f"· {e['n_recordings']} rec")
+        else:
+            detail = (f"+{e['n_rows']} row{'' if e['n_rows'] == 1 else 's'} "
+                      f"· {e['n_recordings']} rec")
+        lines.append(html.Div([
+            html.Span(e["csv_name"], style={
+                "fontFamily": "ui-monospace, monospace", "color": "#cfd0d6",
+                "fontSize": "11px"}),
+            html.Span(f"   {detail}", style={
+                "color": "#808090", "fontSize": "11px", "marginLeft": "auto"}),
+        ], style={"display": "flex", "padding": "2px 0"}))
+        if overwrite and e.get("removed_files"):
+            lines.append(html.Div(
+                "⚠ removed rows for: " + ", ".join(e["removed_files"]),
+                style={"color": "#ff9f0a", "fontSize": "10px",
+                       "padding": "0 0 2px 10px"}))
+    children = [
+        html.Div(head, style={"color": "#30d158", "fontWeight": "700",
+                              "fontSize": "12px", "marginBottom": "2px"}),
+        html.Div(f"→ {base_dir}", style={
+            "color": "#808090", "fontFamily": "ui-monospace, monospace",
+            "fontSize": "11px", "marginBottom": "6px"}),
+        html.Div(lines, style={
+            "maxHeight": "220px", "overflowY": "auto",
+            "border": "1px solid rgba(255,255,255,0.06)",
+            "borderRadius": "6px", "padding": "4px 8px"}),
+    ]
+    if sheet_note:
+        children.append(html.Div(sheet_note, style={
+            "color": "#808090", "fontSize": "11px", "marginTop": "6px"}))
+    return html.Div(children)
 
 
 def _day_stats(store, animal: str, day, items: list[dict],
