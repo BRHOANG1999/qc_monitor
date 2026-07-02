@@ -204,6 +204,12 @@ def main():
             if (loop_start - last_health_time) > health_interval:
                 accessible = watcher.check_network_accessible()
                 alert_engine.check_network(accessible)
+                # Stall + format-drift alerts read the latest scan summary
+                # (newest .mat on the share + recording-like files the pattern
+                # skipped) so a silent ingest halt announces itself.
+                alert_engine.check_processing_stalled(watcher.last_scan_stats)
+                alert_engine.check_unrecognized_recordings(
+                    watcher.last_scan_stats)
 
                 if accessible:
                     consecutive_network_failures = 0

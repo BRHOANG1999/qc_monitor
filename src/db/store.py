@@ -1439,6 +1439,45 @@ class Store:
         finally:
             conn.close()
 
+    def newest_processed_at(self) -> datetime | None:
+        """When the daemon last finished a file (max processed_at, status
+        done), or None. Compared against the newest .mat mtime on the share
+        to detect a processing stall."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(processed_at) AS m FROM processed_files "
+                "WHERE status = 'done'").fetchone()
+        finally:
+            conn.close()
+        if row and row["m"]:
+            try:
+                return datetime.fromisoformat(row["m"])
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    def matlab_failed_files(self, hours: int = 168) -> list[dict]:
+        """Recordings whose Tier-2 MATLAB step errored (status='matlab_error'),
+        newest first, with the MATLAB error_message. Powers the Overview
+        'failed processing' card so per-file failures aren't silent."""
+        conn = self._connect()
+        try:
+            cutoff = (datetime.now() - timedelta(hours=int(hours))).isoformat()
+            rows = conn.execute(
+                """SELECT pf.id AS file_id, pf.file_path, pf.session_dir,
+                          pf.chunk_datetime, pf.processed_at,
+                          mr.error_message, mr.exit_status
+                   FROM processed_files pf
+                   LEFT JOIN matlab_results mr ON mr.file_id = pf.id
+                   WHERE pf.status = 'matlab_error'
+                     AND (pf.processed_at IS NULL OR pf.processed_at > ?)
+                   ORDER BY pf.processed_at DESC""",
+                (cutoff,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------ #
     #  evoked_waveforms
     # ------------------------------------------------------------------ #
