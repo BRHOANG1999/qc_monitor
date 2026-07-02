@@ -149,6 +149,14 @@ def layout(store: Store, config: dict | None = None):
                    "alignItems": "center",
                    "marginBottom": "12px",
                    "flexWrap": "wrap"}),
+        html.Div(
+            "Each CSV row's onset time is in EventEO (sample), "
+            "EventEO_WallClock (date + time) and EO_HourOfDay (0-23.99, for "
+            "circadian binning). Peak_Index / Peak_Stamp are blank for "
+            "manually-scored events (they come only from the automated "
+            "detector).",
+            style={"color": "#808090", "fontSize": "11px",
+                   "marginBottom": "10px", "maxWidth": "680px"}),
         # Status / diff toast for finalize.
         html.Div(id="evtv-finalize-status",
                   style={"color": "#a0a0b0",
@@ -1759,6 +1767,9 @@ def _file_meta_for_row(store, row: dict, bhz_cfg: dict
         folder=_os.path.dirname(fp) + _os.sep,
         filename=_os.path.basename(fp),
         fs=fs, cutoff=0.05, channel=2,
+        # Peak_Index/Peak_Stamp come only from the automated detector; a
+        # PI-approved manual review has no envelope peak, so they stay blank
+        # (the onset is in EventEO / EventEO_WallClock / EO_HourOfDay).
         peak_index=None, peak_stamp=None, peak_dt=peak_dt,
     )
 

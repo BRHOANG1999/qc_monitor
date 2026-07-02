@@ -426,6 +426,9 @@ def _build_csv_file_meta(store, file_id: int, channel: int,
         folder=folder, filename=filename,
         fs=fs, cutoff=(cutoff if (cutoff and cutoff > 0) else _BHZ_CUTOFF),
         channel=int(channel),
+        # Peak_Index/Peak_Stamp are the automated detector's envelope-peak
+        # output; manual review has no detected peak, so they stay None (the
+        # onset lives in EventEO / EventEO_WallClock / EO_HourOfDay instead).
         peak_index=None, peak_stamp=None, peak_dt=chunk_dt,
         auc_threshold=auc_threshold, auc_window=auc_window,
     )
@@ -1832,6 +1835,19 @@ def _video_mass_analyze_panel() -> html.Details:
                     html.Div(id="video-ma-session-stats",
                               style={"marginBottom": "8px"}),
                     html.Div([
+                        html.Span("🔬 Threshold detections",
+                                  style={"color": "#5e7ce2",
+                                          "fontWeight": "700",
+                                          "fontSize": "12px"}),
+                        html.Span(
+                            " — the detector flagged these at your cutoff. "
+                            "Browse a pool and REVIEW each: score the real "
+                            "events, or mark “No events seen.” "
+                            "(Different from the \U0001f6a9 Needs-scoring "
+                            "pool, which is your own onsets to finish.)",
+                            style={"color": "#a0a0b0", "fontSize": "11px"}),
+                    ], style={"marginBottom": "6px", "padding": "0 2px"}),
+                    html.Div([
                         html.Button(
                             "Browse Pool 1 (envelope)",
                             id="video-ma-browse-p1", n_clicks=0,
@@ -2208,8 +2224,10 @@ def layout(store: Store, bridge: dict | None = None):
                                   "borderRadius": "6px", "padding": "4px"}),
             ),
             _details_card(
-                "Needs scoring",
-                summary_sub="quick-flagged files -- click to finish scoring",
+                "🚩 Needs scoring — finish your onsets",
+                summary_sub="Files where YOU dropped an EEG onset but haven't "
+                            "fully scored it yet (type + Racine + all "
+                            "landmarks). Open one to complete it.",
                 open_default=False,
                 content=html.Div(
                     id="video-needs-scoring-list",
@@ -3255,7 +3273,10 @@ def layout(store: Store, bridge: dict | None = None):
                               "can use it immediately, AND keep the file in "
                               "the 'Needs scoring' pool for full scoring "
                               "later. The PI's finalize (overwrite) replaces "
-                              "these preliminary rows.",
+                              "these preliminary rows. Your onset is in the "
+                              "EventEO / EventEO_WallClock / EO_HourOfDay "
+                              "columns; Peak_Index/Peak_Stamp stay blank "
+                              "(they're set only by the automated detector).",
                         style={"marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
@@ -3797,9 +3818,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     html.Span(ts_label, style={
                         "color": "#f0f0f5", "fontWeight": "600",
                         "fontSize": "12px"}),
-                    html.Span(f"  · {n_ev} flagged", style={
-                        "color": "#f0b429", "fontSize": "11px",
-                        "marginLeft": "auto"}),
+                    html.Span(
+                        f"🚩 {n_ev} onset{'' if n_ev == 1 else 's'} · "
+                        f"finish scoring",
+                        title="You flagged an EEG onset here but haven't "
+                              "scored type + Racine + landmarks. Open to "
+                              "complete it.",
+                        style={"color": "#f0b429", "fontSize": "11px",
+                               "fontWeight": "600", "marginLeft": "auto"}),
                 ], style={"display": "flex", "width": "100%"}),
                 html.Span(fname, title=fname, style={
                     "color": "#6f7080", "fontSize": "10px",
