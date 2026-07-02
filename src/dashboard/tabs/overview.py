@@ -2215,6 +2215,9 @@ def _overview_tab(store: Store, config: dict | None = None):
             _build_overview_thumbnail(store, config, session_dir, "mean"),
             id="overview-thumbnail",
         ),
+        # Per-client signature of the last-rendered thumbnail (mode + newest
+        # recording) so a refresh tick with nothing new skips the rebuild.
+        dcc.Store(id="overview-thumb-sig"),
     ])
 
     # Active session basics (session name / file counts / errors) now
@@ -2796,19 +2799,32 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("overview-thumbnail", "children"),
         Output("overview-hist24-poll", "disabled"),
+        Output("overview-thumb-sig", "data"),
         Input("overview-trace-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("overview-hist24-poll", "n_intervals"),
         Input("overview-hist24-n", "value"),
+        State("overview-thumb-sig", "data"),
     )
-    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n):
+    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n, last_sig):
         mode = trace_mode or "mean"
         if mode == "hist24":
-            return _hist24_render(config, hist_n)
+            # hist24 has its own cache + poll; let it manage rebuilds.
+            children, poll_off = _hist24_render(config, hist_n)
+            return children, poll_off, no_update
+        # The Latest-Evoked thumbnail only needs to change when a NEW
+        # recording arrives -- not on every refresh tick. Short-circuit when
+        # the (mode, newest-recording) signature is unchanged.
+        try:
+            sig = f"{mode}:{store.max_processed_file_id()}"
+        except Exception:  # noqa: BLE001
+            sig = None
+        if sig is not None and sig == last_sig:
+            return no_update, True, no_update
         sessions = store.get_sessions()
         session_dir = sessions[0]["session_dir"] if sessions else ""
-        return _build_overview_thumbnail(
-            store, config, session_dir, mode), True
+        return (_build_overview_thumbnail(store, config, session_dir, mode),
+                True, sig)
 
     @app.callback(
         Output("snapshot-expanded", "data"),

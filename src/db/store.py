@@ -1457,6 +1457,18 @@ class Store:
                 return None
         return None
 
+    def max_processed_file_id(self) -> int:
+        """Highest processed_files id -- a cheap 'has a new recording arrived?'
+        signature so the Overview thumbnail rebuilds per new file instead of
+        on every refresh tick."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(id) AS m FROM processed_files").fetchone()
+            return int(row["m"]) if row and row["m"] is not None else 0
+        finally:
+            conn.close()
+
     def requeue_failed_files(self) -> int:
         """Flip every ``matlab_error`` recording back to ``pending`` so the
         daemon reprocesses them (e.g. after fixing the MATLAB cause). Returns
