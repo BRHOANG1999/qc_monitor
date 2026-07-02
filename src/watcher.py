@@ -16,6 +16,11 @@ logger = logging.getLogger("qc_monitor.watcher")
 # processed into evokedOutput.
 MAT_PATTERN = re.compile(r"_{2,3}(\d{4}_\d{2}_\d{2}__\d{2}_\d{2}_\d{2})\.mat$")
 
+# A recorder timestamp ANYWHERE in the name -- used only to spot ".mat that
+# looks like a recording but didn't match MAT_PATTERN" (a format-drift canary
+# so a future rename can't silently skip files the way the ___/__ change did).
+RECORDING_TS_RX = re.compile(r"\d{4}_\d{2}_\d{2}__\d{2}_\d{2}_\d{2}")
+
 
 @dataclass
 class NewFile:
@@ -31,15 +36,27 @@ class FileWatcher:
     def __init__(self, watch_paths: list[str], min_file_age_sec: int = 60):
         self.watch_paths = watch_paths
         self.min_file_age_sec = min_file_age_sec
+        # Summary of the most recent scan, read by the health loop to detect a
+        # stall (nothing processed while newer files sit on the share) and to
+        # alarm on recording-like .mat that the pattern skipped (format drift).
+        self.last_scan_stats = self._empty_stats()
+
+    @staticmethod
+    def _empty_stats() -> dict:
+        return {"newest_mat_mtime": 0.0, "n_scanned": 0,
+                "n_skipped_recordinglike": 0, "skipped_samples": []}
 
     def scan(self, known_paths: set[str]) -> list[NewFile]:
         """Scan watch paths for new .mat files not in known_paths.
 
         Only returns files whose mtime is older than min_file_age_sec
-        (to avoid reading partial writes).
+        (to avoid reading partial writes). Also refreshes ``last_scan_stats``
+        (newest .mat mtime + count of recording-like files the pattern
+        skipped) for the health-loop stall/format-drift alerts.
         """
         new_files = []
         now = time.time()
+        stats = self._empty_stats()
 
         for root_path in self.watch_paths:
             if not os.path.isdir(root_path):
@@ -51,14 +68,22 @@ class FileWatcher:
                     if not entry.is_dir():
                         continue
                     # Monthly folders (e.g., MARCH_2026) or session dirs
-                    self._scan_directory(entry.path, known_paths, new_files, now)
+                    self._scan_directory(entry.path, known_paths, new_files,
+                                         now, stats)
             except OSError as e:
                 logger.error("Error scanning %s: %s", root_path, e)
 
+        self.last_scan_stats = stats
+        if stats["n_skipped_recordinglike"]:
+            logger.warning(
+                "Scan skipped %d .mat that look like recordings but don't "
+                "match the filename pattern (possible recorder format change): "
+                "%s", stats["n_skipped_recordinglike"],
+                ", ".join(stats["skipped_samples"]))
         return new_files
 
     def _scan_directory(self, dir_path: str, known_paths: set[str],
-                        new_files: list[NewFile], now: float):
+                        new_files: list[NewFile], now: float, stats: dict):
         """Recursively scan a directory for session folders containing .mat files."""
         try:
             entries = list(os.scandir(dir_path))
@@ -67,41 +92,48 @@ class FileWatcher:
 
         has_mat = False
         for entry in entries:
-            if entry.is_file() and entry.name.endswith(".mat") and MAT_PATTERN.search(entry.name):
-                has_mat = True
-                if entry.path in known_paths:
-                    continue
+            if not (entry.is_file() and entry.name.endswith(".mat")):
+                continue
+            has_mat = True    # a session folder with .mat -> don't recurse
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            stats["n_scanned"] += 1
+            if stat.st_mtime > stats["newest_mat_mtime"]:
+                stats["newest_mat_mtime"] = stat.st_mtime
 
-                try:
-                    stat = entry.stat()
-                except OSError:
-                    continue
+            m = MAT_PATTERN.search(entry.name)
+            if not m:
+                # Recording-like name (has a timestamp) that the pattern
+                # rejected -> the format-drift canary.
+                if RECORDING_TS_RX.search(entry.name):
+                    stats["n_skipped_recordinglike"] += 1
+                    if len(stats["skipped_samples"]) < 5:
+                        stats["skipped_samples"].append(entry.name)
+                continue
 
-                # Age gate: skip files still being written
-                if (now - stat.st_mtime) < self.min_file_age_sec:
-                    continue
+            if entry.path in known_paths:
+                continue
+            # Age gate: skip files still being written
+            if (now - stat.st_mtime) < self.min_file_age_sec:
+                continue
 
-                # Extract datetime from filename
-                m = MAT_PATTERN.search(entry.name)
-                chunk_datetime = m.group(1) if m else ""
-
-                session_dir = dir_path
-                session_name = os.path.basename(dir_path)
-
-                new_files.append(NewFile(
-                    path=entry.path,
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
-                    session_dir=session_dir,
-                    session_name=session_name,
-                    chunk_datetime=chunk_datetime,
-                ))
+            new_files.append(NewFile(
+                path=entry.path,
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                session_dir=dir_path,
+                session_name=os.path.basename(dir_path),
+                chunk_datetime=m.group(1),
+            ))
 
         # Recurse into subdirectories (for monthly folders containing session dirs)
         if not has_mat:
             for entry in entries:
                 if entry.is_dir() and not entry.name.startswith("."):
-                    self._scan_directory(entry.path, known_paths, new_files, now)
+                    self._scan_directory(entry.path, known_paths, new_files,
+                                         now, stats)
 
     def check_network_accessible(self) -> bool:
         """Check if at least one watch path is accessible."""
