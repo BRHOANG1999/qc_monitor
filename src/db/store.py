@@ -4278,8 +4278,27 @@ class Store:
                    WHERE pf.has_video = 1
                      AND sc.eeg_channels IS NOT NULL"""
             ).fetchall()
+            # Threshold-detection pool per animal: the envelope-peak count
+            # (n_with_peaks) from each animal's MOST-RECENT completed Mass
+            # Analyze scan. These are the auto-detector candidates awaiting
+            # review -- a different axis from the review-pipeline statuses
+            # above, so it lives in its own column on the Overview card.
+            ma_jobs = conn.execute(
+                """SELECT animal_id, n_with_peaks, finished_at, created_at
+                   FROM mass_analyze_job
+                   WHERE status = 'done'"""
+            ).fetchall()
         finally:
             conn.close()
+        # Keep only the latest done job per animal (by finished/created).
+        threshold_by_animal: dict[str, int] = {}
+        _latest_key: dict[str, str] = {}
+        for j in ma_jobs:
+            a = j["animal_id"]
+            key = (j["finished_at"] or "") + "|" + (j["created_at"] or "")
+            if key >= _latest_key.get(a, ""):
+                _latest_key[a] = key
+                threshold_by_animal[a] = int(j["n_with_peaks"] or 0)
         # Index review rows by file for a per-(file, animal) latest lookup.
         rev_by_file: dict[int, list] = {}
         for rr in rev:
@@ -4312,6 +4331,7 @@ class Store:
                     "n_approved": 0,
                     "n_flagged": 0,
                     "n_needs_scoring": 0,
+                    "n_threshold": 0,
                     "created_window": 0,
                     "approved_window": 0,
                     "last_activity_at": "",
@@ -4340,6 +4360,10 @@ class Store:
                 if (updated_at
                         and updated_at > slot["last_activity_at"]):
                     slot["last_activity_at"] = updated_at
+        # Attach the auto-detector threshold-pool count per animal.
+        for slot in per_animal.values():
+            slot["n_threshold"] = threshold_by_animal.get(
+                slot["animal_id"], 0)
         out = list(per_animal.values())
         # Sort: animals with growing backlog first (positive
         # net delta), then by queue size descending.

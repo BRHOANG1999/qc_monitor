@@ -2504,7 +2504,8 @@ def _build_behavioral_seizure_status_card(store, config=None):
     total_approved = sum(r["approved_window"] for r in rows)
     total_queue = sum(r["n_queue"] for r in rows)
     total_pending = sum(r["n_pending_pi"] for r in rows)
-    total_flagged = sum(r.get("n_needs_scoring", 0) for r in rows)
+    total_needs = sum(r.get("n_needs_scoring", 0) for r in rows)
+    total_threshold = sum(r.get("n_threshold", 0) for r in rows)
     rate_delta = total_created - total_approved
     rate_per_day = rate_delta / 7.0
     if rate_per_day > 5:
@@ -2545,8 +2546,11 @@ def _build_behavioral_seizure_status_card(store, config=None):
                        style={"color": "#cfd0d6"}),
             html.Span(f"{total_pending} pending PI  ·  ",
                        style={"color": "#cfd0d6"}),
-            html.Span(f"{total_flagged} flagged",
-                       style={"color": "#ff9f0a" if total_flagged
+            html.Span(f"🔬 {total_threshold} threshold  ·  ",
+                       style={"color": "#5e7ce2" if total_threshold
+                              else "#cfd0d6"}),
+            html.Span(f"🚩 {total_needs} needs scoring",
+                       style={"color": "#ff9f0a" if total_needs
                               else "#cfd0d6"}),
         ], style={"fontSize": "12px",
                    "marginTop": "2px"}),
@@ -2628,7 +2632,20 @@ def _bsz_cards(rows):
                                       "fontWeight": "600"}),
                 ]),
                 html.Div([
-                    html.Span("flagged",
+                    html.Span("🔬 threshold",
+                               style={"color": "#888",
+                                       "fontSize": "10px",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.5px"}),
+                    html.Div(f"{r.get('n_threshold', 0)}",
+                              style={"color": "#5e7ce2"
+                                     if r.get("n_threshold")
+                                     else "#cfd0d6",
+                                      "fontSize": "16px",
+                                      "fontWeight": "600"}),
+                ]),
+                html.Div([
+                    html.Span("🚩 needs scoring",
                                style={"color": "#888",
                                        "fontSize": "10px",
                                        "textTransform": "uppercase",
@@ -2653,7 +2670,7 @@ def _bsz_cards(rows):
                 ]),
             ], style={"display": "grid",
                        "gridTemplateColumns":
-                           "repeat(5, 1fr)",
+                           "repeat(3, 1fr)",
                        "gap": "8px",
                        "marginBottom": "4px"}),
             html.Div(
@@ -2679,8 +2696,10 @@ def _bsz_cards(rows):
 def _bsz_charts(rows):
     """Per-animal donut charts (the 'Charts' view) -- one donut per animal
     showing its review-status composition (queue / pending PI / approved /
-    flagged), with the total in the centre. Colours match the cards."""
-    labels = ["queue", "pending PI", "approved", "flagged"]
+    needs scoring), with the total in the centre. Colours match the cards.
+    (Threshold detections are a detector metric that overlaps the queue, so
+    they are shown on the cards but not in this pipeline-composition pie.)"""
+    labels = ["queue", "pending PI", "approved", "needs scoring"]
     colors = ["#8a8a99", "#5e7ce2", "#30d158", "#ff9f0a"]
     n = len(rows)
     cols = min(n, 5) if n else 1
