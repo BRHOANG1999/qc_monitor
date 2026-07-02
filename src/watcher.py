@@ -94,11 +94,14 @@ class FileWatcher:
         except OSError:
             return
 
-        has_mat = False
+        # Only a RECORDING file (matching MAT_PATTERN) marks this as a leaf
+        # session folder. A stray non-recording .mat (recorder_settings.mat,
+        # artifact_baseline.mat) sitting in a PARENT folder must NOT block
+        # recursion into the session subfolders below it.
+        has_recording = False
         for entry in entries:
             if not (entry.is_file() and entry.name.endswith(".mat")):
                 continue
-            has_mat = True    # a session folder with .mat -> don't recurse
             try:
                 stat = entry.stat()
             except OSError:
@@ -108,13 +111,15 @@ class FileWatcher:
             m = MAT_PATTERN.search(entry.name)
             if not m:
                 # Recording-like name (has a timestamp) that the pattern
-                # rejected -> the format-drift canary.
+                # rejected -> the format-drift canary. A settings/artifact
+                # .mat has no timestamp -> ignored entirely.
                 if RECORDING_TS_RX.search(entry.name):
                     stats["n_skipped_recordinglike"] += 1
                     if len(stats["skipped_samples"]) < 5:
                         stats["skipped_samples"].append(entry.name)
                 continue
 
+            has_recording = True   # real recording -> leaf session folder
             # Track the newest recording on the share by its embedded
             # datetime (immune to a backup re-copy bumping mtimes).
             if m.group(1) > stats["newest_chunk_dt"]:
@@ -135,8 +140,9 @@ class FileWatcher:
                 chunk_datetime=m.group(1),
             ))
 
-        # Recurse into subdirectories (for monthly folders containing session dirs)
-        if not has_mat:
+        # Recurse into subdirectories (monthly/parent folders that hold
+        # session dirs) unless this folder is itself a leaf session folder.
+        if not has_recording:
             for entry in entries:
                 if entry.is_dir() and not entry.name.startswith("."):
                     self._scan_directory(entry.path, known_paths, new_files,

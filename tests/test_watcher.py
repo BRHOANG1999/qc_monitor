@@ -84,6 +84,23 @@ def test_scan_recurses_into_month_folders(tmp_path):
     assert len(found) == 1
 
 
+def test_recurses_past_stray_mat_in_parent(tmp_path):
+    """A non-recording .mat in a PARENT folder (recorder_settings.mat,
+    artifact_baseline.mat) must NOT stop recursion into the session subfolder
+    -- the exact regression that stopped ingest mid-experiment."""
+    parent = tmp_path / "database"
+    session = parent / "stimStability__x_BCH110SR_BCH061SLM"
+    session.mkdir(parents=True)
+    # Stray non-recording .mat right next to the session folder.
+    _write(str(parent / "recorder_settings.mat"))
+    _write(str(parent / "artifact_baseline.mat"))
+    rec = session / _NEW
+    _write(str(rec)); _age(str(rec), 3600)
+    w = FileWatcher([str(tmp_path)], min_file_age_sec=60)
+    found = w.scan(known_paths=set())
+    assert [os.path.basename(f.path) for f in found] == [_NEW]
+
+
 def test_skip_canary_counts_recordinglike_nonmatches(tmp_path):
     session = tmp_path / "s"
     session.mkdir()
