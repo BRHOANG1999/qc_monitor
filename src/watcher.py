@@ -9,8 +9,12 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("qc_monitor.watcher")
 
-# KMrecorder file pattern: <sessionname>___YYYY_MM_DD__HH_MM_SS.mat
-MAT_PATTERN = re.compile(r"___(\d{4}_\d{2}_\d{2}__\d{2}_\d{2}_\d{2})\.mat$")
+# KMrecorder file pattern: <sessionname>__YYYY_MM_DD__HH_MM_SS.mat
+# The separator before the timestamp is 2 OR 3 underscores: older baseline
+# recordings used ``___`` but newer ones (e.g. stimStability) use ``__``, so
+# accept both -- otherwise the newer files are silently skipped and never
+# processed into evokedOutput.
+MAT_PATTERN = re.compile(r"_{2,3}(\d{4}_\d{2}_\d{2}__\d{2}_\d{2}_\d{2})\.mat$")
 
 
 @dataclass
