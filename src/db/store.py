@@ -1647,6 +1647,135 @@ class Store:
             conn.close()
 
     # ------------------------------------------------------------------ #
+    #  channel_impedance (transfer impedance per file+channel, both phases)
+    # ------------------------------------------------------------------ #
+
+    def upsert_channel_impedance(self, file_id: int, channel: int,
+                                 channel_name: str, animal_id: str,
+                                 electrode: str, rec: dict) -> None:
+        """Insert/replace one (file, channel) impedance row.
+
+        *rec* is the dict returned by ``impedance.impedance_for_channel``
+        (gain / charge_nc / pulse_width_us / neg_ratio / v_*_raw / i_*_ua /
+        impedance_*_kohm). Missing fields persist as NULL so gain-unknown
+        channels still get a row (with NULL impedance).
+        """
+        assert isinstance(file_id, int) and file_id > 0, "file_id > 0"
+        assert isinstance(channel, int), "channel int"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO channel_impedance
+                   (file_id, channel, channel_name, animal_id, electrode,
+                    gain, charge_nc, pulse_width_us, neg_ratio,
+                    v_pos_raw, v_neg_raw, i_pos_ua, i_neg_ua,
+                    impedance_pos_kohm, impedance_neg_kohm, computed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    file_id, channel, channel_name, animal_id, electrode,
+                    rec.get("gain"), rec.get("charge_nc"),
+                    rec.get("pulse_width_us"), rec.get("neg_ratio"),
+                    rec.get("v_pos_raw"), rec.get("v_neg_raw"),
+                    rec.get("i_pos_ua"), rec.get("i_neg_ua"),
+                    rec.get("impedance_pos_kohm"),
+                    rec.get("impedance_neg_kohm"),
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def files_missing_impedance(self, limit: int | None = None) -> list[int]:
+        """File ids that have evoked_waveforms but no channel_impedance row
+        yet, newest recording first (LIFO backfill)."""
+        conn = self._connect()
+        try:
+            sql = ("""SELECT DISTINCT ew.file_id
+                      FROM evoked_waveforms ew
+                      JOIN processed_files pf ON pf.id = ew.file_id
+                      LEFT JOIN channel_impedance ci ON ci.file_id = ew.file_id
+                      WHERE ci.file_id IS NULL
+                      ORDER BY pf.chunk_datetime DESC""")
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            rows = conn.execute(sql).fetchall()
+            return [int(r["file_id"]) for r in rows]
+        finally:
+            conn.close()
+
+    def files_gain_missing_impedance(self, limit: int | None = None
+                                     ) -> list[int]:
+        """Stim files whose impedance couldn't be computed because the
+        amplifier gain was unknown at the time (charge present, gain NULL,
+        impedance NULL). Re-tried on later runs so a File_Records edit that
+        adds the gain gets picked up. Non-stim files (charge NULL/0) are NOT
+        returned -- they legitimately have no transfer impedance."""
+        conn = self._connect()
+        try:
+            sql = ("""SELECT DISTINCT ci.file_id
+                      FROM channel_impedance ci
+                      JOIN processed_files pf ON pf.id = ci.file_id
+                      WHERE ci.charge_nc IS NOT NULL AND ci.charge_nc > 0
+                        AND ci.gain IS NULL
+                        AND ci.impedance_pos_kohm IS NULL
+                        AND ci.impedance_neg_kohm IS NULL
+                      ORDER BY pf.chunk_datetime DESC""")
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            rows = conn.execute(sql).fetchall()
+            return [int(r["file_id"]) for r in rows]
+        finally:
+            conn.close()
+
+    def impedance_series_by_channel(self, days: int | None = None,
+                                    exclude: list[str] | None = None
+                                    ) -> dict:
+        """Per-(animal, channel_name) time series of both impedances.
+
+        Returns ``{(animal_id, channel_name): [rows...]}`` where each row is
+        ``{file_id, chunk_datetime, impedance_pos_kohm, impedance_neg_kohm}``
+        ordered oldest->newest. *exclude* drops animals by case-insensitive
+        substring (e.g. 'Randles'). Only rows with a computed impedance in
+        at least one phase are returned.
+        """
+        excl = [e.lower() for e in (exclude or []) if e]
+        conn = self._connect()
+        try:
+            params: list = []
+            where = ["(ci.impedance_pos_kohm IS NOT NULL "
+                     "OR ci.impedance_neg_kohm IS NOT NULL)"]
+            if days is not None:
+                cutoff = (datetime.now() - timedelta(days=int(days))).isoformat()
+                where.append("pf.chunk_datetime >= ?")
+                params.append(cutoff)
+            sql = f"""SELECT ci.animal_id, ci.channel_name, ci.file_id,
+                             pf.chunk_datetime,
+                             ci.impedance_pos_kohm, ci.impedance_neg_kohm
+                      FROM channel_impedance ci
+                      JOIN processed_files pf ON pf.id = ci.file_id
+                      WHERE {' AND '.join(where)}
+                      ORDER BY pf.chunk_datetime ASC"""
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        out: dict = {}
+        max_iter = len(rows) + 1
+        for i, r in enumerate(rows):
+            assert i < max_iter, "impedance series runaway"
+            animal = r["animal_id"] or ""
+            if excl and any(e in animal.lower() for e in excl):
+                continue
+            key = (animal, r["channel_name"] or "")
+            out.setdefault(key, []).append({
+                "file_id": int(r["file_id"]),
+                "chunk_datetime": r["chunk_datetime"] or "",
+                "impedance_pos_kohm": r["impedance_pos_kohm"],
+                "impedance_neg_kohm": r["impedance_neg_kohm"],
+            })
+        return out
+
+    # ------------------------------------------------------------------ #
     #  processing_log
     # ------------------------------------------------------------------ #
 

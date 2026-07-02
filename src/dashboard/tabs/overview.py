@@ -2158,6 +2158,10 @@ def _overview_tab(store: Store, config: dict | None = None):
         id="overview-bsz-status",
         style={"marginBottom": "12px"},
     )
+    impedance_status = html.Div(
+        _build_impedance_trend_card(store, config),
+        id="overview-impedance",
+    )
     matlab_failed = _build_matlab_failed_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
@@ -2415,6 +2419,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
+        impedance_status,  # per-channel transfer-impedance drift trend
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
 
@@ -2743,6 +2748,189 @@ def _bsz_charts(rows):
 
 
 
+# ===================================================================== #
+#  Transfer-impedance trend card
+# ===================================================================== #
+
+# Max channels charted (keeps the figure a sane height); overflow is
+# reported in the header rather than silently dropped.
+_IMPEDANCE_MAX_CHANNELS = 30
+
+
+def _impedance_cfg(config) -> dict:
+    """Drift thresholds + baseline window, shared with the alert rule."""
+    rules = ((config or {}).get("alerting", {}) or {}).get("rules", {}) or {}
+    return {
+        "pct": float(rules.get("impedance_shift_pct", 40)),
+        "pct_crit": float(rules.get("impedance_shift_pct_critical", 75)),
+        "window": int(rules.get("impedance_baseline_window", 10)),
+        "min_history": int(rules.get("impedance_min_history", 4)),
+    }
+
+
+def _median(vals: list) -> float | None:
+    s = sorted(v for v in vals if v is not None)
+    if not s:
+        return None
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def _drift_stat(values: list, window: int, min_history: int) -> dict | None:
+    """Rolling-median drift of the newest point vs the prior *window*.
+
+    Returns ``{latest, baseline, drift_pct}`` or None when there isn't
+    enough history / the baseline is degenerate.
+    """
+    vals = [v for v in values if v is not None]
+    if len(vals) < max(2, min_history):
+        return None
+    latest = vals[-1]
+    baseline = _median(vals[max(0, len(vals) - 1 - window):-1])
+    if baseline is None or baseline == 0:
+        return None
+    return {"latest": latest, "baseline": baseline,
+            "drift_pct": (latest - baseline) / baseline * 100.0}
+
+
+def _impedance_surface_card(children) -> "html.Div":
+    return html.Div(children, style={
+        "marginBottom": "12px", "background": COLOR_SURFACE_1,
+        "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_MD})
+
+
+def _build_impedance_trend_card(store, config=None):
+    """Per-channel transfer-impedance trend (both stim phases) over time,
+    with each phase's rolling-median baseline band + drift flagging."""
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("impedance_series_by_channel failed: %s", e)
+        series = {}
+    if not series:
+        return _impedance_surface_card(html.Div(
+            "No transfer-impedance data yet. Computed from evoked stim "
+            "responses once amplifier gains (File_Records) are available.",
+            style={"padding": "12px 14px", "color": "#a0a0b0",
+                    "fontSize": "12px"}))
+    icfg = _impedance_cfg(config)
+    channels = _impedance_channel_rows(series, icfg)
+    n_total = len(channels)
+    n_drift = sum(1 for c in channels if c["drifting"])
+    shown = channels[:_IMPEDANCE_MAX_CHANNELS]
+    header = _impedance_header(n_total, n_drift, len(shown), icfg)
+    body = _impedance_figure(shown, icfg)
+    return _impedance_surface_card([header, body])
+
+
+def _impedance_channel_rows(series: dict, icfg: dict) -> list[dict]:
+    """One entry per (animal, channel): series rows + per-phase drift."""
+    out = []
+    for (animal, ch), rows in series.items():
+        pos = _drift_stat([r["impedance_pos_kohm"] for r in rows],
+                          icfg["window"], icfg["min_history"])
+        neg = _drift_stat([r["impedance_neg_kohm"] for r in rows],
+                          icfg["window"], icfg["min_history"])
+        drifting = any(st and abs(st["drift_pct"]) >= icfg["pct"]
+                       for st in (pos, neg))
+        out.append({"animal": animal, "channel": ch, "rows": rows,
+                    "pos": pos, "neg": neg, "drifting": drifting})
+    # Drifting channels float to the top, then by animal/channel.
+    out.sort(key=lambda c: (not c["drifting"], c["animal"], c["channel"]))
+    return out
+
+
+def _impedance_header(n_total, n_drift, n_shown, icfg):
+    bits = [
+        html.Span("Transfer impedance drift",
+                  style={"color": "#f0f0f5", "fontWeight": "600",
+                          "fontSize": "13px"}),
+        html.Span(f"  (kΩ per channel · both phases · baseline = rolling "
+                  f"median of last {icfg['window']})",
+                  style={"color": "#888", "fontSize": "11px"}),
+    ]
+    summary = [
+        html.Span(f"{n_total} channels  ·  ", style={"color": "#cfd0d6"}),
+        html.Span(f"⚠ {n_drift} drifting >{icfg['pct']:.0f}%",
+                  style={"color": "#ff9f0a" if n_drift else "#30d158",
+                          "fontWeight": "600"}),
+    ]
+    if n_shown < n_total:
+        summary.append(html.Span(f"  ·  showing {n_shown} of {n_total}",
+                                  style={"color": "#888"}))
+    return html.Div([
+        html.Div(bits),
+        html.Div(summary, style={"fontSize": "12px", "marginTop": "2px"}),
+    ], style={"padding": "12px 14px",
+               "borderBottom": f"1px solid {COLOR_DIVIDER}"})
+
+
+def _impedance_figure(channels: list[dict], icfg: dict):
+    """Small-multiples: one subplot per channel, pos+neg traces + baseline
+    band. Newest point turns red when its phase has drifted past threshold."""
+    n = len(channels)
+    if n == 0:
+        return html.Div()
+    cols = min(n, 3)
+    n_rows = (n + cols - 1) // cols
+    titles = [f"{c['animal']} {c['channel']}" for c in channels]
+    fig = make_subplots(rows=n_rows, cols=cols, subplot_titles=titles,
+                        vertical_spacing=0.16, horizontal_spacing=0.06)
+    for i, c in enumerate(channels):
+        rr, cc = i // cols + 1, i % cols + 1
+        x = list(range(len(c["rows"])))
+        dates = [r["chunk_datetime"] for r in c["rows"]]
+        _add_phase_trace(fig, rr, cc, x, dates,
+                         [r["impedance_pos_kohm"] for r in c["rows"]],
+                         c["pos"], "#5e7ce2", "pos", icfg, i == 0)
+        _add_phase_trace(fig, rr, cc, x, dates,
+                         [r["impedance_neg_kohm"] for r in c["rows"]],
+                         c["neg"], "#ff9f0a", "neg", icfg, i == 0)
+    for ann in fig.layout.annotations[:n]:
+        ann.font.size = 11
+        ann.font.color = "#f0f0f5"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=90 + 150 * n_rows, margin=dict(l=10, r=10, t=36, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.06,
+                     xanchor="center", x=0.5, font=dict(size=10),
+                     bgcolor="rgba(0,0,0,0)"),
+        font=dict(color="#cfd0d6"))
+    fig.update_xaxes(showticklabels=False)
+    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+                     style={"padding": "8px 6px"})
+
+
+def _add_phase_trace(fig, rr, cc, x, dates, yvals, stat, color, label,
+                     icfg, show_legend):
+    """Add one phase's line (+ baseline band + drift-highlighted latest)."""
+    fig.add_trace(go.Scatter(
+        x=x, y=yvals, mode="lines+markers", name=f"{label} phase",
+        legendgroup=label, showlegend=show_legend,
+        line=dict(color=color, width=1.5), marker=dict(size=3),
+        customdata=dates,
+        hovertemplate=(f"{label}: %{{y:.3f}} kΩ<br>%{{customdata}}"
+                       "<extra></extra>")), rr, cc)
+    if stat is None:
+        return
+    band = stat["baseline"] * icfg["pct"] / 100.0
+    for yb, dash in ((stat["baseline"], "dot"),):
+        fig.add_hline(y=yb, line=dict(color=color, width=1, dash=dash),
+                      row=rr, col=cc, opacity=0.5)
+    fig.add_hrect(y0=stat["baseline"] - band, y1=stat["baseline"] + band,
+                  line_width=0, fillcolor=color, opacity=0.08,
+                  row=rr, col=cc)
+    if abs(stat["drift_pct"]) >= icfg["pct"]:
+        fig.add_trace(go.Scatter(
+            x=[x[-1]], y=[yvals[-1]], mode="markers", showlegend=False,
+            marker=dict(size=8, color="#ff453a", symbol="circle-open",
+                        line=dict(width=2, color="#ff453a")),
+            hovertemplate=(f"DRIFT {stat['drift_pct']:+.0f}%<br>"
+                           f"{stat['latest']:.3f} vs {stat['baseline']:.3f} kΩ"
+                           "<extra></extra>")), rr, cc)
+
+
 def layout(store: Store, config: dict | None = None):
     """Public tab entrypoint (mirrors the other tab modules)."""
     return _overview_tab(store, config)
@@ -2797,6 +2985,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-queue", "children"),
         Output("overview-home-grid", "children"),
         Output("overview-km-log", "children"),
+        Output("overview-impedance", "children"),
         Input("refresh-trigger", "data"),
         prevent_initial_call=True,
     )
@@ -2807,6 +2996,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _build_overview_queue(store),
             _build_home_grid_children(store, config, _date.today()),
             _build_km_log_section(config),
+            _build_impedance_trend_card(store, config),
         )
 
     # Thumbnail has its own callback because the radio adds an

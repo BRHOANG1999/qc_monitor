@@ -10,6 +10,29 @@ from src.alerting.email_alert import EmailAlerter
 logger = logging.getLogger("qc_monitor.alerting.rules")
 
 
+def _median(vals: list) -> float | None:
+    s = sorted(v for v in vals if v is not None)
+    if not s:
+        return None
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def _drift_stat(values: list, window: int, min_history: int) -> dict | None:
+    """Rolling-median drift of the newest value vs the prior *window*.
+    Returns ``{latest, baseline, drift_pct}`` or None if too little history
+    / a degenerate baseline. Shared conceptually with the Overview card."""
+    vals = [v for v in values if v is not None]
+    if len(vals) < max(2, min_history):
+        return None
+    latest = vals[-1]
+    baseline = _median(vals[max(0, len(vals) - 1 - window):-1])
+    if baseline is None or baseline == 0:
+        return None
+    return {"latest": latest, "baseline": baseline,
+            "drift_pct": (latest - baseline) / baseline * 100.0}
+
+
 class AlertRuleEngine:
     def __init__(self, store: Store, emailer: EmailAlerter, config: dict):
         self.store = store
@@ -18,6 +41,18 @@ class AlertRuleEngine:
         self.rate_limit_minutes = rules_cfg.get("rate_limit_per_type_minutes", 60)
         self.network_down_minutes = rules_cfg.get("network_down_minutes", 5)
         self.no_data_hours = rules_cfg.get("no_data_hours", 2)
+        # Transfer-impedance drift thresholds (per channel, per phase).
+        self.impedance_shift_pct = float(
+            rules_cfg.get("impedance_shift_pct", 40))
+        self.impedance_shift_pct_critical = float(
+            rules_cfg.get("impedance_shift_pct_critical", 75))
+        self.impedance_baseline_window = int(
+            rules_cfg.get("impedance_baseline_window", 10))
+        self.impedance_min_history = int(
+            rules_cfg.get("impedance_min_history", 4))
+        self.impedance_exclude = (
+            (config.get("overview", {}) or {}).get("exclude_animals")
+            or ["Randles"])
 
         self._network_down_since: datetime | None = None
 
@@ -104,6 +139,47 @@ class AlertRuleEngine:
             f"{len(failed)} recording(s) failed MATLAB processing in the last "
             f"{lookback_hours}h (most recent: {newest}). They produce no "
             f"evoked data -- see the Overview 'failed processing' card.")
+
+    def check_impedance_shift(self):
+        """Fire (rate-limited) when a channel's transfer impedance drifts
+        past ``impedance_shift_pct`` from its rolling-median baseline, on
+        either stimulus phase. One aggregated alert lists every drifting
+        (animal, channel, phase); severity escalates to critical when any
+        crosses ``impedance_shift_pct_critical``. Silent until a channel has
+        ``impedance_min_history`` measurements."""
+        try:
+            series = self.store.impedance_series_by_channel(
+                exclude=self.impedance_exclude)
+        except Exception:  # noqa: BLE001 -- alerting must not crash the loop
+            return
+        flags = self._impedance_flags(series)
+        if not flags:
+            return
+        crit = any(abs(st["drift_pct"]) >= self.impedance_shift_pct_critical
+                   for *_r, st in flags)
+        lines = [f"{a} {c} {ph} {st['latest']:.3f}kΩ vs "
+                 f"{st['baseline']:.3f} ({st['drift_pct']:+.0f}%)"
+                 for a, c, ph, st in flags[:8]]
+        more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
+        self._fire_alert(
+            "impedance_shift", "critical" if crit else "warning",
+            f"{len(flags)} channel-phase(s) drifted "
+            f">{self.impedance_shift_pct:.0f}% from baseline "
+            f"transfer impedance: " + "; ".join(lines) + more)
+
+    def _impedance_flags(self, series: dict) -> list:
+        """Every (animal, channel, phase, drift_stat) past the warn pct."""
+        flags = []
+        for (animal, ch), rows in (series or {}).items():
+            for phase, key in (("pos", "impedance_pos_kohm"),
+                               ("neg", "impedance_neg_kohm")):
+                st = _drift_stat([r[key] for r in rows],
+                                 self.impedance_baseline_window,
+                                 self.impedance_min_history)
+                if st and abs(st["drift_pct"]) >= self.impedance_shift_pct:
+                    flags.append((animal, ch, phase, st))
+        flags.sort(key=lambda f: -abs(f[3]["drift_pct"]))
+        return flags
 
     def _fire_alert(self, alert_type: str, severity: str, message: str,
                     file_id: int = None, session_dir: str = None):

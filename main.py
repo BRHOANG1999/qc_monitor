@@ -32,6 +32,7 @@ from src.alerting.email_alert import EmailAlerter
 from src.alerting.rules import AlertRuleEngine
 from src.notifications.scheduler import DigestScheduler
 from src.utils.logging_config import setup_logging
+from src.utils.impedance_refresh import refresh_impedance
 
 
 def load_config(path: str) -> dict:
@@ -158,6 +159,18 @@ def main():
 
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
+    impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
+
+    # One-time transfer-impedance backfill in the background so a large
+    # historical sweep doesn't block startup. Incremental refreshes run on
+    # the impedance cadence in the loop below (cheap once caught up).
+    def _impedance_backfill():
+        try:
+            refresh_impedance(store, config)
+        except Exception:
+            logger.exception("initial impedance backfill failed")
+    threading.Thread(target=_impedance_backfill, daemon=True,
+                     name="qc-impedance-backfill").start()
 
     # Launch dashboard in background thread
     if not args.no_dashboard:
@@ -184,6 +197,7 @@ def main():
 
     # Main loop
     last_health_time = 0
+    last_impedance_time = 0
     consecutive_network_failures = 0
     files_since_scan = 10  # force initial scan
 
@@ -228,6 +242,16 @@ def main():
                     backoff = min(300, poll_interval * (2 ** min(consecutive_network_failures, 4)))
                     time.sleep(backoff)
                     continue
+
+            # Transfer-impedance: incremental refresh (new/gain-arrived files)
+            # then drift check, on a slower cadence than the health tick.
+            if (loop_start - last_impedance_time) > impedance_interval:
+                try:
+                    refresh_impedance(store, config)
+                    alert_engine.check_impedance_shift()
+                except Exception as e:
+                    logger.error("Impedance refresh/check failed: %s", e)
+                last_impedance_time = loop_start
 
             # Scan for new files every 10 processed files or when queue is empty
             if files_since_scan >= 10 or not store.get_pending_files(limit=1):

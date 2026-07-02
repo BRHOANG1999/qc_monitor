@@ -252,6 +252,34 @@ CREATE TABLE IF NOT EXISTS evoked_waveforms (
     UNIQUE(file_id, channel, version_id)
 );
 
+-- Per-(file, channel) transfer impedance, both stimulus phases.
+-- Z_kOhm = (v_raw/gain*1000) / I_uA, where I_uA = charge_nC/pulse_width_us
+-- *1000. Positive (fast) + negative (slow, 1:ratio recharge) phases have
+-- different currents, so both impedances are stored. Gain comes from the
+-- File_Records sheet (recording amplifier gain), NOT from any .mat file.
+CREATE TABLE IF NOT EXISTS channel_impedance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES processed_files(id),
+    channel INTEGER NOT NULL,
+    channel_name TEXT,
+    animal_id TEXT,
+    electrode TEXT,
+    gain REAL,
+    charge_nc REAL,
+    pulse_width_us REAL,
+    neg_ratio REAL,
+    v_pos_raw REAL,
+    v_neg_raw REAL,
+    i_pos_ua REAL,
+    i_neg_ua REAL,
+    impedance_pos_kohm REAL,
+    impedance_neg_kohm REAL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(file_id, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_chimp_animal_chan
+    ON channel_impedance(animal_id, channel_name);
+
 -- Processing activity log
 CREATE TABLE IF NOT EXISTS processing_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

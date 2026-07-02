@@ -149,6 +149,14 @@ alerting:
     seizure_warning: true
     stim_delivery_failure: true
     rate_limit_per_type_minutes: 60
+    # Transfer-impedance drift: warn when a channel's per-phase impedance
+    # moves more than impedance_shift_pct from its rolling-median baseline
+    # (last impedance_baseline_window recordings); critical past
+    # impedance_shift_pct_critical. Needs >= impedance_min_history points.
+    impedance_shift_pct: 40
+    impedance_shift_pct_critical: 75
+    impedance_baseline_window: 10
+    impedance_min_history: 4
 dashboard:
   host: 0.0.0.0
   port: 8050
@@ -221,6 +229,15 @@ operator_log:
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   sheet_id: 1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0
   tab_name: Notes
+# Per-channel recording amplifier gain -> transfer-impedance computation.
+# File_Records tab (gid 1989999192) holds EEG File / Animal ID & Channel /
+# Amplifier Gain (pipe-separated, positionally aligned) per recording.
+amplifier_records:
+  enabled: true
+  refresh_minutes: 60
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  sheet_id: 1a7E0t_Go3IXUpJj0AFfq2KSlXkjMrw1KZa1GdIWnoe0
+  tab_name: File_Records
 notifications:
   state_file: data/notification_state.json
   eod_digest:

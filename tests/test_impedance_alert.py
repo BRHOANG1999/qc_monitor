@@ -1,0 +1,103 @@
+"""Tests for the transfer-impedance drift alert (rules.check_impedance_shift)."""
+
+from src.alerting.rules import AlertRuleEngine, _drift_stat
+
+
+class _FakeStore:
+    def __init__(self, series, last_alert=None):
+        self._series = series
+        self._last_alert = last_alert
+        self.inserted = []
+
+    def impedance_series_by_channel(self, exclude=None):
+        return self._series
+
+    def get_last_alert_time(self, alert_type):
+        return self._last_alert
+
+    def insert_alert(self, *args):
+        self.inserted.append(args)
+
+
+class _FakeEmailer:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, subject, body, severity):
+        self.sent.append((subject, body, severity))
+
+
+def _engine(series, last_alert=None, **rule_overrides):
+    rules = {"impedance_shift_pct": 40, "impedance_shift_pct_critical": 75,
+             "impedance_baseline_window": 10, "impedance_min_history": 4}
+    rules.update(rule_overrides)
+    cfg = {"alerting": {"rules": rules}}
+    store = _FakeStore(series, last_alert)
+    return AlertRuleEngine(store, _FakeEmailer(), cfg), store
+
+
+def _rows(pos_vals, neg_vals=None):
+    neg_vals = neg_vals if neg_vals is not None else [None] * len(pos_vals)
+    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
+             "impedance_pos_kohm": p, "impedance_neg_kohm": n}
+            for i, (p, n) in enumerate(zip(pos_vals, neg_vals), start=1)]
+
+
+def test_drift_stat_basic():
+    st = _drift_stat([1.0, 1.0, 1.0, 1.5], window=10, min_history=4)
+    assert st["baseline"] == 1.0
+    assert st["latest"] == 1.5
+    assert st["drift_pct"] == 50.0
+
+
+def test_drift_stat_needs_min_history():
+    assert _drift_stat([1.0, 1.5], window=10, min_history=4) is None
+
+
+def test_alert_fires_on_drift():
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 1.0, 1.0, 1.6])}  # +60%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert len(store.inserted) == 1
+    alert_type, severity, message = store.inserted[0][:3]
+    assert alert_type == "impedance_shift"
+    assert severity == "warning"
+    assert "BCH110SLM" in message and "pos" in message
+
+
+def test_alert_critical_on_large_drift():
+    series = {("BCH062", "BCH062SR"): _rows([1.0, 1.0, 1.0, 2.0])}  # +100%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert store.inserted[0][1] == "critical"
+
+
+def test_no_alert_when_stable():
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 1.0, 1.0, 1.02])}  # +2%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert store.inserted == []
+
+
+def test_no_alert_below_min_history():
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 2.0])}  # only 2 points
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert store.inserted == []
+
+
+def test_negative_phase_drift_flagged():
+    series = {("BCH062", "BCH062SR"): _rows(
+        [1.0, 1.0, 1.0, 1.0], neg_vals=[0.3, 0.3, 0.3, 0.6])}  # neg +100%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert len(store.inserted) == 1
+    assert "neg" in store.inserted[0][2]
+
+
+def test_rate_limited(monkeypatch):
+    from datetime import datetime
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 1.0, 1.0, 1.6])}
+    eng, store = _engine(series, last_alert=datetime.now())  # just fired
+    eng.check_impedance_shift()
+    assert store.inserted == []  # suppressed by rate limit
