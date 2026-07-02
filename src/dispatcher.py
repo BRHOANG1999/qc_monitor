@@ -350,9 +350,14 @@ class Dispatcher:
             **self.config.get("criticality", {}),
         }
         matlab_exe = self.config.get("matlab_exe", "matlab")
+        # Big 1-hour recordings (500+ MB, loaded over the network) can take
+        # well over 5 min for evoked extraction + features + wavelet CWT, so
+        # the timeout is config-driven (matlab_timeout_sec) with a generous
+        # default -- 300s was too short and false-flagged them as failures.
+        timeout = int(self.config.get("matlab_timeout_sec", 1200))
         result = matlab_run_pipeline(
             new_file.path, matlab_exe=matlab_exe,
-            timeout=300, config=matlab_config,
+            timeout=timeout, config=matlab_config,
         )
         t2_elapsed = time.time() - t2_start
 
