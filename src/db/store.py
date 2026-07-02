@@ -1439,6 +1439,20 @@ class Store:
         finally:
             conn.close()
 
+    def newest_processed_chunk_datetime(self) -> str | None:
+        """Embedded recording timestamp ('YYYY_MM_DD__HH_MM_SS') of the newest
+        processed recording, or None. Compared against the newest recording on
+        the share -- by recording time, not file mtime -- so a daily backup
+        that re-copies old files doesn't look like new data."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(chunk_datetime) AS m FROM processed_files "
+                "WHERE status = 'done'").fetchone()
+        finally:
+            conn.close()
+        return row["m"] if row and row["m"] else None
+
     def newest_processed_at(self) -> datetime | None:
         """When the daemon last finished a file (max processed_at, status
         done), or None. Compared against the newest .mat mtime on the share

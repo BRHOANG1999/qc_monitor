@@ -43,7 +43,11 @@ class FileWatcher:
 
     @staticmethod
     def _empty_stats() -> dict:
-        return {"newest_mat_mtime": 0.0, "n_scanned": 0,
+        # newest_chunk_dt = the newest recording on the share by its EMBEDDED
+        # timestamp (from the filename), NOT file mtime -- the daemon watches a
+        # daily backup that re-copies old files with fresh mtimes, so mtime
+        # would look "new" every backup. The embedded datetime never changes.
+        return {"newest_chunk_dt": "", "n_scanned": 0,
                 "n_skipped_recordinglike": 0, "skipped_samples": []}
 
     def scan(self, known_paths: set[str]) -> list[NewFile]:
@@ -100,8 +104,6 @@ class FileWatcher:
             except OSError:
                 continue
             stats["n_scanned"] += 1
-            if stat.st_mtime > stats["newest_mat_mtime"]:
-                stats["newest_mat_mtime"] = stat.st_mtime
 
             m = MAT_PATTERN.search(entry.name)
             if not m:
@@ -112,6 +114,11 @@ class FileWatcher:
                     if len(stats["skipped_samples"]) < 5:
                         stats["skipped_samples"].append(entry.name)
                 continue
+
+            # Track the newest recording on the share by its embedded
+            # datetime (immune to a backup re-copy bumping mtimes).
+            if m.group(1) > stats["newest_chunk_dt"]:
+                stats["newest_chunk_dt"] = m.group(1)
 
             if entry.path in known_paths:
                 continue

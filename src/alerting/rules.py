@@ -35,29 +35,43 @@ class AlertRuleEngine:
             self._network_down_since = None
 
     def check_processing_stalled(self, scan_stats: dict):
-        """Fire when a recording has sat on the share, unprocessed, for longer
-        than ``no_data_hours`` -- i.e. the newest .mat on the share is that
-        much newer than the last file we finished. Catches a daemon hang, a
-        queue stall, AND the silent-skip case (a recorder rename where nothing
-        ever reaches the queue, so pending stays 0)."""
-        newest_share = (scan_stats or {}).get("newest_mat_mtime") or 0.0
-        if newest_share <= 0:
-            return                       # no files on the share to judge
-        last_proc = self.store.newest_processed_at()
-        last_proc_ts = last_proc.timestamp() if last_proc else 0.0
-        if (newest_share - last_proc_ts) <= self.no_data_hours * 3600:
-            return                       # keeping up (or nothing newer)
-        newest_str = datetime.fromtimestamp(newest_share).strftime(
-            "%Y-%m-%d %H:%M")
-        last_str = last_proc.strftime("%Y-%m-%d %H:%M") if last_proc else "never"
+        """Fire when a recording NEWER (by its embedded recording time) than
+        anything we've processed has sat on the share, unprocessed, for longer
+        than ``no_data_hours``. Keyed on the recording's filename datetime, NOT
+        file mtime -- the daemon watches a daily backup that re-copies old
+        files with fresh mtimes, so mtime would false-alarm every backup.
+        Catches a daemon hang, a queue stall, AND the silent-skip case (a
+        recorder rename where nothing ever reaches the queue, so pending
+        stays 0)."""
+        share_dt = (scan_stats or {}).get("newest_chunk_dt") or ""
+        if not share_dt:
+            return                       # no recordings on the share to judge
+        proc_dt = self.store.newest_processed_chunk_datetime() or ""
+        if share_dt <= proc_dt:
+            return                       # nothing on the share newer than
+            #                              what we've processed (a backup
+            #                              re-copy of old files doesn't count)
+        try:
+            share_when = datetime.strptime(share_dt, "%Y_%m_%d__%H_%M_%S")
+        except (ValueError, TypeError):
+            return
+        if (datetime.now() - share_when).total_seconds() \
+                <= self.no_data_hours * 3600:
+            return                       # fresh -- give it time to process
+        newest_str = share_when.strftime("%Y-%m-%d %H:%M")
+        try:
+            last_str = datetime.strptime(
+                proc_dt, "%Y_%m_%d__%H_%M_%S").strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            last_str = proc_dt or "never"
         n_skip = (scan_stats or {}).get("n_skipped_recordinglike") or 0
         skip_note = (f" {n_skip} file(s) skipped the filename pattern."
                      if n_skip else "")
         self._fire_alert(
             "processing_stalled", "critical",
-            f"Processing may be stalled: newest recording on the share "
-            f"({newest_str}) is >{self.no_data_hours}h newer than the last "
-            f"processed file (last processed {last_str}).{skip_note}")
+            f"Processing may be stalled: a recording from {newest_str} on the "
+            f"share is newer than the last processed recording ({last_str}) "
+            f"and has been unprocessed for >{self.no_data_hours}h.{skip_note}")
 
     def check_unrecognized_recordings(self, scan_stats: dict):
         """Fire when the scan saw .mat files that look like recordings (have a

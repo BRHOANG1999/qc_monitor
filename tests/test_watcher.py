@@ -101,15 +101,21 @@ def test_skip_canary_counts_recordinglike_nonmatches(tmp_path):
                for s in w.last_scan_stats["skipped_samples"])
 
 
-def test_scan_stats_track_newest_mtime(tmp_path):
+def test_scan_stats_track_newest_recording_by_embedded_dt(tmp_path):
+    """Newest recording is tracked by its EMBEDDED timestamp, not file mtime
+    -- so a daily backup re-copying old files (fresh mtimes) doesn't look new."""
     session = tmp_path / "s"
     session.mkdir()
-    mat = session / _NEW
-    _write(str(mat)); _age(str(mat), 120)
+    older = session / "baseline__a_BCH110SR___2026_07_01__08_00_00.mat"
+    newer = session / _NEW  # ...2026_07_01__19_09_29.mat
+    _write(str(older)); _age(str(older), 3600)
+    # The NEWER-by-recording-time file is re-copied "now" (fresh mtime) --
+    # mtime order is opposite recording order, so embedded dt must win.
+    _write(str(newer)); _age(str(newer), 120)
     w = FileWatcher([str(tmp_path)], min_file_age_sec=60)
     w.scan(known_paths=set())
-    assert w.last_scan_stats["newest_mat_mtime"] > 0
-    assert w.last_scan_stats["n_scanned"] == 1
+    assert w.last_scan_stats["newest_chunk_dt"] == "2026_07_01__19_09_29"
+    assert w.last_scan_stats["n_scanned"] == 2
 
 
 if __name__ == "__main__":
