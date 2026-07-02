@@ -72,7 +72,9 @@ COLUMNS: tuple[str, ...] = (
     # AUC_Threshold / AUC_Window_s = the sliding-window-AUC screen settings
     # used for this file (the raw-envelope threshold is the Cutoff column);
     # recording both makes each row self-documenting about how it was detected.
-    "EventEO_WallClock",
+    # EO_HourOfDay = the onset's fractional hour of day (0-23.999) so seizures
+    # can be binned by circadian time directly, no datetime parsing.
+    "EventEO_WallClock", "EO_HourOfDay",
     "AUC_Threshold", "AUC_Window_s",
     "SoftwareVersion",
 )
@@ -95,6 +97,7 @@ _NUMERIC_COLS: frozenset[str] = frozenset((
     "EventPAs_1", "EventPAe_1", "EventPAs_2", "EventPAe_2",
     "EventPAs_3", "EventPAe_3",
     "Score", "Light",
+    "EO_HourOfDay",
     "AUC_Threshold", "AUC_Window_s",
 ))
 
@@ -149,6 +152,22 @@ def _wall_clock_eo(eo_sec, file_meta: dict, fs: float) -> str:
     offset = (float(pidx) / fs) if (pidx not in (None, "") and fs > 0) else 0.0
     wall = peak_dt - timedelta(seconds=offset) + timedelta(seconds=eo)
     return wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _eo_hour_of_day(eo_sec, file_meta: dict, fs: float):
+    """Fractional hour of day (0-23.999) of the EEG onset, so seizures can be
+    binned by circadian time directly. Derived from the same wall-clock the
+    ``EventEO_WallClock`` column uses. Returns None (blank cell) when there's
+    no onset / no recording timestamp."""
+    wall = _wall_clock_eo(eo_sec, file_meta, fs)
+    if not wall:
+        return None
+    try:
+        dt = datetime.strptime(wall, "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return None
+    return round(dt.hour + dt.minute / 60.0
+                 + (dt.second + dt.microsecond / 1e6) / 3600.0, 4)
 
 
 def _fmt_cell(col: str, val) -> str:
@@ -216,6 +235,7 @@ def _event_to_row(event: dict, file_meta: dict,
     row["EventEO"] = _to_sample_index(event.get("EO_sec"), fs)
     row["EventEO_WallClock"] = _wall_clock_eo(
         event.get("EO_sec"), file_meta, fs)
+    row["EO_HourOfDay"] = _eo_hour_of_day(event.get("EO_sec"), file_meta, fs)
     row["EventLAS"] = _to_sample_index(event.get("LAS_sec"), fs)
     row["EventBO"] = _to_sample_index(event.get("BO_sec"), fs)
     row["EventPID"] = _to_sample_index(event.get("PID_sec"), fs)
@@ -247,6 +267,36 @@ def _no_events_row(file_meta: dict) -> dict:
     return row
 
 
+def _ensure_header(path: Path) -> None:
+    """If *path* exists with a header that differs from the current COLUMNS,
+    rewrite it in place so newly appended rows stay column-aligned. Old rows
+    are preserved (keyed by name); columns added since (e.g. EO_HourOfDay,
+    EventEO_WallClock) are blank-filled, dropped columns discarded. No-op for a
+    new file or one already on the current schema -- this repairs the schema
+    drift that would otherwise spill columns when appending to an older CSV."""
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), None)
+    except (OSError, csv.Error, StopIteration):
+        return
+    if header is None or tuple(header) == COLUMNS:
+        return
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            old_rows = list(csv.DictReader(f))
+    except (OSError, csv.Error):
+        return
+    tmp = path.with_suffix(path.suffix + ".hdrtmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+        writer.writerow(COLUMNS)
+        for r in old_rows:
+            writer.writerow([r.get(c, "") for c in COLUMNS])
+    tmp.replace(path)
+
+
 def write_event_rows(csv_path: str | Path,
                        file_meta: dict,
                        events: list[dict],
@@ -270,6 +320,9 @@ def write_event_rows(csv_path: str | Path,
     assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
     path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Upgrade a legacy/older-schema CSV to the current COLUMNS before we
+    # append, so the new row's extra columns don't spill past the header.
+    _ensure_header(path)
     existing = _read_existing_eos(path)
     # Always carry the file-level meta into every row.
     is_new = not path.exists()

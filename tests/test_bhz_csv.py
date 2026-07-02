@@ -46,8 +46,8 @@ class CsvHeader(unittest.TestCase):
         ``AUC_Window_s`` and ``SoftwareVersion`` are lab-local additions
         appended at the end, so they're excluded from the reference
         comparison."""
-        lab_local = ("EventEO_WallClock", "AUC_Threshold", "AUC_Window_s",
-                     "SoftwareVersion")
+        lab_local = ("EventEO_WallClock", "EO_HourOfDay", "AUC_Threshold",
+                     "AUC_Window_s", "SoftwareVersion")
         ref = _ref_header()
         # Fallback path returns our own COLUMNS; strip trailing additions.
         while ref and ref[-1] in lab_local:
@@ -257,6 +257,65 @@ class PartialEegOnlyEvent(unittest.TestCase):
                     + timedelta(seconds=eo_sec)).strftime(
                         "%Y-%m-%d %H:%M:%S.%f")[:-3]
             self.assertEqual(r["EventEO_WallClock"], want)
+
+
+class CircadianEO(unittest.TestCase):
+
+    def test_eo_hour_of_day(self):
+        fm = build_file_meta(
+            folder="D:/x/", filename="rec.mat", fs=20000.0, cutoff=0.05,
+            channel=2, peak_index=None, peak_stamp=None,
+            peak_dt=datetime(2026, 6, 25, 14, 30, 0))
+        from src.utils.bhz_csv import _event_to_row
+        row = _event_to_row({"type": "LVF", "EO_sec": 3700.0, "racine": 4},
+                            fm, 20000.0)
+        # 14:30:00 + 3700s = 15:31:40 -> 15 + 31/60 + 40/3600
+        self.assertEqual(row["EventEO_WallClock"], "2026-06-25 15:31:40.000")
+        self.assertAlmostEqual(row["EO_HourOfDay"], 15.5278, places=3)
+        # No onset -> blank both.
+        no = _event_to_row({"type": "", "EO_sec": None}, fm, 20000.0)
+        self.assertIsNone(no["EO_HourOfDay"])
+        self.assertEqual(no["EventEO_WallClock"], "")
+
+
+class HeaderMigration(unittest.TestCase):
+
+    def test_append_migrates_legacy_header(self):
+        """Appending to a CSV whose header predates the current COLUMNS
+        rewrites the header + preserves old rows, so the new row aligns."""
+        tmpdir = tempfile.mkdtemp(prefix="bhz_hdr_")
+        try:
+            path = Path(tmpdir) / "legacy.csv"
+            # A legacy CSV: only the first-44 columns, one data row.
+            legacy_cols = [c for c in COLUMNS if c not in (
+                "EventEO_WallClock", "EO_HourOfDay", "AUC_Threshold",
+                "AUC_Window_s", "SoftwareVersion")]
+            with path.open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f, lineterminator="\n")
+                w.writerow(legacy_cols)
+                w.writerow(["D:/x/", "old.mat"] + [""] * (len(legacy_cols) - 2))
+            fm = build_file_meta(
+                folder="D:/x/", filename="new.mat", fs=20000.0, cutoff=0.05,
+                channel=2, peak_index=None, peak_stamp=None,
+                peak_dt=datetime(2026, 6, 25, 14, 30, 0))
+            n = write_event_rows(path, fm,
+                                 [{"type": "LVF", "EO_sec": 10.0}], 20000.0)
+            self.assertEqual(n, 1)
+            with path.open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            with path.open("r", encoding="utf-8", newline="") as f:
+                header = next(csv.reader(f))
+            # Header upgraded to current schema; every row has all columns.
+            self.assertEqual(tuple(header), COLUMNS)
+            self.assertEqual(len(rows), 2)                 # old + new, aligned
+            self.assertEqual(rows[0]["filename"], "old.mat")
+            self.assertEqual(rows[0]["EO_HourOfDay"], "")  # old row blank-filled
+            self.assertEqual(rows[1]["filename"], "new.mat")
+            self.assertTrue(rows[1]["EO_HourOfDay"])       # new row populated
+        finally:
+            for p in Path(tmpdir).glob("*"):
+                p.unlink()
+            os.rmdir(tmpdir)
 
 
 class FilenameResolver(unittest.TestCase):
