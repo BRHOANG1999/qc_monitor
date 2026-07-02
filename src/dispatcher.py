@@ -115,8 +115,10 @@ class Dispatcher:
 
             # Tier 2 is gated by config -- a deployment without MATLAB
             # still benefits from Tier 1 + Tier 3.
+            matlab_status = None
             if self.config.get("matlab_exe") is not None:
-                self._run_tier2_matlab(file_id, new_file, version_id)
+                matlab_status = self._run_tier2_matlab(
+                    file_id, new_file, version_id)
 
             # Tier 3: companion video QC + alert.
             video_cfg = self.config.get("video_qc", {}) or {}
@@ -128,6 +130,19 @@ class Dispatcher:
                                             version_id)
 
             total_elapsed = time.time() - t_total_start
+            # A MATLAB crash/timeout is NOT a clean pass: flag the file
+            # terminally (matlab_error, excluded from the pending queue so it
+            # isn't retried forever) so the Overview surfaces it instead of it
+            # looking identical to a legitimate no-stimuli 'done'.
+            if matlab_status == "error":
+                self.store.update_file_status(file_id, "matlab_error")
+                self.store.log_activity(
+                    "WARNING", "MATLAB_FAILED",
+                    f"MATLAB failed: {os.path.basename(new_file.path)}",
+                    file_id=file_id, file_path=new_file.path,
+                    duration_sec=total_elapsed,
+                )
+                return False
             self.store.update_file_status(file_id, "done")
             self.store.log_activity(
                 "INFO", "PROCESSING_DONE",
@@ -319,9 +334,11 @@ class Dispatcher:
     # ------------------------------------------------------------------ #
 
     def _run_tier2_matlab(self, file_id: int, new_file: NewFile,
-                           version_id: int | None) -> None:
+                           version_id: int | None) -> str:
         """Shell out to MATLAB, parse the result, fan it out across the
-        five evoked / criticality tables."""
+        five evoked / criticality tables. Returns the MATLAB ``exit_status``
+        ('success' on a clean run -- including a legitimate no-stimuli file --
+        'error' on a crash/timeout) so the caller can flag failed files."""
         t2_start = time.time()
 
         # Flatten the three config sections MATLAB needs into one dict
@@ -344,6 +361,7 @@ class Dispatcher:
         self._persist_evoked_features(file_id, result, version_id)
         self._persist_evoked_waveforms(file_id, result, version_id)
         self._persist_criticality(file_id, result, version_id)
+        return result.get("exit_status", "unknown")
 
     def _log_tier2(self, new_file: NewFile, result: dict,
                     t2_elapsed: float, file_id: int) -> None:

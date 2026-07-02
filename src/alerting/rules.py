@@ -1,6 +1,7 @@
 """Alert rule engine with rate limiting."""
 
 import logging
+import os
 from datetime import datetime
 
 from src.db.store import Store
@@ -72,6 +73,23 @@ class AlertRuleEngine:
             f"{n} .mat file(s) look like recordings but don't match the "
             f"filename pattern and are NOT being processed (possible recorder "
             f"format change). Examples: {samples}")
+
+    def check_matlab_failures(self, lookback_hours: int = 1):
+        """Fire (rate-limited) when files have failed the MATLAB step
+        recently, so a per-file crash isn't silent -- it also shows on the
+        Overview 'failed processing' card and the Alerts tab."""
+        try:
+            failed = self.store.matlab_failed_files(hours=lookback_hours)
+        except Exception:  # noqa: BLE001 -- alerting must never crash the loop
+            return
+        if not failed:
+            return
+        newest = os.path.basename(failed[0].get("file_path") or "")
+        self._fire_alert(
+            "matlab_error", "warning",
+            f"{len(failed)} recording(s) failed MATLAB processing in the last "
+            f"{lookback_hours}h (most recent: {newest}). They produce no "
+            f"evoked data -- see the Overview 'failed processing' card.")
 
     def _fire_alert(self, alert_type: str, severity: str, message: str,
                     file_id: int = None, session_dir: str = None):

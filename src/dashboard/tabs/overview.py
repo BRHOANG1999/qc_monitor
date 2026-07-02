@@ -2158,6 +2158,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         id="overview-bsz-status",
         style={"marginBottom": "12px"},
     )
+    matlab_failed = _build_matlab_failed_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
@@ -2409,6 +2410,7 @@ def _overview_tab(store: Store, config: dict | None = None):
 
     return html.Div([
         cards,         # pills strip, full width
+        matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
@@ -2421,6 +2423,44 @@ def _excluded_animals(config) -> list[str]:
     ov = (config or {}).get("overview", {}) or {}
     val = ov.get("exclude_animals")
     return list(val) if isinstance(val, list) else ["Randles"]
+
+
+def _build_matlab_failed_card(store):
+    """A red banner listing recordings whose MATLAB (Tier-2) step errored, so
+    a per-file failure isn't invisible (an empty Evoked tab otherwise looks
+    identical to a legitimate no-stimuli file). Empty Div when none."""
+    try:
+        failed = store.matlab_failed_files(hours=168)
+    except Exception:  # noqa: BLE001
+        failed = []
+    if not failed:
+        return html.Div()
+    rows = []
+    for f in failed[:10]:
+        name = os.path.basename(f.get("file_path") or "") or f"#{f.get('file_id')}"
+        err = (f.get("error_message") or "").strip().replace("\n", " ")
+        rows.append(html.Div([
+            html.Span(name, style={"color": "#f0f0f5", "fontSize": "12px",
+                                    "fontWeight": "600"}),
+            html.Span(f"  {err[:140]}" if err else "",
+                      style={"color": "#a0a0b0", "fontSize": "11px"}),
+        ], style={"padding": "3px 0",
+                  "borderBottom": "1px solid rgba(255,255,255,0.06)"}))
+    extra = (f"  (+{len(failed) - 10} more)" if len(failed) > 10 else "")
+    return html.Div([
+        html.Div(f"⚠ {len(failed)} recording(s) failed MATLAB processing "
+                 f"(last 7 days){extra}",
+                 style={"color": "#ff453a", "fontWeight": "700",
+                        "fontSize": "13px", "marginBottom": "6px"}),
+        html.Div("These produced no evoked data. Fix the cause, then "
+                 "reprocess (they are not retried automatically).",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                        "marginBottom": "8px"}),
+        *rows,
+    ], style={"marginBottom": "12px", "padding": "10px 14px",
+              "background": "rgba(255,69,58,0.08)",
+              "border": "1px solid rgba(255,69,58,0.35)",
+              "borderRadius": "8px"})
 
 
 def _build_behavioral_seizure_status_card(store, config=None):

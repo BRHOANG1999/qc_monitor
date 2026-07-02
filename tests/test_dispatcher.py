@@ -505,6 +505,76 @@ def test_tier3_critical_video_without_emailer_does_not_raise(tmp_path):
 
 
 # ===================================================================== #
+#  MATLAB failure surfacing (terminal, not silently 'done')
+# ===================================================================== #
+
+def test_matlab_error_flags_file_terminally(tmp_path):
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    config = {
+        "matlab_exe": "stub-matlab", "qc_thresholds": {}, "artifact": {},
+        "feature_analysis": {"analysis_start_ms": 1.0, "analysis_end_ms": 50.0},
+        "criticality": {"ar_order": 5}, "video_qc": {"enabled": False},
+    }
+    dispatcher = Dispatcher(store, config)
+    dispatcher._session_configs["/fake/session"] = _make_session_config()
+    nf = NewFile(
+        path="/fake/session/err_2026_01_02__00_00_00.mat",
+        size=1, mtime=1_700_000_000.0, session_dir="/fake/session",
+        session_name="session", chunk_datetime="2026_01_02__00_00_00",
+    )
+    err = {"exit_status": "error",
+           "error_message": "MATLAB timed out after 300s"}
+    with patch("src.dispatcher.load_mat",
+               return_value=_make_chunk(nf.path)), \
+         patch("src.dispatcher.matlab_run_pipeline", return_value=err), \
+         patch("src.dispatcher.video_path_for_mat", return_value=None):
+        ok = dispatcher.process_file(nf, version_id=None)
+
+    assert ok is False
+    with store.connection() as conn:
+        status = conn.execute(
+            "SELECT status FROM processed_files WHERE file_path=?",
+            (nf.path,)).fetchone()["status"]
+    assert status == "matlab_error"                       # not 'done'
+    # Terminal: excluded from the pending queue (no auto-retry).
+    assert not any(p["file_path"] == nf.path
+                   for p in store.get_pending_files(limit=999))
+    # Surfaced for the Overview card / alert.
+    assert any(f["file_path"] == nf.path
+               for f in store.matlab_failed_files(hours=168))
+
+
+def test_matlab_success_stays_done(tmp_path):
+    """A clean MATLAB run (incl. a legitimate no-stimuli file) stays 'done'."""
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    config = {
+        "matlab_exe": "stub-matlab", "qc_thresholds": {}, "artifact": {},
+        "feature_analysis": {"analysis_start_ms": 1.0, "analysis_end_ms": 50.0},
+        "criticality": {"ar_order": 5}, "video_qc": {"enabled": False},
+    }
+    dispatcher = Dispatcher(store, config)
+    dispatcher._session_configs["/fake/session"] = _make_session_config()
+    nf = NewFile(
+        path="/fake/session/ok_2026_01_03__00_00_00.mat",
+        size=1, mtime=1_700_000_000.0, session_dir="/fake/session",
+        session_name="session", chunk_datetime="2026_01_03__00_00_00",
+    )
+    ok_result = {"exit_status": "success", "num_stimuli": 0, "num_traces": 0}
+    with patch("src.dispatcher.load_mat",
+               return_value=_make_chunk(nf.path)), \
+         patch("src.dispatcher.matlab_run_pipeline", return_value=ok_result), \
+         patch("src.dispatcher.video_path_for_mat", return_value=None):
+        ok = dispatcher.process_file(nf, version_id=None)
+    assert ok is True
+    with store.connection() as conn:
+        status = conn.execute(
+            "SELECT status FROM processed_files WHERE file_path=?",
+            (nf.path,)).fetchone()["status"]
+    assert status == "done"
+    assert store.matlab_failed_files(hours=168) == []
+
+
+# ===================================================================== #
 #  Manual entry point
 # ===================================================================== #
 

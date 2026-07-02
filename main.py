@@ -210,6 +210,7 @@ def main():
                 alert_engine.check_processing_stalled(watcher.last_scan_stats)
                 alert_engine.check_unrecognized_recordings(
                     watcher.last_scan_stats)
+                alert_engine.check_matlab_failures()
 
                 if accessible:
                     consecutive_network_failures = 0
