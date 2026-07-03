@@ -2930,18 +2930,19 @@ def _impedance_figure(channels: list[dict], icfg: dict):
         ann.font.color = "#f0f0f5"
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=90 + 150 * n_rows, margin=dict(l=10, r=10, t=36, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.06,
-                     xanchor="center", x=0.5, font=dict(size=10),
-                     bgcolor="rgba(0,0,0,0)"),
+        height=120 + 165 * n_rows,
+        margin=dict(l=52, r=16, t=42, b=34), showlegend=False,
         font=dict(color="#cfd0d6"))
-    # Show real date ticks so the measurement timescale is clear.
+    # Show real date ticks so the measurement timescale is clear; give the
+    # y tick labels + 'kΩ' room so they aren't clipped at the card edge.
     fig.update_xaxes(showticklabels=True, tickfont=dict(size=8),
                      nticks=4, tickformat="%b %d", tickangle=0,
-                     gridcolor="#2a2a3a")
-    fig.update_yaxes(title_text="kΩ", title_font=dict(size=9))
+                     gridcolor="#2a2a3a", automargin=True)
+    fig.update_yaxes(title_text="kΩ", title_font=dict(size=9),
+                     tickfont=dict(size=8), nticks=5,
+                     gridcolor="#2a2a3a", automargin=True)
     return dcc.Graph(figure=fig, config={"displayModeBar": False},
-                     style={"padding": "8px 6px"})
+                     style={"padding": "8px 10px"})
 
 
 def _add_access_r_trace(fig, rr, cc, x, dates, yvals, stat, icfg):
@@ -3068,36 +3069,48 @@ def _impedance_example_figure(wf: dict, row: dict):
     xs = [t[i] for i in range(min(len(t), len(m))) if lo <= t[i] <= hi]
     ys = [m[i] for i in range(min(len(t), len(m))) if lo <= t[i] <= hi]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", showlegend=False,
                              line=dict(color="#cfd0d6", width=1.5),
                              name="recorded (raw)"))
     tr = find_current_transitions(sm, t)
     if tr is not None:
-        _mark_ohmic_step(fig, t, m, tr)
+        r_rev = row.get("access_r_reversal_kohm")
+        r_off = row.get("access_r_offset_kohm")
+        _mark_ohmic_step(fig, t, m, tr, r_rev, r_off)
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=220, margin=dict(l=40, r=10, t=16, b=30),
-        showlegend=False, font=dict(color="#cfd0d6"),
+        height=240, margin=dict(l=40, r=10, t=16, b=30),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.0,
+                     xanchor="left", x=0, font=dict(size=9),
+                     bgcolor="rgba(0,0,0,0)"),
+        font=dict(color="#cfd0d6"),
         xaxis=dict(title="ms from stimulus", gridcolor="#2a2a3a"),
         yaxis=dict(title="raw", gridcolor="#2a2a3a"))
     return dcc.Graph(figure=fig, config={"displayModeBar": False},
                      style={"padding": "4px 2px"})
 
 
-def _mark_ohmic_step(fig, t, m, tr):
-    """Mark the reversal (blue) and offset (orange) ohmic steps on the trace:
-    a vertical line at each transition connecting the pre/post samples."""
+def _mark_ohmic_step(fig, t, m, tr, r_rev=None, r_off=None):
+    """Mark the reversal (blue) and offset (orange) ohmic steps: a bold
+    segment across each transition (pre→post sample) + a dotted guide line at
+    the transition time, labelled with that step's Rₐ so both are obvious."""
     _onset, reversal, offset = tr
-    for idx, color, label in ((reversal, "#5e7ce2", "reversal ΔV"),
-                              (offset, "#ff9f0a", "offset ΔV")):
+    for idx, color, base, rval in (
+            (reversal, "#5e7ce2", "reversal", r_rev),
+            (offset, "#ff9f0a", "off", r_off)):
         if idx is None or idx < 1 or idx >= len(m):
             continue
+        tag = (f"{base} → Rₐ={rval:.3f} kΩ" if rval is not None
+               else f"{base} ΔV")
+        fig.add_vline(x=t[idx], line=dict(color=color, width=1, dash="dot"),
+                      opacity=0.4)
         fig.add_trace(go.Scatter(
             x=[t[idx - 1], t[idx]], y=[m[idx - 1], m[idx]],
-            mode="lines+markers", name=label,
-            line=dict(color=color, width=2.5),
-            marker=dict(size=7, color=color),
-            hovertemplate=f"{label}: %{{y:.3f}}<extra></extra>"))
+            mode="lines+markers", name=tag,
+            line=dict(color=color, width=3),
+            marker=dict(size=8, color=color),
+            hovertemplate=f"{base} ΔV: %{{y:.3f}}<extra></extra>"))
 
 
 def layout(store: Store, config: dict | None = None):
