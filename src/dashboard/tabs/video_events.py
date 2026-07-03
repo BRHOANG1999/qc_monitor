@@ -850,17 +850,28 @@ def register_callbacks(app, store) -> None:
         events[idx]["racine"] = int(stage)
         return events
 
+    # Commit the comment to the store on BLUR, not on every keystroke.
+    # Writing per-keystroke fed video-events-store, which re-rendered the
+    # whole events list (_render_events_list) and re-created the textarea
+    # mid-type -- the cursor "rubberbanded". dcc.Textarea has no `debounce`
+    # in this Dash, so we trigger on n_blur and read the value from State.
     @app.callback(
         Output("video-events-store", "data",
                 allow_duplicate=True),
         Input({"type": "event-comment", "idx": ALL,
+                "field": ALL}, "n_blur"),
+        State({"type": "event-comment", "idx": ALL,
                 "field": ALL}, "value"),
         State("video-events-store", "data"),
         prevent_initial_call=True,
     )
-    def _set_comment(_values, events):
+    def _set_comment(_blurs, _values, events):
         trig = callback_context.triggered_id
-        if not isinstance(trig, dict):
+        triggered = callback_context.triggered or []
+        # Ignore spurious fires when the list re-renders (n_blur resets to
+        # None/0); only act on a real blur (n_blur incremented to >= 1).
+        if not isinstance(trig, dict) or not triggered \
+                or not triggered[0].get("value"):
             return no_update
         idx = trig.get("idx"); field = trig.get("field")
         events = list(events or [])
@@ -869,10 +880,12 @@ def register_callbacks(app, store) -> None:
         if field not in ("onset_comment", "behavior_comment",
                           "score_comment", "video_quality"):
             return no_update
-        triggered = callback_context.triggered or []
+        # Pull the blurred box's current text from the aligned State list.
         new_val = ""
-        for t in triggered:
-            new_val = t.get("value") or ""
+        for s in (callback_context.states_list[0] or []):
+            if s.get("id") == trig:
+                new_val = s.get("value") or ""
+                break
         events[idx] = dict(events[idx])
         events[idx][field] = str(new_val)
         return events
