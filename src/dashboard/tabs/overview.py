@@ -3103,16 +3103,21 @@ def _impedance_example_steps(row: dict):
     i_pos, i_neg = _f("i_pos_ua"), _f("i_neg_ua")
     rev, off, ra = (_f("access_r_reversal_kohm"), _f("access_r_offset_kohm"),
                     _f("access_r_kohm"))
-    di_rev = (i_pos + i_neg) if (i_pos and i_neg) else None
+    # ΔI is the current STEP at each transition (not a phase amplitude):
+    #   reversal flips +I_fast → −I_slow, so the step is the SUM;
+    #   off goes −I_slow → 0, so the step is I_slow.
+    rev_expr = (f"I_fast+I_slow = {i_pos:.1f}+{i_neg:.1f} = {i_pos + i_neg:.1f}"
+                if (i_pos and i_neg) else None)
+    off_expr = f"I_slow = {i_neg:.1f}" if i_neg else None
 
-    def _line(label, r, di, color):
-        if r is None or di is None:
+    def _line(label, r, di_expr, color):
+        if r is None or di_expr is None:
             return html.Div(f"{label}: n/a", style={"color": "#888",
                             "fontFamily": "monospace", "fontSize": "11px"})
         return html.Div([
             html.Span(f"{label}:  ", style={"color": color,
                                             "fontWeight": "600"}),
-            html.Span(f"ΔI = {di:.1f} µA   ·   "
+            html.Span(f"ΔI = {di_expr} µA   ·   "
                       f"Rₐ = |ΔV| ÷ ΔI = {r:.3f} kΩ"),
         ], style={"fontFamily": "monospace", "fontSize": "11px",
                    "color": "#cfd0d6", "marginBottom": "3px"})
@@ -3129,8 +3134,8 @@ def _impedance_example_steps(row: dict):
                  "value):",
                  style={"color": "#a0a0b0", "fontSize": "11px",
                          "marginBottom": "5px"}),
-        _line("Fast→slow reversal", rev, di_rev, "#5e7ce2"),
-        _line("Slow→off", off, i_neg, "#ff9f0a"),
+        _line("Fast→slow reversal", rev, rev_expr, "#5e7ce2"),
+        _line("Slow→off", off, off_expr, "#ff9f0a"),
         html.Div(f"→ Rₐ = mean = {ra:.3f} kΩ  ({agree})" if ra is not None
                  else f"→ Rₐ rejected ({agree})",
                  style={"color": "#f0f0f5", "fontWeight": "600",
