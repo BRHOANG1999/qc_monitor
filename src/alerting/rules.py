@@ -141,11 +141,11 @@ class AlertRuleEngine:
             f"evoked data -- see the Overview 'failed processing' card.")
 
     def check_impedance_shift(self):
-        """Fire (rate-limited) when a channel's transfer impedance drifts
-        past ``impedance_shift_pct`` from its rolling-median baseline, on
-        either stimulus phase. One aggregated alert lists every drifting
-        (animal, channel, phase); severity escalates to critical when any
-        crosses ``impedance_shift_pct_critical``. Silent until a channel has
+        """Fire (rate-limited) when a channel's ACCESS RESISTANCE (Rₐ, from
+        the ohmic step of the stim pulse) drifts past ``impedance_shift_pct``
+        from its rolling-median baseline. One aggregated alert lists every
+        drifting (animal, channel); severity escalates to critical past
+        ``impedance_shift_pct_critical``. Silent until a channel has
         ``impedance_min_history`` measurements."""
         try:
             series = self.store.impedance_series_by_channel(
@@ -161,28 +161,27 @@ class AlertRuleEngine:
             return
         crit = any(abs(st["drift_pct"]) >= self.impedance_shift_pct_critical
                    for *_r, st in flags)
-        lines = [f"{a} {c} {ph} {st['latest']:.3f}kΩ vs "
+        lines = [f"{a} {c} {st['latest']:.3f}kΩ vs "
                  f"{st['baseline']:.3f} ({st['drift_pct']:+.0f}%)"
-                 for a, c, ph, st in flags[:8]]
+                 for a, c, st in flags[:8]]
         more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
         self._fire_alert(
             "impedance_shift", "critical" if crit else "warning",
-            f"{len(flags)} channel-phase(s) drifted "
-            f">{self.impedance_shift_pct:.0f}% from baseline "
-            f"transfer impedance: " + "; ".join(lines) + more)
+            f"{len(flags)} channel(s) drifted "
+            f">{self.impedance_shift_pct:.0f}% from baseline access "
+            f"resistance: " + "; ".join(lines) + more)
 
     def _impedance_flags(self, series: dict) -> list:
-        """Every (animal, channel, phase, drift_stat) past the warn pct."""
+        """Every (animal, channel, drift_stat) whose access resistance is past
+        the warn pct."""
         flags = []
         for (animal, ch), rows in (series or {}).items():
-            for phase, key in (("pos", "impedance_pos_kohm"),
-                               ("neg", "impedance_neg_kohm")):
-                st = _drift_stat([r[key] for r in rows],
-                                 self.impedance_baseline_window,
-                                 self.impedance_min_history)
-                if st and abs(st["drift_pct"]) >= self.impedance_shift_pct:
-                    flags.append((animal, ch, phase, st))
-        flags.sort(key=lambda f: -abs(f[3]["drift_pct"]))
+            st = _drift_stat([r.get("access_r_kohm") for r in rows],
+                             self.impedance_baseline_window,
+                             self.impedance_min_history)
+            if st and abs(st["drift_pct"]) >= self.impedance_shift_pct:
+                flags.append((animal, ch, st))
+        flags.sort(key=lambda f: -abs(f[2]["drift_pct"]))
         return flags
 
     def _fire_alert(self, alert_type: str, severity: str, message: str,

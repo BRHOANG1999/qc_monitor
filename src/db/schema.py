@@ -274,6 +274,13 @@ CREATE TABLE IF NOT EXISTS channel_impedance (
     i_neg_ua REAL,
     impedance_pos_kohm REAL,
     impedance_neg_kohm REAL,
+    -- Electrode ACCESS RESISTANCE (kΩ) from the ohmic voltage step at a
+    -- current transition (the metric; the peak/mean impedance_* above is
+    -- legacy and no longer written). r_access = mean of the fast→slow
+    -- reversal step and the slow→off step.
+    access_r_kohm REAL,
+    access_r_reversal_kohm REAL,
+    access_r_offset_kohm REAL,
     computed_at TEXT NOT NULL,
     UNIQUE(file_id, channel)
 );

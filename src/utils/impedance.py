@@ -154,6 +154,125 @@ def compute_impedances(v_pos_raw, v_neg_raw, gain, i_pos_ua, i_neg_ua
     return (z_pos, z_neg)
 
 
+# ===================================================================== #
+#  Access resistance (ohmic step at a current transition) -- the metric.
+#
+#  Rₐ = |ΔV / ΔI| measured as the INSTANTANEOUS voltage step across a
+#  current transition. The electrode double-layer (polarization) voltage
+#  cannot change instantaneously, so the step at a transition is purely the
+#  ohmic (access/series) drop -- it isolates access resistance from
+#  polarization by construction. This replaces the peak-vs-mean phase
+#  "impedance", which mixed resistive + capacitive terms and used two
+#  non-comparable statistics.
+# ===================================================================== #
+
+# The stim-copy excursion must be at least this (raw units) to count as a
+# real biphasic pulse rather than a flat/absent command.
+STIM_AMP_MIN = 1e-4
+
+
+def find_current_transitions(stim_mean_trace, time_ms):
+    """Locate the biphasic current transitions from the stim-copy average.
+
+    Returns ``(onset, reversal, offset)`` sample indices, or ``None`` if the
+    stim-copy doesn't show a clean fast(+) / slow(−) / off pulse. The
+    stim-copy is a clean recording of the COMMANDED current, so its
+    transitions mark exactly where the recorded electrode voltage shows its
+    ohmic steps -- robust to alignment jitter on the animal channel.
+    """
+    if not stim_mean_trace or not time_ms:
+        return None
+    n = min(len(stim_mean_trace), len(time_ms))
+    if n < 4:
+        return None
+    sm = [float(stim_mean_trace[i]) for i in range(n)]
+    t = [float(time_ms[i]) for i in range(n)]
+    pre = [sm[i] for i in range(n) if t[i] < -0.15]
+    if len(pre) < 2:
+        pre = sm[:max(2, n // 10)]
+    base = sorted(pre)[len(pre) // 2]              # median pre-stim level
+    fast_amp = max(sm) - base                      # positive (fast) excursion
+    slow_amp = base - min(sm)                       # negative (slow) excursion
+    if fast_amp < STIM_AMP_MIN or slow_amp < STIM_AMP_MIN:
+        return None
+    onset = reversal = offset = None
+    max_iter = n + 1
+    for i in range(n):
+        assert i < max_iter, "transition scan runaway"
+        d = sm[i] - base
+        if onset is None:
+            if d > 0.5 * fast_amp:
+                onset = i
+        elif reversal is None:
+            if d < -0.5 * slow_amp:
+                reversal = i
+        elif d > -0.3 * slow_amp:               # risen back toward baseline
+            offset = i
+            break
+    if onset is None or reversal is None or offset is None:
+        return None
+    return (onset, reversal, offset)
+
+
+def _step_kohm(mean_trace, i_after, gain, delta_i_ua) -> float | None:
+    """Ohmic ``|ΔV/ΔI|`` in kΩ for the step landing on sample ``i_after``
+    (jump from ``i_after-1`` → ``i_after``). ΔV gain-corrected to mV, ΔI in
+    µA → kΩ (mV/µA = kΩ). None on missing / bad inputs."""
+    if i_after is None or i_after < 1 or gain in (None, 0) or not delta_i_ua:
+        return None
+    try:
+        g = float(gain)
+        di = float(delta_i_ua)
+        dv_mv = (float(mean_trace[i_after])
+                 - float(mean_trace[i_after - 1])) / g * 1000.0
+    except (TypeError, ValueError, IndexError):
+        return None
+    if g <= 0 or di <= 0:
+        return None
+    return abs(dv_mv) / di
+
+
+# Two independent transitions must agree within this fraction for the
+# access-resistance measurement to be trusted (rejects asymmetric clipping /
+# noise). Symmetric amplifier saturation can still pass -- that's handled
+# upstream by restricting to a non-saturating stimulus protocol.
+ACCESS_R_AGREE_TOL = 0.35
+
+
+def access_resistance(mean_trace, time_ms, stim_mean_trace, gain,
+                      i_fast_ua, i_slow_ua,
+                      agree_tol: float = ACCESS_R_AGREE_TOL) -> dict:
+    """Electrode access resistance from the ohmic voltage step (kΩ).
+
+    Uses the fast→slow REVERSAL (largest ΔI = i_fast+i_slow, best SNR) and
+    the slow→OFF step (ΔI = i_slow) as TWO independent estimates. Reports
+    ``r_access_kohm`` = their mean **only when they agree** within
+    ``agree_tol`` (a QC gate: a clean ohmic measurement gives the same R at
+    both transitions; disagreement flags clipping/noise → r_access None). The
+    individual ``r_reversal_kohm`` / ``r_offset_kohm`` are always returned for
+    debugging. All-None when the stim-copy has no clean pulse or gain/current
+    is missing.
+    """
+    out = {"r_reversal_kohm": None, "r_offset_kohm": None,
+           "r_access_kohm": None, "n_used": 0}
+    tr = find_current_transitions(stim_mean_trace, time_ms)
+    if tr is None or gain in (None, 0) or not i_fast_ua or not i_slow_ua:
+        return out
+    _onset, reversal, offset = tr
+    rev = _step_kohm(mean_trace, reversal, gain,
+                     float(i_fast_ua) + float(i_slow_ua))
+    off = _step_kohm(mean_trace, offset, gain, float(i_slow_ua))
+    out["r_reversal_kohm"] = rev
+    out["r_offset_kohm"] = off
+    if rev is not None and off is not None:
+        mean = (rev + off) / 2.0
+        if mean > 0 and abs(rev - off) / mean <= agree_tol:
+            out["r_access_kohm"] = mean          # both agree -> trusted
+            out["n_used"] = 2
+        # else: disagree -> reject r_access (leave None) but keep rev/off
+    return out
+
+
 def impedance_for_channel(mean_trace, time_ms, gain,
                           charge_nC, pulse_width_us, ratio,
                           pos_guard_ms: float = POS_GUARD_MS) -> dict:

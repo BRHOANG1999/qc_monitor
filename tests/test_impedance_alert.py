@@ -41,11 +41,11 @@ def _engine(series, last_alert=None, active=None, **rule_overrides):
     return AlertRuleEngine(store, _FakeEmailer(), cfg), store
 
 
-def _rows(pos_vals, neg_vals=None):
-    neg_vals = neg_vals if neg_vals is not None else [None] * len(pos_vals)
+def _rows(vals):
+    """Access-resistance series rows (oldest→newest)."""
     return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
-             "impedance_pos_kohm": p, "impedance_neg_kohm": n}
-            for i, (p, n) in enumerate(zip(pos_vals, neg_vals), start=1)]
+             "access_r_kohm": v}
+            for i, v in enumerate(vals, start=1)]
 
 
 def test_drift_stat_basic():
@@ -67,7 +67,7 @@ def test_alert_fires_on_drift():
     alert_type, severity, message = store.inserted[0][:3]
     assert alert_type == "impedance_shift"
     assert severity == "warning"
-    assert "BCH110SLM" in message and "pos" in message
+    assert "BCH110SLM" in message and "access resistance" in message
 
 
 def test_alert_critical_on_large_drift():
@@ -89,15 +89,6 @@ def test_no_alert_below_min_history():
     eng, store = _engine(series)
     eng.check_impedance_shift()
     assert store.inserted == []
-
-
-def test_negative_phase_drift_flagged():
-    series = {("BCH062", "BCH062SR"): _rows(
-        [1.0, 1.0, 1.0, 1.0], neg_vals=[0.3, 0.3, 0.3, 0.6])}  # neg +100%
-    eng, store = _engine(series)
-    eng.check_impedance_shift()
-    assert len(store.inserted) == 1
-    assert "neg" in store.inserted[0][2]
 
 
 def test_inactive_channel_not_alerted():

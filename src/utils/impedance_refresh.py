@@ -17,7 +17,9 @@ import os
 
 from src.utils.amplifier_records import load_amplifier_gains, resolve_gain
 from src.utils.animal import is_animal_channel, split_animal_electrode
-from src.utils.impedance import impedance_for_channel
+from src.utils.impedance import (
+    access_resistance, phase_currents, normalize_ratio,
+)
 
 logger = logging.getLogger("qc_monitor.utils.impedance_refresh")
 
@@ -123,14 +125,40 @@ def _process_one_file(store, file_id: int, gains) -> int:
         animal, elec = split_animal_electrode(ch_name)
         gain = resolve_gain(gains, session_name, file_base, ch_name,
                             animal or "", elec or "")
-        rec = impedance_for_channel(
-            wf.get("mean_trace"), wf.get("time_axis_ms"), gain,
-            stim["charge"], stim["pw"], stim["ratio"])
+        rec = _access_r_record(wf, gain, stim)
         store.upsert_channel_impedance(
             file_id, int(wf.get("channel") or 0), ch_name,
             animal or "", elec or "", rec)
         n += 1
     return n
+
+
+def _access_r_record(wf: dict, gain, stim: dict) -> dict:
+    """Build the channel_impedance record: the ohmic-step ACCESS RESISTANCE
+    (the metric) plus the inputs needed to reproduce it. The legacy peak/mean
+    impedance fields are intentionally left unset (None)."""
+    i_pos, i_neg = phase_currents(stim["charge"], stim["pw"], stim["ratio"])
+    ar = access_resistance(wf.get("mean_trace"), wf.get("time_axis_ms"),
+                           wf.get("stim_mean_trace"), gain, i_pos, i_neg)
+    return {
+        "gain": (float(gain) if gain not in (None, "") else None),
+        "charge_nc": _as_float(stim["charge"]),
+        "pulse_width_us": _as_float(stim["pw"]),
+        "neg_ratio": normalize_ratio(stim["ratio"]),
+        "i_pos_ua": i_pos, "i_neg_ua": i_neg,
+        "v_pos_raw": None, "v_neg_raw": None,        # legacy peak/mean: dropped
+        "impedance_pos_kohm": None, "impedance_neg_kohm": None,
+        "access_r_kohm": ar["r_access_kohm"],
+        "access_r_reversal_kohm": ar["r_reversal_kohm"],
+        "access_r_offset_kohm": ar["r_offset_kohm"],
+    }
+
+
+def _as_float(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def refresh_impedance(store, config: dict, *, limit: int | None = None,
@@ -144,7 +172,7 @@ def refresh_impedance(store, config: dict, *, limit: int | None = None,
     gains = load_amplifier_gains(config or {})
     todo = list(store.files_missing_impedance(limit=limit))
     seen = set(todo)
-    for fid in store.files_gain_missing_impedance(limit=limit):
+    for fid in store.files_needing_access_r(limit=limit):
         if fid not in seen:
             todo.append(fid)
             seen.add(fid)

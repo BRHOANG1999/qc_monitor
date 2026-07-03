@@ -2843,10 +2843,10 @@ def _build_impedance_trend_card(store, config=None):
         series = {k: v for k, v in series.items() if k in active}
     if not series:
         return _collapsible(
-            "Transfer impedance drift",
-            html.Div("No transfer-impedance data for the current recording "
-                     "session yet. Computed from evoked stim responses once "
-                     "amplifier gains (File_Records) are available.",
+            "Electrode access resistance (Rₐ) drift",
+            html.Div("No access-resistance data for the current recording "
+                     "session yet. Computed from the ohmic step of the stim "
+                     "pulse once amplifier gains (File_Records) are available.",
                      style={"color": "#a0a0b0", "fontSize": "12px"}),
             open_default=False, badge="0")
     icfg = _impedance_cfg(config)
@@ -2863,23 +2863,20 @@ def _build_impedance_trend_card(store, config=None):
     badge = (f"{n_total} active · ⚠{n_drift} drifting" if n_drift
              else f"{n_total} active · ok")
     badge_color = "#EF553B" if n_drift else "rgba(48,209,88,0.5)"
-    return _collapsible("Transfer impedance drift", body,
+    return _collapsible("Electrode access resistance (Rₐ) drift", body,
                         open_default=bool(n_drift), badge=badge,
                         badge_color=badge_color)
 
 
 def _impedance_channel_rows(series: dict, icfg: dict) -> list[dict]:
-    """One entry per (animal, channel): series rows + per-phase drift."""
+    """One entry per (animal, channel): access-R series + drift stat."""
     out = []
     for (animal, ch), rows in series.items():
-        pos = _drift_stat([r["impedance_pos_kohm"] for r in rows],
-                          icfg["window"], icfg["min_history"])
-        neg = _drift_stat([r["impedance_neg_kohm"] for r in rows],
-                          icfg["window"], icfg["min_history"])
-        drifting = any(st and abs(st["drift_pct"]) >= icfg["pct"]
-                       for st in (pos, neg))
+        stat = _drift_stat([r["access_r_kohm"] for r in rows],
+                           icfg["window"], icfg["min_history"])
+        drifting = bool(stat and abs(stat["drift_pct"]) >= icfg["pct"])
         out.append({"animal": animal, "channel": ch, "rows": rows,
-                    "pos": pos, "neg": neg, "drifting": drifting})
+                    "stat": stat, "drifting": drifting})
     # Drifting channels float to the top, then by animal/channel.
     out.sort(key=lambda c: (not c["drifting"], c["animal"], c["channel"]))
     return out
@@ -2889,8 +2886,9 @@ def _impedance_header(n_total, n_drift, n_shown, icfg):
     """Compact subhead inside the collapsible body: what the numbers mean +
     counts (the collapsible summary already carries the section title)."""
     line = [
-        html.Span("Animals currently on the rig · kΩ per channel · both "
-                  "phases · ", style={"color": "#888", "fontSize": "11px"}),
+        html.Span("Animals currently on the rig · access resistance Rₐ (kΩ) "
+                  "from the stim ohmic step · ",
+                  style={"color": "#888", "fontSize": "11px"}),
         html.Span(f"baseline = rolling median of last {icfg['window']} · ",
                   style={"color": "#888", "fontSize": "11px"}),
         html.Span(f"{n_total} channels · ", style={"color": "#cfd0d6",
@@ -2924,12 +2922,9 @@ def _impedance_figure(channels: list[dict], icfg: dict):
         dts = [_parse_chunk_dt(d) for d in dates]
         x = dts if all(d is not None for d in dts) else list(
             range(len(c["rows"])))
-        _add_phase_trace(fig, rr, cc, x, dates,
-                         [r["impedance_pos_kohm"] for r in c["rows"]],
-                         c["pos"], "#5e7ce2", "pos", icfg, i == 0)
-        _add_phase_trace(fig, rr, cc, x, dates,
-                         [r["impedance_neg_kohm"] for r in c["rows"]],
-                         c["neg"], "#ff9f0a", "neg", icfg, i == 0)
+        _add_access_r_trace(fig, rr, cc, x, dates,
+                            [r["access_r_kohm"] for r in c["rows"]],
+                            c["stat"], icfg)
     for ann in fig.layout.annotations[:n]:
         ann.font.size = 11
         ann.font.color = "#f0f0f5"
@@ -2949,24 +2944,22 @@ def _impedance_figure(channels: list[dict], icfg: dict):
                      style={"padding": "8px 6px"})
 
 
-def _add_phase_trace(fig, rr, cc, x, dates, yvals, stat, color, label,
-                     icfg, show_legend):
-    """Add one phase's line (+ baseline band + drift-highlighted latest)."""
+def _add_access_r_trace(fig, rr, cc, x, dates, yvals, stat, icfg):
+    """Add a channel's access-R line + rolling-median baseline band + a
+    drift-highlighted latest point."""
     fig.add_trace(go.Scatter(
-        x=x, y=yvals, mode="lines+markers", name=f"{label} phase",
-        legendgroup=label, showlegend=show_legend,
-        line=dict(color=color, width=1.5), marker=dict(size=3),
+        x=x, y=yvals, mode="lines+markers", name="Rₐ", showlegend=False,
+        line=dict(color="#5e7ce2", width=1.5), marker=dict(size=3),
         customdata=dates,
-        hovertemplate=(f"{label}: %{{y:.3f}} kΩ<br>%{{customdata}}"
-                       "<extra></extra>")), rr, cc)
+        hovertemplate="Rₐ: %{y:.3f} kΩ<br>%{customdata}<extra></extra>"),
+        rr, cc)
     if stat is None:
         return
     band = stat["baseline"] * icfg["pct"] / 100.0
-    for yb, dash in ((stat["baseline"], "dot"),):
-        fig.add_hline(y=yb, line=dict(color=color, width=1, dash=dash),
-                      row=rr, col=cc, opacity=0.5)
+    fig.add_hline(y=stat["baseline"], line=dict(color="#5e7ce2", width=1,
+                  dash="dot"), row=rr, col=cc, opacity=0.5)
     fig.add_hrect(y0=stat["baseline"] - band, y1=stat["baseline"] + band,
-                  line_width=0, fillcolor=color, opacity=0.08,
+                  line_width=0, fillcolor="#5e7ce2", opacity=0.08,
                   row=rr, col=cc)
     if abs(stat["drift_pct"]) >= icfg["pct"]:
         fig.add_trace(go.Scatter(
@@ -3012,74 +3005,75 @@ def _impedance_example_block(store, channels: list[dict], icfg: dict):
 
 
 def _impedance_example_steps(row: dict):
-    """The transparent arithmetic for both phases, using the stored values."""
+    """The transparent access-resistance arithmetic for the two transitions,
+    using the stored per-transition values."""
     def _f(k):
         v = row.get(k)
         return None if v is None else float(v)
-    gain, charge, pw = _f("gain"), _f("charge_nc"), _f("pulse_width_us")
-    ratio = _f("neg_ratio") or 3.0
-    i_pos = _f("i_pos_ua")
+    i_pos, i_neg = _f("i_pos_ua"), _f("i_neg_ua")
+    rev, off, ra = (_f("access_r_reversal_kohm"), _f("access_r_offset_kohm"),
+                    _f("access_r_kohm"))
+    di_rev = (i_pos + i_neg) if (i_pos and i_neg) else None
 
-    def _phase(label, v_raw, i_ua, z, color, i_expr):
-        if v_raw is None or gain in (None, 0) or i_ua in (None, 0):
-            return html.Div(f"{label}: n/a", style={"color": "#888"})
-        v_mv = v_raw / gain * 1000.0
+    def _line(label, r, di, color):
+        if r is None or di is None:
+            return html.Div(f"{label}: n/a", style={"color": "#888",
+                            "fontFamily": "monospace", "fontSize": "11px"})
         return html.Div([
             html.Span(f"{label}:  ", style={"color": color,
                                             "fontWeight": "600"}),
-            html.Span(
-                f"V = {v_raw:.3f} / {gain:.0f} × 1000 = {v_mv:.3f} mV   ·   "
-                f"I = {i_expr} = {i_ua:.1f} µA   ·   "
-                f"Z = {v_mv:.3f} / {i_ua:.1f} = {z:.3f} kΩ"),
+            html.Span(f"ΔI = {di:.1f} µA   ·   "
+                      f"Rₐ = |ΔV| ÷ ΔI = {r:.3f} kΩ"),
         ], style={"fontFamily": "monospace", "fontSize": "11px",
                    "color": "#cfd0d6", "marginBottom": "3px"})
-    pos_i = f"{charge:.0f} nC / {pw:.0f} µs × 1000" if pw else "charge/pw"
-    # Slow phase: 1/3 amplitude (charge-balanced over 3x the duration).
-    neg_i = (f"{i_pos:.1f} µA ÷ {ratio:.0f}" if i_pos
-             else f"{charge:.0f} nC / ({pw:.0f}×{ratio:.0f}) µs × 1000")
+    agree = ("agree → trusted" if ra is not None
+             else "disagree → rejected (clipping/noise)")
     return html.Div([
-        html.Div("Current = charge ÷ time (nC is charge, not current). Both "
-                 "phases carry equal & opposite charge so net → 0 (charge "
-                 "balanced); the slow phase spreads the SAME charge over "
-                 "×{r:.0f} the time, so its current is ÷{r:.0f}. "
-                 "Z = (voltage ÷ gain) ÷ current, per phase:".format(r=ratio),
+        html.Div("Access resistance Rₐ = |ΔV| ÷ ΔI at a current transition. "
+                 "The electrode double-layer voltage can't change "
+                 "instantaneously, so the step across a transition is purely "
+                 "the OHMIC (resistive) drop — no peak, no average. Measured "
+                 "at two independent transitions:",
                  style={"color": "#a0a0b0", "fontSize": "11px",
                          "marginBottom": "5px"}),
-        _phase("Positive phase (fast, peak)", _f("v_pos_raw"),
-               i_pos, _f("impedance_pos_kohm"), "#5e7ce2", pos_i),
-        _phase("Negative phase (slow, avg)", _f("v_neg_raw"),
-               _f("i_neg_ua"), _f("impedance_neg_kohm"), "#ff9f0a", neg_i),
+        _line("Fast→slow reversal", rev, di_rev, "#5e7ce2"),
+        _line("Slow→off", off, i_neg, "#ff9f0a"),
+        html.Div(f"→ Rₐ = mean = {ra:.3f} kΩ  ({agree})" if ra is not None
+                 else f"→ Rₐ rejected ({agree})",
+                 style={"color": "#f0f0f5", "fontWeight": "600",
+                         "fontSize": "11px", "marginTop": "3px",
+                         "fontFamily": "monospace"}),
+        html.Div("Note: at 20 kHz the step is one 50-µs sample, so Rₐ "
+                 "includes ≤50 µs of fast capacitive charging (a small, "
+                 "consistent overestimate) — excellent for drift, not an "
+                 "absolute value. High-charge pulses saturate the amplifier, "
+                 "so only the dominant test-pulse charge is tracked.",
+                 style={"color": "#777", "fontSize": "10px",
+                         "marginTop": "5px"}),
     ], style={"padding": "4px 2px 8px"})
 
 
 def _impedance_example_figure(wf: dict, row: dict):
-    """Annotated recorded trace near t=0: positive-phase window (peak) and
-    negative-phase window (mean) shaded, with the extracted voltages marked."""
+    """Annotated recorded trace near t=0 with the current transitions marked
+    and the fast→slow OHMIC STEP (ΔV) highlighted — the Rₐ measurement."""
+    from src.utils.impedance import find_current_transitions
     t = wf.get("time_axis_ms") or []
     m = wf.get("mean_trace") or []
+    sm = wf.get("stim_mean_trace") or []
     if not t or not m:
         return html.Div()
     pw_ms = (float(row.get("pulse_width_us") or 150.0)) / 1000.0
     ratio = float(row.get("neg_ratio") or 3.0)
     lo, hi = -0.3, max(1.0, pw_ms * (1.0 + ratio) + 0.2)
-    xs, ys = [], []
-    for i in range(min(len(t), len(m))):
-        if lo <= t[i] <= hi:
-            xs.append(t[i])
-            ys.append(m[i])
+    xs = [t[i] for i in range(min(len(t), len(m))) if lo <= t[i] <= hi]
+    ys = [m[i] for i in range(min(len(t), len(m))) if lo <= t[i] <= hi]
     fig = go.Figure()
-    fig.add_vrect(x0=-0.1, x1=pw_ms, fillcolor="#5e7ce2", opacity=0.12,
-                  line_width=0, annotation_text="pos phase",
-                  annotation_position="top left",
-                  annotation=dict(font=dict(size=9, color="#5e7ce2")))
-    fig.add_vrect(x0=pw_ms, x1=pw_ms * (1.0 + ratio), fillcolor="#ff9f0a",
-                  opacity=0.10, line_width=0, annotation_text="neg phase",
-                  annotation_position="top right",
-                  annotation=dict(font=dict(size=9, color="#ff9f0a")))
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
                              line=dict(color="#cfd0d6", width=1.5),
                              name="recorded (raw)"))
-    _mark_pos_peak(fig, t, m, pw_ms, row.get("v_pos_raw"))
+    tr = find_current_transitions(sm, t)
+    if tr is not None:
+        _mark_ohmic_step(fig, t, m, tr)
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         height=220, margin=dict(l=40, r=10, t=16, b=30),
@@ -3090,19 +3084,20 @@ def _impedance_example_figure(wf: dict, row: dict):
                      style={"padding": "4px 2px"})
 
 
-def _mark_pos_peak(fig, t, m, pw_ms, v_pos_raw):
-    """Mark the positive-phase peak sample (|max| over [-0.1, pw])."""
-    pk_i, pk = None, -1.0
-    for i in range(min(len(t), len(m))):
-        if -0.1 <= t[i] <= pw_ms and abs(m[i]) > pk:
-            pk, pk_i = abs(m[i]), i
-    if pk_i is None:
-        return
-    label = f"peak {v_pos_raw:.3f}" if v_pos_raw is not None else "peak"
-    fig.add_trace(go.Scatter(
-        x=[t[pk_i]], y=[m[pk_i]], mode="markers+text", text=[label],
-        textposition="top center", textfont=dict(size=9, color="#5e7ce2"),
-        marker=dict(color="#5e7ce2", size=9, symbol="circle")))
+def _mark_ohmic_step(fig, t, m, tr):
+    """Mark the reversal (blue) and offset (orange) ohmic steps on the trace:
+    a vertical line at each transition connecting the pre/post samples."""
+    _onset, reversal, offset = tr
+    for idx, color, label in ((reversal, "#5e7ce2", "reversal ΔV"),
+                              (offset, "#ff9f0a", "offset ΔV")):
+        if idx is None or idx < 1 or idx >= len(m):
+            continue
+        fig.add_trace(go.Scatter(
+            x=[t[idx - 1], t[idx]], y=[m[idx - 1], m[idx]],
+            mode="lines+markers", name=label,
+            line=dict(color=color, width=2.5),
+            marker=dict(size=7, color=color),
+            hovertemplate=f"{label}: %{{y:.3f}}<extra></extra>"))
 
 
 def layout(store: Store, config: dict | None = None):

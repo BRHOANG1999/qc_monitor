@@ -112,6 +112,18 @@ class Store:
         if "n_disagree" not in existing_maj_cols:
             conn.execute("ALTER TABLE mass_analyze_job "
                          "ADD COLUMN n_disagree INTEGER DEFAULT 0")
+        # Access-resistance columns on channel_impedance (the ohmic-step
+        # metric that replaces the legacy peak/mean impedance_*). Added here
+        # because CREATE TABLE IF NOT EXISTS won't alter a table on disk.
+        existing_ci_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(channel_impedance)")
+        }
+        for _rcol in ("access_r_kohm", "access_r_reversal_kohm",
+                       "access_r_offset_kohm"):
+            if _rcol not in existing_ci_cols:
+                conn.execute(
+                    f"ALTER TABLE channel_impedance ADD COLUMN {_rcol} REAL")
         # Animal-electrode selector for the scan channel.
         if "electrode" not in existing_maj_cols:
             conn.execute("ALTER TABLE mass_analyze_job "
@@ -1669,8 +1681,10 @@ class Store:
                    (file_id, channel, channel_name, animal_id, electrode,
                     gain, charge_nc, pulse_width_us, neg_ratio,
                     v_pos_raw, v_neg_raw, i_pos_ua, i_neg_ua,
-                    impedance_pos_kohm, impedance_neg_kohm, computed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    impedance_pos_kohm, impedance_neg_kohm,
+                    access_r_kohm, access_r_reversal_kohm,
+                    access_r_offset_kohm, computed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     file_id, channel, channel_name, animal_id, electrode,
                     rec.get("gain"), rec.get("charge_nc"),
@@ -1679,6 +1693,9 @@ class Store:
                     rec.get("i_pos_ua"), rec.get("i_neg_ua"),
                     rec.get("impedance_pos_kohm"),
                     rec.get("impedance_neg_kohm"),
+                    rec.get("access_r_kohm"),
+                    rec.get("access_r_reversal_kohm"),
+                    rec.get("access_r_offset_kohm"),
                     datetime.now().isoformat(),
                 ),
             )
@@ -1745,22 +1762,20 @@ class Store:
         finally:
             conn.close()
 
-    def files_gain_missing_impedance(self, limit: int | None = None
-                                     ) -> list[int]:
-        """Stim files whose impedance couldn't be computed because the
-        amplifier gain was unknown at the time (charge present, gain NULL,
-        impedance NULL). Re-tried on later runs so a File_Records edit that
-        adds the gain gets picked up. Non-stim files (charge NULL/0) are NOT
-        returned -- they legitimately have no transfer impedance."""
+    def files_needing_access_r(self, limit: int | None = None
+                               ) -> list[int]:
+        """Stim files whose channel_impedance rows have no access resistance
+        yet (``access_r_kohm IS NULL``) -- the legacy peak/mean rows that
+        predate the metric, plus rows that were skipped because the gain was
+        unknown (re-tried when a File_Records edit adds it). Non-stim rows
+        (charge NULL/0) are excluded -- they have no stim pulse to measure."""
         conn = self._connect()
         try:
             sql = ("""SELECT DISTINCT ci.file_id
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
-                      WHERE ci.charge_nc IS NOT NULL AND ci.charge_nc > 0
-                        AND ci.gain IS NULL
-                        AND ci.impedance_pos_kohm IS NULL
-                        AND ci.impedance_neg_kohm IS NULL
+                      WHERE ci.access_r_kohm IS NULL
+                        AND ci.charge_nc IS NOT NULL AND ci.charge_nc > 0
                       ORDER BY pf.chunk_datetime DESC""")
             if limit is not None:
                 sql += f" LIMIT {int(limit)}"
@@ -1783,8 +1798,7 @@ class Store:
                 """SELECT pf.session_dir
                    FROM channel_impedance ci
                    JOIN processed_files pf ON pf.id = ci.file_id
-                   WHERE ci.impedance_pos_kohm IS NOT NULL
-                      OR ci.impedance_neg_kohm IS NOT NULL
+                   WHERE ci.access_r_kohm IS NOT NULL
                    ORDER BY pf.chunk_datetime DESC LIMIT 1"""
             ).fetchone()
             if not newest:
@@ -1811,37 +1825,50 @@ class Store:
                    FROM channel_impedance ci
                    JOIN processed_files pf ON pf.id = ci.file_id
                    WHERE ci.animal_id = ? AND ci.channel_name = ?
-                     AND ci.impedance_pos_kohm IS NOT NULL
+                     AND ci.access_r_kohm IS NOT NULL
                    ORDER BY pf.chunk_datetime DESC LIMIT 1""",
                 (animal_id, channel_name)).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
+    @staticmethod
+    def _dominant_charge_only(rows: list) -> list:
+        """Keep only the rows at the channel's most common stimulus charge
+        (ties → the larger charge). Recordings at other charges are a
+        different protocol (or saturating therapeutic stim) and would corrupt
+        the access-resistance trend."""
+        counts: dict = {}
+        for r in rows:
+            c = r.get("charge_nc")
+            if c is not None:
+                counts[c] = counts.get(c, 0) + 1
+        if not counts:
+            return rows
+        best = max(counts, key=lambda c: (counts[c], c))
+        return [r for r in rows if r.get("charge_nc") == best]
+
     def impedance_series_by_channel(self, days: int | None = None,
                                     exclude: list[str] | None = None
                                     ) -> dict:
-        """Per-(animal, channel_name) time series of both impedances.
+        """Per-(animal, channel_name) time series of access resistance.
 
         Returns ``{(animal_id, channel_name): [rows...]}`` where each row is
-        ``{file_id, chunk_datetime, impedance_pos_kohm, impedance_neg_kohm}``
-        ordered oldest->newest. *exclude* drops animals by case-insensitive
-        substring (e.g. 'Randles'). Only rows with a computed impedance in
-        at least one phase are returned.
+        ``{file_id, chunk_datetime, access_r_kohm}`` ordered oldest->newest.
+        *exclude* drops animals by case-insensitive substring (e.g.
+        'Randles'). Only rows with a computed access resistance are returned.
         """
         excl = [e.lower() for e in (exclude or []) if e]
         conn = self._connect()
         try:
             params: list = []
-            where = ["(ci.impedance_pos_kohm IS NOT NULL "
-                     "OR ci.impedance_neg_kohm IS NOT NULL)"]
+            where = ["ci.access_r_kohm IS NOT NULL"]
             if days is not None:
                 cutoff = (datetime.now() - timedelta(days=int(days))).isoformat()
                 where.append("pf.chunk_datetime >= ?")
                 params.append(cutoff)
             sql = f"""SELECT ci.animal_id, ci.channel_name, ci.file_id,
-                             pf.chunk_datetime,
-                             ci.impedance_pos_kohm, ci.impedance_neg_kohm
+                             pf.chunk_datetime, ci.access_r_kohm, ci.charge_nc
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
                       WHERE {' AND '.join(where)}
@@ -1860,10 +1887,14 @@ class Store:
             out.setdefault(key, []).append({
                 "file_id": int(r["file_id"]),
                 "chunk_datetime": r["chunk_datetime"] or "",
-                "impedance_pos_kohm": r["impedance_pos_kohm"],
-                "impedance_neg_kohm": r["impedance_neg_kohm"],
+                "access_r_kohm": r["access_r_kohm"],
+                "charge_nc": r["charge_nc"],
             })
-        return out
+        # Access resistance must be measured from a CONSISTENT, non-saturating
+        # stimulus. Therapeutic high-charge pulses saturate the amplifier and
+        # corrupt ΔV, so per channel keep only the dominant (mode) charge --
+        # the electrode-integrity test protocol (e.g. 5 nC stimStability).
+        return {k: self._dominant_charge_only(v) for k, v in out.items()}
 
     # ------------------------------------------------------------------ #
     #  processing_log

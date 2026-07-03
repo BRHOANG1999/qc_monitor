@@ -8,8 +8,70 @@ from src.utils.impedance import (
     phase_voltages,
     compute_impedances,
     impedance_for_channel,
+    find_current_transitions,
+    access_resistance,
 )
 from src.utils.impedance_refresh import stimulated_indices
+
+
+# --- Access resistance (ohmic step) ------------------------------------ #
+
+def _synthetic_biphasic(fs_khz=20.0, pw_ms=0.15, ratio=3.0,
+                        i_fast=1.0, R_kohm=0.5, gain=100.0):
+    """Build a synthetic stim-copy + a PURE-RESISTOR animal voltage so the
+    ohmic step is exactly R·ΔI. Returns (time_ms, animal_mean_trace,
+    stim_mean_trace, i_fast_ua, i_slow_ua)."""
+    dt = 1.0 / fs_khz                       # ms per sample
+    t = [round(-1.0 + dt * i, 4) for i in range(int(2.0 / dt))]
+    i_slow = i_fast / ratio
+    stim, volt = [], []
+    for tt in t:
+        if 0 <= tt < pw_ms:                 # fast phase +I
+            cur = i_fast
+        elif pw_ms <= tt < pw_ms * (1 + ratio):   # slow phase -I/ratio
+            cur = -i_slow
+        else:
+            cur = 0.0
+        stim.append(cur)                    # stim-copy = commanded current
+        # Pure resistor with current in µA and R in kΩ: V_mV = I_µA·R_kΩ, and
+        # raw = V_mV/1000 * gain (since the code does v_raw/gain*1000 = mV).
+        volt.append(cur * R_kohm * gain / 1000.0)
+    return t, volt, stim, i_fast, i_slow
+
+
+def test_find_current_transitions_biphasic():
+    t, _v, sm, _if, _is = _synthetic_biphasic()
+    tr = find_current_transitions(sm, t)
+    assert tr is not None
+    onset, reversal, offset = tr
+    # onset near t=0, reversal near pw (0.15), offset near pw*(1+ratio)=0.6
+    assert abs(t[onset]) <= 0.05
+    assert abs(t[reversal] - 0.15) <= 0.05
+    assert abs(t[offset] - 0.60) <= 0.05
+
+
+def test_find_current_transitions_flat_returns_none():
+    t = [round(-1 + 0.05 * i, 3) for i in range(40)]
+    assert find_current_transitions([0.0] * len(t), t) is None
+
+
+def test_access_resistance_pure_resistor_exact():
+    # A pure resistor must give R exactly at BOTH transitions.
+    R, gain, i_fast, ratio = 0.5, 100.0, 1.0, 3.0
+    t, v, sm, i_f, i_s = _synthetic_biphasic(
+        R_kohm=R, gain=gain, i_fast=i_fast, ratio=ratio)
+    out = access_resistance(v, t, sm, gain, i_f, i_s)
+    assert out["r_reversal_kohm"] == pytest.approx(R, abs=1e-6)
+    assert out["r_offset_kohm"] == pytest.approx(R, abs=1e-6)
+    assert out["r_access_kohm"] == pytest.approx(R, abs=1e-6)
+    assert out["n_used"] == 2
+
+
+def test_access_resistance_missing_inputs():
+    t, v, sm, i_f, i_s = _synthetic_biphasic()
+    assert access_resistance(v, t, sm, 0, i_f, i_s)["r_access_kohm"] is None
+    assert access_resistance(v, t, sm, 100, None, i_s)["r_access_kohm"] is None
+    assert access_resistance(v, t, [], 100, i_f, i_s)["r_access_kohm"] is None
 
 
 def test_stimulated_indices_only_channels_after_stimcopy():
