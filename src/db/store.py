@@ -1704,6 +1704,47 @@ class Store:
         finally:
             conn.close()
 
+    def purge_nonstimulated_impedance(self) -> int:
+        """Delete channel_impedance rows for channels that were only RECORDED,
+        not stimulated (an eeg channel is stimulated iff the preceding channel
+        is a stim-copy channel). Removes historical rows for record-only
+        channels (e.g. BCH111SR) created before the stimulated-only filter.
+        Returns the number of rows deleted."""
+        from src.utils.impedance_refresh import stimulated_indices
+        conn = self._connect()
+        try:
+            sessions = conn.execute(
+                """SELECT DISTINCT pf.session_dir
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id"""
+            ).fetchall()
+            deleted = 0
+            max_iter = len(sessions) + 1
+            for i, sr in enumerate(sessions):
+                assert i < max_iter, "purge session scan runaway"
+                sd = sr["session_dir"]
+                cfg = conn.execute(
+                    """SELECT eeg_channels, stim_copy_channels
+                       FROM session_config WHERE session_dir = ?""",
+                    (sd,)).fetchone()
+                eeg = json.loads(cfg["eeg_channels"] or "[]") if cfg else []
+                sc = json.loads(cfg["stim_copy_channels"] or "[]") if cfg else []
+                stim_idx = stimulated_indices(eeg, sc)
+                base = ("DELETE FROM channel_impedance WHERE file_id IN "
+                        "(SELECT id FROM processed_files WHERE session_dir = ?)")
+                if stim_idx:
+                    ph = ",".join("?" for _ in stim_idx)
+                    cur = conn.execute(
+                        f"{base} AND channel NOT IN ({ph})",
+                        [sd, *sorted(stim_idx)])
+                else:
+                    cur = conn.execute(base, [sd])   # none stimulated -> all
+                deleted += cur.rowcount
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
     def files_gain_missing_impedance(self, limit: int | None = None
                                      ) -> list[int]:
         """Stim files whose impedance couldn't be computed because the
@@ -1725,6 +1766,55 @@ class Store:
                 sql += f" LIMIT {int(limit)}"
             rows = conn.execute(sql).fetchall()
             return [int(r["file_id"]) for r in rows]
+        finally:
+            conn.close()
+
+    def active_impedance_channel_keys(self) -> set:
+        """The ``(animal_id, channel_name)`` set stimulated in the MOST-RECENT
+        stim recording session -- i.e. the animals currently on the rig.
+
+        Session = the ``session_dir`` of the newest ``chunk_datetime`` row in
+        channel_impedance. The card + alert scope to these so record-only /
+        retired animals don't clutter the view; each channel's full history
+        is still available for the trend."""
+        conn = self._connect()
+        try:
+            newest = conn.execute(
+                """SELECT pf.session_dir
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id
+                   WHERE ci.impedance_pos_kohm IS NOT NULL
+                      OR ci.impedance_neg_kohm IS NOT NULL
+                   ORDER BY pf.chunk_datetime DESC LIMIT 1"""
+            ).fetchone()
+            if not newest:
+                return set()
+            rows = conn.execute(
+                """SELECT DISTINCT ci.animal_id, ci.channel_name
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id
+                   WHERE pf.session_dir = ?""",
+                (newest["session_dir"],)).fetchall()
+            return {(r["animal_id"] or "", r["channel_name"] or "")
+                    for r in rows}
+        finally:
+            conn.close()
+
+    def latest_impedance_row(self, animal_id: str, channel_name: str
+                             ) -> dict | None:
+        """Newest fully-computed channel_impedance row for a channel, with its
+        recording datetime -- feeds the 'how it's computed' worked example."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT ci.*, pf.chunk_datetime, pf.session_name
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id
+                   WHERE ci.animal_id = ? AND ci.channel_name = ?
+                     AND ci.impedance_pos_kohm IS NOT NULL
+                   ORDER BY pf.chunk_datetime DESC LIMIT 1""",
+                (animal_id, channel_name)).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 

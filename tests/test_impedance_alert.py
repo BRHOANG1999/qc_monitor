@@ -4,13 +4,18 @@ from src.alerting.rules import AlertRuleEngine, _drift_stat
 
 
 class _FakeStore:
-    def __init__(self, series, last_alert=None):
+    def __init__(self, series, last_alert=None, active=None):
         self._series = series
         self._last_alert = last_alert
+        # Default: every channel is "active" so existing tests are unaffected.
+        self._active = active if active is not None else set(series.keys())
         self.inserted = []
 
     def impedance_series_by_channel(self, exclude=None):
         return self._series
+
+    def active_impedance_channel_keys(self):
+        return self._active
 
     def get_last_alert_time(self, alert_type):
         return self._last_alert
@@ -27,12 +32,12 @@ class _FakeEmailer:
         self.sent.append((subject, body, severity))
 
 
-def _engine(series, last_alert=None, **rule_overrides):
+def _engine(series, last_alert=None, active=None, **rule_overrides):
     rules = {"impedance_shift_pct": 40, "impedance_shift_pct_critical": 75,
              "impedance_baseline_window": 10, "impedance_min_history": 4}
     rules.update(rule_overrides)
     cfg = {"alerting": {"rules": rules}}
-    store = _FakeStore(series, last_alert)
+    store = _FakeStore(series, last_alert, active)
     return AlertRuleEngine(store, _FakeEmailer(), cfg), store
 
 
@@ -93,6 +98,14 @@ def test_negative_phase_drift_flagged():
     eng.check_impedance_shift()
     assert len(store.inserted) == 1
     assert "neg" in store.inserted[0][2]
+
+
+def test_inactive_channel_not_alerted():
+    # A drifting channel that is NOT in the most-recent session is skipped.
+    series = {("BCH111", "BCH111SR"): _rows([1.0, 1.0, 1.0, 1.6])}  # +60%
+    eng, store = _engine(series, active={("BCH062", "BCH062SR")})
+    eng.check_impedance_shift()
+    assert store.inserted == []
 
 
 def test_rate_limited(monkeypatch):

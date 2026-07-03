@@ -11,6 +11,7 @@ so a later File_Records edit gets picked up without a manual rescan.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -19,6 +20,40 @@ from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.impedance import impedance_for_channel
 
 logger = logging.getLogger("qc_monitor.utils.impedance_refresh")
+
+
+def stimulated_indices(eeg_channels, stim_copy_channels) -> set:
+    """Channel indices that are actually STIMULATED, not just recorded.
+
+    Lab convention (validated across recordings): a `stimCopy` channel
+    immediately precedes each stimulated animal channel; record-only
+    animals are appended with no preceding stimCopy. So an eeg channel is
+    stimulated iff the index before it is a stim-copy channel. Record-only
+    channels (e.g. BCH111SR) must NOT get a transfer impedance.
+    """
+    sc = set(stim_copy_channels or [])
+    return {int(i) for i in (eeg_channels or []) if (int(i) - 1) in sc}
+
+
+def _session_stim_indices(store, session_dir: str) -> set:
+    """Stimulated channel index set for a session (empty if unknown /
+    non-stim)."""
+    if not session_dir:
+        return set()
+    with store.connection() as conn:
+        row = conn.execute(
+            """SELECT eeg_channels, stim_copy_channels
+               FROM session_config WHERE session_dir = ?""",
+            (session_dir,),
+        ).fetchone()
+    if not row:
+        return set()
+    try:
+        eeg = json.loads(row["eeg_channels"] or "[]")
+        sc = json.loads(row["stim_copy_channels"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    return stimulated_indices(eeg, sc)
 
 
 def _stim_params(store, file_id: int, session_dir: str) -> dict:
@@ -70,13 +105,20 @@ def _process_one_file(store, file_id: int, gains) -> int:
     waveforms = store.get_evoked_waveform_by_file(file_id)
     if not waveforms:
         return 0
-    stim = _stim_params(store, file_id, meta.get("session_dir") or "")
+    session_dir = meta.get("session_dir") or ""
+    stim_idx = _session_stim_indices(store, session_dir)
+    if not stim_idx:
+        return 0                       # no stimulated channel -> nothing to do
+    stim = _stim_params(store, file_id, session_dir)
     file_base = os.path.basename(meta.get("file_path") or "")
     session_name = meta.get("session_name") or ""
     n = 0
     for wf in waveforms:
         ch_name = wf.get("channel_name") or ""
         if not ch_name or not is_animal_channel(ch_name):
+            continue
+        # Only channels actually stimulated (preceded by a stimCopy).
+        if int(wf.get("channel") or -1) not in stim_idx:
             continue
         animal, elec = split_animal_electrode(ch_name)
         gain = resolve_gain(gains, session_name, file_base, ch_name,

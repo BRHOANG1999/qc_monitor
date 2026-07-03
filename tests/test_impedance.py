@@ -9,6 +9,24 @@ from src.utils.impedance import (
     compute_impedances,
     impedance_for_channel,
 )
+from src.utils.impedance_refresh import stimulated_indices
+
+
+def test_stimulated_indices_only_channels_after_stimcopy():
+    # channel_names: stimCopy(0) BCH110SLM(1) stimCopy(2) BCH062SR(3)
+    #                BCH061SLM(4) BCH111SR(5)
+    eeg = [1, 3, 4, 5]
+    stim_copy = [0, 2]
+    # Stimulated = eeg channels preceded by a stimCopy: 1 and 3.
+    assert stimulated_indices(eeg, stim_copy) == {1, 3}
+    # BCH061SLM(4) and BCH111SR(5) are record-only -> excluded.
+    assert 4 not in stimulated_indices(eeg, stim_copy)
+    assert 5 not in stimulated_indices(eeg, stim_copy)
+
+
+def test_stimulated_indices_non_stim_session():
+    assert stimulated_indices([1, 2, 3], []) == set()
+    assert stimulated_indices([], [0]) == set()
 
 
 def test_normalize_ratio():

@@ -2793,35 +2793,44 @@ def _drift_stat(values: list, window: int, min_history: int) -> dict | None:
             "drift_pct": (latest - baseline) / baseline * 100.0}
 
 
-def _impedance_surface_card(children) -> "html.Div":
-    return html.Div(children, style={
-        "marginBottom": "12px", "background": COLOR_SURFACE_1,
-        "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_MD})
-
-
 def _build_impedance_trend_card(store, config=None):
-    """Per-channel transfer-impedance trend (both stim phases) over time,
-    with each phase's rolling-median baseline band + drift flagging."""
+    """Per-channel transfer-impedance trend (both stim phases) over time, for
+    the animals currently on the rig, wrapped in a collapsed section with a
+    glance-able drift badge (Apple-HIG: one container, collapsed by default)."""
     try:
         series = store.impedance_series_by_channel(
             exclude=_excluded_animals(config))
+        active = store.active_impedance_channel_keys()
     except Exception as e:  # noqa: BLE001
-        logger.warning("impedance_series_by_channel failed: %s", e)
-        series = {}
+        logger.warning("impedance card failed: %s", e)
+        series, active = {}, set()
+    # Scope to the most-recent stim session's channels (currently recording).
+    if active:
+        series = {k: v for k, v in series.items() if k in active}
     if not series:
-        return _impedance_surface_card(html.Div(
-            "No transfer-impedance data yet. Computed from evoked stim "
-            "responses once amplifier gains (File_Records) are available.",
-            style={"padding": "12px 14px", "color": "#a0a0b0",
-                    "fontSize": "12px"}))
+        return _collapsible(
+            "Transfer impedance drift",
+            html.Div("No transfer-impedance data for the current recording "
+                     "session yet. Computed from evoked stim responses once "
+                     "amplifier gains (File_Records) are available.",
+                     style={"color": "#a0a0b0", "fontSize": "12px"}),
+            open_default=False, badge="0")
     icfg = _impedance_cfg(config)
     channels = _impedance_channel_rows(series, icfg)
     n_total = len(channels)
     n_drift = sum(1 for c in channels if c["drifting"])
     shown = channels[:_IMPEDANCE_MAX_CHANNELS]
-    header = _impedance_header(n_total, n_drift, len(shown), icfg)
-    body = _impedance_figure(shown, icfg)
-    return _impedance_surface_card([header, body])
+    body = html.Div([
+        _impedance_header(n_total, n_drift, len(shown), icfg),
+        _impedance_example_block(store, channels, icfg),
+        _impedance_figure(shown, icfg),
+    ])
+    badge = (f"{n_total} active · ⚠{n_drift} drifting" if n_drift
+             else f"{n_total} active · ok")
+    badge_color = "#EF553B" if n_drift else "rgba(48,209,88,0.5)"
+    return _collapsible("Transfer impedance drift", body,
+                        open_default=bool(n_drift), badge=badge,
+                        badge_color=badge_color)
 
 
 def _impedance_channel_rows(series: dict, icfg: dict) -> list[dict]:
@@ -2842,28 +2851,23 @@ def _impedance_channel_rows(series: dict, icfg: dict) -> list[dict]:
 
 
 def _impedance_header(n_total, n_drift, n_shown, icfg):
-    bits = [
-        html.Span("Transfer impedance drift",
-                  style={"color": "#f0f0f5", "fontWeight": "600",
-                          "fontSize": "13px"}),
-        html.Span(f"  (kΩ per channel · both phases · baseline = rolling "
-                  f"median of last {icfg['window']})",
+    """Compact subhead inside the collapsible body: what the numbers mean +
+    counts (the collapsible summary already carries the section title)."""
+    line = [
+        html.Span("Animals currently on the rig · kΩ per channel · both "
+                  "phases · ", style={"color": "#888", "fontSize": "11px"}),
+        html.Span(f"baseline = rolling median of last {icfg['window']} · ",
                   style={"color": "#888", "fontSize": "11px"}),
-    ]
-    summary = [
-        html.Span(f"{n_total} channels  ·  ", style={"color": "#cfd0d6"}),
+        html.Span(f"{n_total} channels · ", style={"color": "#cfd0d6",
+                                                    "fontSize": "11px"}),
         html.Span(f"⚠ {n_drift} drifting >{icfg['pct']:.0f}%",
                   style={"color": "#ff9f0a" if n_drift else "#30d158",
-                          "fontWeight": "600"}),
+                          "fontWeight": "600", "fontSize": "11px"}),
     ]
     if n_shown < n_total:
-        summary.append(html.Span(f"  ·  showing {n_shown} of {n_total}",
-                                  style={"color": "#888"}))
-    return html.Div([
-        html.Div(bits),
-        html.Div(summary, style={"fontSize": "12px", "marginTop": "2px"}),
-    ], style={"padding": "12px 14px",
-               "borderBottom": f"1px solid {COLOR_DIVIDER}"})
+        line.append(html.Span(f" · showing {n_shown} of {n_total}",
+                              style={"color": "#888", "fontSize": "11px"}))
+    return html.Div(line, style={"padding": "2px 2px 8px"})
 
 
 def _impedance_figure(channels: list[dict], icfg: dict):
@@ -2929,6 +2933,127 @@ def _add_phase_trace(fig, rr, cc, x, dates, yvals, stat, color, label,
             hovertemplate=(f"DRIFT {stat['drift_pct']:+.0f}%<br>"
                            f"{stat['latest']:.3f} vs {stat['baseline']:.3f} kΩ"
                            "<extra></extra>")), rr, cc)
+
+
+def _impedance_example_block(store, channels: list[dict], icfg: dict):
+    """Optional (collapsed) 'how it's computed' worked example for the newest
+    active stimulated channel: annotated trace + step-by-step arithmetic."""
+    if not channels:
+        return html.Div()
+    ex = max(channels, key=lambda c: c["rows"][-1]["chunk_datetime"])
+    animal, ch = ex["animal"], ex["channel"]
+    try:
+        row = store.latest_impedance_row(animal, ch)
+    except Exception:  # noqa: BLE001
+        row = None
+    if not row:
+        return html.Div()
+    wf = None
+    try:
+        for w in store.get_evoked_waveform_by_file(row["file_id"]):
+            if int(w.get("channel") or -1) == int(row["channel"]):
+                wf = w
+                break
+    except Exception:  # noqa: BLE001
+        wf = None
+    inner = html.Div([
+        _impedance_example_steps(row),
+        (_impedance_example_figure(wf, row) if wf else html.Div(
+            "Waveform unavailable for this recording.",
+            style={"color": "#888", "fontSize": "11px"})),
+    ])
+    when = (row.get("chunk_datetime") or "")[:16]
+    return _collapsible(
+        f"How this is computed — example: {animal} {ch} ({when})",
+        inner, open_default=False)
+
+
+def _impedance_example_steps(row: dict):
+    """The transparent arithmetic for both phases, using the stored values."""
+    def _f(k):
+        v = row.get(k)
+        return None if v is None else float(v)
+    gain, charge, pw = _f("gain"), _f("charge_nc"), _f("pulse_width_us")
+    ratio = _f("neg_ratio") or 3.0
+
+    def _phase(label, v_raw, i_ua, z, color, dur_note):
+        if v_raw is None or gain in (None, 0) or i_ua in (None, 0):
+            return html.Div(f"{label}: n/a", style={"color": "#888"})
+        v_mv = v_raw / gain * 1000.0
+        return html.Div([
+            html.Span(f"{label}:  ", style={"color": color,
+                                            "fontWeight": "600"}),
+            html.Span(
+                f"V = {v_raw:.3f} / {gain:.0f} × 1000 = {v_mv:.3f} mV   ·   "
+                f"I = {charge:.0f} nC / {dur_note} × 1000 = {i_ua:.1f} µA   ·   "
+                f"Z = {v_mv:.3f} / {i_ua:.1f} = {z:.3f} kΩ"),
+        ], style={"fontFamily": "monospace", "fontSize": "11px",
+                   "color": "#cfd0d6", "marginBottom": "3px"})
+    pw_txt = f"{pw:.0f} µs" if pw else "pw"
+    neg_dur = f"({pw:.0f}×{ratio:.0f}) µs" if pw else "pw×ratio"
+    return html.Div([
+        html.Div("Z = (peak/avg voltage ÷ amplifier gain) ÷ commanded "
+                 "current, per stimulus phase:",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                         "marginBottom": "5px"}),
+        _phase("Positive phase (fast, peak)", _f("v_pos_raw"),
+               _f("i_pos_ua"), _f("impedance_pos_kohm"), "#5e7ce2", pw_txt),
+        _phase("Negative phase (slow, avg)", _f("v_neg_raw"),
+               _f("i_neg_ua"), _f("impedance_neg_kohm"), "#ff9f0a", neg_dur),
+    ], style={"padding": "4px 2px 8px"})
+
+
+def _impedance_example_figure(wf: dict, row: dict):
+    """Annotated recorded trace near t=0: positive-phase window (peak) and
+    negative-phase window (mean) shaded, with the extracted voltages marked."""
+    t = wf.get("time_axis_ms") or []
+    m = wf.get("mean_trace") or []
+    if not t or not m:
+        return html.Div()
+    pw_ms = (float(row.get("pulse_width_us") or 150.0)) / 1000.0
+    ratio = float(row.get("neg_ratio") or 3.0)
+    lo, hi = -0.3, max(1.0, pw_ms * (1.0 + ratio) + 0.2)
+    xs, ys = [], []
+    for i in range(min(len(t), len(m))):
+        if lo <= t[i] <= hi:
+            xs.append(t[i])
+            ys.append(m[i])
+    fig = go.Figure()
+    fig.add_vrect(x0=-0.1, x1=pw_ms, fillcolor="#5e7ce2", opacity=0.12,
+                  line_width=0, annotation_text="pos phase",
+                  annotation_position="top left",
+                  annotation=dict(font=dict(size=9, color="#5e7ce2")))
+    fig.add_vrect(x0=pw_ms, x1=pw_ms * (1.0 + ratio), fillcolor="#ff9f0a",
+                  opacity=0.10, line_width=0, annotation_text="neg phase",
+                  annotation_position="top right",
+                  annotation=dict(font=dict(size=9, color="#ff9f0a")))
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+                             line=dict(color="#cfd0d6", width=1.5),
+                             name="recorded (raw)"))
+    _mark_pos_peak(fig, t, m, pw_ms, row.get("v_pos_raw"))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=220, margin=dict(l=40, r=10, t=16, b=30),
+        showlegend=False, font=dict(color="#cfd0d6"),
+        xaxis=dict(title="ms from stimulus", gridcolor="#2a2a3a"),
+        yaxis=dict(title="raw", gridcolor="#2a2a3a"))
+    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+                     style={"padding": "4px 2px"})
+
+
+def _mark_pos_peak(fig, t, m, pw_ms, v_pos_raw):
+    """Mark the positive-phase peak sample (|max| over [-0.1, pw])."""
+    pk_i, pk = None, -1.0
+    for i in range(min(len(t), len(m))):
+        if -0.1 <= t[i] <= pw_ms and abs(m[i]) > pk:
+            pk, pk_i = abs(m[i]), i
+    if pk_i is None:
+        return
+    label = f"peak {v_pos_raw:.3f}" if v_pos_raw is not None else "peak"
+    fig.add_trace(go.Scatter(
+        x=[t[pk_i]], y=[m[pk_i]], mode="markers+text", text=[label],
+        textposition="top center", textfont=dict(size=9, color="#5e7ce2"),
+        marker=dict(color="#5e7ce2", size=9, symbol="circle")))
 
 
 def layout(store: Store, config: dict | None = None):

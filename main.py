@@ -166,6 +166,10 @@ def main():
     # the impedance cadence in the loop below (cheap once caught up).
     def _impedance_backfill():
         try:
+            purged = store.purge_nonstimulated_impedance()
+            if purged:
+                logger.info("Impedance: purged %d record-only channel rows",
+                            purged)
             refresh_impedance(store, config)
         except Exception:
             logger.exception("initial impedance backfill failed")

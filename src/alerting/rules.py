@@ -150,8 +150,12 @@ class AlertRuleEngine:
         try:
             series = self.store.impedance_series_by_channel(
                 exclude=self.impedance_exclude)
+            active = self.store.active_impedance_channel_keys()
         except Exception:  # noqa: BLE001 -- alerting must not crash the loop
             return
+        # Only alert on the animals currently on the rig (most-recent session).
+        if active:
+            series = {k: v for k, v in series.items() if k in active}
         flags = self._impedance_flags(series)
         if not flags:
             return
