@@ -2874,7 +2874,7 @@ def _build_impedance_trend_card(store, config=None):
         series = {k: v for k, v in series.items() if k in active}
     if not series:
         return _collapsible(
-            "Electrode access resistance (Rₐ) drift",
+            "Electrode series resistance (Rₐ) drift",
             html.Div("No access-resistance data for the current recording "
                      "session yet. Computed from the ohmic step of the stim "
                      "pulse once amplifier gains (File_Records) are available.",
@@ -2894,7 +2894,7 @@ def _build_impedance_trend_card(store, config=None):
     badge = (f"{n_total} active · ⚠{n_drift} drifting" if n_drift
              else f"{n_total} active · ok")
     badge_color = "#EF553B" if n_drift else "rgba(48,209,88,0.5)"
-    return _collapsible("Electrode access resistance (Rₐ) drift", body,
+    return _collapsible("Electrode series resistance (Rₐ) drift", body,
                         open_default=bool(n_drift), badge=badge,
                         badge_color=badge_color)
 
@@ -2917,8 +2917,8 @@ def _impedance_header(n_total, n_drift, n_shown, icfg):
     """Compact subhead inside the collapsible body: what the numbers mean +
     counts (the collapsible summary already carries the section title)."""
     line = [
-        html.Span("Animals currently on the rig · access resistance Rₐ (kΩ) "
-                  "from the stim ohmic step · ",
+        html.Span("Animals currently on the rig · effective series resistance Rₐ "
+                  "(kΩ) from the stim voltage-transient step · ",
                   style={"color": "#888", "fontSize": "11px"}),
         html.Span(f"baseline = rolling median of last {icfg['window']} · ",
                   style={"color": "#888", "fontSize": "11px"}),
@@ -3116,14 +3116,17 @@ def _impedance_example_steps(row: dict):
                       f"Rₐ = |ΔV| ÷ ΔI = {r:.3f} kΩ"),
         ], style={"fontFamily": "monospace", "fontSize": "11px",
                    "color": "#cfd0d6", "marginBottom": "3px"})
-    agree = ("agree → trusted" if ra is not None
-             else "disagree → rejected (clipping/noise)")
+    agree = ("linearity check passed" if ra is not None
+             else "rejected (disagree / saturation collapse)")
     return html.Div([
-        html.Div("Access resistance Rₐ = |ΔV| ÷ ΔI at a current transition. "
-                 "The electrode double-layer voltage can't change "
-                 "instantaneously, so the step across a transition is purely "
-                 "the OHMIC (resistive) drop — no peak, no average. Measured "
-                 "at two independent transitions:",
+        html.Div("Series resistance Rₐ = |ΔV| ÷ ΔI at a current transition — "
+                 "the step is dominated by the ohmic (resistive) drop since "
+                 "the double-layer voltage can't jump instantly. At 20 kHz "
+                 "(50 µs/sample) it also folds in a little capacitive "
+                 "charging, so it's an EFFECTIVE series resistance, not a "
+                 "pure Rₐ. Measured at two independent transitions (their "
+                 "agreement is a linearity check, not proof of the absolute "
+                 "value):",
                  style={"color": "#a0a0b0", "fontSize": "11px",
                          "marginBottom": "5px"}),
         _line("Fast→slow reversal", rev, di_rev, "#5e7ce2"),
@@ -3133,11 +3136,14 @@ def _impedance_example_steps(row: dict):
                  style={"color": "#f0f0f5", "fontWeight": "600",
                          "fontSize": "11px", "marginTop": "3px",
                          "fontFamily": "monospace"}),
-        html.Div("Note: at 20 kHz the step is one 50-µs sample, so Rₐ "
-                 "includes ≤50 µs of fast capacitive charging (a small, "
-                 "consistent overestimate) — excellent for drift, not an "
-                 "absolute value. High-charge pulses saturate the amplifier, "
-                 "so only the dominant test-pulse charge is tracked.",
+        html.Div("Caveats: at 20 kHz the step is one 50-µs sample, so Rₐ "
+                 "folds in ≤50 µs of double-layer charging (effective, not "
+                 "absolute — good for DRIFT). Rows where the amp saturated on "
+                 "the fast spike and collapsed before the reversal (spurious "
+                 "R≈0) are rejected; high-charge pulses saturate, so only the "
+                 "dominant test-pulse charge is tracked. The dotted grey line "
+                 "is the stim command I(t) — the steps should sit on its "
+                 "edges.",
                  style={"color": "#777", "fontSize": "10px",
                          "marginTop": "5px"}),
     ], style={"padding": "4px 2px 8px"})
@@ -3161,6 +3167,17 @@ def _impedance_example_figure(wf: dict, row: dict):
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", showlegend=False,
                              line=dict(color="#cfd0d6", width=1.5),
                              name="recorded (raw)"))
+    # Overlay the stim command (stim-copy), scaled to the trace, so the reader
+    # can verify the marked transitions land on the real current edges.
+    smw = [sm[i] for i in range(min(len(t), len(sm))) if lo <= t[i] <= hi]
+    if smw and ys:
+        span = max((abs(v) for v in ys), default=1.0) or 1.0
+        cspan = max((abs(v) for v in smw), default=1.0) or 1.0
+        scale = 0.5 * span / cspan
+        fig.add_trace(go.Scatter(
+            x=xs, y=[v * scale for v in smw], mode="lines",
+            line=dict(color="#8a8a99", width=1, dash="dot"),
+            name="stim command I(t), scaled", hoverinfo="skip"))
     tr = find_current_transitions(sm, t)
     if tr is not None:
         r_rev = row.get("access_r_reversal_kohm")

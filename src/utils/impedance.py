@@ -233,44 +233,72 @@ def _step_kohm(mean_trace, i_after, gain, delta_i_ua) -> float | None:
 
 
 # Two independent transitions must agree within this fraction for the
-# access-resistance measurement to be trusted (rejects asymmetric clipping /
-# noise). Symmetric amplifier saturation can still pass -- that's handled
-# upstream by restricting to a non-saturating stimulus protocol.
+# measurement to pass the LINEARITY check (rejects asymmetric clipping /
+# noise). NB: for an ohmic interface both transitions give the same R by
+# Ohm's law, so agreement confirms linearity, not the absolute value.
 ACCESS_R_AGREE_TOL = 0.35
+
+# Saturation/collapse guard: the reversal step must be at least this fraction
+# of the fast-phase PEAK deflection. When the amp saturates on the fast-phase
+# spike and recovers before the reversal (response collapses to ~baseline by
+# then), the reversal step is spuriously tiny → nonphysical R≈0. Such rows
+# are rejected rather than plotted as a real drop.
+ACCESS_R_MIN_SUSTAIN = 0.15
 
 
 def access_resistance(mean_trace, time_ms, stim_mean_trace, gain,
                       i_fast_ua, i_slow_ua,
-                      agree_tol: float = ACCESS_R_AGREE_TOL) -> dict:
-    """Electrode access resistance from the ohmic voltage step (kΩ).
+                      agree_tol: float = ACCESS_R_AGREE_TOL,
+                      min_sustain: float = ACCESS_R_MIN_SUSTAIN) -> dict:
+    """Effective electrode SERIES resistance from the ohmic voltage step (kΩ).
 
-    Uses the fast→slow REVERSAL (largest ΔI = i_fast+i_slow, best SNR) and
-    the slow→OFF step (ΔI = i_slow) as TWO independent estimates. Reports
-    ``r_access_kohm`` = their mean **only when they agree** within
-    ``agree_tol`` (a QC gate: a clean ohmic measurement gives the same R at
-    both transitions; disagreement flags clipping/noise → r_access None). The
-    individual ``r_reversal_kohm`` / ``r_offset_kohm`` are always returned for
-    debugging. All-None when the stim-copy has no clean pulse or gain/current
-    is missing.
+    Rₐ = |ΔV|/ΔI at a current transition. NB: at 20 kHz one sample is 50 µs,
+    so ΔV folds in ≤50 µs of double-layer charging on top of the pure ohmic
+    drop — this is an *effective* series resistance at ~single-sample
+    bandwidth (great for tracking drift, not an absolute access resistance).
+
+    Uses the fast→slow REVERSAL (largest ΔI, best SNR) and the slow→OFF step
+    as two estimates. Two QC gates: (1) a saturation/collapse guard — reject
+    when the fast-phase response has decayed before the reversal (amp railed
+    and recovered → spurious R≈0); (2) a linearity check — the two transitions
+    must agree within ``agree_tol`` (else clipping/noise). Reports the mean as
+    ``r_access_kohm`` when both pass; individual steps always returned.
     """
     out = {"r_reversal_kohm": None, "r_offset_kohm": None,
            "r_access_kohm": None, "n_used": 0}
     tr = find_current_transitions(stim_mean_trace, time_ms)
     if tr is None or gain in (None, 0) or not i_fast_ua or not i_slow_ua:
         return out
-    _onset, reversal, offset = tr
+    onset, reversal, offset = tr
     rev = _step_kohm(mean_trace, reversal, gain,
                      float(i_fast_ua) + float(i_slow_ua))
     off = _step_kohm(mean_trace, offset, gain, float(i_slow_ua))
     out["r_reversal_kohm"] = rev
     out["r_offset_kohm"] = off
+    # (1) saturation/collapse guard.
+    if not _reversal_sustained(mean_trace, onset, reversal, min_sustain):
+        return out                               # spurious R≈0 -> reject
+    # (2) linearity check.
     if rev is not None and off is not None:
         mean = (rev + off) / 2.0
         if mean > 0 and abs(rev - off) / mean <= agree_tol:
-            out["r_access_kohm"] = mean          # both agree -> trusted
+            out["r_access_kohm"] = mean
             out["n_used"] = 2
-        # else: disagree -> reject r_access (leave None) but keep rev/off
     return out
+
+
+def _reversal_sustained(mean_trace, onset, reversal, min_sustain) -> bool:
+    """True when the reversal step is a real fraction of the fast-phase peak
+    deflection (i.e. the response hadn't already collapsed to baseline)."""
+    if reversal is None or reversal < 1 or onset is None:
+        return False
+    try:
+        peak = max(abs(float(mean_trace[i]))
+                   for i in range(onset, reversal + 1))
+        step = abs(float(mean_trace[reversal]) - float(mean_trace[reversal - 1]))
+    except (TypeError, ValueError, IndexError):
+        return False
+    return peak > 0 and (step / peak) >= min_sustain
 
 
 def impedance_for_channel(mean_trace, time_ms, gain,
