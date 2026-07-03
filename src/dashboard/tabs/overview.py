@@ -3038,10 +3038,11 @@ def _impedance_example_steps(row: dict):
     neg_i = (f"{i_pos:.1f} µA ÷ {ratio:.0f}" if i_pos
              else f"{charge:.0f} nC / ({pw:.0f}×{ratio:.0f}) µs × 1000")
     return html.Div([
-        html.Div("Z = (peak/avg voltage ÷ amplifier gain) ÷ commanded "
-                 "current, per stimulus phase. The slow phase is charge-"
-                 "balanced — same charge over ×{r:.0f} the time, so ÷{r:.0f} "
-                 "the amplitude:".format(r=ratio),
+        html.Div("Current = charge ÷ time (nC is charge, not current). Both "
+                 "phases carry equal & opposite charge so net → 0 (charge "
+                 "balanced); the slow phase spreads the SAME charge over "
+                 "×{r:.0f} the time, so its current is ÷{r:.0f}. "
+                 "Z = (voltage ÷ gain) ÷ current, per phase:".format(r=ratio),
                  style={"color": "#a0a0b0", "fontSize": "11px",
                          "marginBottom": "5px"}),
         _phase("Positive phase (fast, peak)", _f("v_pos_raw"),
