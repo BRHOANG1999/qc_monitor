@@ -1848,6 +1848,51 @@ class Store:
         best = max(counts, key=lambda c: (counts[c], c))
         return [r for r in rows if r.get("charge_nc") == best]
 
+    def recent_channel_traces(self, animal_id: str, channel_name: str,
+                              limit: int = 24) -> list[dict]:
+        """Recent recorded stim-artifact traces for one channel, newest first,
+        restricted to the channel's DOMINANT stimulus charge (the consistent
+        test protocol) and to recordings with a valid access resistance.
+
+        Each dict: ``{chunk_datetime, time_ms, mean_trace}``. Used by the
+        (lazy-loaded) stim-artifact overlay so the reviewer can see how the
+        pulse response changes alongside the Rₐ trend."""
+        conn = self._connect()
+        try:
+            crow = conn.execute(
+                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
+                   WHERE animal_id = ? AND channel_name = ?
+                     AND access_r_kohm IS NOT NULL
+                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
+                   LIMIT 1""", (animal_id, channel_name)).fetchone()
+            if not crow:
+                return []
+            rows = conn.execute(
+                """SELECT pf.chunk_datetime, ew.time_axis_ms, ew.mean_trace
+                   FROM evoked_waveforms ew
+                   JOIN processed_files pf ON pf.id = ew.file_id
+                   JOIN channel_impedance ci
+                     ON ci.file_id = ew.file_id AND ci.channel = ew.channel
+                   WHERE ci.animal_id = ? AND ci.channel_name = ?
+                     AND ci.access_r_kohm IS NOT NULL
+                     AND ci.charge_nc IS ?
+                   ORDER BY pf.chunk_datetime DESC LIMIT ?""",
+                (animal_id, channel_name, crow["charge_nc"],
+                 int(limit))).fetchall()
+        finally:
+            conn.close()
+        out = []
+        for r in rows:
+            try:
+                out.append({
+                    "chunk_datetime": r["chunk_datetime"] or "",
+                    "time_ms": json.loads(r["time_axis_ms"]),
+                    "mean_trace": json.loads(r["mean_trace"]),
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return out
+
     def impedance_series_by_channel(self, days: int | None = None,
                                     exclude: list[str] | None = None
                                     ) -> dict:

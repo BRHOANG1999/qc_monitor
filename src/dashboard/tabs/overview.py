@@ -2162,6 +2162,26 @@ def _overview_tab(store: Store, config: dict | None = None):
         _build_impedance_trend_card(store, config),
         id="overview-impedance",
     )
+    # Stim-artifact overlay: lazily loaded on button click (loading many
+    # traces is heavy), in its own section so a refresh tick doesn't wipe it.
+    artifact_overlay = _collapsible(
+        "Stim-artifact overlay (active channels)",
+        html.Div([
+            html.Div("Overlays the recorded stim artifacts of recent "
+                     "recordings per active channel (oldest→newest) so you "
+                     "can see how the pulse response + ohmic step shift "
+                     "alongside the Rₐ trend.",
+                     style={"color": "#a0a0b0", "fontSize": "11px",
+                             "marginBottom": "6px"}),
+            html.Button("Load / refresh overlay",
+                        id="overview-artifact-btn", n_clicks=0,
+                        style={"fontSize": "12px", "cursor": "pointer",
+                                "padding": "4px 10px", "borderRadius": "5px",
+                                "color": "#f0f0f5", "background": "#3a3a4a",
+                                "border": "1px solid #555"}),
+            dcc.Loading(html.Div(id="overview-artifact-body"), type="dot"),
+        ]),
+        open_default=False)
     matlab_failed = _build_matlab_failed_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
@@ -2419,7 +2439,8 @@ def _overview_tab(store: Store, config: dict | None = None):
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
-        impedance_status,  # per-channel transfer-impedance drift trend
+        impedance_status,  # per-channel access-resistance (Rₐ) drift trend
+        artifact_overlay,  # lazy stim-artifact overlay across recordings
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
 
@@ -2532,15 +2553,16 @@ def _build_behavioral_seizure_status_card(store, config=None):
             f"Backlog shrinking ({rate_per_day:.1f} files/day). "
             "Team ahead of schedule.")
         verdict_color = "#30d158"
-    header = html.Div([
+    # Collapsed = this compressed summary (totals + verdict); expanding
+    # reveals the per-animal cards/charts. The +/- marker + hover come from
+    # the shared `details > summary` CSS (theme.css).
+    summary = html.Summary([
         html.Div([
             html.Span("Behavioral seizure analysis status",
-                       style={"color": "#f0f0f5",
-                               "fontWeight": "600",
+                       style={"color": "#f0f0f5", "fontWeight": "600",
                                "fontSize": "13px"}),
             html.Span("  (last 7 days)",
-                       style={"color": "#888",
-                               "fontSize": "11px"}),
+                       style={"color": "#888", "fontSize": "11px"}),
         ]),
         html.Div([
             html.Span(f"{total_created} created  ·  ",
@@ -2557,31 +2579,31 @@ def _build_behavioral_seizure_status_card(store, config=None):
             html.Span(f"🚩 {total_needs} needs scoring",
                        style={"color": "#ff9f0a" if total_needs
                               else "#cfd0d6"}),
-        ], style={"fontSize": "12px",
-                   "marginTop": "2px"}),
+        ], style={"fontSize": "12px", "marginTop": "2px"}),
         html.Div(verdict_text,
-                  style={"color": verdict_color,
-                          "fontWeight": "600",
-                          "fontSize": "12px",
-                          "marginTop": "6px"}),
-        # Cards <-> Charts view toggle (the body below swaps on change).
+                  style={"color": verdict_color, "fontWeight": "600",
+                          "fontSize": "12px", "marginTop": "6px"}),
+    ], style={"cursor": "pointer", "userSelect": "none",
+               "padding": "12px 14px", "listStyle": "none"})
+    # Body (expanded): Cards <-> Charts toggle + the per-animal detail.
+    body = html.Div([
         dcc.RadioItems(
             id="bsz-view-toggle",
             options=[{"label": " Cards", "value": "cards"},
                       {"label": " Charts", "value": "charts"}],
             value="cards", inline=True,
-            style={"marginTop": "8px", "fontSize": "11px"},
+            style={"margin": "2px 0 4px", "fontSize": "11px"},
             labelStyle={"color": "#cfd0d6", "marginRight": "14px",
                          "cursor": "pointer"},
             inputStyle={"marginRight": "4px"}),
-    ], style={"padding": "12px 14px",
-               "borderBottom": f"1px solid {COLOR_DIVIDER}"})
-    # Body: cards by default; the callback swaps it to charts on toggle.
-    body = html.Div(_bsz_cards(rows), id="overview-bsz-body")
-    return html.Div([header, body],
-                     style={"background": COLOR_SURFACE_1,
-                             "border": f"1px solid {COLOR_DIVIDER}",
-                             "borderRadius": RADIUS_MD})
+        html.Div(_bsz_cards(rows), id="overview-bsz-body"),
+    ], style={"borderTop": f"1px solid {COLOR_DIVIDER}",
+               "padding": "4px 4px 6px"})
+    return html.Details([summary, body], open=False,
+                         style={"background": COLOR_SURFACE_1,
+                                 "border": f"1px solid {COLOR_DIVIDER}",
+                                 "borderRadius": RADIUS_MD,
+                                 "marginBottom": "6px"})
 
 
 def _bsz_cards(rows):
@@ -2755,6 +2777,15 @@ def _bsz_charts(rows):
 # Max channels charted (keeps the figure a sane height); overflow is
 # reported in the header rather than silently dropped.
 _IMPEDANCE_MAX_CHANNELS = 30
+
+# Graph config for the access-R figures: keep a hover mode bar (with a
+# reset-axes button) + double-click-to-reset so pan/zoom is recoverable.
+_IMPEDANCE_GRAPH_CONFIG = {
+    "displayModeBar": "hover", "displaylogo": False,
+    "doubleClick": "reset", "scrollZoom": False,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d",
+                                "autoScale2d", "toggleSpikelines"],
+}
 
 
 def _impedance_cfg(config) -> dict:
@@ -2941,7 +2972,7 @@ def _impedance_figure(channels: list[dict], icfg: dict):
     fig.update_yaxes(title_text="kΩ", title_font=dict(size=9),
                      tickfont=dict(size=8), nticks=5,
                      gridcolor="#2a2a3a", automargin=True)
-    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
                      style={"padding": "8px 10px"})
 
 
@@ -2970,6 +3001,64 @@ def _add_access_r_trace(fig, rr, cc, x, dates, yvals, stat, icfg):
             hovertemplate=(f"DRIFT {stat['drift_pct']:+.0f}%<br>"
                            f"{stat['latest']:.3f} vs {stat['baseline']:.3f} kΩ"
                            "<extra></extra>")), rr, cc)
+
+
+def _impedance_artifact_overlay(store, active_keys, limit: int = 24):
+    """Overlay the recorded stim-artifact traces (per active channel) of the
+    last *limit* recordings, coloured oldest→newest, zoomed to the transition
+    window — so a shift in the pulse response / ohmic step is visible next to
+    the Rₐ trend. Lazily built (heavy: loads many traces)."""
+    from plotly.colors import sample_colorscale
+    keys = sorted(active_keys)
+    if not keys:
+        return html.Div("No active channels.",
+                        style={"color": "#888", "fontSize": "11px"})
+    cols = min(len(keys), 2)
+    n_rows = (len(keys) + cols - 1) // cols
+    fig = make_subplots(rows=n_rows, cols=cols,
+                        subplot_titles=[f"{a} {c}" for a, c in keys],
+                        vertical_spacing=0.18, horizontal_spacing=0.09)
+    lo, hi = -0.3, 1.0
+    n_total = 0
+    for i, (animal, ch) in enumerate(keys):
+        rr, cc = i // cols + 1, i % cols + 1
+        traces = store.recent_channel_traces(animal, ch, limit)
+        oldest_first = list(reversed(traces))       # oldest → newest
+        m = len(oldest_first)
+        n_total += m
+        for j, tr in enumerate(oldest_first):
+            t, y = tr["time_ms"], tr["mean_trace"]
+            xs = [t[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
+            ys = [y[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
+            frac = j / max(1, m - 1)
+            color = sample_colorscale("Turbo", frac)[0]
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines", showlegend=False,
+                line=dict(color=color, width=1), opacity=0.65,
+                customdata=[tr["chunk_datetime"]] * len(xs),
+                hovertemplate="%{y:.3f}<br>%{customdata}<extra></extra>"),
+                rr, cc)
+    for ann in fig.layout.annotations[:len(keys)]:
+        ann.font.size = 11
+        ann.font.color = "#f0f0f5"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=120 + 190 * n_rows, margin=dict(l=52, r=16, t=42, b=34),
+        showlegend=False, font=dict(color="#cfd0d6"))
+    fig.update_xaxes(title_text="ms from stimulus", title_font=dict(size=9),
+                     tickfont=dict(size=8), gridcolor="#2a2a3a",
+                     automargin=True)
+    fig.update_yaxes(title_text="raw", title_font=dict(size=9),
+                     tickfont=dict(size=8), gridcolor="#2a2a3a",
+                     automargin=True)
+    return html.Div([
+        html.Div(f"{n_total} traces · oldest (blue) → newest (red) · "
+                 "dominant test-pulse charge only",
+                 style={"color": "#888", "fontSize": "10px",
+                         "padding": "0 2px 4px"}),
+        dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                  style={"padding": "4px 2px"}),
+    ])
 
 
 def _impedance_example_block(store, channels: list[dict], icfg: dict):
@@ -3087,7 +3176,7 @@ def _impedance_example_figure(wf: dict, row: dict):
         font=dict(color="#cfd0d6"),
         xaxis=dict(title="ms from stimulus", gridcolor="#2a2a3a"),
         yaxis=dict(title="raw", gridcolor="#2a2a3a"))
-    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
                      style={"padding": "4px 2px"})
 
 
@@ -3180,6 +3269,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _build_km_log_section(config),
             _build_impedance_trend_card(store, config),
         )
+
+    # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
+    # user clicks, and lives outside the refreshed card so it persists.
+    @app.callback(
+        Output("overview-artifact-body", "children"),
+        Input("overview-artifact-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def load_artifact_overlay(_n):
+        try:
+            active = store.active_impedance_channel_keys()
+            return _impedance_artifact_overlay(store, active)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("artifact overlay failed: %s", e)
+            return html.Div("Overlay failed to load.",
+                            style={"color": "#888", "fontSize": "11px"})
 
     # Thumbnail has its own callback because the radio adds an
     # additional Input. Re-renders on either trigger; the mean/sem/overlay
