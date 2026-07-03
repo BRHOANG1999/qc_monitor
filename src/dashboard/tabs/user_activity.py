@@ -46,6 +46,7 @@ _AREA_OPTIONS = [
     {"label": "LFP Browser", "value": "lfp_browser"},
     {"label": "Event Verification", "value": "event_verification"},
     {"label": "File browser", "value": "file_browser"},
+    {"label": "Auto-screen (seizure threshold)", "value": "auto-screen"},
 ]
 _PRESENCE_MIN = 15
 

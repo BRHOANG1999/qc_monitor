@@ -1104,6 +1104,14 @@ def scan_for_animal(store, job_id: int,
             (datetime.now().isoformat(), job_id),
         )
         conn.commit()
+    # Record the automatic seizure-threshold scan in the activity feed
+    # (attributed to the PI who ran it) so auto-screening is visible
+    # alongside human review. Best-effort: log_user_activity never raises.
+    store.log_user_activity(
+        job.get("pi_email") or "", "auto-screen", "threshold_scan",
+        target=animal_id,
+        detail={"cutoff": cutoff, "flagged": n_with, "scanned": total,
+                "electrode": electrode})
     return {"status": "done",
              "scanned_files": total,
              "total_files": total,
