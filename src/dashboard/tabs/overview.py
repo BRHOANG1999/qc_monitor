@@ -3182,7 +3182,8 @@ def _impedance_example_figure(wf: dict, row: dict):
         fig.add_trace(go.Scatter(
             x=xs, y=[v * scale for v in smw], mode="lines",
             line=dict(color="#8a8a99", width=1, dash="dot"),
-            name="stim command I(t), scaled", hoverinfo="skip"))
+            name="commanded current I(t) — reference only, scaled (NOT Rₐ)",
+            hoverinfo="skip"))
     tr = find_current_transitions(sm, t)
     if tr is not None:
         r_rev = row.get("access_r_reversal_kohm")
