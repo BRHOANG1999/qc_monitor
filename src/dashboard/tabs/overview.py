@@ -2776,6 +2776,40 @@ def _median(vals: list) -> float | None:
     return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
 
 
+def _parse_chunk_dt(s):
+    """Parse a recorder chunk_datetime ('YYYY_MM_DD__HH_MM_SS' or ISO) to a
+    datetime, else None -- lets the impedance trend use a real time axis."""
+    if not s:
+        return None
+    from datetime import datetime as _dt
+    for fmt in ("%Y_%m_%d__%H_%M_%S", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return _dt.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _impedance_span_note(channels: list[dict]):
+    """A one-line 'these span X → Y' caption so the measurement timescale is
+    obvious at a glance."""
+    dts = [_parse_chunk_dt(r["chunk_datetime"])
+           for c in channels for r in c["rows"]]
+    dts = [d for d in dts if d is not None]
+    if not dts:
+        return html.Div()
+    lo, hi = min(dts), max(dts)
+    n_max = max((len(c["rows"]) for c in channels), default=0)
+    span_days = (hi - lo).total_seconds() / 86400.0
+    span_txt = (f"{span_days:.1f} days" if span_days >= 1
+                else f"{(hi - lo).total_seconds() / 3600.0:.1f} h")
+    return html.Div(
+        f"Timescale: {lo:%Y-%m-%d %H:%M} → {hi:%Y-%m-%d %H:%M}  "
+        f"({span_txt}, up to {n_max} recordings/channel)",
+        style={"color": "#888", "fontSize": "10px", "padding": "0 2px 6px"})
+
+
 def _drift_stat(values: list, window: int, min_history: int) -> dict | None:
     """Rolling-median drift of the newest point vs the prior *window*.
 
@@ -2822,6 +2856,7 @@ def _build_impedance_trend_card(store, config=None):
     shown = channels[:_IMPEDANCE_MAX_CHANNELS]
     body = html.Div([
         _impedance_header(n_total, n_drift, len(shown), icfg),
+        _impedance_span_note(shown),
         _impedance_example_block(store, channels, icfg),
         _impedance_figure(shown, icfg),
     ])
@@ -2883,8 +2918,12 @@ def _impedance_figure(channels: list[dict], icfg: dict):
                         vertical_spacing=0.16, horizontal_spacing=0.06)
     for i, c in enumerate(channels):
         rr, cc = i // cols + 1, i % cols + 1
-        x = list(range(len(c["rows"])))
         dates = [r["chunk_datetime"] for r in c["rows"]]
+        # Real recording datetimes on x so the timescale is explicit; fall
+        # back to an index only if a channel's stamps won't parse.
+        dts = [_parse_chunk_dt(d) for d in dates]
+        x = dts if all(d is not None for d in dts) else list(
+            range(len(c["rows"])))
         _add_phase_trace(fig, rr, cc, x, dates,
                          [r["impedance_pos_kohm"] for r in c["rows"]],
                          c["pos"], "#5e7ce2", "pos", icfg, i == 0)
@@ -2901,7 +2940,11 @@ def _impedance_figure(channels: list[dict], icfg: dict):
                      xanchor="center", x=0.5, font=dict(size=10),
                      bgcolor="rgba(0,0,0,0)"),
         font=dict(color="#cfd0d6"))
-    fig.update_xaxes(showticklabels=False)
+    # Show real date ticks so the measurement timescale is clear.
+    fig.update_xaxes(showticklabels=True, tickfont=dict(size=8),
+                     nticks=4, tickformat="%b %d", tickangle=0,
+                     gridcolor="#2a2a3a")
+    fig.update_yaxes(title_text="kΩ", title_font=dict(size=9))
     return dcc.Graph(figure=fig, config={"displayModeBar": False},
                      style={"padding": "8px 6px"})
 
@@ -2975,8 +3018,9 @@ def _impedance_example_steps(row: dict):
         return None if v is None else float(v)
     gain, charge, pw = _f("gain"), _f("charge_nc"), _f("pulse_width_us")
     ratio = _f("neg_ratio") or 3.0
+    i_pos = _f("i_pos_ua")
 
-    def _phase(label, v_raw, i_ua, z, color, dur_note):
+    def _phase(label, v_raw, i_ua, z, color, i_expr):
         if v_raw is None or gain in (None, 0) or i_ua in (None, 0):
             return html.Div(f"{label}: n/a", style={"color": "#888"})
         v_mv = v_raw / gain * 1000.0
@@ -2985,21 +3029,25 @@ def _impedance_example_steps(row: dict):
                                             "fontWeight": "600"}),
             html.Span(
                 f"V = {v_raw:.3f} / {gain:.0f} × 1000 = {v_mv:.3f} mV   ·   "
-                f"I = {charge:.0f} nC / {dur_note} × 1000 = {i_ua:.1f} µA   ·   "
+                f"I = {i_expr} = {i_ua:.1f} µA   ·   "
                 f"Z = {v_mv:.3f} / {i_ua:.1f} = {z:.3f} kΩ"),
         ], style={"fontFamily": "monospace", "fontSize": "11px",
                    "color": "#cfd0d6", "marginBottom": "3px"})
-    pw_txt = f"{pw:.0f} µs" if pw else "pw"
-    neg_dur = f"({pw:.0f}×{ratio:.0f}) µs" if pw else "pw×ratio"
+    pos_i = f"{charge:.0f} nC / {pw:.0f} µs × 1000" if pw else "charge/pw"
+    # Slow phase: 1/3 amplitude (charge-balanced over 3x the duration).
+    neg_i = (f"{i_pos:.1f} µA ÷ {ratio:.0f}" if i_pos
+             else f"{charge:.0f} nC / ({pw:.0f}×{ratio:.0f}) µs × 1000")
     return html.Div([
         html.Div("Z = (peak/avg voltage ÷ amplifier gain) ÷ commanded "
-                 "current, per stimulus phase:",
+                 "current, per stimulus phase. The slow phase is charge-"
+                 "balanced — same charge over ×{r:.0f} the time, so ÷{r:.0f} "
+                 "the amplitude:".format(r=ratio),
                  style={"color": "#a0a0b0", "fontSize": "11px",
                          "marginBottom": "5px"}),
         _phase("Positive phase (fast, peak)", _f("v_pos_raw"),
-               _f("i_pos_ua"), _f("impedance_pos_kohm"), "#5e7ce2", pw_txt),
+               i_pos, _f("impedance_pos_kohm"), "#5e7ce2", pos_i),
         _phase("Negative phase (slow, avg)", _f("v_neg_raw"),
-               _f("i_neg_ua"), _f("impedance_neg_kohm"), "#ff9f0a", neg_dur),
+               _f("i_neg_ua"), _f("impedance_neg_kohm"), "#ff9f0a", neg_i),
     ], style={"padding": "4px 2px 8px"})
 
 
