@@ -1346,7 +1346,8 @@ def _run_auto_filter_sweep(store) -> dict:
         configs = store.list_animal_screen_configs(enabled_only=True)
     except Exception:  # noqa: BLE001 -- table may be missing on a brand-new DB
         return {"animals": 0, "n_cleared": 0}
-    totals = {"animals": 0, "n_cleared": 0}
+    totals = {"animals": 0, "n_cleared": 0, "n_kept": 0, "n_error": 0}
+    per_animal: dict = {}
     max_iter = len(configs) + 1
     for i, cfg in enumerate(configs):
         assert i < max_iter, "sweep loop runaway"
@@ -1354,12 +1355,32 @@ def _run_auto_filter_sweep(store) -> dict:
             r = auto_screen_for_animal(store, cfg["animal_id"], cfg)
             totals["animals"] += 1
             totals["n_cleared"] += r["n_cleared"]
+            totals["n_kept"] += r.get("n_kept", 0)
+            totals["n_error"] += r.get("n_error", 0)
+            if r["n_cleared"] or r.get("n_kept") or r.get("n_error"):
+                per_animal[cfg["animal_id"]] = {
+                    "cleared": r["n_cleared"], "kept": r.get("n_kept", 0),
+                    "error": r.get("n_error", 0)}
         except Exception:  # noqa: BLE001
             logger.exception("auto_filter sweep animal=%s failed",
                              cfg.get("animal_id"))
-    if totals["n_cleared"]:
-        logger.info("auto_filter sweep cleared %d files across %d animals",
-                    totals["n_cleared"], totals["animals"])
+    # Observable: log + one activity-feed row per sweep that did something, so
+    # the PI can SEE the auto-screening running (and a high kept/error count
+    # points at the real cause if files aren't clearing).
+    if totals["n_cleared"] or totals["n_kept"] or totals["n_error"]:
+        logger.info("auto_filter sweep: %d cleared / %d kept / %d error "
+                    "across %d animals", totals["n_cleared"], totals["n_kept"],
+                    totals["n_error"], totals["animals"])
+        try:
+            store.log_user_activity(
+                _AUTO_FILTER_SYSTEM_EMAIL, "auto-screen", "auto_filter_sweep",
+                target=None,
+                detail={"cleared": totals["n_cleared"],
+                        "kept": totals["n_kept"], "error": totals["n_error"],
+                        "animals": totals["animals"],
+                        "per_animal": per_animal})
+        except Exception:  # noqa: BLE001 -- logging is best-effort
+            logger.debug("auto_filter sweep activity log failed")
     return totals
 
 
@@ -1545,6 +1566,7 @@ _wake = threading.Event()
 # Background auto-filter sweep: set from config.auto_filter in start_worker.
 _AUTO_FILTER_ENABLED = True
 _AUTO_FILTER_INTERVAL = 300.0
+_AUTO_FILTER_SYSTEM_EMAIL = "auto-filter@system"
 
 
 def start_worker(store, config: dict) -> None:
@@ -1566,8 +1588,10 @@ def start_worker(store, config: dict) -> None:
         _SCAN_WORKERS = 4
     # Auto-filter sweep cadence (rides this same daemon).
     af = (config or {}).get("auto_filter", {}) or {}
-    global _AUTO_FILTER_ENABLED, _AUTO_FILTER_INTERVAL
+    global _AUTO_FILTER_ENABLED, _AUTO_FILTER_INTERVAL, _AUTO_FILTER_SYSTEM_EMAIL
     _AUTO_FILTER_ENABLED = af.get("enabled", True) is not False
+    _AUTO_FILTER_SYSTEM_EMAIL = (af.get("system_email")
+                                 or "auto-filter@system")
     try:
         _AUTO_FILTER_INTERVAL = max(30.0,
                                     float(af.get("sweep_interval_sec", 300)))

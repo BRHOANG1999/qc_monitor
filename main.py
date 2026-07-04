@@ -157,6 +157,18 @@ def main():
     alert_engine = AlertRuleEngine(store, dispatcher.emailer, config)
     digest_scheduler = DigestScheduler(config, dispatcher.emailer, store=store)
 
+    # Start the mass-analyze / auto-filter worker in the daemon process too.
+    # It auto-sweeps every enabled per-animal threshold on the
+    # auto_filter.sweep_interval_sec cadence. Previously it was started ONLY
+    # from create_app (the dashboard), so a headless daemon never swept the
+    # queue. start_worker is idempotent -- a no-op if the dashboard already
+    # started it in this same process.
+    try:
+        from src.utils import mass_analyze as _mass_analyze
+        _mass_analyze.start_worker(store, config)
+    except Exception:
+        logger.exception("mass_analyze worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
