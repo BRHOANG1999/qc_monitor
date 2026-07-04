@@ -635,6 +635,11 @@ def layout(store: Store, config: dict | None = None):
                                  "fontSize": FONT_SIZE_BODY,
                                  "marginBottom": SPACE_2}),
                 id="training-detect-wrap"),
+            # Armed-landmark banner: a SEPARATE output from the form so
+            # arming doesn't rebuild every event row (mirrors Video Review's
+            # video-armed-banner). Keeps the pattern-matching event
+            # components stable across the arm -> click cycle.
+            html.Div(id="training-arm-banner"),
             html.Div(id="training-form"),
             html.Div([
                 button("Submit", "training-submit-btn", variant="primary",
@@ -799,25 +804,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("training-form", "children"),
         Input("training-stage", "value"),
         Input("training-events", "data"),
-        Input("training-armed-landmark", "data"),
     )
-    def _render_form(stage, events, armed):
+    def _render_form(stage, events):
         # The stage-1 detection radio is permanent in the layout (toggled by
         # _toggle_impression), so for stage 1 this form area is empty.
         stage = int(stage or 1)
         if stage == 1:
             return ""
-        # Stages 2 / 3: event rows + add button.
-        banner = []
-        if isinstance(armed, dict) and armed.get("field"):
-            banner = [html.Div(
-                f"Armed: click the LFP or Hilbert trace to set "
-                f"{armed['field']} for Event {int(armed.get('idx', 0)) + 1}.",
-                style={"color": COLOR_ACCENT, "fontSize": FONT_SIZE_CAPTION,
-                       "fontWeight": "600", "marginBottom": SPACE_2})]
-        rows = [_event_row(e, i, stage, armed)
+        # Stages 2 / 3: event rows + add button. NB: this deliberately does
+        # NOT depend on training-armed-landmark -- arming updates only the
+        # separate banner (below), so the event rows aren't rebuilt on every
+        # arm/click, keeping their pattern-matching ids stable.
+        rows = [_event_row(e, i, stage)
                 for i, e in enumerate(events or [])]
-        return html.Div(banner + [
+        return html.Div([
             html.Div(rows or [html.Div(
                 "No events added. If you think this recording has no "
                 "BHZ, just submit. Otherwise add one.",
@@ -827,6 +827,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             button("+ Add event", "training-add-btn", variant="secondary",
                    style={"marginTop": SPACE_2}),
         ])
+
+    # Armed-landmark banner -- its own output so arming doesn't rebuild the
+    # event rows (see the training-arm-banner comment in the layout).
+    @app.callback(
+        Output("training-arm-banner", "children"),
+        Input("training-armed-landmark", "data"),
+    )
+    def _render_arm_banner(armed):
+        if not (isinstance(armed, dict) and armed.get("field")):
+            return ""
+        return html.Div(
+            f"Armed: click the LFP or Hilbert trace to set "
+            f"{armed['field']} for Event {int(armed.get('idx', 0)) + 1}.",
+            style={"color": COLOR_ACCENT, "fontSize": FONT_SIZE_CAPTION,
+                   "fontWeight": "600", "marginBottom": SPACE_2})
 
     # ---- Show the detection radio for stage 1 only ---- #
     @app.callback(
@@ -890,40 +905,66 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         events.pop(idx)
         return events
 
-    # Value inputs: type radio + the (ungraded) score-rationale comment.
+    # LVF/HYP type radio: fires on selection (discrete, fine per-value).
     @app.callback(
         Output("training-events", "data", allow_duplicate=True),
         Input({"type": "tr-type", "idx": ALL}, "value"),
-        Input({"type": "tr-comment", "idx": ALL}, "value"),
         State("training-events", "data"),
         prevent_initial_call=True,
     )
-    def _set_text_fields(_types, _comments, events):
+    def _set_type(_types, events):
         events = list(events or [])
         if not events:
             return no_update
         changed = False
-        for group in (callback_context.inputs_list or []):
-            for item in group:
-                cid = item.get("id") or {}
-                idx = cid.get("idx")
-                if idx is None or idx < 0 or idx >= len(events):
-                    continue
-                val = item.get("value")
-                ev = dict(events[idx])
-                if cid.get("type") == "tr-type":
-                    new = val or ""
-                    if new != (ev.get("type") or ""):
-                        ev["type"] = new
-                        events[idx] = ev
-                        changed = True
-                elif cid.get("type") == "tr-comment":
-                    new = val or ""
-                    if new != (ev.get("score_comment") or ""):
-                        ev["score_comment"] = new
-                        events[idx] = ev
-                        changed = True
+        for item in (callback_context.inputs_list[0] or []):
+            cid = item.get("id") or {}
+            idx = cid.get("idx")
+            if idx is None or idx < 0 or idx >= len(events):
+                continue
+            new = item.get("value") or ""
+            ev = dict(events[idx])
+            if new != (ev.get("type") or ""):
+                ev["type"] = new
+                events[idx] = ev
+                changed = True
         return events if changed else no_update
+
+    # Score-rationale comment: commit on BLUR, not per keystroke. Writing
+    # per-keystroke fed training-events, which re-rendered the whole form
+    # (_render_form) and re-created the textarea mid-type -- the cursor
+    # "rubberbanded". dcc.Textarea has no `debounce` in this Dash, so trigger
+    # on n_blur and read the value from State (mirrors video_events._set_comment).
+    @app.callback(
+        Output("training-events", "data", allow_duplicate=True),
+        Input({"type": "tr-comment", "idx": ALL}, "n_blur"),
+        State({"type": "tr-comment", "idx": ALL}, "value"),
+        State("training-events", "data"),
+        prevent_initial_call=True,
+    )
+    def _set_comment(_blurs, _values, events):
+        trig = callback_context.triggered_id
+        triggered = callback_context.triggered or []
+        # Ignore spurious fires on re-render (n_blur resets to None/0); only
+        # act on a real blur (n_blur incremented to >= 1).
+        if not isinstance(trig, dict) or not triggered \
+                or not triggered[0].get("value"):
+            return no_update
+        idx = trig.get("idx")
+        events = list(events or [])
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        new_val = ""
+        for s in (callback_context.states_list[0] or []):
+            if s.get("id") == trig:
+                new_val = s.get("value") or ""
+                break
+        ev = dict(events[idx])
+        if str(new_val) != (ev.get("score_comment") or ""):
+            ev["score_comment"] = str(new_val)
+            events[idx] = ev
+            return events
+        return no_update
 
     # Racine 1-8 buttons (replaces the dropdown -- matches Video Review).
     @app.callback(
@@ -964,7 +1005,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         trig = callback_context.triggered_id
         if not isinstance(trig, dict):
             return no_update
-        want = {"idx": trig.get("idx"), "field": trig.get("field")}
+        try:
+            want = {"idx": int(trig.get("idx")), "field": trig.get("field")}
+        except (TypeError, ValueError):
+            return no_update
         if isinstance(armed, dict) and armed.get("idx") == want["idx"] \
                 and armed.get("field") == want["field"]:
             return None                       # toggle off
@@ -991,9 +1035,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             x = float(click["points"][0]["x"])
         except (TypeError, KeyError, IndexError, ValueError):
             return no_update, no_update
-        idx = armed.get("idx")
+        try:
+            idx = int(armed.get("idx"))
+        except (TypeError, ValueError):
+            return no_update, None
         events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx < 0 or idx >= len(events):
             return no_update, None
         ev = dict(events[idx])
         ev[f"{armed['field']}_sec"] = round(x, 3)
@@ -1635,14 +1682,13 @@ _MINI_BTN = {"padding": "2px 8px", "fontSize": FONT_SIZE_CAPTION,
              "background": COLOR_SURFACE_2, "color": COLOR_TEXT_PRIMARY}
 
 
-def _tr_field_row(idx: int, field: str, event: dict,
-                  armed: dict | None) -> html.Div:
+def _tr_field_row(idx: int, field: str, event: dict) -> html.Div:
     """One landmark row: value display + Drop-at-video-time / Set-on-plot /
-    Clear -- the SAME capture interaction as Video Review (no typed time)."""
+    Clear -- the SAME capture interaction as Video Review (no typed time).
+    The armed state is shown by the separate training-arm-banner, not a
+    per-button highlight, so this row is independent of the armed store."""
     val = event.get(f"{field}_sec")
     shown = f"{float(val):.2f} s" if val not in (None, "") else "(not set)"
-    is_armed = (isinstance(armed, dict) and armed.get("idx") == idx
-                and armed.get("field") == field)
     dot = _LM_COLORS.get(field, "#888")
     return html.Div([
         html.Span("●", style={"color": dot, "marginRight": "4px"}),
@@ -1658,10 +1704,7 @@ def _tr_field_row(idx: int, field: str, event: dict,
                     n_clicks=0, style=_MINI_BTN),
         html.Button("Set on plot",
                     id={"type": "tr-lm-arm", "idx": idx, "field": field},
-                    n_clicks=0,
-                    style={**_MINI_BTN, **({
-                        "background": COLOR_ACCENT,
-                        "borderColor": COLOR_ACCENT} if is_armed else {})}),
+                    n_clicks=0, style=_MINI_BTN),
         html.Button("Clear",
                     id={"type": "tr-lm-clear", "idx": idx, "field": field},
                     n_clicks=0, style=_MINI_BTN),
@@ -1690,8 +1733,7 @@ def _tr_racine_row(idx: int, event: dict) -> html.Div:
         "flexWrap": "wrap", "marginBottom": "4px"})
 
 
-def _event_row(event: dict, idx: int, stage: int,
-               armed: dict | None = None) -> html.Div:
+def _event_row(event: dict, idx: int, stage: int) -> html.Div:
     type_opts = ([{"label": " LVF", "value": "LVF"},
                   {"label": " HYP", "value": "HYP"}]
                  + ([{"label": " Undefined", "value": "Undefined"}]
@@ -1715,7 +1757,7 @@ def _event_row(event: dict, idx: int, stage: int,
     lms = (("EO",) if stage != 3
            else tuple(f for f in _LANDMARKS
                       if f in _required_fields(event) or f == "EO"))
-    rows = [_tr_field_row(idx, lm, event, armed) for lm in lms]
+    rows = [_tr_field_row(idx, lm, event) for lm in lms]
     return html.Div([
         header, *rows, _tr_racine_row(idx, event),
         dcc.Textarea(
