@@ -281,6 +281,11 @@ CREATE TABLE IF NOT EXISTS channel_impedance (
     access_r_kohm REAL,
     access_r_reversal_kohm REAL,
     access_r_offset_kohm REAL,
+    -- Slow-phase STEADY-STATE impedance (kΩ): settled plateau voltage of the
+    -- long slow phase ÷ commanded slow current. Gain-corrected -> comparable
+    -- between animals; a stim-consistency signal complementary to Rₐ.
+    slow_ss_raw REAL,
+    slow_ss_kohm REAL,
     computed_at TEXT NOT NULL,
     UNIQUE(file_id, channel)
 );

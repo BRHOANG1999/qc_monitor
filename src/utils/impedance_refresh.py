@@ -18,7 +18,7 @@ import os
 from src.utils.amplifier_records import load_amplifier_gains, resolve_gain
 from src.utils.animal import is_animal_channel, split_animal_electrode
 from src.utils.impedance import (
-    access_resistance, phase_currents, normalize_ratio,
+    access_resistance, phase_currents, normalize_ratio, slow_steady_state,
 )
 
 logger = logging.getLogger("qc_monitor.utils.impedance_refresh")
@@ -140,6 +140,12 @@ def _access_r_record(wf: dict, gain, stim: dict) -> dict:
     i_pos, i_neg = phase_currents(stim["charge"], stim["pw"], stim["ratio"])
     ar = access_resistance(wf.get("mean_trace"), wf.get("time_axis_ms"),
                            wf.get("stim_mean_trace"), gain, i_pos, i_neg)
+    # Slow-phase steady-state impedance only when Rₐ passed its QC gates
+    # (same saturation/agreement checks exclude bad recordings).
+    zss = {"slow_ss_raw": None, "slow_ss_kohm": None}
+    if ar["r_access_kohm"] is not None:
+        zss = slow_steady_state(wf.get("mean_trace"), wf.get("time_axis_ms"),
+                                wf.get("stim_mean_trace"), gain, i_neg)
     return {
         "gain": (float(gain) if gain not in (None, "") else None),
         "charge_nc": _as_float(stim["charge"]),
@@ -151,6 +157,8 @@ def _access_r_record(wf: dict, gain, stim: dict) -> dict:
         "access_r_kohm": ar["r_access_kohm"],
         "access_r_reversal_kohm": ar["r_reversal_kohm"],
         "access_r_offset_kohm": ar["r_offset_kohm"],
+        "slow_ss_raw": zss["slow_ss_raw"],
+        "slow_ss_kohm": zss["slow_ss_kohm"],
     }
 
 

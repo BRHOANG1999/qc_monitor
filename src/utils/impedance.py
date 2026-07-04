@@ -287,6 +287,52 @@ def access_resistance(mean_trace, time_ms, stim_mean_trace, gain,
     return out
 
 
+# Slow-phase steady-state window (fractions of the slow phase, measured from
+# the reversal to the offset): skip the reversal transient at the start and
+# the offset transient at the end -> the settled plateau in between.
+SLOW_SS_LO = 0.4
+SLOW_SS_HI = 0.9
+
+
+def slow_steady_state(mean_trace, time_ms, stim_mean_trace, gain,
+                      i_slow_ua, lo: float = SLOW_SS_LO,
+                      hi: float = SLOW_SS_HI) -> dict:
+    """Steady-state IMPEDANCE of the long slow (negative) phase (kΩ).
+
+    A stim-consistency signal complementary to Rₐ: the settled plateau voltage
+    of the slow phase, gain-corrected and divided by the COMMANDED slow current
+    -> ``Z_ss = |V_ss|(mV) / i_slow(µA)`` [kΩ]. Because the gain is divided
+    out, Z_ss is comparable BETWEEN animals. V_ss = mean of ``mean_trace`` over
+    the mid-late slow window ``[reversal+lo·span, reversal+hi·span]`` (span =
+    offset-reversal), which avoids the reversal + offset transients. Returns
+    ``{slow_ss_raw, slow_ss_kohm}`` (None on missing/bad inputs). NB: at 20 kHz
+    the slow phase is still decaying, so this is a settled-plateau estimate
+    (window-dependent absolute value; valid for drift + like-for-like
+    cross-animal comparison)."""
+    out = {"slow_ss_raw": None, "slow_ss_kohm": None}
+    tr = find_current_transitions(stim_mean_trace, time_ms)
+    if tr is None or gain in (None, 0) or not i_slow_ua:
+        return out
+    _onset, reversal, offset = tr
+    span = offset - reversal
+    if span <= 1:
+        return out
+    a = reversal + int(span * lo)
+    b = max(a + 1, reversal + int(span * hi))
+    try:
+        g = float(gain)
+        i_s = float(i_slow_ua)
+        win = [float(mean_trace[i]) for i in range(a, min(b, len(mean_trace)))]
+    except (TypeError, ValueError, IndexError):
+        return out
+    if not win or g <= 0 or i_s <= 0:
+        return out
+    v_ss_raw = sum(win) / len(win)
+    out["slow_ss_raw"] = v_ss_raw
+    out["slow_ss_kohm"] = abs(v_ss_raw / g * 1000.0) / i_s
+    return out
+
+
 def _reversal_sustained(mean_trace, onset, reversal, min_sustain) -> bool:
     """True when the reversal step is a real fraction of the fast-phase peak
     deflection (i.e. the response hadn't already collapsed to baseline)."""

@@ -120,7 +120,7 @@ class Store:
             for row in conn.execute("PRAGMA table_info(channel_impedance)")
         }
         for _rcol in ("access_r_kohm", "access_r_reversal_kohm",
-                       "access_r_offset_kohm"):
+                       "access_r_offset_kohm", "slow_ss_raw", "slow_ss_kohm"):
             if _rcol not in existing_ci_cols:
                 conn.execute(
                     f"ALTER TABLE channel_impedance ADD COLUMN {_rcol} REAL")
@@ -1683,8 +1683,9 @@ class Store:
                     v_pos_raw, v_neg_raw, i_pos_ua, i_neg_ua,
                     impedance_pos_kohm, impedance_neg_kohm,
                     access_r_kohm, access_r_reversal_kohm,
-                    access_r_offset_kohm, computed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    access_r_offset_kohm, slow_ss_raw, slow_ss_kohm,
+                    computed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     file_id, channel, channel_name, animal_id, electrode,
                     rec.get("gain"), rec.get("charge_nc"),
@@ -1696,6 +1697,8 @@ class Store:
                     rec.get("access_r_kohm"),
                     rec.get("access_r_reversal_kohm"),
                     rec.get("access_r_offset_kohm"),
+                    rec.get("slow_ss_raw"),
+                    rec.get("slow_ss_kohm"),
                     datetime.now().isoformat(),
                 ),
             )
@@ -1814,6 +1817,30 @@ class Store:
         finally:
             conn.close()
 
+    def latest_zss_per_channel(self) -> dict:
+        """Newest slow-phase steady-state impedance (kΩ) per (animal_id,
+        channel_name), for the cross-animal consistency bars. Only channels
+        with a computed Z_ss. ``{(animal, channel): slow_ss_kohm}``."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT ci.animal_id, ci.channel_name, ci.slow_ss_kohm
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id
+                   WHERE ci.slow_ss_kohm IS NOT NULL
+                     AND pf.chunk_datetime = (
+                       SELECT MAX(pf2.chunk_datetime)
+                       FROM channel_impedance ci2
+                       JOIN processed_files pf2 ON pf2.id = ci2.file_id
+                       WHERE ci2.animal_id = ci.animal_id
+                         AND ci2.channel_name = ci.channel_name
+                         AND ci2.slow_ss_kohm IS NOT NULL)"""
+            ).fetchall()
+            return {(r["animal_id"] or "", r["channel_name"] or ""):
+                    r["slow_ss_kohm"] for r in rows}
+        finally:
+            conn.close()
+
     def latest_impedance_row(self, animal_id: str, channel_name: str
                              ) -> dict | None:
         """Newest fully-computed channel_impedance row for a channel, with its
@@ -1913,7 +1940,8 @@ class Store:
                 where.append("pf.chunk_datetime >= ?")
                 params.append(cutoff)
             sql = f"""SELECT ci.animal_id, ci.channel_name, ci.file_id,
-                             pf.chunk_datetime, ci.access_r_kohm, ci.charge_nc
+                             pf.chunk_datetime, ci.access_r_kohm,
+                             ci.slow_ss_kohm, ci.charge_nc
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
                       WHERE {' AND '.join(where)}
@@ -1933,6 +1961,7 @@ class Store:
                 "file_id": int(r["file_id"]),
                 "chunk_datetime": r["chunk_datetime"] or "",
                 "access_r_kohm": r["access_r_kohm"],
+                "slow_ss_kohm": r["slow_ss_kohm"],
                 "charge_nc": r["charge_nc"],
             })
         # Access resistance must be measured from a CONSISTENT, non-saturating

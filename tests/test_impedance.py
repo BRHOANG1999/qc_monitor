@@ -10,6 +10,7 @@ from src.utils.impedance import (
     impedance_for_channel,
     find_current_transitions,
     access_resistance,
+    slow_steady_state,
 )
 from src.utils.impedance_refresh import stimulated_indices
 
@@ -72,6 +73,40 @@ def test_access_resistance_missing_inputs():
     assert access_resistance(v, t, sm, 0, i_f, i_s)["r_access_kohm"] is None
     assert access_resistance(v, t, sm, 100, None, i_s)["r_access_kohm"] is None
     assert access_resistance(v, t, [], 100, i_f, i_s)["r_access_kohm"] is None
+
+
+def test_slow_steady_state_plateau():
+    # Build a stim-copy pulse + a recorded trace whose slow phase sits at a
+    # known steady-state level, so Z_ss = V_mV / I_slow is exact.
+    dt, pw_ms, ratio = 1.0 / 20.0, 0.15, 3.0
+    t = [round(-1.0 + dt * i, 4) for i in range(int(2.0 / dt))]
+    i_slow, gain, plateau_raw = 11.1, 100.0, 0.5   # raw units
+    sm, volt = [], []
+    for tt in t:
+        if 0 <= tt < pw_ms:
+            sm.append(1.0)          # fast phase +
+            volt.append(3.0)        # big fast deflection (irrelevant to Z_ss)
+        elif pw_ms <= tt < pw_ms * (1 + ratio):
+            sm.append(-0.333)       # slow phase -
+            volt.append(plateau_raw)  # flat slow plateau
+        else:
+            sm.append(0.0)
+            volt.append(0.0)
+    out = slow_steady_state(volt, t, sm, gain, i_slow)
+    # V_ss_mV = plateau_raw/gain*1000 = 0.5/100*1000 = 5 mV; Z = 5/11.1
+    assert out["slow_ss_raw"] == pytest.approx(plateau_raw, abs=1e-6)
+    assert out["slow_ss_kohm"] == pytest.approx(5.0 / i_slow, abs=1e-4)
+
+
+def test_slow_steady_state_missing_inputs():
+    dt = 1.0 / 20.0
+    t = [round(-1.0 + dt * i, 4) for i in range(int(2.0 / dt))]
+    sm = [1.0 if 0 <= tt < 0.15 else (-0.3 if 0.15 <= tt < 0.6 else 0.0)
+          for tt in t]
+    v = [0.5] * len(t)
+    assert slow_steady_state(v, t, sm, 0, 11.1)["slow_ss_kohm"] is None
+    assert slow_steady_state(v, t, sm, 100, None)["slow_ss_kohm"] is None
+    assert slow_steady_state(v, t, [], 100, 11.1)["slow_ss_kohm"] is None
 
 
 def test_stimulated_indices_only_channels_after_stimcopy():

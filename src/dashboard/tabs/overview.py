@@ -2162,6 +2162,10 @@ def _overview_tab(store: Store, config: dict | None = None):
         _build_impedance_trend_card(store, config),
         id="overview-impedance",
     )
+    zss_status = html.Div(
+        _build_zss_consistency_card(store, config),
+        id="overview-zss",
+    )
     # Stim-artifact overlay: lazily loaded on button click (loading many
     # traces is heavy), in its own section so a refresh tick doesn't wipe it.
     artifact_overlay = _collapsible(
@@ -2440,6 +2444,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
         impedance_status,  # per-channel access-resistance (Rₐ) drift trend
+        zss_status,        # slow-phase steady-state impedance (stim consistency)
         artifact_overlay,  # lazy stim-artifact overlay across recordings
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
@@ -2856,6 +2861,126 @@ def _drift_stat(values: list, window: int, min_history: int) -> dict | None:
         return None
     return {"latest": latest, "baseline": baseline,
             "drift_pct": (latest - baseline) / baseline * 100.0}
+
+
+def _build_zss_consistency_card(store, config=None):
+    """Slow-phase steady-state impedance (Z_ss) per channel: a stim-consistency
+    check across time AND between animals (gain-corrected so it's comparable).
+    Cross-animal bars (latest per channel) + per-channel trend, collapsed."""
+    title = "Stim consistency — slow-phase steady-state impedance (Z_ss)"
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+        active = store.active_impedance_channel_keys()
+        latest = store.latest_zss_per_channel()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("zss card failed: %s", e)
+        series, active, latest = {}, set(), {}
+    if active:
+        series = {k: v for k, v in series.items() if k in active}
+        latest = {k: v for k, v in latest.items() if k in active}
+    icfg = _impedance_cfg(config)
+    channels = []
+    for (animal, ch), rows in series.items():
+        vals = [r.get("slow_ss_kohm") for r in rows]
+        if not any(v is not None for v in vals):
+            continue
+        channels.append({
+            "animal": animal, "channel": ch, "rows": rows,
+            "stat": _drift_stat(vals, icfg["window"], icfg["min_history"]),
+            "latest": latest.get((animal, ch))})
+    if not channels:
+        return _collapsible(title, html.Div(
+            "No slow-phase steady-state data for the current session yet.",
+            style={"color": "#a0a0b0", "fontSize": "12px"}),
+            open_default=False, badge="0")
+    channels.sort(key=lambda c: (c["latest"] is None, c["latest"] or 0))
+    body = html.Div([
+        _zss_header(),
+        _impedance_span_note(channels),
+        _zss_bar_figure(channels),
+        _zss_trend_figure(channels, icfg),
+    ])
+    return _collapsible(title, body, open_default=False,
+                        badge=f"{len(channels)} channels")
+
+
+def _zss_header():
+    return html.Div([
+        html.Span("Animals currently on the rig · Z_ss = |V_ss(slow plateau)| "
+                  "÷ commanded I_slow (kΩ, gain-corrected → comparable between "
+                  "animals). ", style={"color": "#888", "fontSize": "11px"}),
+        html.Span("Bars = latest per channel (dashed = median, so an outlier "
+                  "animal pops); trend = over time. At 20 kHz the slow phase "
+                  "is still settling, so Z_ss is a plateau estimate — valid "
+                  "for drift + like-for-like comparison.",
+                  style={"color": "#888", "fontSize": "11px"}),
+    ], style={"padding": "2px 2px 8px"})
+
+
+def _zss_bar_figure(channels: list[dict]):
+    """Horizontal bar of the latest Z_ss per channel + a median guide line."""
+    labeled = [(f"{c['animal']} {c['channel']}", c["latest"])
+               for c in channels if c["latest"] is not None]
+    if not labeled:
+        return html.Div()
+    labeled.sort(key=lambda x: x[1])
+    names = [x[0] for x in labeled]
+    vals = [x[1] for x in labeled]
+    med = _median(vals)
+    fig = go.Figure(go.Bar(
+        x=vals, y=names, orientation="h", marker=dict(color="#5e7ce2"),
+        hovertemplate="%{y}: %{x:.3f} kΩ<extra></extra>"))
+    if med is not None:
+        fig.add_vline(x=med, line=dict(color="#ff9f0a", width=1, dash="dot"),
+                      annotation_text="median",
+                      annotation=dict(font=dict(size=9, color="#ff9f0a")))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=60 + 28 * len(names), margin=dict(l=12, r=16, t=10, b=30),
+        showlegend=False, font=dict(color="#cfd0d6"),
+        xaxis=dict(title="latest Z_ss (kΩ)", gridcolor="#2a2a3a",
+                    automargin=True),
+        yaxis=dict(automargin=True, tickfont=dict(size=9)))
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "4px 2px"})
+
+
+def _zss_trend_figure(channels: list[dict], icfg: dict):
+    """Per-channel Z_ss-vs-date small-multiples (reuses the Rₐ trace helper)."""
+    n = len(channels)
+    if n == 0:
+        return html.Div()
+    cols = min(n, 3)
+    n_rows = (n + cols - 1) // cols
+    titles = [f"{c['animal']} {c['channel']}" for c in channels]
+    fig = make_subplots(rows=n_rows, cols=cols, subplot_titles=titles,
+                        vertical_spacing=0.16, horizontal_spacing=0.06)
+    for i, c in enumerate(channels):
+        rr, cc = i // cols + 1, i % cols + 1
+        dates = [r["chunk_datetime"] for r in c["rows"]]
+        dts = [_parse_chunk_dt(d) for d in dates]
+        x = dts if all(d is not None for d in dts) else list(
+            range(len(c["rows"])))
+        _add_access_r_trace(fig, rr, cc, x, dates,
+                            [r.get("slow_ss_kohm") for r in c["rows"]],
+                            c["stat"], icfg)
+    for ann in fig.layout.annotations[:n]:
+        ann.font.size = 11
+        ann.font.color = "#f0f0f5"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=120 + 165 * n_rows,
+        margin=dict(l=52, r=16, t=42, b=34), showlegend=False,
+        font=dict(color="#cfd0d6"))
+    fig.update_xaxes(showticklabels=True, tickfont=dict(size=8), nticks=4,
+                     tickformat="%b %d", tickangle=0, gridcolor="#2a2a3a",
+                     automargin=True)
+    fig.update_yaxes(title_text="kΩ", title_font=dict(size=9),
+                     tickfont=dict(size=8), nticks=5, gridcolor="#2a2a3a",
+                     automargin=True)
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "8px 10px"})
 
 
 def _build_impedance_trend_card(store, config=None):
@@ -3280,6 +3405,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-home-grid", "children"),
         Output("overview-km-log", "children"),
         Output("overview-impedance", "children"),
+        Output("overview-zss", "children"),
         Input("refresh-trigger", "data"),
         prevent_initial_call=True,
     )
@@ -3291,6 +3417,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _build_home_grid_children(store, config, _date.today()),
             _build_km_log_section(config),
             _build_impedance_trend_card(store, config),
+            _build_zss_consistency_card(store, config),
         )
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
