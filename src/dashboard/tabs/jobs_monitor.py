@@ -128,5 +128,7 @@ def _summary(jobs: list[dict], warming: list[dict]) -> str:
     if n_warm:
         parts.append(f"{n_warm} chronic warm{'' if n_warm == 1 else 's'}")
     if not running and not queued and not n_warm:
-        return "Nothing running — all background workers idle."
+        return ("No jobs queued or running right now. (This is the job "
+                "queue — the background daemons themselves are on the "
+                "Workers tab.)")
     return " · ".join(parts) + "."
