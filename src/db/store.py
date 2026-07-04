@@ -1483,6 +1483,37 @@ class Store:
                 return None
         return None
 
+    def worker_liveness(self) -> dict:
+        """Last-activity ISO timestamp for each background worker, derived from
+        the footprint it leaves in the DB (no per-worker heartbeat needed).
+        Feeds the Workers monitor: a stale timestamp => that worker isn't
+        running. Values are ISO strings or None."""
+        conn = self._connect()
+        try:
+            def _one(sql: str):
+                try:
+                    r = conn.execute(sql).fetchone()
+                except sqlite3.OperationalError:
+                    return None
+                return r[0] if r and r[0] else None
+            return {
+                "processing": _one(
+                    "SELECT MAX(processed_at) FROM processed_files "
+                    "WHERE processed_at IS NOT NULL"),
+                "health": _one("SELECT MAX(timestamp) FROM system_health"),
+                "impedance": _one(
+                    "SELECT MAX(computed_at) FROM channel_impedance"),
+                "auto_filter": _one(
+                    "SELECT MAX(at) FROM user_activity "
+                    "WHERE action = 'auto_filter_sweep'"),
+                "alerts": _one("SELECT MAX(sent_at) FROM alerts"),
+                "mass_analyze": _one(
+                    "SELECT MAX(COALESCE(finished_at, started_at, created_at)) "
+                    "FROM mass_analyze_job"),
+            }
+        finally:
+            conn.close()
+
     def max_processed_file_id(self) -> int:
         """Highest processed_files id -- a cheap 'has a new recording arrived?'
         signature so the Overview thumbnail rebuilds per new file instead of
