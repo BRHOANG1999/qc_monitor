@@ -188,6 +188,25 @@ def main():
     threading.Thread(target=_impedance_backfill, daemon=True,
                      name="qc-impedance-backfill").start()
 
+    # Dedicated heartbeat: write a health row every 30 s INDEPENDENT of the
+    # main processing loop. The loop also inserts health, but it shares its
+    # thread with file processing (MATLAB, up to ~20 min) + impedance refresh,
+    # so under load the loop's health write lags and the Workers tab would
+    # false-flag the daemon "stale". This thread keeps liveness honest.
+    def _heartbeat():
+        hb_iter, hb_max = 0, 10 ** 12
+        while True:
+            assert hb_iter < hb_max, "heartbeat runaway"
+            hb_iter += 1
+            try:
+                store.insert_health(
+                    health_snapshot(watcher, store, 0, db_path))
+            except Exception:
+                logger.debug("heartbeat failed", exc_info=True)
+            time.sleep(30)
+    threading.Thread(target=_heartbeat, daemon=True,
+                     name="qc-heartbeat").start()
+
     # Launch dashboard in background thread
     if not args.no_dashboard:
         dash_thread = threading.Thread(target=run_dashboard, args=(config, store), daemon=True)

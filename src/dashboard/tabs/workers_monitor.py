@@ -27,19 +27,23 @@ from dash import Input, Output, dash_table, dcc, html
 
 from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE
 
-# Each pipeline worker: (key in worker_liveness, label, expected cadence sec,
-# event_driven). event_driven workers are idle-when-nothing-to-do, so an old
-# timestamp reads as "idle" (grey) rather than "stale" (red).
+# Each pipeline worker: (key in worker_liveness, label, running-within sec,
+# down-after sec, event_driven). Fresh within the first window => "running";
+# between the two => "lagging" (amber, alive but busy/behind); past the
+# second => "stale" (red, likely down). event_driven workers are
+# idle-when-nothing-to-do, so an old timestamp reads as "idle" (grey), never
+# stale. Windows are generous: the health loop shares a thread with file
+# processing (MATLAB, up to ~20 min), so it can legitimately lag.
 _WORKERS = [
-    ("health", "Health loop (daemon heartbeat)", 60, False),
-    ("processing", "File processing (dispatcher)", 3600, True),
-    ("impedance", "Impedance refresh", 1800, False),
-    ("auto_filter", "Auto-filter sweep", 300, False),
-    ("mass_analyze", "Mass-analyze scans", 300, True),
-    ("alerts", "Alerts", 3600, True),
+    ("health", "Health loop (daemon heartbeat)", 120, 600, False),
+    ("processing", "File processing (dispatcher)", 7200, 0, True),
+    ("impedance", "Impedance refresh", 2400, 5400, False),
+    ("auto_filter", "Auto-filter sweep", 900, 1800, False),
+    ("mass_analyze", "Mass-analyze scans", 600, 0, True),
+    ("alerts", "Alerts", 7200, 0, True),
 ]
 
-_COLUMNS = ["Worker", "Status", "Last activity", "Expected"]
+_COLUMNS = ["Worker", "Status", "Last activity", "Fresh within"]
 
 
 def _parse_dt(s):
@@ -83,15 +87,19 @@ def _fmt_cadence(sec: int) -> str:
     return f"~{int(sec / 3600)}h"
 
 
-def _status(dt, expected: int, event_driven: bool) -> str:
-    """running (fresh) / stale (should be fresh but isn't) / idle (event-
-    driven, nothing to do) / down (never seen)."""
+def _status(dt, run_within: int, down_after: int, event_driven: bool) -> str:
+    """running (fresh) / lagging (alive but behind) / idle (event-driven,
+    nothing to do) / stale (likely down) / down (never seen)."""
     if dt is None:
         return "idle" if event_driven else "down"
     age = (datetime.now() - dt).total_seconds()
-    if age <= expected * 2:
+    if age <= run_within:
         return "running"
-    return "idle" if event_driven else "stale"
+    if event_driven:
+        return "idle"
+    if age <= down_after:
+        return "lagging"
+    return "stale"
 
 
 def _pipeline_rows(store) -> list[dict]:
@@ -100,13 +108,13 @@ def _pipeline_rows(store) -> list[dict]:
     except Exception:  # noqa: BLE001
         live = {}
     rows = []
-    for key, label, expected, event_driven in _WORKERS:
+    for key, label, run_within, down_after, event_driven in _WORKERS:
         dt = _parse_dt(live.get(key))
         rows.append({
             "Worker": label,
-            "Status": _status(dt, expected, event_driven),
+            "Status": _status(dt, run_within, down_after, event_driven),
             "Last activity": _ago(dt),
-            "Expected": _fmt_cadence(expected),
+            "Fresh within": _fmt_cadence(run_within),
         })
     return rows
 
@@ -132,6 +140,8 @@ _STATUS_STYLE = [
     ZEBRA_STRIPE,
     {"if": {"filter_query": "{Status} = running", "column_id": "Status"},
      "color": "#30d158", "fontWeight": "600"},
+    {"if": {"filter_query": "{Status} = lagging", "column_id": "Status"},
+     "color": "#ff9f0a", "fontWeight": "600"},
     {"if": {"filter_query": "{Status} = stale", "column_id": "Status"},
      "color": "#ff453a", "fontWeight": "600"},
     {"if": {"filter_query": "{Status} = down", "column_id": "Status"},
