@@ -58,7 +58,7 @@ from src.dashboard.design import (
     RADIUS_MD, RADIUS_SM, ROLE_COLORS, SPACE_1, SPACE_2, SPACE_3,
     SPACE_5,
 )
-from src.db.store import Store
+from src.db.store import Store, _current_fidelity_pct
 
 logger = logging.getLogger("qc_monitor.dashboard.overview")
 
@@ -2447,16 +2447,34 @@ def _overview_tab(store: Store, config: dict | None = None):
         "marginBottom": "10px",
     })
 
+    # Umbrella: every stimulation/electrode-derived diagnostic under one
+    # collapsed section at the bottom of the page, with a glanceable badge so
+    # the user knows whether anything inside needs attention.
+    stim_badge, stim_badge_color = _stim_health_badge(store, config)
+    stim_health = _collapsible(
+        "Electrode & stimulation health",
+        html.Div([
+            html.Div("Everything derived from the stimulation pulse — "
+                     "electrode series resistance (Rₐ), stim consistency "
+                     "(Z_ss), current-delivery fidelity, placement-region "
+                     "drift, and the raw stim-artifact overlay.",
+                     style={"color": "#a0a0b0", "fontSize": "11px",
+                             "marginBottom": "8px"}),
+            impedance_status,  # per-channel access-resistance (Rₐ) drift trend
+            zss_status,        # slow-phase steady-state impedance (consistency)
+            fidelity_status,   # current-delivery fidelity (two-edge ratio)
+            region_status,     # drift by placement region (SLM vs SR)
+            artifact_overlay,  # lazy stim-artifact overlay across recordings
+        ]),
+        open_default=False, badge=stim_badge,
+        badge_color=stim_badge_color)
+
     return html.Div([
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
-        impedance_status,  # per-channel access-resistance (Rₐ) drift trend
-        zss_status,        # slow-phase steady-state impedance (stim consistency)
-        fidelity_status,   # current-delivery fidelity (two-edge ratio)
-        region_status,     # drift by placement region (SLM vs SR)
-        artifact_overlay,  # lazy stim-artifact overlay across recordings
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
+        stim_health,   # collapsed umbrella of all stim/electrode diagnostics
     ])
 
 
@@ -2994,6 +3012,40 @@ def _zss_trend_figure(channels: list[dict], icfg: dict):
                      style={"padding": "8px 10px"})
 
 
+def _stim_health_badge(store, config):
+    """Glanceable badge for the umbrella section: how many active (currently-
+    recording) channels are drifting in Rₐ or sagging in current fidelity, so
+    the user knows whether to open the collapsed 'Electrode & stimulation
+    health' section. Reuses one series+active query for both checks."""
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+        active = store.active_impedance_channel_keys()
+    except Exception:  # noqa: BLE001
+        return None, None
+    if active:
+        series = {k: v for k, v in series.items() if k in active}
+    icfg = _impedance_cfg(config)
+    n_drift = n_sag = 0
+    for _key, rows in series.items():
+        st = _drift_stat([r.get("access_r_kohm") for r in rows],
+                         icfg["window"], icfg["min_history"])
+        if st and abs(st["drift_pct"]) >= icfg["pct"]:
+            n_drift += 1
+        fst = _drift_stat_abs([r.get("current_fidelity_pct") for r in rows],
+                              icfg["window"], icfg["min_history"])
+        if fst and fst["median"] is not None and fst["median"] < icfg["sag_pct"]:
+            n_sag += 1
+    if n_drift or n_sag:
+        parts = []
+        if n_drift:
+            parts.append(f"⚠{n_drift} Rₐ drift")
+        if n_sag:
+            parts.append(f"⚠{n_sag} current sag")
+        return " · ".join(parts), "#EF553B"
+    return "all ok", "rgba(48,209,88,0.5)"
+
+
 def _build_current_fidelity_card(store, config=None):
     """Current-delivery fidelity — the two-edge ratio. Each biphasic pulse
     hands us two ohmic edges with different commanded ΔI; each backs out the
@@ -3042,6 +3094,7 @@ def _build_current_fidelity_card(store, config=None):
     body = html.Div([
         _fidelity_header(sag),
         _impedance_span_note(channels),
+        _fidelity_example_block(store, channels, sag),
         _fidelity_bar_figure(channels, sag),
         _fidelity_trend_figure(channels, icfg),
     ])
@@ -3643,6 +3696,101 @@ def _mark_ohmic_step(fig, t, m, tr, r_rev=None, r_off=None):
             line=dict(color=color, width=3),
             marker=dict(size=8, color=color),
             hovertemplate=f"{base} ΔV: %{{y:.3f}}<extra></extra>"))
+
+
+def _fidelity_example_block(store, channels: list[dict], sag_pct: float):
+    """Optional (collapsed) 'how it's computed' worked example for the newest
+    active channel: the two-edge arithmetic that yields the fidelity %, plus
+    the same annotated trace so the reader can see the two ohmic edges the
+    ratio is built from."""
+    if not channels:
+        return html.Div()
+    ex = max(channels, key=lambda c: c["rows"][-1]["chunk_datetime"])
+    animal, ch = ex["animal"], ex["channel"]
+    try:
+        row = store.latest_impedance_row(animal, ch)
+    except Exception:  # noqa: BLE001
+        row = None
+    if not row:
+        return html.Div()
+    wf = None
+    try:
+        for w in store.get_evoked_waveform_by_file(row["file_id"]):
+            if int(w.get("channel") or -1) == int(row["channel"]):
+                wf = w
+                break
+    except Exception:  # noqa: BLE001
+        wf = None
+    inner = html.Div([
+        _fidelity_example_steps(row, sag_pct),
+        (_impedance_example_figure(wf, row) if wf else html.Div(
+            "Waveform unavailable for this recording.",
+            style={"color": "#888", "fontSize": "11px"})),
+    ])
+    when = (row.get("chunk_datetime") or "")[:16]
+    return _collapsible(
+        f"How this is computed — example: {animal} {ch} ({when})",
+        inner, open_default=False)
+
+
+def _fidelity_example_steps(row: dict, sag_pct: float):
+    """The transparent two-edge fidelity arithmetic using the stored per-edge
+    series-resistance values."""
+    def _f(k):
+        v = row.get(k)
+        return None if v is None else float(v)
+    rev, off = _f("access_r_reversal_kohm"), _f("access_r_offset_kohm")
+    fid = _current_fidelity_pct(rev, off)
+
+    def _line(label, r, color):
+        txt = "n/a" if r is None else f"{r:.3f} kΩ"
+        return html.Div([
+            html.Span(f"{label}:  ", style={"color": color,
+                                            "fontWeight": "600"}),
+            html.Span(f"Rₐ = |ΔV| ÷ ΔI(commanded) = {txt}"),
+        ], style={"fontFamily": "monospace", "fontSize": "11px",
+                   "color": "#cfd0d6", "marginBottom": "3px"})
+
+    if fid is None:
+        verdict = "one edge missing — fidelity not computed for this recording"
+        vcolor = "#888"
+    elif fid < sag_pct:
+        verdict = (f"{fid:+.1f}% < {sag_pct:.0f}% → reversal edge sagging = "
+                   "commanded current NOT fully delivered (compliance)")
+        vcolor = "#ff453a"
+    else:
+        verdict = f"{fid:+.1f}% → edges agree, current at setpoint"
+        vcolor = "#30d158"
+    ratio_expr = (f"100 · ({rev:.3f} − {off:.3f}) ÷ mean({rev:.3f}, {off:.3f})"
+                  f" = {fid:+.1f}%" if fid is not None else "n/a")
+    return html.Div([
+        html.Div("The biphasic pulse hands us TWO ohmic edges with different "
+                 "commanded ΔI (the fast→slow reversal steps by I_fast+I_slow; "
+                 "the slow→off step by I_slow). Each edge backs out the SAME "
+                 "series resistance — its voltage step ÷ its OWN commanded ΔI — "
+                 "so if the current is delivered at setpoint the two agree:",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                         "marginBottom": "5px"}),
+        _line("Fast→slow reversal edge (high ΔI)", rev, "#5e7ce2"),
+        _line("Slow→off edge (low ΔI)", off, "#ff9f0a"),
+        html.Div(f"fidelity = 100·(Rₐ_reversal − Rₐ_offset) ÷ mean = "
+                 f"{ratio_expr}",
+                 style={"color": "#cfd0d6", "fontFamily": "monospace",
+                         "fontSize": "11px", "marginTop": "4px"}),
+        html.Div(f"→ {verdict}",
+                 style={"color": vcolor, "fontWeight": "600",
+                         "fontSize": "11px", "marginTop": "3px",
+                         "fontFamily": "monospace"}),
+        html.Div("Why it's impedance-invariant: both edges scale with the same "
+                 "R_s, so the normalized difference cancels R_s entirely — the "
+                 "metric moves only when the current itself is off, decoupled "
+                 "from electrode-impedance drift. Negative means the HIGH-ΔI "
+                 "(reversal) edge sags first, the earliest sign of compliance "
+                 "before Rₐ itself visibly drifts. The two edges are the same "
+                 "ones marked (blue / orange) on the trace below.",
+                 style={"color": "#777", "fontSize": "10px",
+                         "marginTop": "5px"}),
+    ], style={"padding": "4px 2px 8px"})
 
 
 def layout(store: Store, config: dict | None = None):
