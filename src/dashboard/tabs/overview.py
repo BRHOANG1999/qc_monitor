@@ -39,7 +39,7 @@ from dash import (Input, Output, Patch, State, callback_context,
 from plotly.subplots import make_subplots
 
 from src.dashboard.components import (
-    DARK_TABLE_STYLE, ZEBRA_STRIPE,
+    DARK_TABLE_STYLE, DROPDOWN_STYLE, ZEBRA_STRIPE,
     card as _card, loading_icon, pill as _pill,
     section_header as _section_header,
 )
@@ -2461,6 +2461,7 @@ def _overview_tab(store: Store, config: dict | None = None):
                      style={"color": "#a0a0b0", "fontSize": "11px",
                              "marginBottom": "8px"}),
             impedance_status,  # per-channel access-resistance (Rₐ) drift trend
+            _build_electrode_compare_card(store, config),  # pick & overlay
             zss_status,        # slow-phase steady-state impedance (consistency)
             fidelity_status,   # current-delivery fidelity (two-edge ratio)
             region_status,     # drift by placement region (SLM vs SR)
@@ -3331,6 +3332,208 @@ def _region_strip_figure(regions: dict):
                      style={"padding": "4px 2px"})
 
 
+# --------------------------------------------------------------------- #
+#  Electrode-history comparison — overlay any of one animal's electrodes on a
+#  common relative axis (recording #, aligned at each electrode's own first
+#  recording) so histories over DIFFERENT date ranges still compare.
+# --------------------------------------------------------------------- #
+
+_ECMP_COLORS = ["#5e7ce2", "#ff9f0a", "#30d158", "#ff453a", "#bf5af2",
+                "#64d2ff", "#ffd60a", "#ff6482"]
+_ECMP_LABEL = {"color": "#888", "fontSize": "11px", "display": "block",
+               "marginBottom": "2px"}
+
+# The over-time metrics this comparison tool can overlay (field on each series
+# row, display label, unit, and whether normalizing to the median is
+# meaningful). Current fidelity is a signed % already centred near 0, so a
+# ratio-to-median is nonsense → not normalizable (always shown absolute).
+_ECMP_METRICS = {
+    "access_r_kohm":       {"label": "Access resistance Rₐ", "unit": "kΩ",
+                            "normalizable": True},
+    "slow_ss_kohm":        {"label": "Slow steady-state Z_ss", "unit": "kΩ",
+                            "normalizable": True},
+    "current_fidelity_pct": {"label": "Current fidelity", "unit": "%",
+                            "normalizable": False},
+}
+
+
+def _impedance_animals_and_electrodes(store, config) -> dict:
+    """``{animal: [electrode, ...]}`` for every animal/channel with any
+    electrode/stim history. Full colony, not just active — the whole point is
+    to compare a current electrode against a retired one."""
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+    except Exception:  # noqa: BLE001
+        return {}
+    fields = tuple(_ECMP_METRICS.keys())
+    out: dict = {}
+    for (animal, ch), rows in series.items():
+        if not any(r.get(f) is not None for r in rows for f in fields):
+            continue
+        out.setdefault(animal, [])
+        if ch not in out[animal]:
+            out[animal].append(ch)
+    for a in out:
+        out[a].sort()
+    return out
+
+
+def _build_electrode_compare_card(store, config=None):
+    """Interactive: pick an animal, a metric (Rₐ / Z_ss / current fidelity),
+    and any of its electrodes, then overlay their histories on a common
+    relative axis (recording #, aligned at each electrode's first recording) so
+    electrodes recorded over different date ranges still line up for shape
+    comparison. Y toggles absolute / normalized (to each electrode's own
+    median) for the kΩ metrics."""
+    amap = _impedance_animals_and_electrodes(store, config)
+    animals = sorted(amap.keys())
+    if not animals:
+        return _collapsible(
+            "Compare electrode histories",
+            html.Div("No electrode history yet.",
+                     style={"color": "#a0a0b0", "fontSize": "12px"}),
+            open_default=False)
+    # Prefer an animal currently on the rig as the default.
+    try:
+        active = {a for a, _c in store.active_impedance_channel_keys()}
+    except Exception:  # noqa: BLE001
+        active = set()
+    default_animal = next((a for a in animals if a in active), animals[0])
+    default_elecs = amap.get(default_animal, [])[:4]
+    default_metric = "access_r_kohm"
+    controls = html.Div([
+        html.Div([
+            html.Span("Animal", style=_ECMP_LABEL),
+            dcc.Dropdown(
+                id="overview-ecmp-animal",
+                options=[{"label": a, "value": a} for a in animals],
+                value=default_animal, clearable=False,
+                style=DROPDOWN_STYLE, className="dark-dropdown"),
+        ], style={"minWidth": "140px"}),
+        html.Div([
+            html.Span("Metric", style=_ECMP_LABEL),
+            dcc.Dropdown(
+                id="overview-ecmp-metric",
+                options=[{"label": f"{m['label']} ({m['unit']})", "value": k}
+                         for k, m in _ECMP_METRICS.items()],
+                value=default_metric, clearable=False,
+                style=DROPDOWN_STYLE, className="dark-dropdown"),
+        ], style={"minWidth": "180px"}),
+        html.Div([
+            html.Span("Electrodes", style=_ECMP_LABEL),
+            dcc.Dropdown(
+                id="overview-ecmp-electrodes",
+                options=[{"label": c, "value": c} for c in default_elecs],
+                value=default_elecs, multi=True,
+                placeholder="Pick electrodes to overlay",
+                style=DROPDOWN_STYLE, className="dark-dropdown"),
+        ], style={"flex": "1", "minWidth": "220px"}),
+        html.Div([
+            html.Span("Y-axis", style=_ECMP_LABEL),
+            dcc.RadioItems(
+                id="overview-ecmp-ymode",
+                options=[{"label": " Normalized (% of median)",
+                          "value": "norm"},
+                         {"label": " Absolute", "value": "abs"}],
+                value="norm", inline=True,
+                labelStyle={"color": "#ddd", "fontSize": "12px",
+                            "marginRight": "12px"},
+                inputStyle={"marginRight": "4px"}),
+        ], style={"minWidth": "210px"}),
+    ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end",
+              "gap": "12px", "marginBottom": "8px"})
+    body = html.Div([
+        html.Div("Overlay any of one animal's electrodes for any stim/electrode "
+                 "metric on a common relative axis: x = recording # (each "
+                 "electrode aligned at its own first recording, so different "
+                 "date ranges still compare). Hover shows the real date. "
+                 "Normalized = each electrode scaled to its own median (100%) "
+                 "so a low- and a high-value electrode compare by drift shape "
+                 "(N/A for current fidelity, which is already a signed %).",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                         "marginBottom": "8px"}),
+        controls,
+        dcc.Loading(html.Div(
+            _electrode_compare_figure(store, config, default_animal,
+                                      default_elecs, "norm", default_metric),
+            id="overview-ecmp-fig"), type="dot"),
+    ])
+    return _collapsible("Compare electrode histories", body, open_default=False)
+
+
+def _electrode_compare_figure(store, config, animal, electrodes, ymode,
+                              metric="access_r_kohm"):
+    """Overlay the selected electrodes' history for ``metric`` on a recording-
+    index x-axis. ``ymode`` 'norm' scales each electrode to its own median
+    (=100%) when the metric is normalizable; 'abs' plots raw values."""
+    electrodes = electrodes or []
+    spec = _ECMP_METRICS.get(metric) or _ECMP_METRICS["access_r_kohm"]
+    if not animal or not electrodes:
+        return html.Div("Select an animal and at least one electrode.",
+                        style={"color": "#888", "fontSize": "12px",
+                                "padding": "24px 4px"})
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+    except Exception:  # noqa: BLE001
+        series = {}
+    normalized = (ymode != "abs") and spec["normalizable"]
+    unit = spec["unit"]
+    fig = go.Figure()
+    n_plotted = 0
+    for i, ch in enumerate(electrodes):
+        rows = series.get((animal, ch)) or []
+        pts = [(r.get("chunk_datetime"), r.get(metric))
+               for r in rows if r.get(metric) is not None]
+        if not pts:
+            continue
+        dates = [p[0] for p in pts]
+        yraw = [float(p[1]) for p in pts]
+        color = _ECMP_COLORS[i % len(_ECMP_COLORS)]
+        med = _median(yraw) or 0.0
+        if normalized and med:
+            y = [v / med * 100.0 for v in yraw]
+            name = f"{ch} · median {med:.3f} {unit} ({len(y)} recs)"
+            hover = ("%{y:.0f}% of median<br>%{customdata[0]} · "
+                     "%{customdata[1]:.3f} " + unit + "<extra></extra>")
+            cdata = [[d, v] for d, v in zip(dates, yraw)]
+        else:
+            y = yraw
+            name = f"{ch} ({len(y)} recs)"
+            hover = ("%{y:.3f} " + unit + "<br>%{customdata}<extra></extra>")
+            cdata = dates
+        fig.add_trace(go.Scatter(
+            x=list(range(len(y))), y=y, mode="lines+markers", name=name,
+            line=dict(color=color, width=1.6), marker=dict(size=4),
+            customdata=cdata, hovertemplate=hover))
+        n_plotted += 1
+    if n_plotted == 0:
+        return html.Div(f"No {spec['label']} data for the selected electrodes.",
+                        style={"color": "#888", "fontSize": "12px",
+                                "padding": "24px 4px"})
+    if normalized:
+        fig.add_hline(y=100, line=dict(color="#8a8a99", width=1, dash="dot"),
+                      annotation_text="each electrode's median",
+                      annotation=dict(font=dict(size=9, color="#8a8a99")))
+    elif metric == "current_fidelity_pct":
+        # Zero line = current at setpoint; below it the reversal edge is sagging.
+        fig.add_hline(y=0, line=dict(color="#8a8a99", width=1))
+    ytitle = (f"% of each electrode's median {spec['label']}" if normalized
+              else f"{spec['label']} ({unit})")
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=360, margin=dict(l=58, r=16, t=34, b=42),
+        font=dict(color="#cfd0d6"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                    x=0, font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+        xaxis=dict(title="recording # (aligned at each electrode's first)",
+                   gridcolor="#2a2a3a", automargin=True),
+        yaxis=dict(title=ytitle, gridcolor="#2a2a3a", automargin=True))
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "4px 2px"})
+
+
 def _build_impedance_trend_card(store, config=None):
     """Per-channel transfer-impedance trend (both stim phases) over time, for
     the animals currently on the rig, wrapped in a collapsed section with a
@@ -3882,6 +4085,36 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("artifact overlay failed: %s", e)
             return html.Div("Overlay failed to load.",
                             style={"color": "#888", "fontSize": "11px"})
+
+    # Electrode-history comparison: picking an animal repopulates its electrode
+    # list (default = up to 4 of them); the overlay figure redraws on any of
+    # (animal, electrodes, y-mode). prevent_initial_call=True on both because
+    # the card is built with its initial figure already rendered.
+    @app.callback(
+        Output("overview-ecmp-electrodes", "options"),
+        Output("overview-ecmp-electrodes", "value"),
+        Input("overview-ecmp-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def ecmp_electrode_options(animal):
+        elecs = _impedance_animals_and_electrodes(store, config).get(animal, [])
+        return [{"label": c, "value": c} for c in elecs], elecs[:4]
+
+    @app.callback(
+        Output("overview-ecmp-fig", "children"),
+        Input("overview-ecmp-electrodes", "value"),
+        Input("overview-ecmp-ymode", "value"),
+        Input("overview-ecmp-metric", "value"),
+        State("overview-ecmp-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def ecmp_figure(electrodes, ymode, metric, animal):
+        # animal is State: switching animals repopulates the electrode list
+        # (electrode names are animal-specific), which retriggers this via the
+        # electrodes Input with the fresh animal already committed -- so no
+        # stale-electrode flash.
+        return _electrode_compare_figure(store, config, animal, electrodes,
+                                         ymode, metric)
 
     # Thumbnail has its own callback because the radio adds an
     # additional Input. Re-renders on either trigger; the mean/sem/overlay
