@@ -50,6 +50,9 @@ class AlertRuleEngine:
             rules_cfg.get("impedance_baseline_window", 10))
         self.impedance_min_history = int(
             rules_cfg.get("impedance_min_history", 4))
+        # Current-delivery fidelity: fire when a channel's rolling-median
+        # two-edge fidelity drops below this (negative) percent.
+        self.current_sag_pct = float(rules_cfg.get("current_sag_pct", -15))
         self.impedance_exclude = (
             (config.get("overview", {}) or {}).get("exclude_animals")
             or ["Randles"])
@@ -182,6 +185,52 @@ class AlertRuleEngine:
             if st and abs(st["drift_pct"]) >= self.impedance_shift_pct:
                 flags.append((animal, ch, st))
         flags.sort(key=lambda f: -abs(f[2]["drift_pct"]))
+        return flags
+
+    def check_current_sag(self):
+        """Fire (rate-limited) when a channel's CURRENT-DELIVERY FIDELITY (the
+        two-edge ratio) sags below ``current_sag_pct`` (negative). The two
+        ohmic edges of the biphasic pulse each back out the same series R using
+        their exact commanded ΔI, so this is impedance-invariant: a persistent
+        negative means the reversal (high-ΔI) edge is sagging => the commanded
+        current is not being fully delivered (compliance) — the earliest
+        warning, before the impedance itself drifts. Rolling-median so a single
+        noisy edge doesn't trip it. Scoped to the channels currently on the
+        rig; silent until a channel has ``impedance_min_history`` points."""
+        try:
+            series = self.store.impedance_series_by_channel(
+                exclude=self.impedance_exclude)
+            active = self.store.active_impedance_channel_keys()
+        except Exception:  # noqa: BLE001 -- alerting must not crash the loop
+            return
+        if active:
+            series = {k: v for k, v in series.items() if k in active}
+        flags = self._current_sag_flags(series)
+        if not flags:
+            return
+        lines = [f"{a} {c} {med:+.1f}% (latest {latest:+.1f}%)"
+                 for a, c, med, latest in flags[:8]]
+        more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
+        self._fire_alert(
+            "current_sag", "warning",
+            f"{len(flags)} channel(s) show current-delivery sag "
+            f"(<{self.current_sag_pct:.0f}% two-edge fidelity → commanded "
+            f"current not fully delivered): " + "; ".join(lines) + more)
+
+    def _current_sag_flags(self, series: dict) -> list:
+        """Every (animal, channel, median_fidelity, latest) whose rolling-median
+        current fidelity is below the (negative) sag threshold. Most-negative
+        first."""
+        flags = []
+        for (animal, ch), rows in (series or {}).items():
+            vals = [r.get("current_fidelity_pct") for r in rows]
+            vals = [v for v in vals if v is not None]
+            if len(vals) < max(2, self.impedance_min_history):
+                continue
+            med = _median(vals[max(0, len(vals) - self.impedance_baseline_window):])
+            if med is not None and med < self.current_sag_pct:
+                flags.append((animal, ch, med, vals[-1]))
+        flags.sort(key=lambda f: f[2])
         return flags
 
     def _fire_alert(self, alert_type: str, severity: str, message: str,

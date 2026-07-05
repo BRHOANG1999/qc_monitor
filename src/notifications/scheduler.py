@@ -156,6 +156,22 @@ class DigestScheduler:
             return False
         return last_sent_iso != now.date().isoformat()
 
+    def _claim(self, digest: str, now: datetime) -> bool:
+        """Atomically claim a daily/weekly send for today. Returns True only if
+        WE won the claim (nobody has sent this digest today). Restart-proof: the
+        DB row survives restarts and backup reverts, so a relaunched daemon
+        can't re-fire a digest the JSON state file happened to lose. Falls back
+        to True when there's no store (legacy surgery-only construction) — the
+        JSON ``_due_*`` gate is then the only guard, as before."""
+        if self._store is None:
+            return True
+        try:
+            return self._store.record_notification_sent(
+                digest, now.date().isoformat())
+        except Exception as e:  # noqa: BLE001 -- never crash the tick
+            logger.error("notification claim failed for %s: %s", digest, e)
+            return True
+
     # ----- main loop entry ------------------------------------------- #
 
     def tick(self, now: datetime | None = None) -> dict:
@@ -181,6 +197,9 @@ class DigestScheduler:
             return
         if not self._due_daily(now, self._surg_hour, self._state.surgery):
             return
+        if not self._claim("surgery", now):
+            self._state.surgery = now.date().isoformat()   # heal JSON
+            return
         logger.info("Surgery digest fire: %s %02d:%02d",
                      now.date().isoformat(), now.hour, now.minute)
         try:
@@ -204,6 +223,9 @@ class DigestScheduler:
         hour = int(cfg.get("hour", 18))
         if not self._due_daily(now, hour, self._state.eod):
             return
+        if not self._claim("eod", now):
+            self._state.eod = now.date().isoformat()
+            return
         logger.info("EOD digest fire: %s %02d:%02d",
                      now.date().isoformat(), now.hour, now.minute)
         try:
@@ -225,6 +247,9 @@ class DigestScheduler:
         hour = int(cfg.get("hour", 8))
         if not self._due_weekly(now, weekday, hour,
                                   self._state.video_weekly):
+            return
+        if not self._claim("video_weekly", now):
+            self._state.video_weekly = now.date().isoformat()
             return
         logger.info("Video weekly fire: %s %02d:%02d",
                      now.date().isoformat(), now.hour, now.minute)
@@ -248,6 +273,9 @@ class DigestScheduler:
         if not self._due_weekly(now, weekday, hour,
                                   self._state.evoked_weekly):
             return
+        if not self._claim("evoked_weekly", now):
+            self._state.evoked_weekly = now.date().isoformat()
+            return
         logger.info("Evoked weekly fire: %s %02d:%02d",
                      now.date().isoformat(), now.hour, now.minute)
         try:
@@ -269,6 +297,9 @@ class DigestScheduler:
         hour = int(cfg.get("hour", 17))
         if not self._due_weekly(now, weekday, hour,
                                   self._state.review_weekly):
+            return
+        if not self._claim("review_weekly", now):
+            self._state.review_weekly = now.date().isoformat()
             return
         logger.info("Review weekly fire: %s %02d:%02d",
                      now.date().isoformat(), now.hour, now.minute)

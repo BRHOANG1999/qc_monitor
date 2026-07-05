@@ -749,4 +749,16 @@ CREATE TABLE IF NOT EXISTS eeg_file_location (
     path TEXT,
     checked_at TEXT NOT NULL
 );
+
+-- Restart-proof digest dedup: one row per (digest, calendar day) the moment a
+-- recurring email is claimed. The UNIQUE constraint + INSERT OR IGNORE makes
+-- "send at most once per day" atomic across daemon restarts, backup reverts,
+-- and multiple daemon instances -- unlike the JSON state file, which could
+-- revert and re-fire the same digest on every restart.
+CREATE TABLE IF NOT EXISTS notification_log (
+    digest TEXT NOT NULL,
+    sent_date TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    UNIQUE(digest, sent_date)
+);
 """

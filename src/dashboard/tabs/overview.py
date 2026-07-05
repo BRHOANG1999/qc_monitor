@@ -2166,6 +2166,14 @@ def _overview_tab(store: Store, config: dict | None = None):
         _build_zss_consistency_card(store, config),
         id="overview-zss",
     )
+    fidelity_status = html.Div(
+        _build_current_fidelity_card(store, config),
+        id="overview-current-fidelity",
+    )
+    region_status = html.Div(
+        _build_region_drift_card(store, config),
+        id="overview-region-drift",
+    )
     # Stim-artifact overlay: lazily loaded on button click (loading many
     # traces is heavy), in its own section so a refresh tick doesn't wipe it.
     artifact_overlay = _collapsible(
@@ -2445,6 +2453,8 @@ def _overview_tab(store: Store, config: dict | None = None):
         bsz_status,    # per-animal seizure analysis status
         impedance_status,  # per-channel access-resistance (Rₐ) drift trend
         zss_status,        # slow-phase steady-state impedance (stim consistency)
+        fidelity_status,   # current-delivery fidelity (two-edge ratio)
+        region_status,     # drift by placement region (SLM vs SR)
         artifact_overlay,  # lazy stim-artifact overlay across recordings
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
     ])
@@ -2801,6 +2811,7 @@ def _impedance_cfg(config) -> dict:
         "pct_crit": float(rules.get("impedance_shift_pct_critical", 75)),
         "window": int(rules.get("impedance_baseline_window", 10)),
         "min_history": int(rules.get("impedance_min_history", 4)),
+        "sag_pct": float(rules.get("current_sag_pct", -15)),
     }
 
 
@@ -2981,6 +2992,290 @@ def _zss_trend_figure(channels: list[dict], icfg: dict):
                      automargin=True)
     return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
                      style={"padding": "8px 10px"})
+
+
+def _build_current_fidelity_card(store, config=None):
+    """Current-delivery fidelity — the two-edge ratio. Each biphasic pulse
+    hands us two ohmic edges with different commanded ΔI; each backs out the
+    SAME series resistance, so if the current is delivered at setpoint they
+    agree. The normalized difference is impedance-invariant. ~0 => honest
+    current; NEGATIVE => the reversal (high-ΔI) edge sags first => commanded
+    current not fully delivered (compliance) — the earliest warning, before
+    the impedance itself drifts. Collapsed, active channels only."""
+    title = "Current delivery fidelity (edge ratio)"
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+        active = store.active_impedance_channel_keys()
+        latest = store.latest_current_fidelity_per_channel()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("current-fidelity card failed: %s", e)
+        series, active, latest = {}, set(), {}
+    if active:
+        series = {k: v for k, v in series.items() if k in active}
+        latest = {k: v for k, v in latest.items() if k in active}
+    icfg = _impedance_cfg(config)
+    channels = []
+    for (animal, ch), rows in series.items():
+        vals = [r.get("current_fidelity_pct") for r in rows]
+        if not any(v is not None for v in vals):
+            continue
+        channels.append({
+            "animal": animal, "channel": ch, "rows": rows,
+            "stat": _drift_stat_abs(vals, icfg["window"], icfg["min_history"]),
+            "latest": latest.get((animal, ch))})
+    if not channels:
+        return _collapsible(title, html.Div(
+            "No two-edge current-fidelity data for the current session yet "
+            "(needs both ohmic edges — reversal and offset — of the stim "
+            "pulse).", style={"color": "#a0a0b0", "fontSize": "12px"}),
+            open_default=False, badge="0")
+    # A channel is "sagging" when its rolling-median fidelity is below the
+    # (negative) sag threshold. Those float to the top and open the card.
+    sag = icfg["sag_pct"]
+    for c in channels:
+        med = c["stat"]["median"] if c["stat"] else None
+        c["sagging"] = bool(med is not None and med < sag)
+    channels.sort(key=lambda c: (not c["sagging"],
+                                 c["latest"] if c["latest"] is not None else 0))
+    n_sag = sum(1 for c in channels if c["sagging"])
+    body = html.Div([
+        _fidelity_header(sag),
+        _impedance_span_note(channels),
+        _fidelity_bar_figure(channels, sag),
+        _fidelity_trend_figure(channels, icfg),
+    ])
+    badge = (f"{len(channels)} channels · ⚠{n_sag} sagging" if n_sag
+             else f"{len(channels)} channels · ok")
+    badge_color = "#EF553B" if n_sag else "rgba(48,209,88,0.5)"
+    return _collapsible(title, body, open_default=bool(n_sag),
+                        badge=badge, badge_color=badge_color)
+
+
+def _fidelity_header(sag_pct: float):
+    return html.Div([
+        html.Span("Animals currently on the rig · fidelity = 100·(Rₐ_reversal − "
+                  "Rₐ_offset) / mean, from the pulse's two ohmic edges. ",
+                  style={"color": "#888", "fontSize": "11px"}),
+        html.Span("Both edges back out the SAME series R using their exact "
+                  "commanded ΔI, so this is impedance-invariant: ~0 = current "
+                  "at setpoint; ", style={"color": "#888", "fontSize": "11px"}),
+        html.Span(f"negative = reversal (high-ΔI) edge sagging = current not "
+                  f"fully delivered (compliance). Alert below {sag_pct:.0f}%.",
+                  style={"color": "#ff9f0a", "fontSize": "11px"}),
+    ], style={"padding": "2px 2px 8px"})
+
+
+def _fidelity_bar_figure(channels: list[dict], sag_pct: float):
+    """Horizontal bar of the latest fidelity per channel, zero reference +
+    a shaded negative 'sagging' band."""
+    labeled = [(f"{c['animal']} {c['channel']}", c["latest"])
+               for c in channels if c["latest"] is not None]
+    if not labeled:
+        return html.Div()
+    labeled.sort(key=lambda x: x[1])
+    names = [x[0] for x in labeled]
+    vals = [x[1] for x in labeled]
+    colors = ["#ff453a" if v < sag_pct else "#5e7ce2" for v in vals]
+    fig = go.Figure(go.Bar(
+        x=vals, y=names, orientation="h", marker=dict(color=colors),
+        hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
+    lo = min(vals + [sag_pct]) - 3
+    fig.add_vrect(x0=lo, x1=0, line_width=0, fillcolor="#ff453a",
+                  opacity=0.06)
+    fig.add_vline(x=0, line=dict(color="#8a8a99", width=1))
+    fig.add_vline(x=sag_pct, line=dict(color="#ff9f0a", width=1, dash="dot"),
+                  annotation_text="sag limit",
+                  annotation=dict(font=dict(size=9, color="#ff9f0a")))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=60 + 28 * len(names), margin=dict(l=12, r=16, t=10, b=30),
+        showlegend=False, font=dict(color="#cfd0d6"),
+        xaxis=dict(title="latest fidelity (%)", gridcolor="#2a2a3a",
+                   zeroline=False, automargin=True),
+        yaxis=dict(automargin=True, tickfont=dict(size=9)))
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "4px 2px"})
+
+
+def _fidelity_trend_figure(channels: list[dict], icfg: dict):
+    """Per-channel fidelity-vs-date small-multiples with a zero reference line
+    and a shaded negative sagging band."""
+    n = len(channels)
+    if n == 0:
+        return html.Div()
+    cols = min(n, 3)
+    n_rows = (n + cols - 1) // cols
+    titles = [f"{c['animal']} {c['channel']}" for c in channels]
+    fig = make_subplots(rows=n_rows, cols=cols, subplot_titles=titles,
+                        vertical_spacing=0.16, horizontal_spacing=0.06)
+    sag = icfg["sag_pct"]
+    for i, c in enumerate(channels):
+        rr, cc = i // cols + 1, i % cols + 1
+        dates = [r["chunk_datetime"] for r in c["rows"]]
+        dts = [_parse_chunk_dt(d) for d in dates]
+        x = dts if all(d is not None for d in dts) else list(
+            range(len(c["rows"])))
+        yvals = [r.get("current_fidelity_pct") for r in c["rows"]]
+        fig.add_trace(go.Scatter(
+            x=x, y=yvals, mode="lines+markers", showlegend=False,
+            line=dict(color="#5e7ce2", width=1.5), marker=dict(size=3),
+            customdata=dates,
+            hovertemplate="fidelity: %{y:+.1f}%<br>%{customdata}<extra></extra>"),
+            rr, cc)
+        fig.add_hline(y=0, line=dict(color="#8a8a99", width=1), row=rr, col=cc)
+        fig.add_hline(y=sag, line=dict(color="#ff9f0a", width=1, dash="dot"),
+                      row=rr, col=cc, opacity=0.7)
+        # Highlight the latest point red when it's below the sag limit.
+        if yvals and yvals[-1] is not None and yvals[-1] < sag:
+            fig.add_trace(go.Scatter(
+                x=[x[-1]], y=[yvals[-1]], mode="markers", showlegend=False,
+                marker=dict(size=8, color="#ff453a", symbol="circle-open",
+                            line=dict(width=2, color="#ff453a")),
+                hovertemplate=(f"SAG {yvals[-1]:+.1f}%<extra></extra>")), rr, cc)
+    for ann in fig.layout.annotations[:n]:
+        ann.font.size = 11
+        ann.font.color = "#f0f0f5"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=120 + 165 * n_rows,
+        margin=dict(l=52, r=16, t=42, b=34), showlegend=False,
+        font=dict(color="#cfd0d6"))
+    fig.update_xaxes(showticklabels=True, tickfont=dict(size=8), nticks=4,
+                     tickformat="%b %d", tickangle=0, gridcolor="#2a2a3a",
+                     automargin=True)
+    fig.update_yaxes(title_text="%", title_font=dict(size=9),
+                     tickfont=dict(size=8), nticks=5, gridcolor="#2a2a3a",
+                     zeroline=False, automargin=True)
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "8px 10px"})
+
+
+def _drift_stat_abs(values: list, window: int, min_history: int) -> dict | None:
+    """Rolling median of the last *window* points (absolute, not %-of-baseline)
+    — for fidelity, which is already a signed percentage and centred on 0, so
+    a ratio-to-baseline is meaningless. Returns ``{latest, median}`` or None."""
+    vals = [v for v in values if v is not None]
+    if len(vals) < max(2, min_history):
+        return None
+    return {"latest": vals[-1],
+            "median": _median(vals[max(0, len(vals) - window):])}
+
+
+def _build_region_drift_card(store, config=None):
+    """Drift by placement region (SR vs SLM …). Per stimulated channel, the CV
+    of its access-resistance over its dominant-charge history; grouped by the
+    stimulated channel's electrode region. Colony-wide (every channel with
+    enough history) so each region has statistical weight."""
+    title = "Drift by placement region (SLM vs SR)"
+    min_pts = 4
+    try:
+        series = store.impedance_series_by_channel(
+            exclude=_excluded_animals(config))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("region-drift card failed: %s", e)
+        series = {}
+    regions: dict = {}
+    for (animal, ch), rows in series.items():
+        vals = [r.get("access_r_kohm") for r in rows]
+        vals = [v for v in vals if v is not None]
+        if len(vals) < min_pts:
+            continue
+        cv = _coef_of_variation(vals)
+        if cv is None:
+            continue
+        region = _electrode_region(ch)
+        regions.setdefault(region, []).append({
+            "animal": animal, "channel": ch, "cv_pct": cv * 100.0})
+    regions.pop("", None)
+    if len(regions) < 1 or not any(regions.values()):
+        return _collapsible(title, html.Div(
+            "Not enough per-channel history yet to compare regions (need ≥4 "
+            "recordings per stimulated channel).",
+            style={"color": "#a0a0b0", "fontSize": "12px"}),
+            open_default=False, badge="0")
+    body = html.Div([
+        _region_verdict(regions),
+        _region_strip_figure(regions),
+    ])
+    return _collapsible(title, body, open_default=False,
+                        badge=f"{len(regions)} regions")
+
+
+def _electrode_region(channel: str) -> str:
+    """The placement region tag embedded in a stimulated channel name
+    (…SLM…, …SR…). Falls back to '' when none is recognisable."""
+    up = (channel or "").upper()
+    for tag in ("SLM", "SR", "SP", "SO", "SLU"):
+        if tag in up:
+            return tag
+    return ""
+
+
+def _coef_of_variation(vals: list) -> float | None:
+    """Std / mean (population). None when the mean is ~0 or <2 points."""
+    xs = [float(v) for v in vals if v is not None]
+    if len(xs) < 2:
+        return None
+    mean = sum(xs) / len(xs)
+    if mean == 0:
+        return None
+    var = sum((x - mean) ** 2 for x in xs) / len(xs)
+    return (var ** 0.5) / abs(mean)
+
+
+def _region_verdict(regions: dict):
+    """One-line comparison of the per-region median CV, worst region first."""
+    summ = []
+    for region, chans in regions.items():
+        cvs = [c["cv_pct"] for c in chans]
+        summ.append((region, _median(cvs), len(chans)))
+    summ.sort(key=lambda t: (t[1] is None, -(t[1] or 0)))
+    parts = [f"{r} median CV ≈{m:.0f}% (n={n})"
+             for r, m, n in summ if m is not None]
+    verdict = " vs ".join(parts)
+    if len(summ) >= 2 and summ[0][1] and summ[-1][1]:
+        ratio = summ[0][1] / summ[-1][1]
+        verdict += (f" → {summ[0][0]} ~{ratio:.1f}× more drift than "
+                    f"{summ[-1][0]}")
+    return html.Div([
+        html.Div(verdict, style={"color": "#f0f0f5", "fontSize": "12px",
+                                 "fontWeight": "600", "marginBottom": "2px"}),
+        html.Div("Region = the stimulated channel's electrode placement (where "
+                 "we stim + record the artifact). Each point is one channel's "
+                 "access-R CV over its dominant-charge history.",
+                 style={"color": "#888", "fontSize": "11px"}),
+    ], style={"padding": "2px 2px 8px"})
+
+
+def _region_strip_figure(regions: dict):
+    """Per-region strip of per-channel CV (a box + jittered points), sorted by
+    median so the higher-drift region is obvious."""
+    order = sorted(regions.keys(),
+                   key=lambda r: -(_median([c["cv_pct"]
+                                            for c in regions[r]]) or 0))
+    fig = go.Figure()
+    palette = {"SLM": "#ff9f0a", "SR": "#5e7ce2"}
+    for region in order:
+        chans = regions[region]
+        cvs = [c["cv_pct"] for c in chans]
+        labels = [f"{c['animal']} {c['channel']}" for c in chans]
+        color = palette.get(region, "#8a8a99")
+        fig.add_trace(go.Box(
+            x=[region] * len(cvs), y=cvs, name=region, boxpoints="all",
+            jitter=0.5, pointpos=0, marker=dict(color=color, size=6),
+            line=dict(color=color), fillcolor="rgba(0,0,0,0)",
+            text=labels,
+            hovertemplate="%{text}: CV %{y:.0f}%<extra></extra>"))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=280, margin=dict(l=48, r=16, t=14, b=30), showlegend=False,
+        font=dict(color="#cfd0d6"),
+        xaxis=dict(title="placement region", gridcolor="#2a2a3a"),
+        yaxis=dict(title="access-R CV (%)", gridcolor="#2a2a3a",
+                   rangemode="tozero", automargin=True))
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "4px 2px"})
 
 
 def _build_impedance_trend_card(store, config=None):
@@ -3406,6 +3701,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-km-log", "children"),
         Output("overview-impedance", "children"),
         Output("overview-zss", "children"),
+        Output("overview-current-fidelity", "children"),
+        Output("overview-region-drift", "children"),
         Input("refresh-trigger", "data"),
         prevent_initial_call=True,
     )
@@ -3418,6 +3715,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             _build_km_log_section(config),
             _build_impedance_trend_card(store, config),
             _build_zss_consistency_card(store, config),
+            _build_current_fidelity_card(store, config),
+            _build_region_drift_card(store, config),
         )
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the

@@ -28,7 +28,9 @@
       "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback|Duplicate|nonexistent|selected_row_ids\" | Select-Object -Last 8)",
       "PowerShell(python -m pytest tests/test_event_verification_actions.py -q --tb=short 2>&1 | Select-Object -Last 15)",
       "PowerShell(python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3; python tools\\\\smoke_layouts.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"  \\\\[\\(OK|FAIL\\)\\\\]\" | Select-Object -Last 3)",
-      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback\" | Select-Object -Last 3; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3)"
+      "PowerShell(python tools\\\\smoke_boot.py \"$env:TEMP\\\\monitor_smoke.db\" 2>&1 | Select-String -Pattern \"create_app OK|Error|Traceback\" | Select-Object -Last 3; python -m pytest tests/ -q --tb=line 2>&1 | Select-Object -Last 3)",
+      "PowerShell(w32tm *)",
+      "PowerShell(net start *)"
     ]
   }
 }

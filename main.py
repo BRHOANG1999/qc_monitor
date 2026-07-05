@@ -284,6 +284,7 @@ def main():
                 try:
                     refresh_impedance(store, config)
                     alert_engine.check_impedance_shift()
+                    alert_engine.check_current_sag()
                 except Exception as e:
                     logger.error("Impedance refresh/check failed: %s", e)
                 last_impedance_time = loop_start

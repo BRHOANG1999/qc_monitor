@@ -9,6 +9,29 @@ from datetime import datetime, timedelta
 from .schema import SCHEMA_SQL
 
 
+def _current_fidelity_pct(r_reversal, r_offset):
+    """Current-delivery fidelity from the two ohmic edges (signed %).
+
+    Both edges back out the SAME series resistance R_s (each = its voltage
+    step / its commanded ΔI), so if the current is delivered at setpoint they
+    agree. The normalized difference is impedance-invariant (both scale with
+    R_s). ~0 => honest current; NEGATIVE => the reversal (high-ΔI) edge sags
+    first => commanded current not fully delivered (compliance). Returns None
+    when either edge is missing.
+    """
+    if r_reversal is None or r_offset is None:
+        return None
+    try:
+        rev = float(r_reversal)
+        off = float(r_offset)
+    except (TypeError, ValueError):
+        return None
+    mean = (rev + off) / 2.0
+    if mean == 0:
+        return None
+    return 100.0 * (rev - off) / mean
+
+
 class Store:
     # Soft-claim TTL: a reviewer who opens a file holds it (hidden from
     # other reviewers' queues) for this long. Generous vs. the ~40s
@@ -1295,6 +1318,42 @@ class Store:
         finally:
             conn.close()
 
+    def record_notification_sent(self, digest: str, sent_date: str) -> bool:
+        """Atomically claim ``(digest, sent_date)`` for a recurring email.
+
+        Returns True only if THIS call inserted the row — i.e. no one has
+        claimed this digest for this calendar day yet. Returns False if the row
+        already existed (someone already sent it today). The UNIQUE(digest,
+        sent_date) constraint + INSERT OR IGNORE makes the check-and-set atomic,
+        so at most one send happens per digest per day across daemon restarts,
+        backup reverts, and multiple daemon instances."""
+        assert digest, "digest required"
+        assert sent_date, "sent_date required"
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO notification_log
+                   (digest, sent_date, sent_at) VALUES (?, ?, ?)""",
+                (digest, sent_date, datetime.now().isoformat()))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def notification_already_sent(self, digest: str, sent_date: str) -> bool:
+        """True if ``(digest, sent_date)`` has already been recorded. A cheap
+        read-only pre-check; the authoritative gate is
+        ``record_notification_sent`` (atomic)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT 1 FROM notification_log
+                   WHERE digest = ? AND sent_date = ? LIMIT 1""",
+                (digest, sent_date)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def get_recent_alerts(self, hours: int = 24) -> list[dict]:
         conn = self._connect()
         try:
@@ -1872,6 +1931,38 @@ class Store:
         finally:
             conn.close()
 
+    def latest_current_fidelity_per_channel(self) -> dict:
+        """Newest current-delivery fidelity (%) per (animal_id, channel_name),
+        for the cross-animal bars. Derived from the two edge R_s of the
+        newest recording that has both. ``{(animal, channel): fidelity_pct}``."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT ci.animal_id, ci.channel_name,
+                          ci.access_r_reversal_kohm, ci.access_r_offset_kohm
+                   FROM channel_impedance ci
+                   JOIN processed_files pf ON pf.id = ci.file_id
+                   WHERE ci.access_r_reversal_kohm IS NOT NULL
+                     AND ci.access_r_offset_kohm IS NOT NULL
+                     AND pf.chunk_datetime = (
+                       SELECT MAX(pf2.chunk_datetime)
+                       FROM channel_impedance ci2
+                       JOIN processed_files pf2 ON pf2.id = ci2.file_id
+                       WHERE ci2.animal_id = ci.animal_id
+                         AND ci2.channel_name = ci.channel_name
+                         AND ci2.access_r_reversal_kohm IS NOT NULL
+                         AND ci2.access_r_offset_kohm IS NOT NULL)"""
+            ).fetchall()
+            out = {}
+            for r in rows:
+                f = _current_fidelity_pct(r["access_r_reversal_kohm"],
+                                          r["access_r_offset_kohm"])
+                if f is not None:
+                    out[(r["animal_id"] or "", r["channel_name"] or "")] = f
+            return out
+        finally:
+            conn.close()
+
     def latest_impedance_row(self, animal_id: str, channel_name: str
                              ) -> dict | None:
         """Newest fully-computed channel_impedance row for a channel, with its
@@ -1972,7 +2063,8 @@ class Store:
                 params.append(cutoff)
             sql = f"""SELECT ci.animal_id, ci.channel_name, ci.file_id,
                              pf.chunk_datetime, ci.access_r_kohm,
-                             ci.slow_ss_kohm, ci.charge_nc
+                             ci.slow_ss_kohm, ci.charge_nc,
+                             ci.access_r_reversal_kohm, ci.access_r_offset_kohm
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
                       WHERE {' AND '.join(where)}
@@ -1994,6 +2086,8 @@ class Store:
                 "access_r_kohm": r["access_r_kohm"],
                 "slow_ss_kohm": r["slow_ss_kohm"],
                 "charge_nc": r["charge_nc"],
+                "current_fidelity_pct": _current_fidelity_pct(
+                    r["access_r_reversal_kohm"], r["access_r_offset_kohm"]),
             })
         # Access resistance must be measured from a CONSISTENT, non-saturating
         # stimulus. Therapeutic high-charge pulses saturate the amplifier and

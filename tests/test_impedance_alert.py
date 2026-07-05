@@ -105,3 +105,56 @@ def test_rate_limited(monkeypatch):
     eng, store = _engine(series, last_alert=datetime.now())  # just fired
     eng.check_impedance_shift()
     assert store.inserted == []  # suppressed by rate limit
+
+
+# --------------------------------------------------------------------- #
+#  Current-delivery fidelity (two-edge ratio) — check_current_sag
+# --------------------------------------------------------------------- #
+
+def _fid_rows(vals):
+    """Current-fidelity series rows (oldest→newest); vals are signed %."""
+    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
+             "current_fidelity_pct": v}
+            for i, v in enumerate(vals, start=1)]
+
+
+def test_current_sag_fires_when_reversal_edge_sags():
+    # Rolling-median well below the -15% default → sagging.
+    series = {("BCH110", "BCH110SLM"): _fid_rows([-20, -22, -25, -30])}
+    eng, store = _engine(series)
+    eng.check_current_sag()
+    assert len(store.inserted) == 1
+    alert_type, severity, message = store.inserted[0][:3]
+    assert alert_type == "current_sag"
+    assert severity == "warning"
+    assert "BCH110SLM" in message
+
+
+def test_no_current_sag_when_edges_agree():
+    # Fidelity ≈ 0 (edges agree) → current honest, no alert.
+    series = {("BCH062", "BCH062SR"): _fid_rows([0.5, -0.3, 0.1, 0.4])}
+    eng, store = _engine(series)
+    eng.check_current_sag()
+    assert store.inserted == []
+
+
+def test_no_current_sag_above_min_history():
+    series = {("BCH110", "BCH110SLM"): _fid_rows([-30, -40])}  # 2 points
+    eng, store = _engine(series)
+    eng.check_current_sag()
+    assert store.inserted == []
+
+
+def test_current_sag_scoped_to_active():
+    series = {("BCH111", "BCH111SR"): _fid_rows([-20, -25, -30, -35])}
+    eng, store = _engine(series, active={("BCH062", "BCH062SR")})
+    eng.check_current_sag()
+    assert store.inserted == []
+
+
+def test_current_sag_transient_dip_not_flagged():
+    # One noisy edge, but the rolling median stays above the threshold.
+    series = {("BCH062", "BCH062SR"): _fid_rows([1.0, 0.5, -40, 0.8])}
+    eng, store = _engine(series)
+    eng.check_current_sag()
+    assert store.inserted == []
