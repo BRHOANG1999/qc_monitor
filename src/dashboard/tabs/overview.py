@@ -4088,16 +4088,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     # Electrode-history comparison: picking an animal repopulates its electrode
     # list (default = up to 4 of them); the overlay figure redraws on any of
-    # (animal, electrodes, y-mode). prevent_initial_call=True on both because
-    # the card is built with its initial figure already rendered.
+    # (electrodes, y-mode, metric). No prevent_initial_call here (mirrors the
+    # working chronic animal->session pattern) so the list is always populated
+    # for the current animal even on first interaction.
     @app.callback(
         Output("overview-ecmp-electrodes", "options"),
         Output("overview-ecmp-electrodes", "value"),
         Input("overview-ecmp-animal", "value"),
-        prevent_initial_call=True,
     )
     def ecmp_electrode_options(animal):
-        elecs = _impedance_animals_and_electrodes(store, config).get(animal, [])
+        try:
+            elecs = _impedance_animals_and_electrodes(
+                store, config).get(animal, [])
+        except Exception as e:  # noqa: BLE001 -- never blank the control silently
+            logger.warning("ecmp electrode options failed: %s", e)
+            elecs = []
         return [{"label": c, "value": c} for c in elecs], elecs[:4]
 
     @app.callback(
