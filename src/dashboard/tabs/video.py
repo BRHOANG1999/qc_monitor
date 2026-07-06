@@ -298,6 +298,48 @@ def _animal_ids_from_picker(animal_value: str | None
     return [animal_value]
 
 
+# The three carousel navigation modes: normal unreviewed queue, the auto-filter
+# "has events" flag pool (still-reviewable), and the quick-flag needs-scoring
+# pool. Labels drive the RadioItems + the mode-aware card title/empty text.
+_QUEUE_MODES = [
+    {"value": "queue", "label": "Queue",
+     "title": "Queue (FIFO · {n} unreviewed for {a})",
+     "empty_ok": "🎉  All caught up — no unreviewed recordings for {a}.",
+     "empty": "No unreviewed recordings for {a}."},
+    {"value": "flagged", "label": "🚩 Flag (has events)",
+     "title": "🚩 Flag (FIFO · {n} auto-flagged has-events for {a})",
+     "empty_ok": "No auto-flagged (has-events) recordings for {a}.",
+     "empty": "No auto-flagged (has-events) recordings for {a}."},
+    {"value": "needs_scoring", "label": "⚠️ Needs scoring",
+     "title": "⚠️ Needs scoring ({n} awaiting scoring for {a})",
+     "empty_ok": "No recordings awaiting scoring for {a}.",
+     "empty": "No recordings awaiting scoring for {a}."},
+]
+_QUEUE_MODE_BY_VALUE = {m["value"]: m for m in _QUEUE_MODES}
+
+
+def _fetch_queue_by_mode(store, mode, animal_ids, email, floor, limit):
+    """Return the carousel rows for the chosen navigation *mode*, normalized so
+    every dict carries ``id`` / ``session_dir`` / ``chunk_datetime`` /
+    ``duration_sec`` (the fields the carousel reads). Modes:
+
+    * ``queue`` — normal unreviewed FIFO queue.
+    * ``flagged`` — queue ∩ auto-filter has-events flag (still reviewable).
+    * ``needs_scoring`` — the reviewer quick-flag pool (single animal).
+    """
+    if not animal_ids:
+        return []
+    if mode == "needs_scoring":
+        rows = store.files_needing_scoring_for_animal(animal_ids[0])
+        # Normalize file_id -> id so the carousel's row["id"] works uniformly.
+        for r in rows:
+            r.setdefault("id", r.get("file_id"))
+        return rows
+    return store.get_review_queue(
+        animal_ids, email, limit=limit, since_iso=floor,
+        flagged_only=(mode == "flagged"))
+
+
 def _ma_animal_from_picker(animal_value: str | None
                              ) -> str | None:
     """Single plain animal id from the Step-1 picker value, or
@@ -2167,6 +2209,18 @@ def layout(store: Store, bridge: dict | None = None):
                 ], style={"display": "flex", "alignItems": "center",
                            "gap": "10px", "flexWrap": "wrap",
                            "marginBottom": "6px"}),
+                # Navigation mode: browse the normal queue, the auto-filter
+                # has-events flag pool, or the needs-scoring pool. Same
+                # carousel + Load below, different source list.
+                dcc.RadioItems(
+                    id="video-queue-mode",
+                    options=[{"label": f" {m['label']}", "value": m["value"]}
+                             for m in _QUEUE_MODES],
+                    value="queue", inline=True,
+                    labelStyle={"color": "#ddd", "fontSize": "12px",
+                                "marginRight": "14px", "cursor": "pointer"},
+                    inputStyle={"marginRight": "4px"},
+                    style={"marginBottom": "6px"}),
                 html.Div(id="video-queue-card-title",
                           style={"color": "#a0a0b0", "fontSize": "11px",
                                   "marginBottom": "6px"}),
@@ -3626,14 +3680,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-queue-empty", "children"),
         Input("video-queue-animal", "value"),
         Input("video-queue-position", "data"),
+        Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
         prevent_initial_call="initial_duplicate",
     )
-    def _render_queue_card(animal_value, position, _refresh):
+    def _render_queue_card(animal_value, position, mode, _refresh):
         # nav-wrap visibility: hidden (slim hint instead) until there's a
         # queue to browse; shown once we have rows.
         _HIDE = {"display": "none"}
         _SHOW = {}
+        mode = mode or "queue"
+        spec = _QUEUE_MODE_BY_VALUE.get(mode, _QUEUE_MODE_BY_VALUE["queue"])
         hint = "Pick an animal above to load your queue."
         if not animal_value:
             return ("", "", "", no_update, _HIDE, hint)
@@ -3642,17 +3699,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ("", "", "", no_update, _HIDE, hint)
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
-        rows = store.get_review_queue(animal_ids, email,
-                                        limit=queue_limit,
-                                        since_iso=floor)
+        rows = _fetch_queue_by_mode(store, mode, animal_ids, email, floor,
+                                    queue_limit)
         animal_label = animal_ids[0]
         if not rows:
             caught_up = html.Div([
-                html.Span("🎉  All caught up — ",
-                           style={"color": "#00CC96",
-                                   "fontWeight": "600"}),
-                html.Span(f"no unreviewed recordings for {animal_label}.",
-                           style={"color": "#888"}),
+                html.Span("🎉  All caught up — "
+                          if mode == "queue" else "",
+                          style={"color": "#00CC96", "fontWeight": "600"}),
+                html.Span(spec["empty_ok"].format(a=animal_label),
+                          style={"color": "#888"}),
             ], style={"fontSize": "12px"})
             return ("", "", "", 0, _HIDE, caught_up)
         total = len(rows)
@@ -3673,8 +3729,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                       if age_days >= 1
                       else f"{age_days * 24:.0f} h old")
         warn = age_days >= warn_age_days
-        title = (f"Queue (FIFO · {total} unreviewed for "
-                  f"{animal_label})")
+        title = spec["title"].format(n=total, a=animal_label)
         # If this file is back in the queue because the PI flagged
         # it for re-review, surface the PI's note so the
         # undergrad knows what to look for. Cheap query: one
@@ -3718,13 +3773,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-prev-btn", "n_clicks"),
         Input("video-queue-next-btn", "n_clicks"),
         Input("video-queue-animal", "value"),
+        Input("video-queue-mode", "value"),
         State("video-queue-position", "data"),
         prevent_initial_call=True,
     )
-    def _on_queue_arrow(_prev, _next, _animal, pos):
+    def _on_queue_arrow(_prev, _next, _animal, _mode, pos):
         trig = callback_context.triggered_id
-        if trig == "video-queue-animal":
-            # Reset position to head when the animal changes.
+        if trig in ("video-queue-animal", "video-queue-mode"):
+            # Reset position to head when the animal OR the mode changes.
             return 0
         cur = int(pos or 0)
         if trig == "video-queue-prev-btn":
@@ -3744,9 +3800,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-load-btn", "n_clicks"),
         State("video-queue-animal", "value"),
         State("video-queue-position", "data"),
+        State("video-queue-mode", "value"),
         prevent_initial_call=True,
     )
-    def _on_queue_load(n, animal_value, position):
+    def _on_queue_load(n, animal_value, position, mode):
         if not n or not animal_value:
             return no_update, no_update
         animal_ids = _animal_ids_from_picker(animal_value)
@@ -3754,9 +3811,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update, no_update
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
-        rows = store.get_review_queue(animal_ids, email,
-                                        limit=queue_limit,
-                                        since_iso=floor)
+        rows = _fetch_queue_by_mode(store, mode or "queue", animal_ids, email,
+                                    floor, queue_limit)
         if not rows:
             return no_update, no_update
         clamped = max(0, min(int(position or 0), len(rows) - 1))
@@ -3853,12 +3909,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-queue-list", "children"),
         Input("video-queue-animal", "value"),
+        Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("video-file-dropdown", "value"),
     )
-    def _render_queue(animal_value, _refresh, active_file_id):
-        """Render the per-animal queue list. Each item is a Button
-        with a pattern-matching id so one downstream callback
+    def _render_queue(animal_value, mode, _refresh, active_file_id):
+        """Render the per-animal queue list for the active mode. Each item is a
+        Button with a pattern-matching id so one downstream callback
         handles all clicks. The button whose ``file_id`` matches
         ``active_file_id`` (the dropdown's current value) gets a
         left-border accent + a tinted background so the reviewer
@@ -3868,29 +3925,31 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "Pick an animal above to see your queue.",
                 style={"color": "#888", "fontSize": "12px",
                         "padding": "10px"})
+        mode = mode or "queue"
+        spec = _QUEUE_MODE_BY_VALUE.get(mode, _QUEUE_MODE_BY_VALUE["queue"])
         # Resolve animal_value to a list of animal ids (single
         # selection or the unassigned pool sentinel).
-        if animal_value.startswith("_pool_"):
-            animal_ids = [animal_value[len("_pool_"):]]
-        else:
-            animal_ids = [animal_value]
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
+            return html.Div(
+                "Pick an animal above to see your queue.",
+                style={"color": "#888", "fontSize": "12px",
+                        "padding": "10px"})
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
-        # The "Show all timestamps" list shows the WHOLE queue, not
+        # The "Show all timestamps" list shows the WHOLE pool, not
         # just the first queue_limit (that cap is for the prev/next
         # browse card). High ceiling so every recording is listed.
-        rows = store.get_review_queue(animal_ids, email,
-                                        limit=_QUEUE_LIST_MAX,
-                                        since_iso=floor)
+        rows = _fetch_queue_by_mode(store, mode, animal_ids, email, floor,
+                                    _QUEUE_LIST_MAX)
         if not rows:
             return html.Div([
-                html.Div("🎉  You're all caught up!",
-                          style={"color": "#00CC96",
-                                  "fontWeight": "600",
-                                  "fontSize": "13px",
-                                  "marginBottom": "4px"}),
+                html.Div("🎉  You're all caught up!"
+                         if mode == "queue" else "Nothing here",
+                         style={"color": "#00CC96", "fontWeight": "600",
+                                 "fontSize": "13px", "marginBottom": "4px"}),
                 html.Div(
-                    "No unreviewed recordings for this animal.",
+                    spec["empty"].format(a=animal_ids[0]),
                     style={"color": "#888", "fontSize": "11px"}),
             ], style={"padding": "14px", "textAlign": "center"})
         from datetime import datetime as _dt

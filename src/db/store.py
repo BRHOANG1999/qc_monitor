@@ -3222,10 +3222,17 @@ class Store:
     def get_review_queue(self, animal_ids: list[str],
                           user_email: str,
                           limit: int = 100,
-                          since_iso: str | None = None
+                          since_iso: str | None = None,
+                          *, flagged_only: bool = False
                           ) -> list[dict]:
         """Unreviewed files belonging to *any* of *animal_ids*, FIFO
         (oldest chunk first).
+
+        *flagged_only* narrows the queue to files the auto-filter flagged as
+        has-events (a ``review_event_log`` row with action='auto_filter_flag'
+        for one of *animal_ids*). Same shape + same filters as the full queue,
+        so it is exactly the still-reviewable ∩ auto-flagged subset — the
+        "Flag" navigation mode.
 
         The behavioral-review queue is intentionally FIFO so a
         reviewer always clears the backlog from the front — the
@@ -3263,6 +3270,14 @@ class Store:
         extra_where = ""
         if since_iso:
             extra_where = " AND pf.chunk_datetime >= ?"
+        # "Flag" mode: keep only files this animal's auto-filter flagged as
+        # has-events. EXISTS keeps the row shape + all other filters intact.
+        flag_where = ""
+        if flagged_only:
+            flag_where = (f" AND EXISTS (SELECT 1 FROM review_event_log rel "
+                          f"WHERE rel.file_id = pf.id "
+                          f"AND rel.action = 'auto_filter_flag' "
+                          f"AND rel.animal_id IN ({anim_ph}))")
         # Per-(file, animal) review: each review_state / file_claim NOT EXISTS
         # is scoped to the requested animal(s) so reviewing animal A never
         # drops animal B from the queue. A legacy whole-file row (review
@@ -3281,6 +3296,8 @@ class Store:
         params += anim_args                    # fc animal scope (#3)
         if since_iso:
             params.append(since_iso)          # {extra_where}
+        if flagged_only:
+            params += anim_args                # {flag_where} rel.animal_id IN
         # Over-fetch a little so the post-filter (rejecting rows
         # whose decoded animal list doesn't actually intersect)
         # still has enough hits.
@@ -3330,7 +3347,7 @@ class Store:
                   AND fc.claimed_at >= ?
                   AND (fc.animal_id IN ({anim_ph}) OR fc.animal_id = '')
               )
-              {extra_where}
+              {extra_where}{flag_where}
             ORDER BY pf.chunk_datetime ASC
             LIMIT ?
         """
