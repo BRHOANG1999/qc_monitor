@@ -583,7 +583,7 @@ def _channel_options(store: Store, session_dir: str | None,
         if isinstance(raw_names, list):
             for i in range(min(n_channels, len(raw_names))):
                 options[i] = {
-                    "label": f"{raw_names[i]} (Ch{i})", "value": i,
+                    "label": f"Ch{i} · {raw_names[i]}", "value": i,
                 }
         return options
     # Build EEG-only options with friendly labels.
@@ -597,7 +597,10 @@ def _channel_options(store: Store, session_dir: str | None,
             continue
         name = (raw_names[i] if isinstance(raw_names, list)
                  and i < len(raw_names) else f"Ch{i}")
-        options.append({"label": f"{name} (Ch{i})", "value": i})
+        # Animal-electrode first ("Ch2 · BCH062SR") so the reviewer sees WHICH
+        # animal each channel belongs to -- onsets file under the scored
+        # channel's animal.
+        options.append({"label": f"Ch{i} · {name}", "value": i})
     # If session_config exists but eeg_channels was empty for some
     # reason, give the operator every channel rather than nothing.
     if not options:
@@ -3197,6 +3200,11 @@ def layout(store: Store, bridge: dict | None = None):
                 "Add seizure events on the LFP and finish each one "
                 "with a Racine score. This finishes the recording "
                 "in your queue."),
+            # Which animal these onsets file under (= the SCORED channel's
+            # animal) + the recording's channel->animal legend, so a
+            # multi-animal mis-attribution can't slip through unseen.
+            html.Div(id="video-filed-under-banner",
+                     style={"marginBottom": "8px"}),
             html.Div([
                 dcc.RadioItems(
                     id="video-review-decision",
@@ -4571,8 +4579,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-next-hour-btn", "disabled"),
         Input("video-file-dropdown", "value"),
         Input("video-queue-animal", "value"),
+        Input("video-channel-dropdown", "value"),
     )
-    def _render_now_viewing(file_id, picker_value):
+    def _render_now_viewing(file_id, picker_value, channel):
         if not file_id:
             return ("No recording loaded -- pick one above.",
                     True, True)
@@ -4580,21 +4589,95 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         info = _now_viewing_info(store, int(file_id), prefer)
         if not info:
             return ("Recording loaded.", True, True)
-        label = html.Span([
-            html.Span("Now viewing: ",
-                       style={"color": "#a0a0b0",
-                               "fontWeight": "400"}),
-            html.Span(info["animal"],
-                       style={"color": "#5e7ce2"}),
+        # The animal an onset is FILED UNDER = the scored channel's animal (the
+        # electrode is ground truth), NOT the queue picker. Show that, so a
+        # multi-animal mismatch is obvious.
+        scored = (_animal_for_channel(store, int(file_id), channel)
+                  if channel is not None else None) or info["animal"]
+        parts = [
+            html.Span("Now viewing (scoring): ",
+                      style={"color": "#a0a0b0", "fontWeight": "400"}),
+            html.Span(scored, style={"color": "#5e7ce2",
+                                     "fontWeight": "700"}),
             html.Span(f"  ·  {info['date']}  ·  {info['time']}"),
-            html.Span(f"   (hour {info['index']} of "
-                       f"{info['total']})",
-                       style={"color": "#a0a0b0",
-                               "fontWeight": "400",
-                               "fontSize": "11px"}),
-        ])
-        return (label, info["prev_id"] is None,
+            html.Span(f"   (hour {info['index']} of {info['total']})",
+                      style={"color": "#a0a0b0", "fontWeight": "400",
+                             "fontSize": "11px"}),
+        ]
+        # If the reviewer entered via a different animal's queue, flag it.
+        if prefer and prefer != scored:
+            parts.append(html.Span(f"   · queue: {prefer}",
+                                   style={"color": "#ff9f0a",
+                                          "fontWeight": "400",
+                                          "fontSize": "11px"}))
+        return (html.Span(parts), info["prev_id"] is None,
                 info["next_id"] is None)
+
+    # ---- "Filed under" banner: which animal onsets go to + legend ---- #
+    @app.callback(
+        Output("video-filed-under-banner", "children"),
+        Input("video-file-dropdown", "value"),
+        Input("video-channel-dropdown", "value"),
+        Input("video-review-decision", "value"),
+    )
+    def _render_filed_under(file_id, channel, decision):
+        if not file_id or channel is None:
+            return ""
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel)
+        scored = _animal_for_channel(store, int(file_id), channel)
+        session_dir = _session_dir_for_file(store, int(file_id))
+        names = (store._channel_names_for_session(session_dir)
+                 if session_dir else [])
+        try:
+            ci = int(channel)
+            ch_name = names[ci] if 0 <= ci < len(names) else f"Ch{ci}"
+        except (ValueError, TypeError):
+            ch_name = f"Ch{channel}"
+        # Channel -> animal legend for the (possibly multi-animal) recording.
+        groups: dict = {}
+        order: list = []
+        for i, n in enumerate(names):
+            if isinstance(n, str) and is_animal_channel(n):
+                a, _ = split_animal_electrode(n)
+                if a not in groups:
+                    groups[a] = []
+                    order.append(a)
+                groups[a].append(f"Ch{i}")
+        multi = len(order) > 1
+        legend = " · ".join(f"{a} ({', '.join(groups[a])})" for a in order)
+        rows: list = []
+        if not scored:
+            rows.append(html.Span(
+                f"Scored channel Ch{channel} · {ch_name} isn't an animal "
+                "electrode — pick an animal's brain channel above.",
+                style={"color": "#ff453a", "fontSize": "12px"}))
+        else:
+            rows.append(html.Div([
+                html.Span("⚠ " if multi else "✓ ",
+                          style={"color": "#ff9f0a" if multi else "#30d158"}),
+                html.Span("These onsets file under ",
+                          style={"color": "#a0a0b0", "fontSize": "12px"}),
+                html.Span(scored, style={
+                    "color": "#ffd60a" if multi else "#30d158",
+                    "fontWeight": "700", "fontSize": "13px"}),
+                html.Span(
+                    f"  — scored channel Ch{channel} · {ch_name}."
+                    + ("  Switch the brain channel above to file under a "
+                       "different animal in this recording." if multi else ""),
+                    style={"color": "#a0a0b0", "fontSize": "12px"}),
+            ]))
+        if multi:
+            rows.append(html.Div(
+                f"Recording animals: {legend}",
+                style={"color": "#8a8a99", "fontSize": "11px",
+                       "marginTop": "3px"}))
+        border = ("1px solid rgba(255,159,10,0.30)" if multi
+                  else "1px solid rgba(48,209,88,0.22)")
+        bg = ("rgba(255,159,10,0.10)" if multi else "rgba(48,209,88,0.06)")
+        return html.Div(rows, style={
+            "padding": "6px 10px", "borderRadius": "6px",
+            "background": bg, "border": border})
 
     # Multi-animal sessions: switching the reviewed animal on an
     # already-loaded file re-targets the LFP/Hilbert to THAT animal's

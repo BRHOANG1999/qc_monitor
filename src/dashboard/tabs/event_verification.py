@@ -248,6 +248,26 @@ def _flagged_scored_section() -> html.Details:
                             "marginLeft": "12px"}),
         ], style={"display": "flex", "gap": "8px", "alignItems": "center",
                   "marginBottom": "10px", "flexWrap": "wrap"}),
+        # Bulk re-attribution: fix multi-animal mis-filing. Tick rows filed
+        # under the wrong animal, pick the correct one, Move. Only animals
+        # actually in each recording are accepted (others are skipped).
+        html.Div([
+            html.Span("Re-attribute:",
+                      style={"color": "#cfd0d6", "fontSize": "12px",
+                             "fontWeight": "600"}),
+            html.Span("move selected onsets to",
+                      style={"color": "#a0a0b0", "fontSize": "11px"}),
+            dcc.Dropdown(id="evtv-fs-move-animal", options=[], value=None,
+                         placeholder="animal", clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "140px"},
+                         className="dark-dropdown"),
+            html.Button("Move selected", id="evtv-fs-move-btn", n_clicks=0,
+                        style=_btn_style(warning=True),
+                        title="Re-file the selected onsets under the chosen "
+                              "animal (must be one of that recording's "
+                              "animals). Retires the mis-filed row."),
+        ], style={"display": "flex", "gap": "8px", "alignItems": "center",
+                  "marginBottom": "10px", "flexWrap": "wrap"}),
         html.Div(id="evtv-fs-finalize-status",
                  style={"color": "#a0a0b0", "fontSize": "12px",
                         "minHeight": "16px", "marginBottom": "10px"}),
@@ -1037,6 +1057,7 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("evtv-flagged-table", "data"),
         Output("evtv-fs-sig", "data"),
+        Output("evtv-fs-move-animal", "options"),
         Input("evtv-refresh-btn", "n_clicks"),
         Input("refresh-trigger", "data"),
         State("evtv-fs-sig", "data"),
@@ -1044,13 +1065,24 @@ def register_callbacks(app, store, config: dict) -> None:
     def _render_flagged(_n, _refresh, prev_sig):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
-            return [], no_update
+            return [], no_update, no_update
         rows = _flagged_scored_rows(store)
         sig = "|".join(f"{r['id']}={r['scored']}" for r in rows)
         if callback_context.triggered_id == "refresh-trigger" \
                 and sig == prev_sig:
-            return no_update, no_update
-        return rows, sig
+            return no_update, no_update, no_update
+        # Re-attribution targets = every animal present in the flagged
+        # recordings (so a mis-filed onset can be moved to the right one).
+        animals: set = set()
+        try:
+            for r in store.flagged_files(statuses=("needs_scoring",),
+                                          limit=500):
+                for a in store.session_animals(r.get("session_dir") or ""):
+                    animals.add(a)
+        except Exception:  # noqa: BLE001
+            pass
+        opts = [{"label": a, "value": a} for a in sorted(animals)]
+        return rows, sig, opts
 
     @app.callback(
         Output("evtv-flagged-table", "selected_row_ids",
@@ -1118,6 +1150,54 @@ def register_callbacks(app, store, config: dict) -> None:
         rows = _flagged_scored_rows(store)
         sig = "|".join(f"{x['id']}={x['scored']}" for x in rows)
         return rows, [], msg, fin, sig
+
+    @app.callback(
+        Output("evtv-flagged-table", "data", allow_duplicate=True),
+        Output("evtv-flagged-table", "selected_row_ids",
+                allow_duplicate=True),
+        Output("evtv-fs-status", "children", allow_duplicate=True),
+        Output("evtv-fs-sig", "data", allow_duplicate=True),
+        Input("evtv-fs-move-btn", "n_clicks"),
+        State("evtv-flagged-table", "selected_row_ids"),
+        State("evtv-fs-move-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _fs_move(_n, selected_ids, to_animal):
+        email = (current_user_email() or "").lower()
+        blank = (no_update,) * 4
+        if not _is_pi(config or {}, email) \
+                or not _has_real_click(callback_context.triggered):
+            return blank
+        if not selected_ids:
+            return (no_update, no_update,
+                    "Tick at least one row to re-attribute.", no_update)
+        if not to_animal:
+            return (no_update, no_update,
+                    "Pick a target animal first.", no_update)
+        moved = skipped = 0
+        for sid in (selected_ids or []):
+            # Row id is "<file_id>:<from_animal>".
+            try:
+                fid_s, from_animal = str(sid).split(":", 1)
+                fid = int(fid_s)
+            except (ValueError, AttributeError):
+                skipped += 1
+                continue
+            try:
+                ok = store.reattribute_review(fid, from_animal, to_animal,
+                                              email)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("reattribute %s failed: %s", sid, e)
+                ok = False
+            moved += 1 if ok else 0
+            skipped += 0 if ok else 1
+        rows = _flagged_scored_rows(store)
+        sig = "|".join(f"{x['id']}={x['scored']}" for x in rows)
+        msg = f"Moved {moved} onset file(s) → {to_animal}."
+        if skipped:
+            msg += (f" Skipped {skipped} (target not in that recording, or "
+                    "already that animal).")
+        return rows, [], msg, sig
 
     # Open a flagged row in Video Review (mirrors _open_in_video_review).
     @app.callback(

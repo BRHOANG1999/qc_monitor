@@ -3528,6 +3528,69 @@ class Store:
             return animal
         return None
 
+    def session_animals(self, session_dir: str) -> list[str]:
+        """Distinct animal ids present as EEG channels in a session, in channel
+        order. Powers the multi-animal channel->animal legend and validates a
+        re-attribution target (the animal must actually be in the recording)."""
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel)
+        out: list[str] = []
+        for name in self._channel_names_for_session(session_dir):
+            if isinstance(name, str) and is_animal_channel(name):
+                a, _ = split_animal_electrode(name)
+                if a and a not in out:
+                    out.append(a)
+        return out
+
+    def reattribute_review(self, file_id: int, from_animal: str,
+                           to_animal: str, user_email: str) -> bool:
+        """Move a scored review from one animal to another WITHIN the same
+        recording (fixes multi-animal onset mis-attribution). Copies the latest
+        (file, from_animal) review row's status + events + note onto a new
+        (file, to_animal) row, retires the old row ('abandoned'), and writes a
+        'reattribute' audit event. Returns False when there's no such source
+        row or *to_animal* isn't one of the recording's animals."""
+        assert isinstance(file_id, int), "file_id must be int"
+        assert from_animal and to_animal, "both animals required"
+        assert user_email, "user_email required"
+        if from_animal == to_animal:
+            return False
+        conn = self._connect()
+        try:
+            src = conn.execute(
+                """SELECT rs.status, rs.markers_json, rs.note, pf.session_dir
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   WHERE rs.file_id = ? AND rs.animal_id = ?
+                     AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
+                                  WHERE rs2.file_id = rs.file_id
+                                    AND rs2.animal_id = rs.animal_id)""",
+                (int(file_id), from_animal)).fetchone()
+        finally:
+            conn.close()
+        if not src:
+            return False
+        if to_animal not in self.session_animals(src["session_dir"]):
+            return False
+        try:
+            events = json.loads(src["markers_json"] or "[]")
+        except json.JSONDecodeError:
+            events = []
+        old_note = src["note"] or ""
+        new_note = ((f"{old_note} · " if old_note else "")
+                    + f"re-attributed from {from_animal}")[:280]
+        # New row for the correct animal (same status carries the events),
+        # then retire the mis-filed row so it drops out of that animal's pool.
+        self.mark_review(int(file_id), user_email, src["status"],
+                         markers=events, note=new_note, animal_id=to_animal)
+        self.mark_review(int(file_id), user_email, "abandoned", markers=[],
+                         note=f"re-attributed to {to_animal}",
+                         animal_id=from_animal)
+        self.insert_review_event(
+            int(file_id), user_email, "reattribute",
+            {"from": from_animal, "to": to_animal}, animal_id=to_animal)
+        return True
+
     def _channel_names_for_session(self, session_dir: str
                                       ) -> list[str]:
         """Helper for animal-prefix filtering."""
