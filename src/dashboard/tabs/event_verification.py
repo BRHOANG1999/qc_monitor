@@ -256,11 +256,23 @@ def _flagged_scored_section() -> html.Details:
             html.Span("Re-attribute:",
                       style={"color": "#cfd0d6", "fontSize": "12px",
                              "fontWeight": "600"}),
-            html.Span("move selected onsets to",
+            html.Span("select all filed under",
                       style={"color": "#a0a0b0", "fontSize": "11px"}),
+            dcc.Dropdown(id="evtv-fs-select-animal", options=[], value=None,
+                         placeholder="animal", clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "130px"},
+                         className="dark-dropdown"),
+            html.Button("Select these", id="evtv-fs-select-animal-btn",
+                        n_clicks=0, style=_btn_style(),
+                        title="Tick every row currently filed under the chosen "
+                              "animal (e.g. all the BCH061 rows that should be "
+                              "BCH062)."),
+            html.Span("→ move to",
+                      style={"color": "#a0a0b0", "fontSize": "11px",
+                             "marginLeft": "6px"}),
             dcc.Dropdown(id="evtv-fs-move-animal", options=[], value=None,
                          placeholder="animal", clearable=False,
-                         style={**DROPDOWN_STYLE, "minWidth": "140px"},
+                         style={**DROPDOWN_STYLE, "minWidth": "130px"},
                          className="dark-dropdown"),
             html.Button("Move selected", id="evtv-fs-move-btn", n_clicks=0,
                         style=_btn_style(warning=True),
@@ -1059,6 +1071,7 @@ def register_callbacks(app, store, config: dict) -> None:
         Output("evtv-flagged-table", "data"),
         Output("evtv-fs-sig", "data"),
         Output("evtv-fs-move-animal", "options"),
+        Output("evtv-fs-select-animal", "options"),
         Input("evtv-refresh-btn", "n_clicks"),
         Input("refresh-trigger", "data"),
         State("evtv-fs-sig", "data"),
@@ -1066,36 +1079,48 @@ def register_callbacks(app, store, config: dict) -> None:
     def _render_flagged(_n, _refresh, prev_sig):
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
-            return [], no_update, no_update
+            return [], no_update, no_update, no_update
         rows = _flagged_scored_rows(store)
         sig = "|".join(f"{r['id']}={r['scored']}" for r in rows)
         if callback_context.triggered_id == "refresh-trigger" \
                 and sig == prev_sig:
-            return no_update, no_update, no_update
-        # Re-attribution targets = every animal present in the flagged
-        # recordings (so a mis-filed onset can be moved to the right one).
-        animals: set = set()
+            return no_update, no_update, no_update, no_update
+        # Re-attribution TARGETS = every animal in the flagged recordings.
+        # SELECT-by animals = only the animals rows are currently filed under
+        # (so you can grab "all the BCH061 ones" that should be BCH062).
+        targets: set = set()
         try:
             for r in store.flagged_files(statuses=("needs_scoring",),
                                           limit=500):
                 for a in store.session_animals(r.get("session_dir") or ""):
-                    animals.add(a)
+                    targets.add(a)
         except Exception:  # noqa: BLE001
             pass
-        opts = [{"label": a, "value": a} for a in sorted(animals)]
-        return rows, sig, opts
+        target_opts = [{"label": a, "value": a} for a in sorted(targets)]
+        filed = sorted({r["animal"] for r in rows if r.get("animal")})
+        select_opts = [{"label": a, "value": a} for a in filed]
+        return rows, sig, target_opts, select_opts
 
     @app.callback(
         Output("evtv-flagged-table", "selected_row_ids",
                 allow_duplicate=True),
         Input("evtv-fs-select-scored-btn", "n_clicks"),
         Input("evtv-fs-clear-btn", "n_clicks"),
+        Input("evtv-fs-select-animal-btn", "n_clicks"),
         State("evtv-flagged-table", "data"),
+        State("evtv-fs-select-animal", "value"),
         prevent_initial_call=True,
     )
-    def _fs_select(_a, _b, data):
-        if callback_context.triggered_id == "evtv-fs-clear-btn":
+    def _fs_select(_a, _b, _c, data, sel_animal):
+        trig = callback_context.triggered_id
+        if trig == "evtv-fs-clear-btn":
             return []
+        if trig == "evtv-fs-select-animal-btn":
+            # Tick every row currently filed under the chosen animal.
+            if not sel_animal:
+                return no_update
+            return [r["id"] for r in (data or [])
+                    if r.get("animal") == sel_animal]
         return [r["id"] for r in (data or [])
                 if r.get("scored") == "✓ scored"]
 
@@ -1224,9 +1249,20 @@ def register_callbacks(app, store, config: dict) -> None:
         if not pr or not pr["session_dir"]:
             return no_update, no_update, no_update
         session_dir = pr["session_dir"]
+        # Open on THIS row's animal's electrode (not the session's first
+        # channel) so a re-attributed BCH062 row lands on a BCH062 channel,
+        # not BCH061SLM. Falls back to the first animal channel.
+        animal = row.get("animal") or ""
+        channel = _first_animal_channel_index(store, session_dir)
+        try:
+            elecs = store.electrodes_for_animal_in_session(session_dir, animal)
+            if elecs:
+                channel = int(elecs[0]["channel_index"])
+        except Exception:  # noqa: BLE001
+            pass
         bridge = {
             "session_dir": session_dir, "file_id": file_id,
-            "channel": int(_first_animal_channel_index(store, session_dir)),
+            "channel": int(channel),
             "hp": 0, "lp": 0, "notch": 0, "smooth": 0, "start_sec": 0.0,
             "lfp_dur": float(pr["duration_sec"] or 0.0),
             "seq": int(datetime.now().timestamp() * 1000),
@@ -1339,19 +1375,27 @@ def register_callbacks(app, store, config: dict) -> None:
         sid = active_cell.get("row_id")
         if sid is None:
             return no_update, no_update, no_update
-        file_id = store._file_id_for_state(int(sid))
-        if file_id is None:
-            return no_update, no_update, no_update
         with store.connection() as conn:
             row = conn.execute(
-                "SELECT session_dir, duration_sec "
-                "FROM processed_files WHERE id = ?",
-                (file_id,),
-            ).fetchone()
+                """SELECT rs.animal_id, pf.id AS file_id, pf.session_dir,
+                          pf.duration_sec
+                   FROM review_state rs
+                   JOIN processed_files pf ON pf.id = rs.file_id
+                   WHERE rs.id = ?""", (int(sid),)).fetchone()
         if not row or not row["session_dir"]:
             return no_update, no_update, no_update
+        file_id = int(row["file_id"])
         session_dir = row["session_dir"]
+        # Open on the reviewed animal's electrode, not the session's first
+        # channel (so a BCH062 row doesn't open on BCH061SLM).
         channel = _first_animal_channel_index(store, session_dir)
+        try:
+            elecs = store.electrodes_for_animal_in_session(
+                session_dir, row["animal_id"] or "")
+            if elecs:
+                channel = int(elecs[0]["channel_index"])
+        except Exception:  # noqa: BLE001
+            pass
         bridge = {
             "session_dir": session_dir,
             "file_id": file_id,
