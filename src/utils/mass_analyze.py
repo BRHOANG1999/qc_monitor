@@ -1238,16 +1238,19 @@ def screen_file_verdict(store, file_id: int, session_dir: str,
     ch = animal_channel_index(store, session_dir, animal_id,
                               int(cfg.get("electrode") or 0))
     env_pos = auc_pos = False
+    n_peaks = n_events = 0
     try:
         if "envelope" in screens:
-            env_pos = get_or_compute_peak_count(
+            n_peaks = get_or_compute_peak_count(
                 store, file_id, ch, float(cfg["peak_cutoff"]),
-                min_peak_dist_sec=min_peak_dist_sec).n_peaks > 0
+                min_peak_dist_sec=min_peak_dist_sec).n_peaks
+            env_pos = n_peaks > 0
         if "auc" in screens:
-            auc_pos = get_or_compute_auc_count(
+            n_events = get_or_compute_auc_count(
                 store, file_id, ch, float(cfg["auc_threshold"]),
                 float(cfg["auc_window_sec"]),
-                min_peak_dist_sec=min_peak_dist_sec).n_events > 0
+                min_peak_dist_sec=min_peak_dist_sec).n_events
+            auc_pos = n_events > 0
     except Exception as e:  # noqa: BLE001 -- keep on error, never auto-clear
         logger.warning("screen verdict file=%s ch=%s failed: %s",
                        file_id, ch, e)
@@ -1255,6 +1258,7 @@ def screen_file_verdict(store, file_id: int, session_dir: str,
     crossed = env_pos or auc_pos
     return (("keep" if crossed else "clear"),
             {"channel": ch, "env_pos": env_pos, "auc_pos": auc_pos,
+             "n_peaks": n_peaks, "n_events": n_events,
              "screens": sorted(screens)})
 
 
@@ -1279,29 +1283,64 @@ def _apply_auto_clear(store, file_id, email, animal_id, det, cfg) -> bool:
         return False
 
 
+def _apply_auto_flag(store, file_id, email, animal_id, det, cfg) -> bool:
+    """Record a one-time ``auto_filter_flag`` audit event for a KEPT file (it
+    crossed a screen → has candidate events). Deliberately does NOT change the
+    file's review_state: the file stays in the reviewer queue (reviewers
+    auto-navigate it) and needs_scoring remains a separate manual pool. The
+    event is purely for visibility (counts + audit). True on success."""
+    try:
+        store.insert_review_event(
+            file_id, email, "auto_filter_flag",
+            {"animal_id": animal_id, "channel": det.get("channel"),
+             "screens": det.get("screens"), "n_peaks": det.get("n_peaks"),
+             "n_events": det.get("n_events"),
+             "env_pos": det.get("env_pos"), "auc_pos": det.get("auc_pos"),
+             "peak_cutoff": cfg.get("peak_cutoff"),
+             "auc_threshold": cfg.get("auc_threshold"),
+             "auc_window_sec": cfg.get("auc_window_sec")},
+            animal_id=animal_id)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auto_filter flag file=%s: %s", file_id, e)
+        return False
+
+
 def auto_screen_for_animal(store, animal_id: str, cfg: dict | None = None,
                            *, system_email: str | None = None,
                            min_peak_dist_sec: float =
                                DEFAULT_MIN_PEAK_DIST_SEC) -> dict:
-    """Sweep one animal's pending pool: clear (-> pending_pi_review on the
-    (file, animal) row + an auto_filter_clear event) every file whose active
-    screens all read zero; crossers are left in the queue. Per-(file, animal)
-    review means each animal's slice is independent -- no multi-animal guard.
-    Returns {n_cleared, n_kept, n_skipped, n_error, file_ids_cleared}."""
+    """Sweep one animal's pending pool. Each file is triaged:
+
+    * CLEAR (every active screen reads zero) -> pending_pi_review on the
+      (file, animal) row + an auto_filter_clear event. Leaves the queue.
+    * FLAG (crosses a screen -> has candidate events) -> a one-time
+      auto_filter_flag audit event; the file STAYS in the reviewer queue
+      (reviewers auto-navigate it). No state change; needs_scoring stays a
+      separate manual pool.
+    * ERROR (screen compute failed) -> left in queue untouched (safety).
+
+    Per-(file, animal) review means each animal's slice is independent.
+    Returns {n_cleared, n_flagged, n_newly_flagged, n_error, n_skipped, pool,
+    reasons:{env_only,auc_only,both}, file_ids_cleared, n_kept(=n_flagged)}."""
     assert isinstance(animal_id, str) and animal_id, "animal_id required"
     if cfg is None:
         cfg = store.get_animal_screen_config(animal_id)
+    base = {"n_cleared": 0, "n_flagged": 0, "n_newly_flagged": 0,
+            "n_kept": 0, "n_skipped": 0, "n_error": 0, "pool": 0,
+            "reasons": {"env_only": 0, "auc_only": 0, "both": 0},
+            "file_ids_cleared": []}
     if not cfg or not cfg.get("enabled"):
-        return {"n_cleared": 0, "n_kept": 0, "n_skipped": 0, "n_error": 0,
-                "file_ids_cleared": [], "reason": "disabled"}
+        return {**base, "reason": "disabled"}
     if not active_screens(cfg):
-        return {"n_cleared": 0, "n_kept": 0, "n_skipped": 0, "n_error": 0,
-                "file_ids_cleared": [], "reason": "no_usable_threshold"}
+        return {**base, "reason": "no_usable_threshold"}
     email = (system_email or cfg.get("updated_by")
              or "auto-filter@system").lower()
     files = pending_files_for_animal(store, animal_id)
+    already_flagged = store.auto_filter_flagged_file_ids(animal_id)
     cleared: list = []
-    n_kept = n_skip = n_err = 0
+    n_flag = n_new_flag = n_skip = n_err = 0
+    reasons = {"env_only": 0, "auc_only": 0, "both": 0}
     max_iter = len(files) + 1
     for i, f in enumerate(files):
         assert i < max_iter, "auto_screen loop runaway"
@@ -1312,16 +1351,29 @@ def auto_screen_for_animal(store, animal_id: str, cfg: dict | None = None,
         if det.get("reason") == "error":
             n_err += 1
             continue
-        if verdict != "clear":
-            n_kept += 1
+        if verdict == "clear":
+            if _apply_auto_clear(store, fid, email, animal_id, det, cfg):
+                cleared.append(fid)
+            else:
+                n_skip += 1
             continue
-        if _apply_auto_clear(store, fid, email, animal_id, det, cfg):
-            cleared.append(fid)
-        else:
-            n_skip += 1
-    return {"n_cleared": len(cleared), "n_kept": n_kept,
-            "n_skipped": n_skip, "n_error": n_err,
-            "file_ids_cleared": cleared}
+        # KEEP -> crossed a screen (has candidate events): flag once, keep it
+        # in the reviewer queue.
+        n_flag += 1
+        if det.get("env_pos") and det.get("auc_pos"):
+            reasons["both"] += 1
+        elif det.get("env_pos"):
+            reasons["env_only"] += 1
+        elif det.get("auc_pos"):
+            reasons["auc_only"] += 1
+        if fid not in already_flagged:
+            if _apply_auto_flag(store, fid, email, animal_id, det, cfg):
+                already_flagged.add(fid)
+                n_new_flag += 1
+    return {"n_cleared": len(cleared), "n_flagged": n_flag,
+            "n_newly_flagged": n_new_flag, "n_kept": n_flag,
+            "n_skipped": n_skip, "n_error": n_err, "pool": len(files),
+            "reasons": reasons, "file_ids_cleared": cleared}
 
 
 def kick_auto_screen_for_animal(store, animal_id: str) -> None:
@@ -1345,38 +1397,64 @@ def _run_auto_filter_sweep(store) -> dict:
     try:
         configs = store.list_animal_screen_configs(enabled_only=True)
     except Exception:  # noqa: BLE001 -- table may be missing on a brand-new DB
-        return {"animals": 0, "n_cleared": 0}
-    totals = {"animals": 0, "n_cleared": 0, "n_kept": 0, "n_error": 0}
+        return {"animals": 0, "n_cleared": 0, "n_flagged": 0, "n_error": 0}
+    totals = {"animals": 0, "n_cleared": 0, "n_flagged": 0,
+              "n_newly_flagged": 0, "n_error": 0, "pool": 0}
     per_animal: dict = {}
     max_iter = len(configs) + 1
     for i, cfg in enumerate(configs):
         assert i < max_iter, "sweep loop runaway"
+        aid = cfg["animal_id"]
         try:
-            r = auto_screen_for_animal(store, cfg["animal_id"], cfg)
-            totals["animals"] += 1
-            totals["n_cleared"] += r["n_cleared"]
-            totals["n_kept"] += r.get("n_kept", 0)
-            totals["n_error"] += r.get("n_error", 0)
-            if r["n_cleared"] or r.get("n_kept") or r.get("n_error"):
-                per_animal[cfg["animal_id"]] = {
-                    "cleared": r["n_cleared"], "kept": r.get("n_kept", 0),
-                    "error": r.get("n_error", 0)}
+            r = auto_screen_for_animal(store, aid, cfg)
         except Exception:  # noqa: BLE001
-            logger.exception("auto_filter sweep animal=%s failed",
-                             cfg.get("animal_id"))
-    # Observable: log + one activity-feed row per sweep that did something, so
-    # the PI can SEE the auto-screening running (and a high kept/error count
-    # points at the real cause if files aren't clearing).
-    if totals["n_cleared"] or totals["n_kept"] or totals["n_error"]:
-        logger.info("auto_filter sweep: %d cleared / %d kept / %d error "
-                    "across %d animals", totals["n_cleared"], totals["n_kept"],
-                    totals["n_error"], totals["animals"])
+            logger.exception("auto_filter sweep animal=%s failed", aid)
+            continue
+        totals["animals"] += 1
+        totals["n_cleared"] += r["n_cleared"]
+        totals["n_flagged"] += r.get("n_flagged", 0)
+        totals["n_newly_flagged"] += r.get("n_newly_flagged", 0)
+        totals["n_error"] += r.get("n_error", 0)
+        totals["pool"] += r.get("pool", 0)
+        # Per-animal INFO line whenever the animal had ANY pending file, so the
+        # log shows the sweep working AND why files remain (flagged = has
+        # events -> needs review; error = compute failure).
+        pool = r.get("pool", 0)
+        if pool:
+            rs = r.get("reasons", {})
+            remain = r.get("n_flagged", 0) + r.get("n_error", 0)
+            logger.info(
+                "auto_filter %s: pool=%d cleared=%d flagged=%d "
+                "(env=%d auc=%d both=%d, %d new) error=%d -> %d remain in "
+                "queue (%d has-events + %d error)",
+                aid, pool, r["n_cleared"], r.get("n_flagged", 0),
+                rs.get("env_only", 0), rs.get("auc_only", 0),
+                rs.get("both", 0), r.get("n_newly_flagged", 0),
+                r.get("n_error", 0), remain, r.get("n_flagged", 0),
+                r.get("n_error", 0))
+        if r["n_cleared"] or r.get("n_flagged") or r.get("n_error"):
+            per_animal[aid] = {
+                "pool": pool, "cleared": r["n_cleared"],
+                "flagged": r.get("n_flagged", 0),
+                "new_flags": r.get("n_newly_flagged", 0),
+                "error": r.get("n_error", 0)}
+    # Observable: a per-sweep summary log + one activity-feed row whenever the
+    # sweep touched anything, so the PI can SEE the auto-screening running and
+    # read WHY files remain (flagged/has-events vs error) straight from the row.
+    if totals["n_cleared"] or totals["n_flagged"] or totals["n_error"]:
+        logger.info("auto_filter sweep: %d cleared / %d flagged (%d new) / "
+                    "%d error over %d files across %d animals",
+                    totals["n_cleared"], totals["n_flagged"],
+                    totals["n_newly_flagged"], totals["n_error"],
+                    totals["pool"], totals["animals"])
         try:
             store.log_user_activity(
                 _AUTO_FILTER_SYSTEM_EMAIL, "auto-screen", "auto_filter_sweep",
                 target=None,
                 detail={"cleared": totals["n_cleared"],
-                        "kept": totals["n_kept"], "error": totals["n_error"],
+                        "flagged": totals["n_flagged"],
+                        "new_flags": totals["n_newly_flagged"],
+                        "error": totals["n_error"], "pool": totals["pool"],
                         "animals": totals["animals"],
                         "per_animal": per_animal})
         except Exception:  # noqa: BLE001 -- logging is best-effort

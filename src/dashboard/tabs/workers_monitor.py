@@ -119,6 +119,42 @@ def _pipeline_rows(store) -> list[dict]:
     return rows
 
 
+def _auto_filter_summary(store):
+    """A one-line 'last auto-filter sweep' recap (cleared/flagged/error + age),
+    so the operator can confirm the sweep is doing something and read why files
+    remain in the queue (flagged = has candidate events; error = compute
+    failure) without opening the Activity tab."""
+    try:
+        last = store.latest_auto_filter_sweep()
+    except Exception:  # noqa: BLE001
+        last = None
+    if not last:
+        return html.Div("Last sweep: none recorded yet (the sweep only logs a "
+                        "row when it clears or flags something).",
+                        style={"color": "#8a8a99", "fontSize": "12px",
+                               "marginTop": "4px"})
+    d = last.get("detail") or {}
+    age = _ago(_parse_dt(last.get("at")))
+    cleared, flagged = d.get("cleared", 0), d.get("flagged", 0)
+    err, pool = d.get("error", 0), d.get("pool", 0)
+    parts = [
+        html.Span("Last sweep: ", style={"color": "#8a8a99"}),
+        html.Span(f"{cleared} cleared", style={"color": "#30d158",
+                                               "fontWeight": "600"}),
+        html.Span(" · "),
+        html.Span(f"{flagged} flagged", style={"color": "#ff9f0a",
+                                               "fontWeight": "600"}),
+        html.Span(f" ({d.get('new_flags', 0)} new)",
+                  style={"color": "#8a8a99"}),
+        html.Span(" · "),
+        html.Span(f"{err} error", style={"color": "#ff453a" if err else
+                                         "#8a8a99", "fontWeight": "600"}),
+        html.Span(f" · {pool} files across {d.get('animals', 0)} animals · "
+                  f"{age}", style={"color": "#8a8a99"}),
+    ]
+    return html.Div(parts, style={"fontSize": "12px", "marginTop": "4px"})
+
+
 def _thread_rows() -> list[dict]:
     """The app's named daemon threads alive in THIS process."""
     out = []
@@ -171,6 +207,7 @@ def layout(store):
             data=_pipeline_rows(store),
             **DARK_TABLE_STYLE,
             style_data_conditional=_STATUS_STYLE),
+        html.Div(_auto_filter_summary(store), id="workers-monitor-autofilter"),
         html.Div("Threads in this process",
                  style={"color": "#cfd0d6", "fontSize": "13px",
                         "fontWeight": "600", "margin": "14px 0 4px"}),
@@ -188,7 +225,9 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("workers-monitor-pipeline", "data"),
         Output("workers-monitor-threads", "data"),
+        Output("workers-monitor-autofilter", "children"),
         Input("workers-monitor-poll", "n_intervals"),
     )
     def _refresh(_n):
-        return _pipeline_rows(store), _thread_rows()
+        return (_pipeline_rows(store), _thread_rows(),
+                _auto_filter_summary(store))

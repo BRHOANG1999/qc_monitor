@@ -96,8 +96,26 @@ def _detail_str(detail) -> str:
     except (json.JSONDecodeError, TypeError):
         return str(detail)[:80]
     if isinstance(d, dict):
+        # Auto-filter sweep rows carry a nested per_animal breakdown; render it
+        # readably (per animal: cleared✓ / flagged⚑ / error✗) instead of the
+        # generic k=v truncation, so "why files remain" is visible at a glance.
+        if "per_animal" in d:
+            return _auto_filter_detail(d)
         return ", ".join(f"{k}={v}" for k, v in list(d.items())[:4])[:120]
     return str(d)[:120]
+
+
+def _auto_filter_detail(d: dict) -> str:
+    """Human summary of an auto_filter_sweep detail payload."""
+    head = (f"{d.get('cleared', 0)} cleared · {d.get('flagged', 0)} flagged "
+            f"({d.get('new_flags', 0)} new) · {d.get('error', 0)} error")
+    per = d.get("per_animal") or {}
+    parts = []
+    for aid, s in list(per.items())[:8]:
+        parts.append(f"{aid}: {s.get('cleared', 0)}✓/"
+                     f"{s.get('flagged', 0)}⚑/{s.get('error', 0)}✗")
+    tail = ("  ·  " + "  ".join(parts)) if parts else ""
+    return (head + tail)[:200]
 
 
 def _active_rows(store: Store) -> list[dict]:

@@ -2182,6 +2182,26 @@ class Store:
         except Exception as e:  # noqa: BLE001 -- activity logging is best-effort
             logger.debug("log_user_activity failed: %s", e)
 
+    def latest_auto_filter_sweep(self) -> dict | None:
+        """The most recent auto_filter_sweep activity row as
+        ``{at, detail(dict)}`` (or None). Powers the Workers tab's 'last sweep'
+        summary so the operator sees cleared/flagged/error at a glance."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT at, detail_json FROM user_activity
+                   WHERE action = 'auto_filter_sweep'
+                   ORDER BY at DESC LIMIT 1""").fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        try:
+            detail = json.loads(row["detail_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            detail = {}
+        return {"at": row["at"], "detail": detail}
+
     # The unified feed normalises three sources to one shape. Built once as a
     # subquery and filtered by the caller. review_event_log/training_attempt
     # are folded in so already-audited verbs aren't re-logged into
@@ -3179,6 +3199,23 @@ class Store:
                      AND animal_id = ?""",
                 (animal_id,)).fetchone()
             return int(row["n"]) if row else 0
+        finally:
+            conn.close()
+
+    def auto_filter_flagged_file_ids(self, animal_id: str) -> set:
+        """file_ids this animal's auto-filter has already flagged as has-events
+        (audit log), so the sweep writes the 'auto_filter_flag' event only once
+        per file rather than re-flagging every cycle (flagged files stay in the
+        reviewer queue by design, so they'd otherwise be re-seen each sweep)."""
+        assert isinstance(animal_id, str) and animal_id, "animal_id required"
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT file_id FROM review_event_log
+                   WHERE action = 'auto_filter_flag'
+                     AND animal_id = ?""",
+                (animal_id,)).fetchall()
+            return {int(r["file_id"]) for r in rows}
         finally:
             conn.close()
 
