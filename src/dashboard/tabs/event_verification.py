@@ -209,7 +209,82 @@ def layout(store: Store, config: dict | None = None):
         # Signature of the currently-rendered pending set so the
         # 10s auto-refresh can skip pushing identical data.
         dcc.Store(id="evtv-list-sig", data=None),
+        # Flagged & scored -> submit section (needs_scoring pool with onsets).
+        _flagged_scored_section(),
     ], style={"padding": "20px 24px"})
+
+
+def _flagged_scored_section() -> html.Details:
+    """Collapsible section: the needs_scoring (flagged) files that carry an EEG
+    onset, with a Scored (onset+Racine) flag. The PI ticks the scored ones and
+    Submits -> they flip to pi_approved and their events are written to the
+    per-animal day CSV (reusing the finalize path). Files still missing a
+    Racine stay in Needs scoring."""
+    return html.Details([
+        html.Summary(
+            "Flagged & scored — ready to submit",
+            style={"cursor": "pointer", "color": "#f0f0f5",
+                   "fontSize": "14px", "fontWeight": "700",
+                   "padding": "8px 0"}),
+        html.Div(
+            "Files you flagged with an EEG onset. A file is ready when every "
+            "onset also has a Racine score ('✓ scored'); onset-without-Racine "
+            "stays in Needs scoring. Tick the scored ones and Submit — they "
+            "flip to pi_approved and their onsets are written to the per-animal "
+            "day CSV. Click Open to finish scoring one in Video Review.",
+            style={"color": "#a0a0b0", "fontSize": "12px",
+                   "margin": "4px 0 12px", "maxWidth": "720px"}),
+        html.Div([
+            html.Button("Select all scored", id="evtv-fs-select-scored-btn",
+                        n_clicks=0, style=_btn_style()),
+            html.Button("Clear selection", id="evtv-fs-clear-btn",
+                        n_clicks=0, style=_btn_style(secondary=True)),
+            html.Button("Submit selected → CSV", id="evtv-fs-submit-btn",
+                        n_clicks=0, style=_btn_style(accent=True),
+                        title="Approve the selected scored files and write "
+                              "their onsets to the per-animal BHZ day CSV."),
+            html.Div(id="evtv-fs-status",
+                     style={"color": "#a0a0b0", "fontSize": "11px",
+                            "marginLeft": "12px"}),
+        ], style={"display": "flex", "gap": "8px", "alignItems": "center",
+                  "marginBottom": "10px", "flexWrap": "wrap"}),
+        html.Div(id="evtv-fs-finalize-status",
+                 style={"color": "#a0a0b0", "fontSize": "12px",
+                        "minHeight": "16px", "marginBottom": "10px"}),
+        dcc.Loading(
+            type="circle", color="#5e7ce2", delay_show=180,
+            children=dash_table.DataTable(
+                id="evtv-flagged-table",
+                columns=[
+                    {"name": "Animal", "id": "animal"},
+                    {"name": "Date", "id": "date"},
+                    {"name": "Onsets", "id": "n_events", "type": "numeric"},
+                    {"name": "Status", "id": "scored"},
+                    {"name": "Flagged by", "id": "submitter"},
+                    {"name": "", "id": "view"},
+                ],
+                data=[], row_selectable="multi", sort_action="native",
+                sort_by=[{"column_id": "scored", "direction": "asc"}],
+                page_action="native", page_size=25, cell_selectable=True,
+                style_as_list_view=True, **DARK_TABLE_STYLE,
+                style_data_conditional=[
+                    ZEBRA_STRIPE,
+                    {"if": {"filter_query": "{scored} = '✓ scored'",
+                            "column_id": "scored"},
+                     "color": "#30d158", "fontWeight": "600"},
+                    {"if": {"filter_query": "{scored} = 'needs Racine'",
+                            "column_id": "scored"},
+                     "color": "#ff9f0a"},
+                    {"if": {"column_id": "view"},
+                     "color": "#5e7ce2", "cursor": "pointer",
+                     "fontWeight": "600"},
+                ],
+            ),
+        ),
+        dcc.Store(id="evtv-fs-sig", data=None),
+    ], open=False, style={"marginTop": "20px",
+                          "borderTop": "1px solid #2a2a3a",
+                          "paddingTop": "12px"})
 
 
 # --------------------------------------------------------------- #
@@ -822,6 +897,49 @@ def _pending_table_rows(store, rows: list[dict]) -> list[dict]:
     return out
 
 
+def _row_is_scored(events) -> bool:
+    """A flagged file is 'scored' (submittable) when it has at least one event
+    with an EEG onset AND every onset event also carries a Racine score. Onset
+    without Racine => still needs scoring (per the review contract)."""
+    onset_evs = [e for e in (events or [])
+                 if e.get("EO_sec") not in (None, "")]
+    return bool(onset_evs) and all(
+        e.get("racine") is not None for e in onset_evs)
+
+
+def _flagged_scored_rows(store) -> list[dict]:
+    """Rows for the 'Flagged & scored — ready to submit' table: every
+    needs_scoring (flagged) file that has at least one EEG onset, with a Scored
+    flag (onset+Racine). ``id`` = ``"<file_id>:<animal>"`` so multi-select
+    survives sort/paging and distinguishes a shared recording's animals."""
+    try:
+        rows = store.flagged_files(statuses=("needs_scoring",), limit=500)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("flagged_scored_rows failed: %s", e)
+        return []
+    out: list[dict] = []
+    for r in rows:
+        events = r.get("events") or []
+        onset_evs = [e for e in events if e.get("EO_sec") not in (None, "")]
+        if not onset_evs:
+            continue                      # no onset dropped yet -> not "flagged"
+        animal = r.get("animal") or r.get("animal_id") or ""
+        scored = _row_is_scored(events)
+        out.append({
+            "id": f"{int(r['file_id'])}:{animal}",
+            "file_id": int(r["file_id"]),
+            "animal": animal,
+            "date": _format_chunk_dt(r.get("chunk_datetime")),
+            "n_events": len(onset_evs),
+            "scored": "✓ scored" if scored else "needs Racine",
+            "submitter": r.get("user_email") or "-",
+            "view": "Open >",
+        })
+    # Ready-to-submit (scored) first, then oldest recording first.
+    out.sort(key=lambda x: (x["scored"] != "✓ scored", x["date"]))
+    return out
+
+
 # --------------------------------------------------------------- #
 # Callbacks
 # --------------------------------------------------------------- #
@@ -914,6 +1032,125 @@ def register_callbacks(app, store, config: dict) -> None:
         rows = store.pi_pending_files(limit=500)
         return (_pending_table_rows(store, rows), [], msg,
                 _pending_signature(rows))
+
+    # ---- Flagged & scored -> submit section ---- #
+    @app.callback(
+        Output("evtv-flagged-table", "data"),
+        Output("evtv-fs-sig", "data"),
+        Input("evtv-refresh-btn", "n_clicks"),
+        Input("refresh-trigger", "data"),
+        State("evtv-fs-sig", "data"),
+    )
+    def _render_flagged(_n, _refresh, prev_sig):
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email):
+            return [], no_update
+        rows = _flagged_scored_rows(store)
+        sig = "|".join(f"{r['id']}={r['scored']}" for r in rows)
+        if callback_context.triggered_id == "refresh-trigger" \
+                and sig == prev_sig:
+            return no_update, no_update
+        return rows, sig
+
+    @app.callback(
+        Output("evtv-flagged-table", "selected_row_ids",
+                allow_duplicate=True),
+        Input("evtv-fs-select-scored-btn", "n_clicks"),
+        Input("evtv-fs-clear-btn", "n_clicks"),
+        State("evtv-flagged-table", "data"),
+        prevent_initial_call=True,
+    )
+    def _fs_select(_a, _b, data):
+        if callback_context.triggered_id == "evtv-fs-clear-btn":
+            return []
+        return [r["id"] for r in (data or [])
+                if r.get("scored") == "✓ scored"]
+
+    @app.callback(
+        Output("evtv-flagged-table", "data", allow_duplicate=True),
+        Output("evtv-flagged-table", "selected_row_ids",
+                allow_duplicate=True),
+        Output("evtv-fs-status", "children"),
+        Output("evtv-fs-finalize-status", "children"),
+        Output("evtv-fs-sig", "data", allow_duplicate=True),
+        Input("evtv-fs-submit-btn", "n_clicks"),
+        State("evtv-flagged-table", "selected_row_ids"),
+        prevent_initial_call=True,
+    )
+    def _fs_submit(_n, selected_ids):
+        email = (current_user_email() or "").lower()
+        blank = (no_update,) * 5
+        if not _is_pi(config or {}, email) \
+                or not _has_real_click(callback_context.triggered):
+            return blank
+        if not selected_ids:
+            return (no_update, no_update,
+                    "Tick at least one ✓ scored file first.",
+                    no_update, no_update)
+        # Re-fetch the flagged pool as the source of truth for the events.
+        by_id: dict = {}
+        for r in store.flagged_files(statuses=("needs_scoring",), limit=1000):
+            animal = r.get("animal") or r.get("animal_id") or ""
+            by_id[f"{int(r['file_id'])}:{animal}"] = r
+        submitted = skipped = 0
+        for sid in (selected_ids or []):
+            r = by_id.get(sid)
+            if not r:
+                continue
+            events = r.get("events") or []
+            if not _row_is_scored(events):
+                skipped += 1           # onset without Racine -> stays flagged
+                continue
+            animal = r.get("animal") or r.get("animal_id") or None
+            try:
+                store.mark_review(int(r["file_id"]), email, "pi_approved",
+                                  markers=events, animal_id=animal)
+                submitted += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("flagged submit mark_review failed: %s", e)
+        fin = ""
+        if submitted:
+            fin = _finalize_approved_to_csv(store, config, overwrite=False)
+        msg = f"Submitted {submitted} file(s) → pi_approved + CSV."
+        if skipped:
+            msg += (f" Skipped {skipped} still missing a Racine "
+                    "(left in Needs scoring).")
+        rows = _flagged_scored_rows(store)
+        sig = "|".join(f"{x['id']}={x['scored']}" for x in rows)
+        return rows, [], msg, fin, sig
+
+    # Open a flagged row in Video Review (mirrors _open_in_video_review).
+    @app.callback(
+        Output("lfp-to-video-bridge", "data", allow_duplicate=True),
+        Output("group-tabs", "value", allow_duplicate=True),
+        Output("tabs", "value", allow_duplicate=True),
+        Input("evtv-flagged-table", "active_cell"),
+        State("evtv-flagged-table", "data"),
+        prevent_initial_call=True,
+    )
+    def _fs_open(active_cell, data):
+        if not active_cell or active_cell.get("column_id") != "view":
+            return no_update, no_update, no_update
+        row = next((r for r in (data or [])
+                    if r.get("id") == active_cell.get("row_id")), None)
+        if not row:
+            return no_update, no_update, no_update
+        file_id = int(row["file_id"])
+        with store.connection() as conn:
+            pr = conn.execute(
+                "SELECT session_dir, duration_sec "
+                "FROM processed_files WHERE id = ?", (file_id,)).fetchone()
+        if not pr or not pr["session_dir"]:
+            return no_update, no_update, no_update
+        session_dir = pr["session_dir"]
+        bridge = {
+            "session_dir": session_dir, "file_id": file_id,
+            "channel": int(_first_animal_channel_index(store, session_dir)),
+            "hp": 0, "lp": 0, "notch": 0, "smooth": 0, "start_sec": 0.0,
+            "lfp_dur": float(pr["duration_sec"] or 0.0),
+            "seq": int(datetime.now().timestamp() * 1000),
+        }
+        return bridge, "analysis", "video"
 
     # ---- Per-animal auto-filter thresholds ---- #
     @app.callback(
