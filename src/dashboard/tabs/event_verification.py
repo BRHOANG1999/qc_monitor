@@ -27,7 +27,8 @@ from dash import dash_table, dcc, html, no_update
 from src.db.store import Store
 from src.dashboard import activity as _activity
 from src.dashboard.auth import current_user_email
-from src.dashboard.components import DARK_TABLE_STYLE, ZEBRA_STRIPE
+from src.dashboard.components import (
+    DARK_TABLE_STYLE, DROPDOWN_STYLE, ZEBRA_STRIPE)
 from src.dashboard.tabs.review_status import _is_pi
 from src.utils import bhz_csv as _bhz_csv
 from src.utils import mass_analyze as _mass_analyze
