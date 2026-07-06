@@ -4062,10 +4062,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         """Translate a queue button click into setting the existing
         session + file dropdowns, which cascades through every
         downstream callback unchanged."""
-        if not n_clicks_list or not any(n_clicks_list):
-            return no_update, no_update
+        # Act ONLY on a genuine click: the TRIGGERING button's n_clicks must be
+        # >= 1. The needs-scoring / queue lists re-render on refresh-trigger and
+        # on the file-dropdown change, which re-creates the buttons with
+        # n_clicks=0; the old `any(n_clicks_list)` guard would still fire on
+        # such a re-render and callback_context.triggered_id could resolve to
+        # the ACTIVE file -- reloading the file you were already on instead of
+        # the one you clicked. Gating on the triggered value fixes that.
+        triggered = callback_context.triggered or []
         trig = callback_context.triggered_id
-        if not isinstance(trig, dict):
+        if not isinstance(trig, dict) or not triggered \
+                or not (triggered[0].get("value") or 0):
             return no_update, no_update
         file_id = trig.get("file_id")
         if file_id is None:
@@ -4085,6 +4092,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     current_user_email() or "anon",
                                     "claim",
                                     {"source": "queue_click"})
+        logger.info("queue/needs-scoring click -> load file_id=%s session=%s",
+                    int(file_id), row["session_dir"])
         return row["session_dir"], int(file_id)
 
     # ---- P1-4 predictive prefetch ---- #
