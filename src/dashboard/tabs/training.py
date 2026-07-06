@@ -24,7 +24,7 @@ import os
 import random
 import threading
 
-from dash import (Input, Output, State, dcc, html, no_update, ALL,
+from dash import (Input, Output, State, Patch, dcc, html, no_update, ALL,
                    callback_context)
 
 from src.dashboard import activity as _activity
@@ -879,11 +879,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _add_event(_n, events):
         if not _n:
             return no_update
-        events = list(events or [])
-        events.append({"type": "", "racine": None, "EO_sec": None,
-                       "LAS_sec": None, "BO_sec": None, "PID_sec": None,
-                       "BB_sec": None, "score_comment": ""})
-        return events
+        patched = Patch()
+        patched.append({"type": "", "racine": None, "EO_sec": None,
+                        "LAS_sec": None, "BO_sec": None, "PID_sec": None,
+                        "BB_sec": None, "score_comment": ""})
+        return patched
 
     @app.callback(
         Output("training-events", "data", allow_duplicate=True),
@@ -899,11 +899,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx = trig.get("idx")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(events or []):
             return no_update
-        events.pop(idx)
-        return events
+        patched = Patch()
+        del patched[idx]
+        return patched
 
     # LVF/HYP type radio: fires on selection (discrete, fine per-value).
     @app.callback(
@@ -913,22 +913,26 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _set_type(_types, events):
-        events = list(events or [])
-        if not events:
+        # Targeted Patch on just the changed event's "type" -- NOT a
+        # read-modify-write of the whole store. Two field-writers firing close
+        # together (e.g. type then Racine) used to each read the same snapshot
+        # and the second clobbered the first's field (lost update); a Patch
+        # touches only [idx]["type"], so concurrent writers to other fields
+        # (racine / onsets) can't wipe the type.
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
             return no_update
-        changed = False
+        idx = trig.get("idx")
+        if idx is None or idx < 0 or idx >= len(events or []):
+            return no_update
+        new = ""
         for item in (callback_context.inputs_list[0] or []):
-            cid = item.get("id") or {}
-            idx = cid.get("idx")
-            if idx is None or idx < 0 or idx >= len(events):
-                continue
-            new = item.get("value") or ""
-            ev = dict(events[idx])
-            if new != (ev.get("type") or ""):
-                ev["type"] = new
-                events[idx] = ev
-                changed = True
-        return events if changed else no_update
+            if (item.get("id") or {}).get("idx") == idx:
+                new = item.get("value") or ""
+                break
+        patched = Patch()
+        patched[idx]["type"] = new
+        return patched
 
     # Score-rationale comment: commit on BLUR, not per keystroke. Writing
     # per-keystroke fed training-events, which re-rendered the whole form
@@ -951,20 +955,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 or not triggered[0].get("value"):
             return no_update
         idx = trig.get("idx")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(events or []):
             return no_update
         new_val = ""
         for s in (callback_context.states_list[0] or []):
             if s.get("id") == trig:
                 new_val = s.get("value") or ""
                 break
-        ev = dict(events[idx])
-        if str(new_val) != (ev.get("score_comment") or ""):
-            ev["score_comment"] = str(new_val)
-            events[idx] = ev
-            return events
-        return no_update
+        patched = Patch()
+        patched[idx]["score_comment"] = str(new_val)
+        return patched
 
     # Racine 1-8 buttons (replaces the dropdown -- matches Video Review).
     @app.callback(
@@ -982,13 +982,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx, stage_n = trig.get("idx"), trig.get("stage")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(events or []):
             return no_update
-        ev = dict(events[idx])
-        ev["racine"] = int(stage_n)
-        events[idx] = ev
-        return events
+        patched = Patch()
+        patched[idx]["racine"] = int(stage_n)
+        return patched
 
     # "Set on plot": arm a landmark so the next LFP click sets it. Clicking
     # the armed button again disarms. Mirrors video-armed-landmark.
@@ -1039,13 +1037,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             idx = int(armed.get("idx"))
         except (TypeError, ValueError):
             return no_update, None
-        events = list(events or [])
-        if idx < 0 or idx >= len(events):
+        if idx < 0 or idx >= len(events or []):
             return no_update, None
-        ev = dict(events[idx])
-        ev[f"{armed['field']}_sec"] = round(x, 3)
-        events[idx] = ev
-        return events, None
+        patched = Patch()
+        patched[idx][f"{armed['field']}_sec"] = round(x, 3)
+        return patched, None
 
     # "Drop at video time": capture the playhead, scaled to LFP seconds.
     @app.callback(
@@ -1065,17 +1061,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx, field = trig.get("idx"), trig.get("field")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(events or []):
             return no_update
         lfp_dur = (current or {}).get("lfp_dur")
         t = _to_lfp_seconds(cur_time, vid_dur, lfp_dur)
         if t is None:
             return no_update
-        ev = dict(events[idx])
-        ev[f"{field}_sec"] = round(float(t), 3)
-        events[idx] = ev
-        return events
+        patched = Patch()
+        patched[idx][f"{field}_sec"] = round(float(t), 3)
+        return patched
 
     # "Clear" a landmark time.
     @app.callback(
@@ -1092,13 +1086,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx, field = trig.get("idx"), trig.get("field")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(events or []):
             return no_update
-        ev = dict(events[idx])
-        ev[f"{field}_sec"] = None
-        events[idx] = ev
-        return events
+        patched = Patch()
+        patched[idx][f"{field}_sec"] = None
+        return patched
 
     # ---- Submit: grade, persist, reveal feedback ---- #
     @app.callback(

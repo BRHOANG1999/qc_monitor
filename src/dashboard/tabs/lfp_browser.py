@@ -226,10 +226,19 @@ def layout(store: Store, default: str | None = None):
                   data={"hp": 0, "lp": 0, "notch": 0, "smooth": 0,
                         "show_psd": False, "show_scalo": False}),
 
-        dcc.Graph(id="lfp-plot",
-                  figure=empty_fig(
-                      "Select a session and file, then click Load",
-                      height=600)),
+        # Loading feedback: the raw-LFP read + filter can take ~1s+ for an
+        # hour-long 20 kHz chunk, so wrap the plot in a spinner overlay that
+        # shows the moment "Load LFP" (or Apply) is clicked -- the user never
+        # stares at a frozen-looking plot wondering if it worked.
+        dcc.Loading(
+            id="lfp-plot-loading", type="default", color="#636EFA",
+            delay_show=150,
+            overlay_style={"visibility": "visible", "opacity": 0.55},
+            children=dcc.Graph(
+                id="lfp-plot",
+                figure=empty_fig(
+                    "Select a session and file, then click Load",
+                    height=600))),
 
         # Per-channel "View video" buttons. Populated dynamically by
         # load_lfp -- one button per LFP channel. Clicking jumps to
