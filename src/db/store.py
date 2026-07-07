@@ -3044,6 +3044,38 @@ class Store:
                 pass
         return out
 
+    # ---- Multi-animal review scoping: single source of truth (A3) --------
+    # A recording holds several animals; review_state is per (file, animal),
+    # with animal_id NULL for legacy/unattributed whole-file rows. Omitting
+    # these predicates is how a cage-mate's review leaked into another animal's
+    # queue/counts (the "0 pending despite 80 files" bug). Build the scope from
+    # these fragments instead of re-typing the SQL. They emit only fixed table
+    # aliases and `?` placeholders -- all values stay bound parameters.
+
+    @staticmethod
+    def _sql_latest_row_correlated(file_expr: str, outer: str = "rs") -> str:
+        """`<outer>.id = <newest id in this row's (file, animal) group>`,
+        correlated to the OUTER row's animal_id -- the caller iterates one row
+        per animal (NULL groups with NULL). No bound parameter."""
+        return (f"{outer}.id = (SELECT MAX(rs2.id) FROM review_state rs2 "
+                f"WHERE rs2.file_id = {file_expr} "
+                f"AND (rs2.animal_id = {outer}.animal_id "
+                f"OR (rs2.animal_id IS NULL AND {outer}.animal_id IS NULL)))")
+
+    @staticmethod
+    def _sql_animal_or_null(alias: str = "rs") -> str:
+        """`(<alias> belongs to the ? animal OR is an unattributed whole-file
+        row)`. Binds ONE animal parameter."""
+        return f"({alias}.animal_id = ? OR {alias}.animal_id IS NULL)"
+
+    @staticmethod
+    def _sql_latest_row_param(file_expr: str, alias: str = "rs") -> str:
+        """`<alias>.id = <newest id for the ? animal-or-unattributed group>`.
+        Binds ONE animal parameter inside the MAX subquery."""
+        return (f"{alias}.id = (SELECT MAX(rs2.id) FROM review_state rs2 "
+                f"WHERE rs2.file_id = {file_expr} "
+                f"AND (rs2.animal_id = ? OR rs2.animal_id IS NULL))")
+
     def files_needing_scoring_for_animal(self, animal_id: str
                                            ) -> list[dict]:
         """Files whose LATEST review_state is 'needs_scoring' for
@@ -3124,6 +3156,7 @@ class Store:
         assert statuses, "statuses required"
         assert isinstance(limit, int) and limit > 0, "limit > 0"
         placeholders = ",".join("?" for _ in statuses)
+        latest = self._sql_latest_row_correlated("pf.id")
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -3134,11 +3167,7 @@ class Store:
                     FROM processed_files pf
                     JOIN review_state rs ON rs.file_id = pf.id
                     WHERE rs.status IN ({placeholders})
-                      AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
-                                   WHERE rs2.file_id = pf.id
-                                     AND (rs2.animal_id = rs.animal_id
-                                          OR (rs2.animal_id IS NULL
-                                              AND rs.animal_id IS NULL)))
+                      AND {latest}
                     ORDER BY pf.chunk_datetime DESC
                     LIMIT ?""",
                 (*statuses, int(limit)),
@@ -4013,6 +4042,7 @@ class Store:
         # (duration_sec IS NULL OR > thr): drop measured-short files, keep
         # unknown-length ones.
         dur = "AND (pf.duration_sec IS NULL OR pf.duration_sec > ?)"
+        latest = self._sql_latest_row_correlated("rs.file_id")
         conn = self._connect()
         try:
             # One row per (file, animal) whose LATEST review is pi_approved --
@@ -4030,11 +4060,7 @@ class Store:
                    FROM review_state rs
                    JOIN processed_files pf ON pf.id = rs.file_id
                    WHERE rs.status='pi_approved'
-                     AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
-                                  WHERE rs2.file_id = rs.file_id
-                                    AND (rs2.animal_id = rs.animal_id
-                                         OR (rs2.animal_id IS NULL
-                                             AND rs.animal_id IS NULL)))
+                     AND {latest}
                      {dur}""",
                 (email, float(min_duration_sec))).fetchall()
         finally:

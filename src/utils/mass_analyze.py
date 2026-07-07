@@ -321,11 +321,11 @@ def pending_files_for_animal(store, animal_id: str,
     # Per-(file, animal) review: a file already reviewed for ANOTHER animal is
     # still eligible for THIS animal's screen, so the review/claim gates are
     # scoped to *animal_id* (NULL / '' legacy rows are whole-file wildcards).
-    review_gate = "" if include_reviewed else """
+    review_gate = "" if include_reviewed else f"""
                  AND NOT EXISTS (
                    SELECT 1 FROM review_state rs
                    WHERE rs.file_id = pf.id
-                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
+                     AND {store._sql_animal_or_null('rs')}
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
@@ -674,7 +674,7 @@ def count_pending_for_animal(store, animal_id: str) -> int:
         "animal_id required"
     with store.connection() as conn:
         row = conn.execute(
-            """SELECT COUNT(DISTINCT pf.id) AS n
+            f"""SELECT COUNT(DISTINCT pf.id) AS n
                FROM processed_files pf
                JOIN session_config sc
                  ON sc.session_dir = pf.session_dir
@@ -682,7 +682,7 @@ def count_pending_for_animal(store, animal_id: str) -> int:
                  AND NOT EXISTS (
                    SELECT 1 FROM review_state rs
                    WHERE rs.file_id = pf.id
-                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
+                     AND {store._sql_animal_or_null('rs')}
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
@@ -755,7 +755,7 @@ def labeled_files_for_animal(store, animal_id: str) -> list[dict]:
         "animal_id required"
     with store.connection() as conn:
         rows = conn.execute(
-            """SELECT pf.id AS file_id, pf.session_dir,
+            f"""SELECT pf.id AS file_id, pf.session_dir,
                       sc.channel_names AS channel_names,
                       rs.status, rs.markers_json
                FROM processed_files pf
@@ -767,14 +767,11 @@ def labeled_files_for_animal(store, animal_id: str) -> list[dict]:
                  -- animal's row (or a legacy whole-file NULL), never a
                  -- cage-mate's -- otherwise multi-animal recordings grade the
                  -- screen against the wrong animal's ground truth.
-                 AND (rs.animal_id = ? OR rs.animal_id IS NULL)
+                 AND {store._sql_animal_or_null('rs')}
                  AND rs.status IN ('has_events', 'no_events',
                                     'pi_approved')
                  -- latest row per (file, animal) only
-                 AND rs.id = (
-                   SELECT MAX(rs2.id) FROM review_state rs2
-                   WHERE rs2.file_id = pf.id
-                     AND (rs2.animal_id = ? OR rs2.animal_id IS NULL))
+                 AND {store._sql_latest_row_param('pf.id')}
                ORDER BY pf.chunk_datetime ASC""",
             (f'%"{animal_id}%', animal_id, animal_id),
         ).fetchall()
