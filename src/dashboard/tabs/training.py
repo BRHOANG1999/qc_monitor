@@ -923,13 +923,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx = trig.get("idx")
-        if idx is None or idx < 0 or idx >= len(events or []):
+        events = events or []
+        if idx is None or idx < 0 or idx >= len(events):
             return no_update
         new = ""
         for item in (callback_context.inputs_list[0] or []):
             if (item.get("id") or {}).get("idx") == idx:
                 new = item.get("value") or ""
                 break
+        # Only write on a GENUINE change. _render_form recreates this radio on
+        # every training-events change, which re-fires this callback with the
+        # already-stored value; without this guard that re-fire patches the
+        # store again -> re-render -> re-fire ... a feedback loop that made a
+        # freshly-picked HYP snap back to LVF. (Racine/comment writers are
+        # guarded by n_clicks/n_blur, so only the type radio hit this.)
+        if new == (events[idx].get("type") or ""):
+            return no_update
         patched = Patch()
         patched[idx]["type"] = new
         return patched
