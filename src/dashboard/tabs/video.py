@@ -797,6 +797,35 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
     return fig
 
 
+def add_click_catcher(fig) -> None:
+    """Make the ENTIRE plot column clickable, not just the ~1px signal line.
+
+    Plotly emits clickData only when the pointer hits a line/marker, so a click
+    in the empty space above/below the trace at a given time fired nothing --
+    the "Set on plot: click does nothing" complaint. This lays a transparent,
+    full-height bar at every sample x (centered on t[i], width = one sample), so
+    a click ANYWHERE in that column returns t[i] -- identical precision to
+    hitting the line. hoverinfo='skip' keeps it out of the unified hover, and it
+    spans only the data's own y-range so the axis doesn't rescale. Mutates *fig*
+    in place; a no-op if the primary trace has no usable data."""
+    try:
+        base = fig.data[0]
+        xs = [v for v in (base.x if base.x is not None else [])]
+        ys = [v for v in (base.y if base.y is not None else [])
+              if v is not None]
+    except (IndexError, AttributeError, TypeError):
+        return
+    if len(xs) < 2 or not ys:
+        return
+    ymin, ymax = float(min(ys)), float(max(ys))
+    height = (ymax - ymin) or 1.0
+    dx = (float(xs[-1]) - float(xs[0])) / (len(xs) - 1)   # uniform decimation
+    fig.add_trace(go.Bar(
+        x=xs, y=[height] * len(xs), base=ymin, width=dx,
+        marker=dict(color="rgba(0,0,0,0)", line=dict(width=0)),
+        hoverinfo="skip", showlegend=False, name="_click_catcher"))
+
+
 # BHZ_DETECTOR peak-detector defaults (behavioral_seizure_
 # detection.m:237). minpeakdist = fs * 30 * 5 samples (= 150
 # s); cutoff defaults to 0.05 to match the lab's CSV examples.

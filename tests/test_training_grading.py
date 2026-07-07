@@ -36,6 +36,43 @@ def test_stage1_detection_match_and_miss():
     assert grade_attempt(1, [], {"events_present": True})["score"] == 0.0
 
 
+# ---- Stage 2/3: unscoreable (no-EO) events must not skew the score --- #
+
+def test_stage2_typeonly_validated_event_not_counted():
+    # A validated event with a type but NO onset can't be matched (stage 2/3
+    # grade by EO). It must NOT sit in the denominator as a permanent miss:
+    # a student who correctly reports no scoreable seizure gets full credit.
+    val = [_ev(eo=None, type_="LVF", racine=3)]        # type-only, no onset
+    r = grade_attempt(2, val, {"events_present": False, "events": []})
+    assert r["score"] == 1.0
+
+
+def test_stage2_student_event_without_eo_not_false_positive():
+    # A student event with no onset is unscoreable -> ignored, NOT a false
+    # alarm. Here they also correctly matched the real one, so score is full.
+    val = [_ev(eo=10.0, type_="LVF", racine=3)]
+    student = {"events_present": True,
+               "events": [_ev(eo=10.0, type_="LVF", racine=3),
+                          _ev(eo=None, type_="HYP", racine=2)]}  # no onset
+    r = grade_attempt(2, val, student)
+    assert r["breakdown"]["false_pos"] == 0
+    assert r["score"] == 1.0
+
+
+def test_stage2_score_is_reproducible_regardless_of_typeonly_noise():
+    # The SAME real answer must score the same whether or not an unscoreable
+    # type-only row is present on either side (no oscillation).
+    val = [_ev(eo=10.0, type_="LVF", racine=3)]
+    ans = {"events_present": True, "events": [_ev(eo=10.0, type_="LVF",
+                                                  racine=3)]}
+    base = grade_attempt(2, val, ans)["score"]
+    noisy_val = val + [_ev(eo=None, type_="HYP", racine=5)]
+    noisy_ans = {"events_present": True,
+                 "events": ans["events"] + [_ev(eo=None, type_="LVF",
+                                                 racine=1)]}
+    assert grade_attempt(2, noisy_val, noisy_ans)["score"] == base
+
+
 # ---- Stage 2: type + racine ---------------------------------------- #
 
 def test_stage2_perfect_match():

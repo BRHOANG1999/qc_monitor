@@ -142,6 +142,14 @@ def grade_attempt(stage: int, validated_events: Any, student_answer: Any,
         }
 
     student = _real_events(student_answer.get("events"))
+    # Stages 2-3 grade by EO onset: an event with no numeric EO can't be
+    # matched (match_events skips it). Left in place it would sit in the
+    # denominator forever as a "miss" (validated side) or count as a false
+    # alarm (student side), so the SAME answer scores differently depending on
+    # whether a type-only row snuck in. Drop the unscoreable rows from BOTH
+    # sides so grading is fair and reproducible.
+    validated = [v for v in validated if v.get("EO_sec") is not None]
+    student = [s for s in student if s.get("EO_sec") is not None]
     # An explicit "no events" with none added is a clean no-events call.
     if not validated and not student:
         return {"score": 1.0,

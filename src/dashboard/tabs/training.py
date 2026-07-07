@@ -45,7 +45,7 @@ from src.utils import past_events as _past
 # Reused from the Video Review tab -- the LFP/Hilbert figure builders and
 # the file-path lookup. video.py never imports this module, so no cycle.
 from src.dashboard.tabs.video import (
-    _file_path_for_id, _decimated_lfp, _build_lfp_figure,
+    _file_path_for_id, _decimated_lfp, _build_lfp_figure, add_click_catcher,
     _render_hilbert_trace, _render_auc_trace, _empty_lfp_fig,
     _session_dir_for_file, _stim_times_for_file, _stim_copy_channels)
 # Pure, id-agnostic helpers so Training's scoring matches Video Review's
@@ -234,6 +234,7 @@ def _filtered_trace(store: Store, file_id: int, channel: int,
                                         _AUC_WINDOW_SEC)
         else:
             fig, _s = _render_hilbert_trace(store, file_id, channel)
+        add_click_catcher(fig)   # click anywhere in the column sets a landmark
         return fig
     except Exception:
         return _empty_lfp_fig("Trace failed to load.")
@@ -270,6 +271,7 @@ def _build_figures(store: Store, file_id: int, channel: int,
         lfp = _build_lfp_figure(t, sig, label=f"Ch{channel}",
                                  uirevision=f"train:{file_id}:{channel}",
                                  title=ttl)
+        add_click_catcher(lfp)   # click anywhere in the column sets a landmark
     except Exception:
         lfp = _empty_lfp_fig("LFP failed to load.")
         dur = 0.0
@@ -421,9 +423,17 @@ def _build_prompt(store: Store, email: str, stage: int,
     life = store.training_lifetime_stats(email, int(stage))
     lifetxt = (f"{life['mean'] * 100:.0f}% over {life['n']} attempts"
                if life["n"] else "—")
+    # A round can end with nothing scored if every remaining example went stale
+    # (its validated seizure was cleared mid-round). Say so plainly rather than
+    # the misleading "0% on 0 examples".
+    if not scores:
+        headline = ("Round ended — its remaining examples were re-validated "
+                    "with no seizure and skipped. Load a fresh round below.")
+    else:
+        headline = (f"Round complete — {rmean:.0f}% on these "
+                    f"{len(scores)} examples (lifetime {lifetxt}).")
     return card(
-        html.Div(f"Round complete — {rmean:.0f}% on these "
-                 f"{rnd['examples']} examples (lifetime {lifetxt}).",
+        html.Div(headline,
                  style={"fontWeight": "700", "color": COLOR_TEXT_PRIMARY,
                         "marginBottom": SPACE_3}),
         html.Div("How confident are you in your scoring now? (1 = unsure, "
@@ -669,6 +679,10 @@ def layout(store: Store, config: dict | None = None):
                              {"label": " Yes — there is at least one BHZ",
                               "value": "yes"}],
                     value=None,
+                    # Opt OUT of the blanket session-persistence (_enable_
+                    # persistence): a stale yes/no must not resurface on a tab
+                    # remount; _reset_detect clears it fresh on each load.
+                    persistence=False,
                     labelStyle={"display": "block",
                                  "color": COLOR_TEXT_PRIMARY,
                                  "fontSize": FONT_SIZE_BODY,
@@ -829,14 +843,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("training-hilbert", "figure", allow_duplicate=True),
         Input("training-lfp-mode", "value"),
         State("training-current", "data"),
+        State("training-events", "data"),
         prevent_initial_call=True,
     )
-    def _toggle_lfp_mode(mode, current):
+    def _toggle_lfp_mode(mode, current, events):
         if not current or not current.get("file_id"):
             return no_update
-        return _filtered_trace(store, int(current["file_id"]),
-                               int(current.get("channel") or 0),
-                               mode or "hilbert")
+        fig = _filtered_trace(store, int(current["file_id"]),
+                              int(current.get("channel") or 0),
+                              mode or "hilbert")
+        # The fresh panel has no onset lines yet; re-add them so switching
+        # Hilbert<->AUC mid-scoring doesn't drop the student's red markers.
+        lines = _eo_line_shapes(events)
+        if lines:
+            fig.update_layout(
+                shapes=list(fig.layout.shapes or []) + lines)
+        return fig
 
     # ---- Stage-dependent scoring form + detection-radio visibility ---- #
     @app.callback(
@@ -928,6 +950,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
     @app.callback(
         Output("training-events", "data", allow_duplicate=True),
+        Output("training-armed-landmark", "data", allow_duplicate=True),
         Input({"type": "tr-remove", "idx": ALL}, "n_clicks"),
         State("training-events", "data"),
         prevent_initial_call=True,
@@ -935,16 +958,19 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _remove_event(_clicks, events):
         if not any((t.get("value") or 0)
                    for t in (callback_context.triggered or [])):
-            return no_update
+            return no_update, no_update
         trig = callback_context.triggered_id
         if not isinstance(trig, dict):
-            return no_update
+            return no_update, no_update
         idx = trig.get("idx")
         if idx is None or idx < 0 or idx >= len(events or []):
-            return no_update
+            return no_update, no_update
         patched = Patch()
         del patched[idx]
-        return patched
+        # Removing an event shifts every later index down by one, so a landmark
+        # armed for one of them would now point at the WRONG event. Disarm on
+        # any removal (the student re-arms the one they want).
+        return patched, None
 
     # LVF/HYP type radio: fires on selection (discrete, fine per-value).
     @app.callback(
@@ -1174,7 +1200,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         ) + nope[1:]
             answer = {"events_present": detect == "yes", "events": []}
         else:
-            answer = {"events_present": bool(events), "events": events or []}
+            # Stages 2/3 grade by onset. If the student ADDED events but none
+            # carry an EO_sec, nothing scoreable was placed (often the onset
+            # click didn't land) -- warn instead of silently grading it as a
+            # no-seizure call. A genuine "no seizure" is expressed by adding no
+            # events, so this never blocks that path.
+            evs = events or []
+            if evs and not any((e or {}).get("EO_sec") is not None
+                               for e in evs):
+                return (_note("Set an onset time for your event(s) — click the "
+                              "LFP/Hilbert trace (or 'Drop at video time'). To "
+                              "call this recording seizure-free instead, remove "
+                              "the event(s) and submit.", COLOR_WARNING),
+                        ) + nope[1:]
+            answer = {"events_present": bool(evs), "events": evs}
         result = _grade.grade_attempt(
             stage, validated, answer,
             onset_tol_s=cfg["onset_tol_s"], racine_tol=cfg["racine_tol"])
@@ -1503,6 +1542,70 @@ function(currentTime, fig, current) {
 """
 
 
+# When the student sets an onset (EO_sec) the plot must show a RED vertical
+# line at that time. Clientside (like the cursor) so placing an onset doesn't
+# round-trip the whole figure -- which now carries the click-catcher's bars.
+# Re-add fresh red lines from the current events every time and DROP any prior
+# red line (identified by its colour), so cursor/threshold shapes survive and
+# lines never accumulate. Coexists with _CURSOR_JS: that preserves shapes[1:],
+# these preserve every non-red shape.
+_EO_LINE_COLOR = "#ff453a"      # same red Video Review uses for EO
+_EO_LINES_JS = """
+function(events, fig) {
+    if (fig === undefined || fig === null || !fig.layout) {
+        return window.dash_clientside.no_update;
+    }
+    var existing = (fig.layout.shapes || []);
+    var shapes = [];
+    for (var k = 0; k < existing.length; k++) {
+        var s = existing[k];
+        if (!(s && s.line && s.line.color === '""" + _EO_LINE_COLOR + """')) {
+            shapes.push(s);                       // keep cursor / threshold
+        }
+    }
+    var ev = events || [];
+    for (var i = 0; i < ev.length; i++) {
+        if (i >= 16) { break; }                   // bound shapes per figure
+        var e = ev[i];
+        var eo = (e && e.EO_sec);
+        if (eo === null || eo === undefined) { continue; }
+        var t = parseFloat(eo);
+        if (!isFinite(t)) { continue; }
+        shapes.push({
+            type: 'line', xref: 'x', yref: 'paper',
+            x0: t, x1: t, y0: 0, y1: 1,
+            line: {color: '""" + _EO_LINE_COLOR + """', width: 2}
+        });
+    }
+    return {
+        data: fig.data,
+        layout: Object.assign({}, fig.layout, {shapes: shapes})
+    };
+}
+"""
+
+
+def _eo_line_shapes(events) -> list[dict]:
+    """Red onset shapes at each event's EO_sec (max 16) -- the server-side twin
+    of _EO_LINES_JS, so a figure rebuilt on the server (e.g. the Hilbert/AUC
+    mode switch) shows the same onset markers as live placement does."""
+    out: list[dict] = []
+    for i, e in enumerate(events or []):
+        if i >= 16:
+            break
+        eo = (e or {}).get("EO_sec")
+        if eo is None:
+            continue
+        try:
+            t = float(eo)
+        except (TypeError, ValueError):
+            continue
+        out.append({"type": "line", "xref": "x", "yref": "paper",
+                    "x0": t, "x1": t, "y0": 0, "y1": 1,
+                    "line": {"color": _EO_LINE_COLOR, "width": 2}})
+    return out
+
+
 def _xsync_js(target_id: str) -> str:
     """Clientside: when the source graph's x-range (or autorange) changes,
     Plotly.relayout the target graph to match. The echo guard (skip when the
@@ -1598,6 +1701,17 @@ def _register_cursor_sync(app) -> None:
             Input("training-current-time", "data"),
             State(graph_id, "figure"),
             State("training-current", "data"),
+            prevent_initial_call=True,
+        )
+
+    # 2b. Draw a red vertical line at each event's onset (EO_sec) on both
+    #     panels, live as the student places them. Coexists with the cursor.
+    for graph_id in ("training-lfp", "training-hilbert"):
+        app.clientside_callback(
+            _EO_LINES_JS,
+            Output(graph_id, "figure", allow_duplicate=True),
+            Input("training-events", "data"),
+            State(graph_id, "figure"),
             prevent_initial_call=True,
         )
 
