@@ -183,6 +183,17 @@ class DigestScheduler:
                          "(skipping this tick; will retry)", digest, e)
             return False
 
+    def _release(self, digest: str, now: datetime) -> None:
+        """Undo a claim after the send RAISED, so a transient send exception
+        doesn't leave the digest permanently suppressed by a dead claim."""
+        if self._store is None:
+            return
+        try:
+            self._store.release_notification_sent(
+                digest, now.date().isoformat())
+        except Exception as e:  # noqa: BLE001
+            logger.error("notification release failed for %s: %s", digest, e)
+
     # ----- main loop entry ------------------------------------------- #
 
     def tick(self, now: datetime | None = None) -> dict:
@@ -219,6 +230,7 @@ class DigestScheduler:
         except Exception as e:
             logger.error("Surgery digest send raised: %s", e,
                           exc_info=True)
+            self._release("surgery", now)   # dead claim -> retry next tick
             return
         # Mark as sent regardless of partial-failure so SMTP downtime
         # doesn't retry every poll. Next attempt is tomorrow.
@@ -244,6 +256,7 @@ class DigestScheduler:
                                        self._store, self._emailer)
         except Exception as e:
             logger.error("EOD digest send raised: %s", e, exc_info=True)
+            self._release("eod", now)
             return
         self._state.eod = now.date().isoformat()
         fired["eod"] = bool(result.get("sent"))
@@ -269,6 +282,7 @@ class DigestScheduler:
                                          self._store, self._emailer)
         except Exception as e:
             logger.error("Video weekly send raised: %s", e, exc_info=True)
+            self._release("video_weekly", now)
             return
         self._state.video_weekly = now.date().isoformat()
         fired["video_weekly"] = bool(result.get("sent"))
@@ -294,6 +308,7 @@ class DigestScheduler:
                                           self._store, self._emailer)
         except Exception as e:
             logger.error("Evoked weekly send raised: %s", e, exc_info=True)
+            self._release("evoked_weekly", now)
             return
         self._state.evoked_weekly = now.date().isoformat()
         fired["evoked_weekly"] = bool(result.get("sent"))
@@ -320,6 +335,7 @@ class DigestScheduler:
         except Exception as e:
             logger.error("Review weekly send raised: %s", e,
                           exc_info=True)
+            self._release("review_weekly", now)
             return
         self._state.review_weekly = now.date().isoformat()
         fired["review_weekly"] = bool(result.get("sent"))

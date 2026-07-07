@@ -1214,21 +1214,20 @@ def commit_threshold(store, animal_id: str, cutoff: float,
             skipped.append(fid)
             continue
         try:
-            store.mark_review(
-                fid, pi_email, "pending_pi_review",
-                markers=[],
-                note=(f"Mass Analyze auto-clear at "
-                       f"cutoff={cutoff:g}"),
-                animal_id=animal_id,
-            )
-            store.insert_review_event(
-                fid, pi_email, "mass_analyze_clear",
-                {"cutoff": float(cutoff),
-                 "channel": ch,
-                 "animal_id": animal_id,
-                 "min_peak_dist_sec":
-                     float(min_peak_dist_sec)},
-            )
+            # Atomic: the finalize + its provenance event in ONE transaction,
+            # so a crash between them can't advance the file to pending_pi_review
+            # without the 'mass_analyze_clear' audit row (which would let it
+            # masquerade as a manual clear).
+            with store.transaction() as conn:
+                store._mark_review_conn(
+                    conn, fid, pi_email, "pending_pi_review", markers=[],
+                    note=f"Mass Analyze auto-clear at cutoff={cutoff:g}",
+                    animal_id=animal_id)
+                store._insert_review_event_conn(
+                    conn, fid, pi_email, "mass_analyze_clear",
+                    {"cutoff": float(cutoff), "channel": ch,
+                     "animal_id": animal_id,
+                     "min_peak_dist_sec": float(min_peak_dist_sec)})
             cleared.append(fid)
         except Exception as e:
             logger.warning(
@@ -1307,18 +1306,20 @@ def screen_file_verdict(store, file_id: int, session_dir: str,
 def _apply_auto_clear(store, file_id, email, animal_id, det, cfg) -> bool:
     """Write the pending_pi_review row + auto_filter_clear audit. True on ok."""
     try:
-        store.mark_review(
-            file_id, email, "pending_pi_review", markers=[],
-            note=f"Auto-filter: no events at {animal_id} thresholds",
-            animal_id=animal_id)
-        store.insert_review_event(
-            file_id, email, "auto_filter_clear",
-            {"animal_id": animal_id, "channel": det.get("channel"),
-             "screens": det.get("screens"),
-             "peak_cutoff": cfg.get("peak_cutoff"),
-             "auc_threshold": cfg.get("auc_threshold"),
-             "auc_window_sec": cfg.get("auc_window_sec")},
-            animal_id=animal_id)
+        # Atomic finalize + audit (one transaction).
+        with store.transaction() as conn:
+            store._mark_review_conn(
+                conn, file_id, email, "pending_pi_review", markers=[],
+                note=f"Auto-filter: no events at {animal_id} thresholds",
+                animal_id=animal_id)
+            store._insert_review_event_conn(
+                conn, file_id, email, "auto_filter_clear",
+                {"animal_id": animal_id, "channel": det.get("channel"),
+                 "screens": det.get("screens"),
+                 "peak_cutoff": cfg.get("peak_cutoff"),
+                 "auc_threshold": cfg.get("auc_threshold"),
+                 "auc_window_sec": cfg.get("auc_window_sec")},
+                animal_id=animal_id)
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning("auto_filter mark file=%s: %s", file_id, e)

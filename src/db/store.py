@@ -1383,6 +1383,20 @@ class Store:
         finally:
             conn.close()
 
+    def release_notification_sent(self, digest: str, sent_date: str) -> None:
+        """Undo a claim. Used when the send RAISED after the claim was
+        recorded, so the digest isn't permanently suppressed by a dead claim --
+        the next tick can retry. (A clean 'not sent' from SMTP-down is left
+        claimed on purpose so the scheduler doesn't retry-spam.)"""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM notification_log "
+                         "WHERE digest = ? AND sent_date = ?",
+                         (digest, sent_date))
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_recent_alerts(self, hours: int = 24) -> list[dict]:
         conn = self._connect()
         try:
