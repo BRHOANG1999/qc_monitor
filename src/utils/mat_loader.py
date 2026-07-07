@@ -40,7 +40,13 @@ def load_mat(path: str) -> ChunkData:
     elif "data" in data:
         sbuf = np.asarray(data["data"], dtype=np.float64)
         chunk_info = data.get("chunkInfo", None)
-        if chunk_info is not None:
+        # v7 (scipy) gives a struct object (.samplingRate); v7.3 (_load_hdf5)
+        # gives a dict. getattr on a dict silently missed samplingRate and
+        # defaulted fs to 20000 -- corrupting duration + every time->sample
+        # conversion for HDF5 chunks. Handle both shapes.
+        if isinstance(chunk_info, dict):
+            fs = float(chunk_info.get("samplingRate", 20000))
+        elif chunk_info is not None:
             fs = float(getattr(chunk_info, "samplingRate", 20000))
         else:
             fs = 20000.0

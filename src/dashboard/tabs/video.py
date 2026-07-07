@@ -6521,10 +6521,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _restore_note_context(n_list):
         nope = (no_update,) * 8
-        if not n_list or not any(n_list):
-            return nope
+        # Act only on a genuine click (triggered value >= 1), not a re-render
+        # re-fire that any(n_list) would let through with a stale triggered_id.
+        triggered = callback_context.triggered or []
         trig = callback_context.triggered_id
-        if not isinstance(trig, dict):
+        if (not isinstance(trig, dict) or not triggered
+                or not (triggered[0].get("value") or 0)):
             return nope
         ann_id = trig.get("ann_id")
         try:

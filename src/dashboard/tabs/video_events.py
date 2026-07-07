@@ -666,9 +666,14 @@ def register_callbacks(app, store) -> None:
         events = list(events or [])
         if idx < 0 or idx >= len(events):
             return no_update, None
-        events[idx] = dict(events[idx])
-        events[idx][f"{field}_sec"] = float(round(float(x), 3))
-        return events, None  # disarm after dropping
+        # Targeted Patch (NOT a whole-list rewrite): two event-store writers
+        # firing close together each read the same State snapshot and the
+        # second clobbered the first's field (lost update). A Patch touches
+        # only [idx][field], so concurrent writers to other fields can't wipe
+        # each other. (Mirrors the training.py fix.)
+        patched = Patch()
+        patched[idx][f"{field}_sec"] = float(round(float(x), 3))
+        return patched, None  # disarm after dropping
 
     @app.callback(
         Output("video-events-list", "children"),
@@ -695,11 +700,11 @@ def register_callbacks(app, store) -> None:
         prevent_initial_call=True,
     )
     def _add_event(_clicks, events):
-        events = list(events or [])
-        if len(events) >= 32:
+        if len(list(events or [])) >= 32:
             return no_update
-        events.append(blank_event())
-        return events
+        patched = Patch()
+        patched.append(blank_event())
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -716,11 +721,11 @@ def register_callbacks(app, store) -> None:
         if not isinstance(trig, dict):
             return no_update
         idx = trig.get("idx")
-        events = list(events or [])
-        if idx is None or idx < 0 or idx >= len(events):
+        if idx is None or idx < 0 or idx >= len(list(events or [])):
             return no_update
-        events.pop(idx)
-        return events
+        patched = Patch()
+        del patched[idx]
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -730,19 +735,30 @@ def register_callbacks(app, store) -> None:
         prevent_initial_call=True,
     )
     def _set_type(values, events):
-        # Sync each event's type from ITS OWN radio (keyed by idx), not
-        # "the last triggered value applied to the first triggered
-        # idx" -- that cross-assigned one event's value onto another's
-        # index, so picking a type for event 2 cleared event 1's type.
-        # Re-rendering recreates every radio and re-fires this
-        # ALL-pattern callback; apply_event_types only rewrites entries
-        # that differ, so recreation is a no-op. See apply_event_types.
-        inputs = (callback_context.inputs_list[0]
-                  if callback_context.inputs_list else [])
-        pairs = [((item.get("id") or {}).get("idx"), item.get("value"))
-                 for item in inputs]
-        new_events, changed = apply_event_types(events, pairs)
-        return new_events if changed else no_update
+        # Patch ONLY the changed event's type, keyed on the triggered radio's
+        # idx. Two things this guards: (1) lost-update -- a whole-list rewrite
+        # here clobbered a concurrent racine/landmark write; (2) the re-render
+        # feedback loop -- _render_events_list recreates every radio and
+        # re-fires this ALL-pattern callback, so we must NO-OP when the value
+        # already matches the store, or the type snaps back (the HYP->LVF bug
+        # fixed in training.py). Both are handled by the change guard + Patch.
+        trig = callback_context.triggered_id
+        if not isinstance(trig, dict):
+            return no_update
+        idx = trig.get("idx")
+        events = events or []
+        if idx is None or idx < 0 or idx >= len(events):
+            return no_update
+        new = None
+        for item in (callback_context.inputs_list[0] or []):
+            if (item.get("id") or {}).get("idx") == idx:
+                new = item.get("value")
+                break
+        if new == events[idx].get("type"):
+            return no_update
+        patched = Patch()
+        patched[idx]["type"] = new
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -764,9 +780,9 @@ def register_callbacks(app, store) -> None:
             new_val = t.get("value")
         if new_val not in (0, 1, 2):
             return no_update
-        events[idx] = dict(events[idx])
-        events[idx]["light"] = int(new_val)
-        return events
+        patched = Patch()
+        patched[idx]["light"] = int(new_val)
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -798,9 +814,9 @@ def register_callbacks(app, store) -> None:
         t_lfp = _to_lfp_seconds(video_t, lfp_dur, lfp_dur)
         if t_lfp is None:
             return no_update
-        events[idx] = dict(events[idx])
-        events[idx][f"{field}_sec"] = float(round(t_lfp, 3))
-        return events
+        patched = Patch()
+        patched[idx][f"{field}_sec"] = float(round(t_lfp, 3))
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -822,9 +838,9 @@ def register_callbacks(app, store) -> None:
             return no_update
         if field not in EVENT_FIELDS:
             return no_update
-        events[idx] = dict(events[idx])
-        events[idx][f"{field}_sec"] = None
-        return events
+        patched = Patch()
+        patched[idx][f"{field}_sec"] = None
+        return patched
 
     @app.callback(
         Output("video-events-store", "data",
@@ -846,9 +862,9 @@ def register_callbacks(app, store) -> None:
             return no_update
         if not isinstance(stage, int) or not (1 <= stage <= 8):
             return no_update
-        events[idx] = dict(events[idx])
-        events[idx]["racine"] = int(stage)
-        return events
+        patched = Patch()
+        patched[idx]["racine"] = int(stage)
+        return patched
 
     # Commit the comment to the store on BLUR, not on every keystroke.
     # Writing per-keystroke fed video-events-store, which re-rendered the
@@ -886,6 +902,6 @@ def register_callbacks(app, store) -> None:
             if s.get("id") == trig:
                 new_val = s.get("value") or ""
                 break
-        events[idx] = dict(events[idx])
-        events[idx][field] = str(new_val)
-        return events
+        patched = Patch()
+        patched[idx][field] = str(new_val)
+        return patched

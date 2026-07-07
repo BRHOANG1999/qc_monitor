@@ -430,14 +430,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _on_view_video(n_clicks_list, relayout, session_dir,
                         file_path, hp, lp, notch, smooth_ms):
-        # Pattern-matched callbacks fire with n_clicks_list = list of
-        # all matching components' n_clicks. The build step also
-        # triggers this with zero clicks; only act when something was
-        # actually clicked.
-        if not n_clicks_list or not any(n_clicks_list):
-            return no_update, no_update, no_update, no_update
+        # Act ONLY on a genuine click: the TRIGGERING button's n_clicks must be
+        # >= 1. The per-channel buttons are rebuilt every load (n_clicks reset
+        # to 0); the old any(n_clicks_list) guard still fired on that re-render
+        # and triggered_id could resolve to a stale/active channel, hijacking
+        # the tab. Gate on the triggered value instead.
+        triggered = callback_context.triggered or []
         trig = callback_context.triggered_id
-        if not isinstance(trig, dict):
+        if (not isinstance(trig, dict) or not triggered
+                or not (triggered[0].get("value") or 0)):
             return no_update, no_update, no_update, no_update
         channel = int(trig.get("channel", 0))
         if not file_path:

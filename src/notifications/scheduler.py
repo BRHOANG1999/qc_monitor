@@ -118,6 +118,10 @@ class DigestScheduler:
                 eod=str(raw.get("eod") or ""),
                 video_weekly=str(raw.get("video_weekly") or ""),
                 evoked_weekly=str(raw.get("evoked_weekly") or ""),
+                # review_weekly was dropped here on load, so its persisted
+                # send-once date never round-tripped -> the weekly review
+                # digest could re-send after a restart. Round-trip it.
+                review_weekly=str(raw.get("review_weekly") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
             )
         except (FileNotFoundError, json.JSONDecodeError):
@@ -169,8 +173,15 @@ class DigestScheduler:
             return self._store.record_notification_sent(
                 digest, now.date().isoformat())
         except Exception as e:  # noqa: BLE001 -- never crash the tick
-            logger.error("notification claim failed for %s: %s", digest, e)
-            return True
+            # Fail CLOSED: skip this tick rather than send. A transient WAL
+            # lock clears and the next tick retries (the JSON _due_* gate is
+            # still True since we didn't send), so nothing is permanently
+            # lost -- whereas failing OPEN would defeat the atomic dedup and
+            # re-introduce the multi-restart double-send this guard exists to
+            # prevent.
+            logger.error("notification claim failed for %s: %s "
+                         "(skipping this tick; will retry)", digest, e)
+            return False
 
     # ----- main loop entry ------------------------------------------- #
 

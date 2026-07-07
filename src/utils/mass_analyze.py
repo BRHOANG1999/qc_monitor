@@ -756,35 +756,50 @@ def labeled_files_for_animal(store, animal_id: str) -> list[dict]:
     with store.connection() as conn:
         rows = conn.execute(
             """SELECT pf.id AS file_id, pf.session_dir,
+                      sc.channel_names AS channel_names,
                       rs.status, rs.markers_json
                FROM processed_files pf
                JOIN session_config sc
                  ON sc.session_dir = pf.session_dir
                JOIN review_state rs ON rs.file_id = pf.id
                WHERE sc.channel_names LIKE ?
+                 -- Per-(file, animal) review: the label MUST come from THIS
+                 -- animal's row (or a legacy whole-file NULL), never a
+                 -- cage-mate's -- otherwise multi-animal recordings grade the
+                 -- screen against the wrong animal's ground truth.
+                 AND (rs.animal_id = ? OR rs.animal_id IS NULL)
                  AND rs.status IN ('has_events', 'no_events',
                                     'pi_approved')
-                 -- latest row per file only
-                 AND rs.updated_at = (
-                   SELECT MAX(rs2.updated_at) FROM review_state rs2
-                   WHERE rs2.file_id = pf.id)
+                 -- latest row per (file, animal) only
+                 AND rs.id = (
+                   SELECT MAX(rs2.id) FROM review_state rs2
+                   WHERE rs2.file_id = pf.id
+                     AND (rs2.animal_id = ? OR rs2.animal_id IS NULL))
                ORDER BY pf.chunk_datetime ASC""",
-            (f'%"{animal_id}%',),
+            (f'%"{animal_id}%', animal_id, animal_id),
         ).fetchall()
     out: list[dict] = []
-    max_iter = 8192
+    max_iter = 1_000_000                 # true runaway backstop, not a cap
+    session_match: dict[str, bool] = {}   # channel->animal test is per-session
     for i, r in enumerate(rows):
         assert i < max_iter, "labeled scan runaway"
-        # Precise animal match (the LIKE is loose).
-        names = store._channel_names_for_session(r["session_dir"])
-        match = False
-        for n in names:
-            if not isinstance(n, str) or not is_animal_channel(n):
-                continue
-            a, _ = split_animal_electrode(n)
-            if a == animal_id:
-                match = True
-                break
+        # Precise animal match (the LIKE is loose), cached per session_dir --
+        # channel_names comes from the row's JOIN, no per-row DB round-trip.
+        sdir = r["session_dir"]
+        match = session_match.get(sdir)
+        if match is None:
+            match = False
+            try:
+                names = json.loads(r["channel_names"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                names = []
+            for n in names:
+                if isinstance(n, str) and is_animal_channel(n):
+                    a, _ = split_animal_electrode(n)
+                    if a == animal_id:
+                        match = True
+                        break
+            session_match[sdir] = match
         if not match:
             continue
         truth = file_ground_truth(r["status"], r["markers_json"])
@@ -1058,10 +1073,19 @@ def scan_for_animal(store, job_id: int,
     done = 0
 
     def _work(f):
-        channel = animal_channel_index(
-            store, f["session_dir"], animal_id, electrode)
         npk = None
         auc_pos = None
+        # Channel resolve hits the DB (electrodes_for_animal_in_session) and
+        # can raise under WAL contention on a big scan -- keep it INSIDE the
+        # guard so one bad file/transient error doesn't propagate out of the
+        # pool and abort the whole scan (_run_file_pool re-raises fut.result()).
+        try:
+            channel = animal_channel_index(
+                store, f["session_dir"], animal_id, electrode)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mass_analyze channel resolve file=%s failed: %s",
+                            f["file_id"], e)
+            return (None, None)
         try:
             npk = get_or_compute_peak_count(
                 store, int(f["file_id"]), channel, cutoff,
@@ -1584,16 +1608,18 @@ def run_screen_benchmark(store, job_id: int,
     done = 0
 
     def _work(f):
-        channel = animal_channel_index(
-            store, f["session_dir"], animal_id, electrode)
+        # Guard the channel resolve too -- it hits the DB and must not raise
+        # out of the pool (see scan_for_animal._work).
         try:
+            channel = animal_channel_index(
+                store, f["session_dir"], animal_id, electrode)
             env_pos, auc_pos = screen_file(
                 store, int(f["file_id"]), channel,
                 peak_cutoff, auc_threshold, auc_window,
                 min_peak_dist_sec=min_peak_dist_sec)
         except Exception as e:
-            logger.warning("benchmark file=%s ch=%s failed: %s",
-                            f["file_id"], channel, e)
+            logger.warning("benchmark file=%s failed: %s",
+                            f["file_id"], e)
             return None
         return (env_pos, auc_pos, f["truth"] == "pos")
 
@@ -1709,6 +1735,27 @@ def start_worker(store, config: dict) -> None:
     logger.info("mass_analyze worker started")
 
 
+def _guarded_job(store, table: str, job_id: int, fn) -> None:
+    """Run a job body; on ANY unhandled exception flip the row to 'failed'
+    (WHERE status='running') so a crash can't leave it stuck at 'running' until
+    the next daemon restart (active_job_for_animal would keep re-surfacing a
+    dead job and the UI progress poll would spin forever). Never re-raises."""
+    assert table in ("mass_analyze_job", "screen_eval_job"), "known table"
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 -- worker must survive one bad job
+        logger.exception("%s %s crashed", table, job_id)
+        try:
+            with store.connection() as conn:
+                conn.execute(
+                    f"UPDATE {table} SET status='failed', error=?, "
+                    "finished_at=? WHERE id=? AND status='running'",
+                    (str(e)[:500], datetime.now().isoformat(), int(job_id)))
+                conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("could not fail-mark %s %s", table, job_id)
+
+
 def _worker_loop(store) -> None:
     interval = 2.0
     max_iter = 10 ** 9
@@ -1725,7 +1772,9 @@ def _worker_loop(store) -> None:
                        ORDER BY created_at ASC LIMIT 1"""
                 ).fetchone()
             if row is not None:
-                scan_for_animal(store, int(row["id"]))
+                _guarded_job(store, "mass_analyze_job", int(row["id"]),
+                             lambda rid=int(row["id"]):
+                             scan_for_animal(store, rid))
                 continue
             # No scan pending -- look for a benchmark job.
             with store.connection() as conn:
@@ -1735,7 +1784,9 @@ def _worker_loop(store) -> None:
                        ORDER BY created_at ASC LIMIT 1"""
                 ).fetchone()
             if brow is not None:
-                run_screen_benchmark(store, int(brow["id"]))
+                _guarded_job(store, "screen_eval_job", int(brow["id"]),
+                             lambda bid=int(brow["id"]):
+                             run_screen_benchmark(store, bid))
                 continue
             # Low-priority background auto-filter sweep (interactive scans
             # above drain first). Runs every _AUTO_FILTER_INTERVAL seconds.

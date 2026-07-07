@@ -73,6 +73,22 @@ def test_own_review_removes_file_from_pending(tmp_path):
     assert ma.count_pending_for_animal(s, "BCH900") == 2
 
 
+def test_labeled_files_uses_this_animals_ground_truth(tmp_path):
+    # Multi-animal recording: BCH900 said 'no events' (neg), cage-mate BCH901
+    # said 'events' (pos) on the SAME file. The screen benchmark for BCH900
+    # must grade against BCH900's verdict, not BCH901's (the pre-fix MAX
+    # subquery wasn't animal-scoped and picked whichever review was latest).
+    s = _store(tmp_path, n_files=1)
+    # BCH901 reviews first (pos), BCH900 later (neg) -> BCH900's is the latest.
+    s.mark_review(1, "rev@lab", "has_events",
+                  markers=[{"EO_sec": 5.0}], animal_id="BCH901")
+    s.mark_review(1, "rev@lab", "no_events", markers=[], animal_id="BCH900")
+    lf900 = ma.labeled_files_for_animal(s, "BCH900")
+    lf901 = ma.labeled_files_for_animal(s, "BCH901")
+    assert [(r["file_id"], r["truth"]) for r in lf900] == [(1, "neg")]
+    assert [(r["file_id"], r["truth"]) for r in lf901] == [(1, "pos")]
+
+
 def test_large_animal_does_not_crash_the_post_filter(tmp_path):
     # >4096 files (the old max_iter) for one animal must not crash
     # pending_files_for_animal; it should return them all.

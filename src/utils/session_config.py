@@ -64,6 +64,23 @@ def discover_session_config(mat_path: str) -> SessionConfig:
 
     try:
         data = scipy.io.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
+    except NotImplementedError:
+        # v7.3 (HDF5-format) .mat -- scipy raises NotImplementedError. The old
+        # broad `except` swallowed this and returned an EMPTY config, silently
+        # mis-labelling every channel for the session. Mirror mat_loader's
+        # fallback, and if fnstr still can't be decoded, fail LOUDLY.
+        try:
+            from src.utils.mat_loader import _load_hdf5
+            data = _load_hdf5(mat_path)
+        except Exception as e:  # noqa: BLE001
+            logger.error("v7.3 .mat auto-discovery failed for %s: %s",
+                         mat_path, e)
+            return config
+        if "fnstr" not in data:
+            logger.error("v7.3 .mat %s has no decodable fnstr -- channel "
+                         "names/roles could NOT be auto-discovered (channels "
+                         "would be mislabelled); skipping.", mat_path)
+            return config
     except Exception as e:
         logger.warning("Failed to load %s for auto-discovery: %s", mat_path, e)
         return config

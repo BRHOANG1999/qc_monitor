@@ -241,6 +241,22 @@ class AlertRuleEngine:
             logger.debug("Alert rate-limited: %s", alert_type)
             return
 
+        # Record it for the UI alerts log regardless (this also sets the
+        # rate-limit clock -- an occurrence is an occurrence). But CHECK the
+        # email result: send() returns False when disabled/misconfigured or on
+        # SMTP failure, and silently ignoring that meant a failed CRITICAL
+        # alert email went nowhere with no trace. Log the failure loudly.
         self.store.insert_alert(alert_type, severity, message, file_id, session_dir)
-        self.emailer.send(f"{alert_type}: {message[:80]}", message, severity)
-        logger.warning("Alert fired [%s/%s]: %s", severity, alert_type, message)
+        try:
+            ok = self.emailer.send(
+                f"{alert_type}: {message[:80]}", message, severity)
+        except Exception as e:  # noqa: BLE001 -- alerting must not crash the loop
+            ok = False
+            logger.error("Alert email raised [%s/%s]: %s (%s)",
+                         severity, alert_type, message, e)
+        if ok:
+            logger.warning("Alert fired [%s/%s]: %s",
+                           severity, alert_type, message)
+        else:
+            logger.error("Alert recorded but email NOT sent [%s/%s]: %s",
+                         severity, alert_type, message)

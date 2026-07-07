@@ -3018,7 +3018,8 @@ class Store:
             rows = conn.execute(
                 """SELECT pf.id AS file_id, pf.session_dir,
                           pf.file_path, pf.chunk_datetime,
-                          pf.duration_sec, rs.markers_json
+                          pf.duration_sec, rs.markers_json,
+                          sc.channel_names AS channel_names
                    FROM processed_files pf
                    JOIN session_config sc
                      ON sc.session_dir = pf.session_dir
@@ -3035,19 +3036,31 @@ class Store:
             ).fetchall()
         finally:
             conn.close()
+        # Precise animal match (the LIKE is loose), cached per session_dir --
+        # channel_names rides on the JOIN, so no per-row connection (the old
+        # _channel_names_for_session-per-row was an N+1 of connect+pragma).
         out: list[dict] = []
+        session_match: dict[str, bool] = {}
         for r in rows:
-            names = self._channel_names_for_session(r["session_dir"])
-            match = False
-            for n in names:
-                if not isinstance(n, str) or not is_animal_channel(n):
-                    continue
-                a, _ = split_animal_electrode(n)
-                if a == animal_id:
-                    match = True
-                    break
+            sdir = r["session_dir"]
+            match = session_match.get(sdir)
+            if match is None:
+                match = False
+                try:
+                    names = json.loads(r["channel_names"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    names = []
+                for n in names:
+                    if isinstance(n, str) and is_animal_channel(n):
+                        a, _ = split_animal_electrode(n)
+                        if a == animal_id:
+                            match = True
+                            break
+                session_match[sdir] = match
             if match:
-                out.append(dict(r))
+                d = dict(r)
+                d.pop("channel_names", None)   # internal; not part of the API
+                out.append(d)
         return out
 
     def flagged_files(self, *, statuses: tuple = ("needs_scoring",),
