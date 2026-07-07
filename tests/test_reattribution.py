@@ -109,6 +109,35 @@ def test_reattribute_rejects_animal_not_in_recording(tmp_path):
     assert st == "needs_scoring"
 
 
+def test_reattribute_is_atomic_on_failure(tmp_path, monkeypatch):
+    # A failure PART-WAY through the move must roll back entirely -- no new
+    # to-animal row, from-animal NOT retired (the double-attribution bug).
+    s = _store(tmp_path)
+    s.mark_review(4213, "rev@lab", "needs_scoring",
+                  markers=[{"EO_sec": 1.0, "racine": 2}], animal_id="BCH061")
+    real = s._insert_review_event_conn
+    calls = {"n": 0}
+
+    def boom(conn, *a, **k):
+        calls["n"] += 1
+        # Let the two mark_review event-inserts through; blow up on the final
+        # 'reattribute' provenance event.
+        if a and a[2] == "reattribute":
+            raise RuntimeError("simulated crash mid-reattribute")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(s, "_insert_review_event_conn", boom)
+    import pytest
+    with pytest.raises(RuntimeError):
+        s.reattribute_review(4213, "BCH061", "BCH062", "pi@lab")
+    # Rolled back: BCH061 still needs_scoring, BCH062 has NOTHING.
+    st061, ev061 = _latest_status(s, 4213, "BCH061")
+    st062, _ = _latest_status(s, 4213, "BCH062")
+    assert st061 == "needs_scoring"
+    assert [e["EO_sec"] for e in ev061] == [1.0]
+    assert st062 is None
+
+
 def test_reattribute_noop_same_animal_and_missing_source(tmp_path):
     s = _store(tmp_path)
     assert s.reattribute_review(4213, "BCH061", "BCH061", "pi@lab") is False

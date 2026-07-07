@@ -48,9 +48,31 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode=WAL is a PERSISTENT property of the database file, so it
+        # is set ONCE in _init_db -- re-declaring it on every connect was a
+        # checkpoint-triggering write that cost ~7x the rest of connect+close
+        # for zero benefit. foreign_keys is per-connection and MUST stay here.
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    @contextmanager
+    def transaction(self):
+        """A single connection with an explicit BEGIN..COMMIT (rollback on
+        error). Use for multi-statement writes that must be atomic -- e.g. a
+        review_state change plus its audit event, or moving a review between
+        animals -- so a crash / WAL-lock mid-way can't leave half-applied
+        state. sqlite3's implicit-BEGIN is deferred and unpredictable, hence
+        the explicit BEGIN."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @contextmanager
     def connection(self):
@@ -72,6 +94,14 @@ class Store:
 
     def _init_db(self):
         conn = self._connect()
+        try:
+            # Declare WAL ONCE (persistent in the DB header thereafter).
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._init_db_schema(conn)
+        finally:
+            conn.close()   # never leak the handle if a migration raises
+
+    def _init_db_schema(self, conn):
         conn.executescript(SCHEMA_SQL)
         # Idempotent forward-compat migrations: add columns to old DBs
         # that pre-date the audit-trail work.
@@ -237,8 +267,7 @@ class Store:
                              "ADD COLUMN filename TEXT")
         except Exception:
             pass  # brand-new DB: SCHEMA_SQL already created the columns
-        conn.commit()
-        conn.close()
+        conn.commit()   # connection closed by _init_db's finally
 
     def _migrate_review_state_pi_statuses(self, conn) -> None:
         """Promote pre-existing review_state rows to the PI flow.
@@ -2580,6 +2609,21 @@ class Store:
         finally:
             conn.close()
 
+    def _insert_review_event_conn(self, conn, file_id: int, user_email: str,
+                                   action: str, payload: dict | None = None,
+                                   animal_id: str | None = None) -> int:
+        """review_event_log INSERT on an EXISTING connection (no commit/close)
+        -- the atomic building block that transaction()-composed writes reuse
+        so a review change + its audit event land together or not at all."""
+        cur = conn.execute(
+            """INSERT INTO review_event_log
+               (file_id, user_email, action, payload_json, animal_id, at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (int(file_id), user_email.lower(), action,
+             json.dumps(payload or {}), (animal_id or None),
+             datetime.now().isoformat()))
+        return int(cur.lastrowid)
+
     def insert_review_event(self, file_id: int, user_email: str,
                               action: str,
                               payload: dict | None = None,
@@ -2593,21 +2637,9 @@ class Store:
         assert isinstance(file_id, int), "file_id must be int"
         assert user_email, "user_email required"
         assert action, "action required"
-        now = datetime.now().isoformat()
-        conn = self._connect()
-        try:
-            cur = conn.execute(
-                """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json,
-                    animal_id, at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (file_id, user_email.lower(), action,
-                 json.dumps(payload or {}), (animal_id or None), now),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
-        finally:
-            conn.close()
+        with self.transaction() as conn:
+            return self._insert_review_event_conn(
+                conn, file_id, user_email, action, payload, animal_id)
 
     def mark_review(self, file_id: int, user_email: str,
                      status: str,
@@ -2636,6 +2668,18 @@ class Store:
                            "pi_approved", "pi_flagged",
                            "needs_scoring"), \
             f"bad status {status!r}"
+        with self.transaction() as conn:
+            return self._mark_review_conn(
+                conn, file_id, user_email, status,
+                markers=markers, note=note, animal_id=animal_id)
+
+    def _mark_review_conn(self, conn, file_id: int, user_email: str,
+                           status: str, markers: list[dict] | None = None,
+                           note: str | None = None,
+                           animal_id: str | None = None) -> int:
+        """review_state INSERT + matching audit event on an EXISTING connection
+        (no commit/close). The atomic core of mark_review; call it inside a
+        transaction() when composing with other writes (e.g. reattribute)."""
         now = datetime.now().isoformat()
         markers_json = json.dumps(markers or [])
         animal = (animal_id or None)
@@ -2644,30 +2688,18 @@ class Store:
                        else "pi_flag" if status == "pi_flagged"
                        else "quick_flag" if status == "needs_scoring"
                        else "finish")
-        conn = self._connect()
-        try:
-            cur = conn.execute(
-                """INSERT INTO review_state
-                   (file_id, user_email, status, markers_json,
-                    note, animal_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (file_id, user_email.lower(), status, markers_json,
-                 note, animal, now, now),
-            )
-            conn.execute(
-                """INSERT INTO review_event_log
-                   (file_id, user_email, action, payload_json,
-                    animal_id, at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (file_id, user_email.lower(), log_action,
-                 json.dumps({"status": status,
-                              "n_markers": len(markers or [])}),
-                 animal, now),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
-        finally:
-            conn.close()
+        cur = conn.execute(
+            """INSERT INTO review_state
+               (file_id, user_email, status, markers_json,
+                note, animal_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (int(file_id), user_email.lower(), status, markers_json,
+             note, animal, now, now))
+        self._insert_review_event_conn(
+            conn, file_id, user_email, log_action,
+            {"status": status, "n_markers": len(markers or [])},
+            animal_id=animal)
+        return int(cur.lastrowid)
 
     # ------------------------------------------------------------------ #
     # Soft-claim: file_claim table (see schema.py). Keeps two reviewers
@@ -3592,16 +3624,22 @@ class Store:
         old_note = src["note"] or ""
         new_note = ((f"{old_note} · " if old_note else "")
                     + f"re-attributed from {from_animal}")[:280]
-        # New row for the correct animal (same status carries the events),
-        # then retire the mis-filed row so it drops out of that animal's pool.
-        self.mark_review(int(file_id), user_email, src["status"],
-                         markers=events, note=new_note, animal_id=to_animal)
-        self.mark_review(int(file_id), user_email, "abandoned", markers=[],
-                         note=f"re-attributed to {to_animal}",
-                         animal_id=from_animal)
-        self.insert_review_event(
-            int(file_id), user_email, "reattribute",
-            {"from": from_animal, "to": to_animal}, animal_id=to_animal)
+        # ATOMIC: new row for the correct animal + retire the mis-filed row +
+        # provenance event, all in ONE transaction. Previously these were 3
+        # separate commits, so a crash/WAL-lock between them could leave the
+        # review DOUBLE-attributed (from-animal not retired) -> double-counted
+        # in both pools and double-exported to CSV.
+        with self.transaction() as conn:
+            self._mark_review_conn(conn, int(file_id), user_email,
+                                   src["status"], markers=events,
+                                   note=new_note, animal_id=to_animal)
+            self._mark_review_conn(conn, int(file_id), user_email, "abandoned",
+                                   markers=[],
+                                   note=f"re-attributed to {to_animal}",
+                                   animal_id=from_animal)
+            self._insert_review_event_conn(
+                conn, int(file_id), user_email, "reattribute",
+                {"from": from_animal, "to": to_animal}, animal_id=to_animal)
         return True
 
     def _channel_names_for_session(self, session_dir: str
