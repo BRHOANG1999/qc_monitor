@@ -4015,22 +4015,31 @@ class Store:
         dur = "AND (pf.duration_sec IS NULL OR pf.duration_sec > ?)"
         conn = self._connect()
         try:
+            # One row per (file, animal) whose LATEST review is pi_approved --
+            # NOT grouped by file. A recording is multi-animal, and the seizure
+            # may live on a cage-mate's channel; aggregating the markers in
+            # Python (below) keeps has_seizure/rep honest across all animals,
+            # where a bare GROUP BY rs.file_id would read one arbitrary animal's
+            # (often empty) markers and mislabel the file as no-seizure.
             rows = conn.execute(
-                f"""SELECT rs.file_id, rs.markers_json, pf.session_dir,
+                f"""SELECT rs.file_id, rs.animal_id, rs.markers_json,
+                          pf.session_dir,
                           (SELECT MAX(ta.id) FROM training_attempt ta
                             WHERE ta.student_email=? AND ta.file_id=rs.file_id)
                             AS last_seen
                    FROM review_state rs
                    JOIN processed_files pf ON pf.id = rs.file_id
-                   WHERE rs.status='pi_approved' {dur}
-                   GROUP BY rs.file_id""",
+                   WHERE rs.status='pi_approved'
+                     AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
+                                  WHERE rs2.file_id = rs.file_id
+                                    AND (rs2.animal_id = rs.animal_id
+                                         OR (rs2.animal_id IS NULL
+                                             AND rs.animal_id IS NULL)))
+                     {dur}""",
                 (email, float(min_duration_sec))).fetchall()
         finally:
             conn.close()
-        out: list[dict] = []
-        for i, r in enumerate(rows):
-            assert i < 1_000_000, "candidate pool scan exceeds bound"
-            out.append(self._pool_row_labels(r, _real_events))
+        out = self._aggregate_pool_rows(rows, _real_events)
         # Historical scored events imported from the BHZ CSV exports
         # (src/utils/past_events.py) add practice candidates without going
         # through the live review pipeline. A real pi_approved row for the
@@ -4077,20 +4086,41 @@ class Store:
                         "last_seen": (int(ls) if ls is not None else None)})
         return out
 
-    def _pool_row_labels(self, r, real_events_fn) -> dict:
-        try:
-            events = json.loads(r["markers_json"] or "[]")
-        except (json.JSONDecodeError, TypeError):
-            events = []
-        real = real_events_fn(events)
-        rep = (max(real, key=lambda e: (e.get("racine") or 0))
-               if real else None)
-        ls = r["last_seen"]
-        return {"file_id": int(r["file_id"]), "has_seizure": bool(real),
-                "rep_type": (rep.get("type") if rep else None),
-                "rep_racine": (rep.get("racine") if rep else None),
-                "animals": self._animals_for_session(r["session_dir"]),
-                "last_seen": (int(ls) if ls is not None else None)}
+    def _aggregate_pool_rows(self, rows, real_events_fn) -> list[dict]:
+        """Collapse the per-(file, animal) latest-review rows into one pool
+        entry per file. has_seizure / rep are aggregated across ALL animals on
+        the file, so a multi-animal recording whose seizure belongs to one
+        cage-mate is never mislabelled no-seizure because another animal's
+        channel was blank. rep = highest-Racine real event across animals."""
+        by_file: dict[int, dict] = {}
+        order: list[int] = []
+        for i, r in enumerate(rows):
+            assert i < 1_000_000, "candidate pool scan exceeds bound"
+            fid = int(r["file_id"])
+            g = by_file.get(fid)
+            if g is None:
+                g = {"session_dir": r["session_dir"],
+                     "last_seen": r["last_seen"], "real": []}
+                by_file[fid] = g
+                order.append(fid)
+            try:
+                events = json.loads(r["markers_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                events = []
+            g["real"].extend(real_events_fn(events))
+        out: list[dict] = []
+        for fid in order:
+            g = by_file[fid]
+            real = g["real"]
+            rep = (max(real, key=lambda e: (e.get("racine") or 0))
+                   if real else None)
+            ls = g["last_seen"]
+            out.append({"file_id": fid, "has_seizure": bool(real),
+                        "rep_type": (rep.get("type") if rep else None),
+                        "rep_racine": (rep.get("racine") if rep else None),
+                        "animals": self._animals_for_session(g["session_dir"]),
+                        "last_seen": (int(ls) if ls is not None else None)})
+        return out
 
     def _animals_for_session(self, session_dir: str) -> list[str]:
         from src.utils.animal import (
@@ -4151,6 +4181,26 @@ class Store:
                 "started_after_id": int(row["started_after_id"]),
                 "files": json.loads(row["files_json"] or "[]"),
                 "examples": int(row["examples"])}
+
+    def prune_training_round(self, round_id: int,
+                              files: list[int]) -> None:
+        """Rewrite an open round's file list (and its example count) after
+        stale entries are dropped at serve time -- e.g. a stage 2/3 round
+        built when a file still read has-seizure, whose review was later
+        corrected to no-events. Only unanswered tail files should be removed;
+        the caller preserves the already-answered prefix."""
+        assert isinstance(round_id, int), "round_id must be int"
+        assert isinstance(files, list), "files must be a list"
+        ids = [int(f) for f in files]
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE training_round SET files_json=?, examples=? "
+                "WHERE id=?",
+                (json.dumps(ids), len(ids), int(round_id)))
+            conn.commit()
+        finally:
+            conn.close()
 
     def round_scores(self, student_email: str, stage: int,
                       started_after_id: int) -> list[float]:

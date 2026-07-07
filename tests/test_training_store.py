@@ -138,6 +138,88 @@ def test_candidate_pool_labels(tmp_path):
     assert set(pool[1]["animals"]) == {"BCH062", "BCH061"}
 
 
+def _approve_animal(store, file_id, animal, events, session="sessM"):
+    """A per-animal pi_approved review_state row (multi-animal recording)."""
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_files (id, file_path, "
+            "session_dir, duration_sec) VALUES (?, ?, ?, ?)",
+            (file_id, f"/f/{file_id}.mat", session, 3600.0))
+        conn.execute(
+            """INSERT INTO review_state
+               (file_id, user_email, status, animal_id, markers_json,
+                created_at, updated_at)
+               VALUES (?, 'pi@x', 'pi_approved', ?, ?, ?, ?)""",
+            (file_id, animal, json.dumps(events),
+             "2026-02-01T00:00:00", "2026-02-01T00:00:00"))
+        conn.commit()
+
+
+def test_candidate_pool_aggregates_seizure_across_animals(tmp_path):
+    # T2: a multi-animal recording whose seizure is on the SECOND animal must
+    # read has-seizure. A GROUP BY rs.file_id that picked animal 1's blank
+    # markers would mislabel it no-seizure and drop it from stage 2/3 rounds.
+    store = _store(tmp_path)
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO session_config (session_dir, channel_names, "
+            "eeg_channels, discovered_at) VALUES ('sessM', ?, ?, '2026-01-01')",
+            (json.dumps(["stimCopy", "BCH061SLM", "BCH062SR"]),
+             json.dumps([1])))
+        conn.commit()
+    _approve_animal(store, 7, "BCH061", [])                       # blank
+    _approve_animal(store, 7, "BCH062",
+                    [{"type": "HYP", "EO_sec": 4.0, "racine": 5}])  # seizure
+    pool = {c["file_id"]: c for c in store.training_candidate_pool("stu@x")}
+    assert pool[7]["has_seizure"] is True
+    assert pool[7]["rep_racine"] == 5 and pool[7]["rep_type"] == "HYP"
+
+
+def test_prune_training_round_rewrites_files_and_count(tmp_path):
+    store = _store(tmp_path)
+    for fid in (1, 2, 3):
+        _pf(store, fid)
+    r = store.create_training_round("stu@x", 2, [1, 2, 3])
+    store.prune_training_round(r["round_id"], [1, 3])
+    cur = store.current_training_round("stu@x", 2)
+    assert cur["files"] == [1, 3] and cur["examples"] == 2
+
+
+def test_next_valid_file_skips_stale_stage2(tmp_path):
+    # T1: a stage-2 round persisted with a file whose validated seizure was
+    # later cleared must skip+prune that file at serve time -- stage 2/3 must
+    # always have a seizure to score.
+    from src.dashboard.tabs.training import _next_valid_file
+    store = _store(tmp_path)
+    _approve_animal(store, 1, "BCH062",
+                    [{"type": "LVF", "EO_sec": 2.0, "racine": 3}])
+    _approve_animal(store, 2, "BCH062", [])          # stale: no seizure
+    _approve_animal(store, 3, "BCH062",
+                    [{"type": "HYP", "EO_sec": 9.0, "racine": 4}])
+    rnd = store.create_training_round("stu@x", 2, [1, 2, 3])
+    # idx 0 -> file 1 is valid, round untouched.
+    fid, rnd = _next_valid_file(store, 2, rnd, 0)
+    assert fid == 1 and rnd["files"] == [1, 2, 3]
+    # idx 1 -> file 2 stale, dropped; file 3 shifts into the slot.
+    fid, rnd = _next_valid_file(store, 2, rnd, 1)
+    assert fid == 3 and rnd["files"] == [1, 3] and rnd["examples"] == 2
+    assert store.current_training_round("stu@x", 2)["files"] == [1, 3]
+    # idx 2 -> nothing scoreable remains -> round ends.
+    fid, rnd = _next_valid_file(store, 2, rnd, 2)
+    assert fid is None
+
+
+def test_next_valid_file_keeps_negatives_in_stage1(tmp_path):
+    # Stage 1 is detection: a no-seizure example is a legitimate negative and
+    # must NOT be pruned.
+    from src.dashboard.tabs.training import _next_valid_file
+    store = _store(tmp_path)
+    _approve_animal(store, 1, "BCH062", [])          # negative
+    rnd = store.create_training_round("stu@x", 1, [1])
+    fid, rnd2 = _next_valid_file(store, 1, rnd, 0)
+    assert fid == 1 and rnd2["files"] == [1]
+
+
 def test_round_scoped_grade_reset_keeps_history(tmp_path):
     store = _store(tmp_path)
     for fid in (1, 2, 3):

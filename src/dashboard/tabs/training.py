@@ -325,6 +325,42 @@ def _resolve_for_load(store: Store, config: dict, file_id: int) -> None:
                        file_id, e)
 
 
+def _validated_events_for(store: Store, file_id: int):
+    """The validated (ground-truth) events for a file, resolved to the animal
+    carrying the seizure on a multi-animal recording (else the recording)."""
+    gt_animal = store.validated_seizure_animal_for_file(file_id)
+    if gt_animal is not None:
+        return store.validated_events_for_file(file_id, animal_id=gt_animal)
+    return store.validated_events_for_file(file_id)
+
+
+def _next_valid_file(store: Store, stage: int, rnd: dict, idx: int):
+    """The file_id to serve at position *idx*, skipping stage 2/3 examples
+    whose validated seizure was since cleared (a stale round persisted before
+    the review was corrected to no-events). Skipped, still-unanswered files are
+    pruned from the round. Returns (file_id, rnd'); file_id is None when nothing
+    scoreable remains -- the round then ends on what was actually scored."""
+    files = list(rnd["files"])
+    changed = False
+    max_iter, it = len(files) + 1, 0
+    while idx < len(files):
+        it += 1
+        assert it < max_iter + 1, "round scan exceeds bound"
+        # Stage 1 (detection) keeps negatives; stages 2/3 must have a real
+        # seizure -- gate on _real_events, same as the pool's has_seizure.
+        if stage == 1 or _grade._real_events(
+                _validated_events_for(store, int(files[idx]))):
+            break
+        files.pop(idx)          # drop the stale example; next file shifts in
+        changed = True
+    if changed:
+        store.prune_training_round(rnd["round_id"], files)
+        rnd = {**rnd, "files": files, "examples": len(files)}
+    if idx >= len(files):
+        return None, rnd
+    return int(files[idx]), rnd
+
+
 def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
                 config: dict | None = None):
     """('loaded', payload) for the next round example, ('complete', rnd) when
@@ -336,7 +372,10 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     idx = _round_idx(store, email, stage, rnd)
     if idx >= rnd["examples"]:
         return "complete", rnd
-    file_id = int(rnd["files"][idx])
+    file_id, rnd = _next_valid_file(store, stage, rnd, idx)
+    if file_id is None:
+        # Every remaining example went stale -- end on what was scored.
+        return "complete", rnd
     # Locate the EEG on disk now, only for this one file (lazy, cached).
     _resolve_for_load(store, config or {}, file_id)
     mat_path = _file_path_for_id(store, file_id)
