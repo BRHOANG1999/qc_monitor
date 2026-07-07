@@ -88,6 +88,21 @@ def test_parse_row_legacy_pipe_comment():
     assert ev["eeg_onset"] is True
 
 
+def test_seizure_type_maps_lvhf_to_lvf():
+    # The lab writes low-voltage onsets as "LVHF" (High-Frequency); "LVF" is
+    # NOT a substring of "LVHF", so it used to parse to None -> "?" and
+    # mis-grade a correct LVF. It must map to LVF.
+    assert pe._seizure_type("", ["LVHF"]) == "LVF"
+    assert pe._seizure_type("LVHF (Low Voltage High Frequency)", []) == "LVF"
+    assert pe._seizure_type("", ["HYP"]) == "HYP"
+    assert pe._seizure_type("", ["LVF"]) == "LVF"
+    # A real CSV comment lead token.
+    row = _norm(folder="Z:\\b\\", filename=_FN, fs="5000", Channel="3",
+                Peak_Index="10472908", Score="3",
+                Comment="LVHF | EEG-ONSET | Gradual, abrupt buildup.")
+    assert pe.parse_row(row, "leg.csv")["type"] == "LVF"
+
+
 def test_markers_for_event_seconds():
     ev = pe.parse_row(_norm(filename=_FN, fs="20000", Channel="5",
                             Peak_Index="1", Score="4", Onset="LVF",

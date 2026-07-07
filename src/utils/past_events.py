@@ -139,10 +139,17 @@ def _to_int(val) -> int | None:
 
 def _seizure_type(onset: str, comment_parts: list[str]) -> str | None:
     """LVF/HYP from the new-format ``Onset`` column or the legacy pipe-
-    delimited ``Comment`` ("HYP | EEG-ONSET | ...")."""
+    delimited ``Comment`` ("HYP | EEG-ONSET | ...").
+
+    The lab writes low-voltage onsets as "LVHF" (Low-Voltage High-Frequency);
+    the app's canonical label is "LVF" (Low-Voltage Fast) -- the SAME onset
+    pattern. "LVHF" does not contain the substring "LVF" (the H splits it), so
+    without an explicit case it parsed to None -> stored as no type -> rendered
+    "?" AND mis-graded a student who correctly picked LVF. Map every low-voltage
+    spelling to LVF."""
     hay = onset or (comment_parts[0] if comment_parts else "")
     up = hay.upper()
-    if "LVF" in up:
+    if "LVHF" in up or "LVF" in up or "LVH" in up:
         return "LVF"
     if "HYP" in up:
         return "HYP"
