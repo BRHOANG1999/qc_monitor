@@ -798,31 +798,26 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
 
 
 def add_click_catcher(fig) -> None:
-    """Make the ENTIRE plot column clickable, not just the ~1px signal line.
+    """Make the signal a FAT click target so "Set on plot" reliably registers.
 
-    Plotly emits clickData only when the pointer hits a line/marker, so a click
-    in the empty space above/below the trace at a given time fired nothing --
-    the "Set on plot: click does nothing" complaint. This lays a transparent,
-    full-height bar at every sample x (centered on t[i], width = one sample), so
-    a click ANYWHERE in that column returns t[i] -- identical precision to
-    hitting the line. hoverinfo='skip' keeps it out of the unified hover, and it
-    spans only the data's own y-range so the axis doesn't rescale. Mutates *fig*
-    in place; a no-op if the primary trace has no usable data."""
+    Plotly emits clickData only when the pointer lands on the ~1px WebGL line,
+    so clicks kept missing it. Overlay a transparent, WIDE (~16px) Scattergl
+    line on the SAME points as the signal: a click anywhere along the trace path
+    now returns that exact sample time -- and the red onset line lands where you
+    clicked. Critically this is ONE lightweight WebGL trace, not a bar per sample
+    (thousands of SVG rects, which froze the tab under the 10 Hz cursor redraw).
+    hoverinfo='skip' keeps it out of the unified hover. Mutates *fig* in place;
+    a no-op if the primary trace has no usable data."""
     try:
         base = fig.data[0]
-        xs = [v for v in (base.x if base.x is not None else [])]
-        ys = [v for v in (base.y if base.y is not None else [])
-              if v is not None]
-    except (IndexError, AttributeError, TypeError):
+        xs, ys = base.x, base.y
+    except (IndexError, AttributeError):
         return
-    if len(xs) < 2 or not ys:
+    if xs is None or ys is None or len(xs) < 2:
         return
-    ymin, ymax = float(min(ys)), float(max(ys))
-    height = (ymax - ymin) or 1.0
-    dx = (float(xs[-1]) - float(xs[0])) / (len(xs) - 1)   # uniform decimation
-    fig.add_trace(go.Bar(
-        x=xs, y=[height] * len(xs), base=ymin, width=dx,
-        marker=dict(color="rgba(0,0,0,0)", line=dict(width=0)),
+    fig.add_trace(go.Scattergl(
+        x=xs, y=ys, mode="lines",
+        line=dict(color="rgba(0,0,0,0)", width=16),
         hoverinfo="skip", showlegend=False, name="_click_catcher"))
 
 
