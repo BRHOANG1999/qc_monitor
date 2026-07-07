@@ -359,22 +359,30 @@ def pending_files_for_animal(store, animal_id: str,
             params,
         ).fetchall()
     # Post-filter: the LIKE is loose ("BCH062" would also match
-    # "BCH0620"); use the parser to be precise.
+    # "BCH0620"); use the parser to be precise. The channel->animal test only
+    # depends on the SESSION, so cache it per session_dir -- an animal with
+    # months of recordings shares a handful of sessions across thousands of
+    # files, and re-querying per row is a needless N+1.
+    # max_iter is a TRUE runaway backstop (far above any real file count), not
+    # a functional cap -- the old 4096 turned a valid large result into a crash
+    # for long-recorded animals like BCH040. rows is already a finite fetched
+    # list, so this only guards against absurd sizes.
     out: list[dict] = []
-    max_iter = 4096
+    max_iter = 1_000_000
+    session_match: dict[str, bool] = {}
     for i, r in enumerate(rows):
         assert i < max_iter, "row scan runaway"
-        names = store._channel_names_for_session(r["session_dir"])
-        match = False
-        for n in names:
-            if not isinstance(n, str):
-                continue
-            if not is_animal_channel(n):
-                continue
-            a, _ = split_animal_electrode(n)
-            if a == animal_id:
-                match = True
-                break
+        sdir = r["session_dir"]
+        match = session_match.get(sdir)
+        if match is None:
+            match = False
+            for n in store._channel_names_for_session(sdir):
+                if isinstance(n, str) and is_animal_channel(n):
+                    a, _ = split_animal_electrode(n)
+                    if a == animal_id:
+                        match = True
+                        break
+            session_match[sdir] = match
         if match:
             out.append(dict(r))
     return out
@@ -654,6 +662,13 @@ def count_pending_for_animal(store, animal_id: str) -> int:
     the lab uses; if the counter ever overcounts it's a small UX
     bug, not a correctness issue (the actual scan still walks the
     precise list).
+
+    CRITICAL: the review_state / file_claim exclusions are scoped to
+    *animal_id* (or a legacy whole-file NULL/'' row) -- review is per-(file,
+    animal). Every recording here is MULTI-ANIMAL, so an unscoped exclusion
+    (any animal's terminal review hides the file) collapses the count to ~0
+    for a lightly-reviewed animal whose cage-mates are heavily reviewed. This
+    must match ``pending_files_for_animal`` exactly.
     """
     assert isinstance(animal_id, str) and animal_id, \
         "animal_id required"
@@ -667,6 +682,7 @@ def count_pending_for_animal(store, animal_id: str) -> int:
                  AND NOT EXISTS (
                    SELECT 1 FROM review_state rs
                    WHERE rs.file_id = pf.id
+                     AND (rs.animal_id = ? OR rs.animal_id IS NULL)
                      AND rs.status IN (
                          'claimed', 'no_events', 'has_events',
                          'abandoned', 'pending_pi_review',
@@ -677,9 +693,11 @@ def count_pending_for_animal(store, animal_id: str) -> int:
                  AND NOT EXISTS (
                    SELECT 1 FROM file_claim fc
                    WHERE fc.file_id = pf.id
+                     AND (fc.animal_id = ? OR fc.animal_id = '')
                      AND fc.claimed_at >= ?
                  )""",
-            (f'%"{animal_id}%', store.claim_cutoff_iso()),
+            (f'%"{animal_id}%', animal_id, animal_id,
+             store.claim_cutoff_iso()),
         ).fetchone()
     return int(row["n"]) if row else 0
 
