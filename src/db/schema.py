@@ -461,6 +461,11 @@ CREATE INDEX IF NOT EXISTS idx_review_event_log_at
     ON review_event_log(at);
 CREATE INDEX IF NOT EXISTS idx_review_event_log_user
     ON review_event_log(user_email);
+-- Covers the "Flag" queue's EXISTS(auto_filter_flag for this animal on this
+-- file) and auto_filter_flagged_file_ids' (action, animal_id -> file_id) scan,
+-- which otherwise full-scan review_event_log per candidate file.
+CREATE INDEX IF NOT EXISTS idx_review_event_log_action_animal_file
+    ON review_event_log(action, animal_id, file_id);
 
 -- ----------------------------------------------------------------------
 -- file_claim: soft-lock so two reviewers don't double-score the same
