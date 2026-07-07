@@ -838,18 +838,28 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                int(current.get("channel") or 0),
                                mode or "hilbert")
 
-    # ---- Stage-dependent scoring form ---- #
+    # ---- Stage-dependent scoring form + detection-radio visibility ---- #
     @app.callback(
         Output("training-form", "children"),
+        Output("training-detect-wrap", "style"),
         Input("training-stage", "value"),
         Input("training-events", "data"),
     )
     def _render_form(stage, events):
-        # The stage-1 detection radio is permanent in the layout (toggled by
-        # _toggle_impression), so for stage 1 this form area is empty.
+        # The stage-1 detection radio is a PERMANENT component (its selection
+        # survives event re-renders); this callback only toggles its wrapper's
+        # visibility. Visibility is co-emitted WITH the form -- NOT a separate
+        # stage-only callback -- because the Training tab is rebuilt on every
+        # tab switch (render_tab) and training-stage is persistent: after a
+        # remount Dash restores the stage value but does NOT reliably re-fire a
+        # single-input callback, which left the detect radio visible in stage 2
+        # (form showed stage 2, radio stayed stage 1). Emitting both here keeps
+        # them in lockstep, since this callback also fires on training-events
+        # (set on every example load).
         stage = int(stage or 1)
+        detect_style = {} if stage == 1 else {"display": "none"}
         if stage == 1:
-            return ""
+            return "", detect_style
         # Stages 2 / 3: event rows + add button. NB: this deliberately does
         # NOT depend on training-armed-landmark -- arming updates only the
         # separate banner (below), so the event rows aren't rebuilt on every
@@ -865,7 +875,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         "marginBottom": SPACE_2})]),
             button("+ Add event", "training-add-btn", variant="secondary",
                    style={"marginTop": SPACE_2}),
-        ])
+        ]), detect_style
 
     # Armed-landmark banner -- its own output so arming doesn't rebuild the
     # event rows (see the training-arm-banner comment in the layout).
@@ -881,14 +891,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             f"{armed['field']} for Event {int(armed.get('idx', 0)) + 1}.",
             style={"color": COLOR_ACCENT, "fontSize": FONT_SIZE_CAPTION,
                    "fontWeight": "600", "marginBottom": SPACE_2})
-
-    # ---- Show the detection radio for stage 1 only ---- #
-    @app.callback(
-        Output("training-detect-wrap", "style"),
-        Input("training-stage", "value"),
-    )
-    def _toggle_impression(stage):
-        return ({} if int(stage or 1) == 1 else {"display": "none"})
 
     # ---- Reset the detection answer when a new example loads ---- #
     @app.callback(
