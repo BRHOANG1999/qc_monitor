@@ -114,6 +114,52 @@ def test_mixed_verdicts_count_and_classify(tmp_path, monkeypatch):
     assert r["reasons"] == {"env_only": 1, "auc_only": 1, "both": 1}
 
 
+def _screen_ok(s, aid, cfg):
+    return {"n_cleared": 0, "n_flagged": 0, "n_newly_flagged": 0,
+            "n_error": 0, "pool": 0, "reasons": {}}
+
+
+def test_has_pending_interactive_job(tmp_path):
+    store = _store(tmp_path, [])
+    assert ma._has_pending_interactive_job(store) is False
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO mass_analyze_job (pi_email, animal_id, cutoff, "
+            "status, created_at) VALUES ('pi@x','BCH1',0.05,'pending','t')")
+        conn.commit()
+    assert ma._has_pending_interactive_job(store) is True
+
+
+def test_sweep_yields_to_interactive_job(tmp_path, monkeypatch):
+    # The sweep must preempt itself between animals when an interactive scan
+    # lands, so a user-requested Mass Analyze never waits out the whole sweep.
+    store = _store(tmp_path, [])
+    cfgs = [{"animal_id": f"BCH{n}"} for n in (1, 2, 3)]
+    monkeypatch.setattr(store, "list_animal_screen_configs",
+                        lambda enabled_only=True: cfgs)
+    seen: list[str] = []
+
+    def fake_screen(s, aid, cfg):
+        seen.append(aid)
+        return _screen_ok(s, aid, cfg)
+
+    monkeypatch.setattr(ma, "auto_screen_for_animal", fake_screen)
+    r = ma._run_auto_filter_sweep(store,
+                                  should_yield=lambda: len(seen) >= 1)
+    assert r["yielded"] is True
+    assert seen == ["BCH1"]        # stopped after one, didn't sweep all three
+
+
+def test_sweep_completes_without_yield(tmp_path, monkeypatch):
+    store = _store(tmp_path, [])
+    cfgs = [{"animal_id": f"BCH{n}"} for n in (1, 2)]
+    monkeypatch.setattr(store, "list_animal_screen_configs",
+                        lambda enabled_only=True: cfgs)
+    monkeypatch.setattr(ma, "auto_screen_for_animal", _screen_ok)
+    r = ma._run_auto_filter_sweep(store, should_yield=lambda: False)
+    assert r["yielded"] is False and r["animals"] == 2
+
+
 def test_disabled_and_no_threshold_are_noops(tmp_path):
     store = _store(tmp_path, [])
     off = ma.auto_screen_for_animal(store, "BCH111",

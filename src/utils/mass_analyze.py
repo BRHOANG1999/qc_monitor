@@ -1430,20 +1430,46 @@ def kick_auto_screen_for_animal(store, animal_id: str) -> None:
                      name=f"qc-autofilter-{animal_id}").start()
 
 
-def _run_auto_filter_sweep(store) -> dict:
+def _has_pending_interactive_job(store) -> bool:
+    """True when a user-requested scan or benchmark is waiting. The background
+    sweep yields to it so an interactive Mass Analyze never queues behind the
+    whole sweep (which can run minutes across many animals)."""
+    try:
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM mass_analyze_job WHERE status='pending' "
+                "UNION ALL "
+                "SELECT 1 FROM screen_eval_job WHERE status='pending' "
+                "LIMIT 1").fetchone()
+        return row is not None
+    except Exception:  # noqa: BLE001 -- absence of the table means no jobs
+        return False
+
+
+def _run_auto_filter_sweep(store, should_yield=None) -> dict:
     """Sweep every enabled animal_screen_config. Bounded, single-threaded
     inside the worker loop; idempotent (pending_files_for_animal excludes
-    already-cleared files)."""
+    already-cleared files, so a yielded sweep resumes cleanly next cycle).
+
+    *should_yield* (called between animals) lets an interactive scan preempt
+    the sweep: when it returns True the sweep stops early with yielded=True and
+    the worker loop drains the interactive job before resuming."""
     try:
         configs = store.list_animal_screen_configs(enabled_only=True)
     except Exception:  # noqa: BLE001 -- table may be missing on a brand-new DB
-        return {"animals": 0, "n_cleared": 0, "n_flagged": 0, "n_error": 0}
+        return {"animals": 0, "n_cleared": 0, "n_flagged": 0, "n_error": 0,
+                "yielded": False}
     totals = {"animals": 0, "n_cleared": 0, "n_flagged": 0,
-              "n_newly_flagged": 0, "n_error": 0, "pool": 0}
+              "n_newly_flagged": 0, "n_error": 0, "pool": 0, "yielded": False}
     per_animal: dict = {}
     max_iter = len(configs) + 1
     for i, cfg in enumerate(configs):
         assert i < max_iter, "sweep loop runaway"
+        # Preempt for a user-requested scan: yield the worker between animals
+        # (and before the first) so interactive work is never blocked.
+        if should_yield is not None and should_yield():
+            totals["yielded"] = True
+            break
         aid = cfg["animal_id"]
         try:
             r = auto_screen_for_animal(store, aid, cfg)
@@ -1788,12 +1814,18 @@ def _worker_loop(store) -> None:
                 continue
             # Low-priority background auto-filter sweep (interactive scans
             # above drain first). Runs every _AUTO_FILTER_INTERVAL seconds.
+            # The sweep yields between animals when an interactive job lands, so
+            # a user scan never waits out the whole sweep; a yielded sweep keeps
+            # last_sweep unmoved and resumes on the next idle cycle.
             now = time.monotonic()
             if (_AUTO_FILTER_ENABLED
                     and now - last_sweep >= _AUTO_FILTER_INTERVAL):
-                last_sweep = now
-                _run_auto_filter_sweep(store)
-                continue
+                res = _run_auto_filter_sweep(
+                    store,
+                    should_yield=lambda: _has_pending_interactive_job(store))
+                if not res.get("yielded"):
+                    last_sweep = now      # completed -> wait a full interval
+                continue                  # yielded -> re-check jobs immediately
             _wake.wait(timeout=interval)
             _wake.clear()
         except Exception:
