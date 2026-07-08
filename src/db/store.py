@@ -3141,6 +3141,24 @@ class Store:
                 out.append(d)
         return out
 
+    def animals_with_needs_scoring(self) -> list[str]:
+        """Distinct animals with >=1 file whose LATEST review is needs_scoring
+        (the quick-flag pool). A DB fallback for the Video Review animal picker
+        so a Google-Sheets assignment hiccup or reassignment can never hide an
+        animal that still has real scoring work queued."""
+        latest = self._sql_latest_row_correlated("rs.file_id")
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""SELECT DISTINCT rs.animal_id
+                    FROM review_state rs
+                    WHERE rs.status = 'needs_scoring'
+                      AND rs.animal_id IS NOT NULL
+                      AND {latest}""").fetchall()
+        finally:
+            conn.close()
+        return sorted(r["animal_id"] for r in rows if r["animal_id"])
+
     def flagged_files(self, *, statuses: tuple = ("needs_scoring",),
                        limit: int = 500) -> list[dict]:
         """Files whose LATEST review_state status is in *statuses* (default the

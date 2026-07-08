@@ -3593,6 +3593,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "label": a,
                     "value": f"_pool_{a}",
                 })
+        # DB fallback: an animal with real needs_scoring work must ALWAYS be
+        # pickable, even if the Google Sheet dropped it (reassigned to someone
+        # else, or the warmer cache missed so it fell out of BOTH my_animals AND
+        # the unassigned pool). Without this, a reviewer gets locked out of
+        # finishing onsets they already flagged -- the "animal vanished from the
+        # picker" bug that stranded 58 BCH062 files mid-scoring.
+        try:
+            need_work = store.animals_with_needs_scoring()
+        except Exception as e:  # noqa: BLE001 -- fallback must never break picker
+            logger.debug("needs-scoring picker fallback failed: %s", e)
+            need_work = []
+        have = {o["value"] for o in options}
+        extra = [a for a in need_work
+                 if a not in have and f"_pool_{a}" not in have]
+        if extra:
+            options.append({"label": "── Has scoring work ──",
+                            "value": "__NEEDS__", "disabled": True})
+            for a in extra:
+                options.append({
+                    "label": f"⚠️  {a}  (finish scoring)",
+                    "value": f"_pool_{a}"})
         # Blank on first load. The reviewer explicitly picks an
         # animal each session -- no auto-default ever (caveat #6
         # of the queue-card plan). We only preserve the current
@@ -3605,17 +3626,23 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Friendlier status copy: don't shout "no animals
         # assigned" at the user when the lab simply hasn't
         # filled in the sheet yet.
-        if not my_animals and not unassigned:
+        scoring_note = (f"  ⚠️ {len(extra)} animal"
+                        f"{'' if len(extra) == 1 else 's'} still have scoring "
+                        "work (shown below)." if extra else "")
+        if not my_animals and not unassigned and not extra:
             status = "No animals in the DB yet."
+        elif not my_animals and not unassigned:
+            status = ("Assignment sheet unavailable — showing animals with "
+                      "pending scoring work below.")
         elif not my_animals:
             status = (f"Sheet has no assignments yet. "
                        f"Showing all {len(unassigned)} "
                        f"animal{'' if len(unassigned) == 1 else 's'} "
-                       "in the DB.")
+                       "in the DB." + scoring_note)
         else:
             status = (f"Assigned to you: "
                        f"{', '.join(my_animals)}. "
-                       "Pick one above to start reviewing.")
+                       "Pick one above to start reviewing." + scoring_note)
         return options, new_value, status
 
     # Progress + streak strip. Pattern source: Linear sprint
