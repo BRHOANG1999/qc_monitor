@@ -3921,7 +3921,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "maxWidth": "100%", "overflow": "hidden",
                     "textOverflow": "ellipsis",
                     "whiteSpace": "nowrap"}),
-            ], id={"type": "video-queue-item",
+            ], id={"type": "video-needs-item",
                     "file_id": int(r["file_id"])},
                 n_clicks=0,
                 style={"display": "flex", "flexDirection": "column",
@@ -4088,23 +4088,34 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Input({"type": "video-queue-item", "file_id": ALL},
                 "n_clicks"),
+        Input({"type": "video-needs-item", "file_id": ALL},
+                "n_clicks"),
         prevent_initial_call=True,
     )
-    def _load_from_queue(n_clicks_list):
-        """Translate a queue button click into setting the existing
-        session + file dropdowns, which cascades through every
-        downstream callback unchanged."""
-        # Act ONLY on a genuine click: the TRIGGERING button's n_clicks must be
-        # >= 1. The needs-scoring / queue lists re-render on refresh-trigger and
-        # on the file-dropdown change, which re-creates the buttons with
-        # n_clicks=0; the old `any(n_clicks_list)` guard would still fire on
-        # such a re-render and callback_context.triggered_id could resolve to
-        # the ACTIVE file -- reloading the file you were already on instead of
-        # the one you clicked. Gating on the triggered value fixes that.
-        triggered = callback_context.triggered or []
+    def _load_from_queue(_queue_clicks, _needs_clicks):
+        """Translate a queue OR needs-scoring button click into setting the
+        existing session + file dropdowns, which cascades through every
+        downstream callback unchanged.
+
+        The queue "Show all timestamps" list and the dedicated "Needs scoring"
+        card use DIFFERENT id types (video-queue-item vs video-needs-item) on
+        purpose: in needs_scoring mode both lists render the SAME files, and a
+        shared id type produced DUPLICATE component ids in the DOM, which breaks
+        Dash's pattern-match click routing -- clicking a needs-scoring file did
+        nothing. Distinct types keep every button uniquely addressable.
+        """
+        # Act ONLY on a genuine click: SOME triggered input's n_clicks must be
+        # >= 1. Both lists re-render on refresh-trigger / file-dropdown change,
+        # re-creating buttons with n_clicks=0; the old `any(n_clicks)` guard
+        # fired on those re-renders too (reloading the current file). Gate on
+        # the triggered VALUE -- and scan ALL triggered entries, not just
+        # triggered[0], since a coincident re-render can order a value=0 entry
+        # first and mask the real click.
+        if not any((t.get("value") or 0)
+                   for t in (callback_context.triggered or [])):
+            return no_update, no_update
         trig = callback_context.triggered_id
-        if not isinstance(trig, dict) or not triggered \
-                or not (triggered[0].get("value") or 0):
+        if not isinstance(trig, dict):
             return no_update, no_update
         file_id = trig.get("file_id")
         if file_id is None:
