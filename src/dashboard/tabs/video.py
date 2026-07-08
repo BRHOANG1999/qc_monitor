@@ -4405,12 +4405,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _start_channel_load(_ch, state):
         # Channel change re-fires LFP + Hilbert but not video.
         # Only mark those two; leave video chip whatever it was.
+        # Patch (not dict(state) write-back) so a near-simultaneous
+        # _mark_legs_done can't clobber this with a stale whole-dict snapshot.
         if not state:
             return no_update
-        next_state = dict(state)
-        next_state["lfp"] = "loading"
-        next_state["hilbert"] = "loading"
-        return next_state
+        patched = Patch()
+        patched["lfp"] = "loading"
+        patched["hilbert"] = "loading"
+        return patched
 
     # ---- Instant blank-on-load (clientside) ---- #
     # The moment the reviewer prompts a new file, wipe BOTH plot figures
@@ -4566,21 +4568,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             t["prop_id"].split(".")[0]
             for t in callback_context.triggered
         }
-        next_state = dict(state)
+        # Patch only the leg(s) that actually flipped (guarding on the CURRENT
+        # state value read from State), so a concurrent _start_channel_load
+        # writing the other legs isn't clobbered by a whole-dict write-back.
+        patched = Patch()
         changed = False
         if ("video-player-container" in triggered
-                and next_state.get("video") == "loading"):
-            next_state["video"] = "done"
+                and state.get("video") == "loading"):
+            patched["video"] = "done"
             changed = True
         if ("video-lfp-loadtoken" in triggered
-                and next_state.get("lfp") == "loading"):
-            next_state["lfp"] = "done"
+                and state.get("lfp") == "loading"):
+            patched["lfp"] = "done"
             changed = True
         if ("video-hilbert-loadtoken" in triggered
-                and next_state.get("hilbert") == "loading"):
-            next_state["hilbert"] = "done"
+                and state.get("hilbert") == "loading"):
+            patched["hilbert"] = "done"
             changed = True
-        return next_state if changed else no_update
+        return patched if changed else no_update
 
     # Soft-claim: when a reviewer loads a recording, claim it so it
     # drops out of OTHER reviewers' queues for the TTL window (see
@@ -5536,7 +5541,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             store, animal_value, int(file_id), email,
             queue_limit=queue_limit)
         if next_file is None:
-            return (badge, [], no_update, no_update, no_update)
+            # No file to advance to -> STAY on this one. Don't clear the events
+            # store (the [] paths above are safe only because they hand off to a
+            # new file whose drafts _rescope_events reloads); clearing here would
+            # blank the onsets the reviewer just exported and can still edit.
+            return (badge, no_update, no_update, no_update, no_update)
         return (badge, [], next_session, next_file, no_update)
 
     # ---- file/channel options ---- #
