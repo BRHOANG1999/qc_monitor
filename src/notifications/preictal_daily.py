@@ -112,15 +112,20 @@ def send_preictal_daily(today: date, config: dict, store, emailer) -> dict:
 
     # Figures + standalone HTML report (best-effort; only when a derivatives
     # root is configured, so unit tests with a bare config stay text-only).
+    # Figures are INLINED (deliverable + validation) so the email itself is the
+    # visual report. The .html report is NOT attached by default -- enterprise
+    # mail security (e.g. umn.edu) quarantines HTML attachments as a phishing
+    # risk, which silently drops the whole message; set attach_report: true to
+    # opt back in. The report still lands in the run pocket regardless.
     figs, report_path = _figures_and_report(config, store, run, rows)
     img_html = "".join(
         f'<div style="margin-top:14px"><img src="cid:{os.path.basename(p)}" '
-        f'style="max-width:900px;width:100%"></div>' for p in figs)
+        f'style="max-width:920px;width:100%"></div>' for p in figs)
     html = ("<h3>Pre-ictal daily sweep</h3><pre>"
             + "\n".join(lines[1:]) + "</pre>" + img_html)
     if report_path:
-        html += ("<p style='color:#777;font-size:12px'>Full self-contained "
-                 f"report attached: {os.path.basename(report_path)}</p>")
+        html += ("<p style='color:#777;font-size:12px'>Self-contained report "
+                 f"saved in the run pocket: {report_path}</p>")
 
     n_surv = len(_survivors(rows))
     subject = (f"Pre-ictal daily — {n_surv} scale(s) survive the null "
@@ -129,7 +134,7 @@ def send_preictal_daily(today: date, config: dict, store, emailer) -> dict:
                        recipients=recipients, subject_prefix=False)
     if figs:
         send_kwargs["attachments"] = figs
-    if report_path:
+    if report_path and cfg.get("attach_report", False):
         send_kwargs["file_attachments"] = [report_path]
     try:
         ok = emailer.send(**send_kwargs)
@@ -143,21 +148,33 @@ def send_preictal_daily(today: date, config: dict, store, emailer) -> dict:
 
 def _figures_and_report(config, store, run, rows):
     """(inline figure PNG paths, report HTML path) for the digest, or ([], None)
-    when no derivatives root is configured or rendering isn't available."""
+    when no derivatives root is configured or rendering isn't available. The
+    report render also writes the deliverable + validation PNGs into out_dir;
+    we collect them ALL (ordered deliverable -> pipeline -> scoring) for inline
+    embedding so the email body is the full visual report."""
     root = ((config or {}).get("preictal", {}) or {}).get("derivatives_root")
     if not root:
         return [], None
     out_dir = os.path.join(root, "figures", f"run_{run['id']}")
-    figs, report_path = [], None
-    try:
-        from src.preictal import figures
-        figs = figures.render_run_figures(dict(run), rows, out_dir)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("preictal digest figures failed: %s", e)
+    report_path = None
     try:
         from src.preictal import report as _report
         report_path = _report.render_run_report(store, dict(run), rows,
                                                  config, out_dir)
     except Exception as e:  # noqa: BLE001
         logger.warning("preictal digest report failed: %s", e)
+
+    def _rank(name):
+        if "pipeline" in name:
+            return 1
+        if "scoring" in name:
+            return 2
+        return 0                                       # deliverable first
+    figs = []
+    try:
+        pngs = [f for f in os.listdir(out_dir) if f.lower().endswith(".png")]
+        figs = [os.path.join(out_dir, f)
+                for f in sorted(pngs, key=_rank)]
+    except OSError:
+        pass
     return figs, report_path
