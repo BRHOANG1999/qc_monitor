@@ -525,5 +525,9 @@ preictal:
   cwt:
     wavelet: "cmor1.5-1.0"              # complex Morlet
     min_leadtime_sec: 1.0
+    max_leadtime_sec: 21600             # cap the ISI lookback at 6 h -- a longer
+                                        # "pre-ictal" window is really interictal
+                                        # (long rhythms = evoked_rhythms' job) and
+                                        # would explode CWT compute
     scales_per_octave: 4                # log/dyadic scale spacing
   features: ["*"]                       # open-ended registry (Stage 1: line_length)

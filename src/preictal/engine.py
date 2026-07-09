@@ -71,7 +71,8 @@ def _period_bounds(period_start: str | None, period_end: str | None):
 
 def _enumerate_seizures(store, animals: list[str], buffer_sec: float,
                          min_lead: float, lo: float | None = None,
-                         hi: float | None = None):
+                         hi: float | None = None,
+                         max_lookback: float | None = None):
     """(usable_pairs, in_scope_seizure_rows). ROLLING scope: analyze only
     seizures whose ONSET falls in [lo, hi) -- but ISI + lookback ceiling still
     use each animal's FULL seizure history (the predecessor that sets a
@@ -81,7 +82,7 @@ def _enumerate_seizures(store, animals: list[str], buffer_sec: float,
     for a in (animals or []):
         szs = scored_seizures(store, a)                     # full history
         isis = inter_seizure_intervals(szs)
-        ceils = lookback_ceilings(szs, buffer_sec)
+        ceils = lookback_ceilings(szs, buffer_sec, max_lookback)
         for sz, isi_v, ceil in zip(szs, isis, ceils):
             if lo is not None and sz.onset_epoch < lo:
                 continue
@@ -191,6 +192,7 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
     step_sec = float(tcfg.get("step_sec", 1.0))
     target_fs = float(tcfg.get("target_fs", 500.0))
     min_lead = float(ccfg.get("min_leadtime_sec", 1.0))
+    max_lookback = float(ccfg.get("max_leadtime_sec", 21600.0))   # cap: 6 h
     spo = int(ccfg.get("scales_per_octave", 4))
     buffer = float(ecfg.get("post_ictal_buffer_sec", 300.0))
     channel_role = "eeg"
@@ -212,7 +214,7 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
     try:
         lo, hi = _period_bounds(period_start, period_end)
         pairs, seizure_rows = _enumerate_seizures(store, animals, buffer,
-                                                  min_lead, lo, hi)
+                                                  min_lead, lo, hi, max_lookback)
         ceilings = [c for _, c in pairs]
         scale_rows: list[dict] = []
         n_scales = 0

@@ -78,6 +78,18 @@ def test_ceiling_none_when_buffer_eats_interval():
                                                                        None]
 
 
+def test_ceiling_capped_at_max_lookback():
+    # A 41-day ISI must NOT become a 41-day lookback -- cap it (else the
+    # trajectory explodes and it isn't pre-ictal anymore).
+    szs = [_sz(0.0), _sz(3_500_000.0)]        # ~40.5-day gap
+    ceil = isi.lookback_ceilings(szs, post_ictal_buffer_sec=300.0,
+                                 max_lookback_sec=21600.0)
+    assert ceil[0] is None and ceil[1] == 21600.0
+    # Under the cap, uncapped value passes through.
+    szs2 = [_sz(0.0), _sz(1000.0)]
+    assert isi.lookback_ceilings(szs2, 300.0, 21600.0) == [None, 700.0]
+
+
 # ------------------------------------------------------------------ #
 #  behavioral_seizures -- absolute onset across chunk boundaries + mixed fmt
 # ------------------------------------------------------------------ #

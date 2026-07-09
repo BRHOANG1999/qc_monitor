@@ -197,11 +197,18 @@ def inter_seizure_intervals(seizures: list[Seizure]) -> list[float | None]:
     return isi
 
 
-def lookback_ceilings(seizures: list[Seizure],
-                       post_ictal_buffer_sec: float) -> list[float | None]:
-    """Per-seizure lookback ceiling = ISI - post_ictal_buffer. None where the
-    seizure has no predecessor OR the buffer eats the whole interval (nothing
-    pre-ictal is reachable -- that seizure is unusable)."""
+def lookback_ceilings(seizures: list[Seizure], post_ictal_buffer_sec: float,
+                       max_lookback_sec: float | None = None
+                       ) -> list[float | None]:
+    """Per-seizure lookback ceiling = ISI - post_ictal_buffer, CAPPED at
+    *max_lookback_sec*. None where the seizure has no predecessor OR the buffer
+    eats the whole interval.
+
+    The cap matters: a long ISI (e.g. a 41-day gap) would otherwise make the
+    "pre-ictal" window span days -- not pre-ictal at all (it's the whole
+    interictal span), and a multi-million-sample trajectory that explodes CWT
+    compute. Fast pre-ictal change lives in a bounded window; long-timescale
+    rhythms belong to the evoked_rhythms module, not per-seizure lookback."""
     assert post_ictal_buffer_sec >= 0, "buffer must be >= 0"
     out: list[float | None] = []
     for isi in inter_seizure_intervals(seizures):
@@ -209,6 +216,8 @@ def lookback_ceilings(seizures: list[Seizure],
             out.append(None)
             continue
         ceiling = isi - post_ictal_buffer_sec
+        if max_lookback_sec is not None and ceiling > max_lookback_sec:
+            ceiling = float(max_lookback_sec)
         out.append(ceiling if ceiling > 0 else None)
     return out
 
