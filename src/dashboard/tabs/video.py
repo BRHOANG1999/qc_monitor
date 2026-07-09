@@ -379,6 +379,20 @@ _QUEUE_MODES = [
 ]
 _QUEUE_MODE_BY_VALUE = {m["value"]: m for m in _QUEUE_MODES}
 
+# Header (title, sub) for the pool LIST card, per pool -- so the card's text
+# follows the Pool dropdown, not a fixed "Needs more onsets".
+_POOL_LIST_HEADER = {
+    "queue": ("Queue (FIFO)",
+              "Unreviewed recordings, oldest first — click one to load."),
+    "flagged": ("🚩 Flag (has events)",
+                "The auto-filter / Mass Analyze detected candidate events "
+                "here — click one to review."),
+    "needs_scoring": ("⚠️ Needs more onsets",
+                      "Files you submitted with an onset (EO) + Racine but "
+                      "still missing some landmarks — open one to add the "
+                      "rest."),
+}
+
 
 def _fetch_queue_by_mode(store, mode, animal_ids, email, floor, limit):
     """Return the carousel rows for the chosen navigation *mode*, normalized so
@@ -2421,19 +2435,32 @@ def layout(store: Store, bridge: dict | None = None):
                                       "1px solid rgba(255,255,255,0.06)",
                                   "borderRadius": "6px", "padding": "4px"}),
             ),
-            _details_card(
-                "⚠️ Needs more onsets — finish your landmarks",
-                summary_sub="Files YOU submitted with an onset (EO) + Racine "
-                            "but still missing some landmarks (LAS/BO/PID/BB). "
-                            "Open one to add the rest.",
-                open_default=False,
-                content=html.Div(
-                    id="video-needs-scoring-list",
-                    style={"maxHeight": "220px", "overflowY": "auto",
-                            "background": "#13131f",
-                            "border": "1px solid rgba(240,180,41,0.25)",
-                            "borderRadius": "6px", "padding": "4px"}),
-            ),
+            # Pool LIST card: title + sub + contents all follow the Pool
+            # dropdown (video-queue-mode) via _pool_list_header +
+            # _render_needs_scoring. Built manually (not _details_card) so the
+            # title/sub can carry ids the header callback updates.
+            html.Details([
+                html.Summary([
+                    html.Span(id="video-pool-list-title",
+                               style={"color": "#cfd0d6", "fontSize": "12px",
+                                       "fontWeight": "600"}),
+                    html.Span(id="video-pool-list-sub",
+                               style={"color": "#888", "fontSize": "11px",
+                                       "marginLeft": "4px"}),
+                ], style={"cursor": "pointer", "userSelect": "none",
+                           "padding": "8px 8px", "listStyle": "none",
+                           "borderRadius": "6px"}),
+                html.Div(
+                    html.Div(
+                        id="video-needs-scoring-list",
+                        style={"maxHeight": "220px", "overflowY": "auto",
+                                "background": "#13131f",
+                                "border": "1px solid rgba(240,180,41,0.25)",
+                                "borderRadius": "6px", "padding": "4px"}),
+                    style={"padding": "0 8px 8px 8px"}),
+            ], open=False, className="qc-expandable", style={
+                "borderBottom": "1px solid rgba(255,255,255,0.06)",
+                "marginTop": "8px", "marginBottom": "8px"}),
             _details_card(
                 "Pick any recording manually",
                 summary_sub="bypass the queue -- choose session/file/channel",
@@ -4038,72 +4065,89 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         row = rows[0]                 # head of the newly-selected pool
         return row["session_dir"], int(row["id"])
 
-    # The "Needs scoring" pool: quick-flagged files awaiting full
-    # scoring. Reuses the video-queue-item id type so a click loads the
-    # file through the existing _load_from_queue handler (which prefills
-    # the draft events on file change).
+    # Pool LIST card header: title + sub follow the Pool dropdown.
+    @app.callback(
+        Output("video-pool-list-title", "children"),
+        Output("video-pool-list-sub", "children"),
+        Input("video-queue-mode", "value"),
+    )
+    def _pool_list_header(mode):
+        title, sub = _POOL_LIST_HEADER.get(
+            mode or "queue", _POOL_LIST_HEADER["queue"])
+        return title, f" · {sub}"
+
+    # Pool LIST card contents: the files of the SELECTED pool (video-queue-
+    # mode), so the card follows the same source as the carousel. Rows keep
+    # the video-needs-item id type so a click loads the file through
+    # _load_from_queue (which prefills any draft events on file change).
     @app.callback(
         Output("video-needs-scoring-list", "children"),
         Input("video-queue-animal", "value"),
+        Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("video-file-dropdown", "value"),
     )
-    def _render_needs_scoring(animal_value, _refresh, active_file_id):
-        animal = _ma_animal_from_picker(animal_value)
-        if not animal:
+    def _render_needs_scoring(animal_value, mode, _refresh, active_file_id):
+        mode = mode or "queue"
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
             return html.Div(
-                "Pick an animal to see its quick-flag pool.",
+                "Pick an animal to see this pool.",
                 style={"color": "#888", "fontSize": "11px",
                         "padding": "8px"})
+        email = current_user_email() or ""
+        floor = store.review_backlog_floor()
         try:
-            rows = store.files_needing_scoring_for_animal(str(animal))
+            rows = _fetch_queue_by_mode(store, mode, animal_ids, email,
+                                         floor, _QUEUE_LIST_MAX)
         except Exception as e:
-            logger.warning("files_needing_scoring failed: %s", e)
+            logger.warning("pool list fetch failed: %s", e)
             rows = []
         if not rows:
             return html.Div(
-                "Nothing flagged for scoring.",
+                "Nothing in this pool.",
                 style={"color": "#888", "fontSize": "11px",
                         "padding": "8px"})
         from datetime import datetime as _dt
         items = []
         for r in rows:
+            fid = int(r.get("id") or r.get("file_id"))
             ts_raw = r.get("chunk_datetime") or ""
             try:
                 ts_label = _dt.strptime(
-                    ts_raw, "%Y_%m_%d__%H_%M_%S").strftime(
-                        "%Y-%m-%d  %H:%M")
+                    ts_raw, "%Y_%m_%d__%H_%M_%S").strftime("%Y-%m-%d  %H:%M")
             except ValueError:
                 ts_label = ts_raw
-            try:
-                n_ev = len(json.loads(r.get("markers_json") or "[]"))
-            except (json.JSONDecodeError, TypeError):
-                n_ev = 0
+            # Per-pool badge.
+            if mode == "needs_scoring":
+                try:
+                    n_ev = len(json.loads(r.get("markers_json") or "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    n_ev = 0
+                badge = (f"🚩 {n_ev} onset{'' if n_ev == 1 else 's'} · "
+                         "finish scoring")
+                badge_color = "#f0b429"
+            elif mode == "flagged":
+                badge, badge_color = "🚩 detector flagged", "#f0b429"
+            else:
+                badge, badge_color = "", "#888"
             fname = os.path.basename(r.get("file_path") or "")
             is_active = (active_file_id is not None
-                          and int(r["file_id"]) == int(active_file_id))
+                          and fid == int(active_file_id))
+            top_row = [html.Span(ts_label, style={
+                "color": "#f0f0f5", "fontWeight": "600", "fontSize": "12px"})]
+            if badge:
+                top_row.append(html.Span(
+                    badge, style={"color": badge_color, "fontSize": "11px",
+                                   "fontWeight": "600", "marginLeft": "auto"}))
             items.append(html.Button([
-                html.Div([
-                    html.Span(ts_label, style={
-                        "color": "#f0f0f5", "fontWeight": "600",
-                        "fontSize": "12px"}),
-                    html.Span(
-                        f"🚩 {n_ev} onset{'' if n_ev == 1 else 's'} · "
-                        f"finish scoring",
-                        title="You flagged an EEG onset here but haven't "
-                              "scored type + Racine + landmarks. Open to "
-                              "complete it.",
-                        style={"color": "#f0b429", "fontSize": "11px",
-                               "fontWeight": "600", "marginLeft": "auto"}),
-                ], style={"display": "flex", "width": "100%"}),
+                html.Div(top_row, style={"display": "flex", "width": "100%"}),
                 html.Span(fname, title=fname, style={
                     "color": "#6f7080", "fontSize": "10px",
                     "fontFamily": "ui-monospace, monospace",
                     "maxWidth": "100%", "overflow": "hidden",
-                    "textOverflow": "ellipsis",
-                    "whiteSpace": "nowrap"}),
-            ], id={"type": "video-needs-item",
-                    "file_id": int(r["file_id"])},
+                    "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
+            ], id={"type": "video-needs-item", "file_id": fid},
                 n_clicks=0,
                 style={"display": "flex", "flexDirection": "column",
                         "alignItems": "flex-start", "width": "100%",
@@ -4112,8 +4156,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                         if is_active else "transparent"),
                         "color": "#cfd0d6", "padding": "6px 10px",
                         "cursor": "pointer",
-                        "borderBottom":
-                            "1px solid rgba(255,255,255,0.04)",
+                        "borderBottom": "1px solid rgba(255,255,255,0.04)",
                         "borderLeft": ("3px solid #f0b429" if is_active
                                         else "3px solid transparent"),
                         "textAlign": "left"}))
