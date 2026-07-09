@@ -48,16 +48,43 @@ def _resolve_channel_index(store, seizure) -> int:
         return 0
 
 
+def _period_bounds(period_start: str | None, period_end: str | None):
+    """Epoch [lo, hi) for the rolling window from ISO dates (period_end is
+    inclusive -> +1 day). None on either side = unbounded (adhoc = all-time)."""
+    from datetime import datetime, timedelta
+    lo = hi = None
+    if period_start:
+        try:
+            lo = datetime.fromisoformat(period_start).timestamp()
+        except ValueError:
+            pass
+    if period_end:
+        try:
+            hi = (datetime.fromisoformat(period_end)
+                  + timedelta(days=1)).timestamp()
+        except ValueError:
+            pass
+    return lo, hi
+
+
 def _enumerate_seizures(store, animals: list[str], buffer_sec: float,
-                         min_lead: float):
-    """(usable_pairs, all_seizure_rows). A pair is (Seizure, ceiling_sec) with a
-    real pre-ictal window; rows mirror every seizure for the pocket."""
+                         min_lead: float, lo: float | None = None,
+                         hi: float | None = None):
+    """(usable_pairs, in_scope_seizure_rows). ROLLING scope: analyze only
+    seizures whose ONSET falls in [lo, hi) -- but ISI + lookback ceiling still
+    use each animal's FULL seizure history (the predecessor that sets a
+    window's ceiling may be from before the period). A pair is (Seizure,
+    ceiling_sec) with a real pre-ictal window."""
     pairs, rows = [], []
     for a in (animals or []):
-        szs = behavioral_seizures(store, a)
+        szs = behavioral_seizures(store, a)                 # full history
         isis = inter_seizure_intervals(szs)
         ceils = lookback_ceilings(szs, buffer_sec)
         for sz, isi_v, ceil in zip(szs, isis, ceils):
+            if lo is not None and sz.onset_epoch < lo:
+                continue
+            if hi is not None and sz.onset_epoch >= hi:
+                continue
             if ceil and ceil > min_lead:
                 pairs.append((sz, float(ceil)))
             rows.append({"file_id": sz.file_id, "animal_id": sz.animal_id,
@@ -102,8 +129,9 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
         scope, period_start, period_end, animals or [],
         event_source=ecfg.get("event_source", "behavioral"), version_id=version_id)
     try:
+        lo, hi = _period_bounds(period_start, period_end)
         pairs, seizure_rows = _enumerate_seizures(store, animals, buffer,
-                                                  min_lead)
+                                                  min_lead, lo, hi)
         ceilings = [c for _, c in pairs]
         scale_rows: list[dict] = []
         n_scales = 0

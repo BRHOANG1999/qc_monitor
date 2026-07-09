@@ -98,6 +98,37 @@ def test_engine_end_to_end_planted_scale(tmp_path, monkeypatch):
                                        "scale_summary.csv"))
 
 
+def test_period_scope_filters_by_onset_but_keeps_full_isi(tmp_path):
+    # Rolling window = one day. A seizure IN the window is analyzed with its
+    # ceiling derived from a predecessor BEFORE the window; seizures outside the
+    # window are excluded from analysis (but still seed ISI).
+    store = Store(str(tmp_path / "data" / "m.db"))
+    days = [("2026_07_06__00_00_00", 1),   # before window
+            ("2026_07_07__00_00_00", 2),   # in window
+            ("2026_07_08__00_00_00", 3)]   # after window
+    with store.connection() as conn:
+        for i, (cd, _r) in enumerate(days, start=1):
+            conn.execute("INSERT INTO processed_files (id, file_path, "
+                         "session_dir, chunk_datetime, duration_sec) VALUES "
+                         "(?,?,?,?,3600.0)", (i, f"/s/{i}.mat", "/s", cd))
+            conn.execute("INSERT INTO review_state (file_id, user_email, status, "
+                         "animal_id, markers_json, created_at, updated_at) "
+                         "VALUES (?,?,?,?,?,?,?)",
+                         (i, "p", "pi_approved", "BCH040",
+                          json.dumps([{"EO_sec": 0.0, "racine": 3}]),
+                          "t", "t"))
+        conn.commit()
+    from src.preictal.engine import _enumerate_seizures, _period_bounds
+    lo, hi = _period_bounds("2026-07-07", "2026-07-07")
+    pairs, rows = _enumerate_seizures(store, ["BCH040"], buffer_sec=300.0,
+                                      min_lead=1.0, lo=lo, hi=hi)
+    # Only the 2026-07-07 seizure is in scope.
+    assert len(rows) == 1 and rows[0]["chunk_datetime"] == "2026_07_07__00_00_00"
+    # Its ceiling comes from the 2026-07-06 predecessor (ISI 1 day - buffer).
+    assert len(pairs) == 1
+    assert abs(pairs[0][1] - (86400.0 - 300.0)) < 1e-6
+
+
 def test_engine_no_seizures_is_clean_done(tmp_path):
     """No usable seizures -> a clean 'done' run with 0 scales (no crash)."""
     store = Store(str(tmp_path / "data" / "m.db"))
