@@ -170,6 +170,44 @@ def _inject_landmarks(fig, events):
     return fig
 
 
+def _saved_landmarks_for(store, file_id, channel):
+    """The CURRENT file's saved onset draft, read from the DB for the
+    (file, scored-channel's animal).
+
+    A heavy trace rebuild triggered by a FILE/CHANNEL switch cannot trust the
+    live ``video-events-store`` State: that store still holds the PREVIOUS
+    file's events until ``_rescope_events`` updates it a callback-round later,
+    so drawing from it paints the old file's red onset lines on the new trace.
+    Reading the freshly-selected file's saved draft here draws the RIGHT
+    onsets on the switch. Returns ``[]`` when nothing is saved / no animal.
+    """
+    try:
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            return []
+        latest = store.get_review_state(int(file_id), animal_id=animal)
+    except Exception:                       # never block the plot
+        return []
+    if not latest or not latest.get("markers_json"):
+        return []
+    try:
+        evs = json.loads(latest["markers_json"])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return evs if isinstance(evs, list) else []
+
+
+def _landmarks_for_rebuild(store, file_id, channel, live_events):
+    """Pick the onset source for a heavy trace rebuild. On a file/channel
+    switch the live store lags, so use the DB draft; on a same-file rebuild
+    (filter/feature/blank change) the live store is current and may hold
+    unsaved edits, so use it."""
+    trig = callback_context.triggered_id
+    if trig in ("video-file-dropdown", "video-channel-dropdown"):
+        return _saved_landmarks_for(store, file_id, channel)
+    return live_events
+
+
 # Stim-blanking lives in src/utils/stim_blank.py so the Mass Analyze
 # scan computes the envelope on the exact same blanked signal. These
 # thin wrappers keep the existing call sites.
@@ -6027,9 +6065,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
 
         fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}",
                                  uirevision=f"{file_id}:{channel}")
-        # Always draw any flagged onsets so they survive this rebuild
-        # (channel/filter/blank changes), not just events-store updates.
-        _inject_landmarks(fig, events)
+        # Draw the CURRENT file's onsets so they survive this rebuild. On a
+        # file/channel switch the live store lags (still the previous file),
+        # so _landmarks_for_rebuild reads the new file's saved draft instead.
+        _inject_landmarks(fig, _landmarks_for_rebuild(
+            store, file_id, channel, events))
         filt_bits = []
         if hp and hp > 0: filt_bits.append(f"HP={hp:g}")
         if lp and lp > 0: filt_bits.append(f"LP={lp:g}")
@@ -6106,9 +6146,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             file_id, feature, channel, ma_cutoff, blank_raw,
             auc_window, ll_start_ms, ll_end_ms,
             smooth_sec, rollwin, postproc)
-        # Draw flagged onsets on every Hilbert rebuild, not only on
-        # events-store changes.
-        _inject_landmarks(fig, events)
+        # Draw the CURRENT file's onsets on every Hilbert rebuild (not only on
+        # events-store changes). On a file/channel switch the live store lags,
+        # so _landmarks_for_rebuild reads the new file's saved draft instead.
+        _inject_landmarks(fig, _landmarks_for_rebuild(
+            store, file_id, channel, events))
         return fig, status, datetime.now().timestamp()
 
     def _compute_analysis(file_id, feature,
