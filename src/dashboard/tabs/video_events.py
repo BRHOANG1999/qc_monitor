@@ -127,6 +127,76 @@ def is_event_complete(event: dict) -> bool:
     return True
 
 
+# Fields whose presence means an event holds real reviewer work (so a Submit
+# must route/keep it, never discard it). Mirrors blank_event().
+_MEANINGFUL_SEC = ("EO_sec", "LAS_sec", "BO_sec", "PID_sec", "BB_sec")
+_MEANINGFUL_TEXT = ("onset_comment", "behavior_comment", "score_comment",
+                     "roomlight", "video_quality")
+
+
+def event_is_meaningful(event: dict) -> bool:
+    """True if *event* holds any reviewer-entered data (a landmark time, a
+    Racine score, a seizure type, a light level, or a comment). A pristine
+    ``blank_event()`` is NOT meaningful."""
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") in ("LVF", "HYP", "Undefined"):
+        return True
+    if event.get("racine") not in (None, "", []):
+        return True
+    if event.get("light") not in (None, "", []):
+        return True
+    if any(event.get(f) not in (None, "") for f in _MEANINGFUL_SEC):
+        return True
+    return any((event.get(f) or "").strip() for f in _MEANINGFUL_TEXT)
+
+
+def has_meaningful_edits(events) -> bool:
+    """True if ANY event in *events* holds reviewer-entered data."""
+    return any(event_is_meaningful(e) for e in (events or []))
+
+
+def event_has_minimum_to_submit(event: dict) -> bool:
+    """The minimum for an event to be submittable: an EEG onset (EO) AND a
+    Racine score (1-8). Other landmarks (LAS/BO/PID/BB) can be filled in
+    later -- such an event routes to the 'Needs more onsets' pool."""
+    assert isinstance(event, dict), "event must be dict"
+    if event.get("EO_sec") in (None, ""):
+        return False
+    r = event.get("racine")
+    try:
+        return r is not None and 1 <= int(r) <= 8
+    except (TypeError, ValueError):
+        return False
+
+
+def submit_route(events) -> tuple:
+    """Decide where a single 'Submit' routes, from the editor's event list
+    (the confirmed rule: EO + Racine required per event).
+
+    Returns ``(status, blocking)`` where *status* is one of:
+      - ``'no_events'``         : no meaningful events -> submit as no-events.
+      - ``'pending_pi_review'`` : every meaningful event is fully complete
+                                  (type + all required landmarks + Racine).
+      - ``'needs_scoring'``     : every meaningful event has the EO+Racine
+                                  minimum but >=1 still needs secondary
+                                  landmarks ('Needs more onsets').
+      - ``None``                : BLOCKED -- *blocking* holds the 1-based
+                                  indices of events missing EO or Racine.
+    """
+    meaningful = [(i, e) for i, e in enumerate(events or [])
+                  if event_is_meaningful(e)]
+    if not meaningful:
+        return ("no_events", [])
+    blocking = [i + 1 for i, e in meaningful
+                if not event_has_minimum_to_submit(e)]
+    if blocking:
+        return (None, blocking)
+    if all(is_event_complete(e) for _i, e in meaningful):
+        return ("pending_pi_review", [])
+    return ("needs_scoring", [])
+
+
 def events_status_label(events: list[dict]) -> tuple[str, str]:
     """Return ``(text, color)`` for the events-complete status
     pill. Color is one of the design tokens."""

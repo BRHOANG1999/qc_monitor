@@ -310,10 +310,11 @@ _QUEUE_MODES = [
      "title": "🚩 Flag (FIFO · {n} auto-flagged has-events for {a})",
      "empty_ok": "No auto-flagged (has-events) recordings for {a}.",
      "empty": "No auto-flagged (has-events) recordings for {a}."},
-    {"value": "needs_scoring", "label": "⚠️ Needs scoring",
-     "title": "⚠️ Needs scoring ({n} awaiting scoring for {a})",
-     "empty_ok": "No recordings awaiting scoring for {a}.",
-     "empty": "No recordings awaiting scoring for {a}."},
+    {"value": "needs_scoring", "label": "⚠️ Needs more onsets",
+     "title": "⚠️ Needs more onsets ({n} scored, awaiting remaining "
+              "onsets for {a})",
+     "empty_ok": "No recordings awaiting more onsets for {a}.",
+     "empty": "No recordings awaiting more onsets for {a}."},
 ]
 _QUEUE_MODE_BY_VALUE = {m["value"]: m for m in _QUEUE_MODES}
 
@@ -360,39 +361,10 @@ def _animal_for_channel(store, file_id, channel) -> str | None:
     return store.animal_for_file_channel(file_id, channel)
 
 
-# Fields whose presence means an event row holds real reviewer work, so it
-# must never be silently discarded. Mirrors video_events.blank_event(). Kept
-# here (not imported) so the save guard AND the autosave flush can call it
-# without a circular import.
-_MEANINGFUL_SEC_FIELDS = ("EO_sec", "LAS_sec", "BO_sec", "PID_sec", "BB_sec")
-_MEANINGFUL_TEXT_FIELDS = ("onset_comment", "behavior_comment",
-                            "score_comment", "roomlight", "video_quality")
-
-
-def _event_is_meaningful(event) -> bool:
-    """True if *event* carries any reviewer-entered data -- a landmark time, a
-    Racine score, a seizure type, a light level, or a comment. A pristine
-    ``blank_event()`` is NOT meaningful."""
-    if not isinstance(event, dict):
-        return False
-    if event.get("type") in ("LVF", "HYP", "Undefined"):
-        return True
-    if event.get("racine") not in (None, "", []):
-        return True
-    if event.get("light") not in (None, "", []):
-        return True
-    for _f in _MEANINGFUL_SEC_FIELDS:
-        if event.get(_f) not in (None, ""):
-            return True
-    for _f in _MEANINGFUL_TEXT_FIELDS:
-        if (event.get(_f) or "").strip():
-            return True
-    return False
-
-
-def _has_meaningful_edits(events) -> bool:
-    """True if ANY event in *events* holds reviewer-entered data."""
-    return any(_event_is_meaningful(e) for e in (events or []))
+# Meaningfulness predicates live in video_events (single source of truth,
+# shared with submit_route); alias them here for the save guard + autosave.
+_event_is_meaningful = _events.event_is_meaningful
+_has_meaningful_edits = _events.has_meaningful_edits
 
 
 def _events_digest(events) -> str:
@@ -1955,8 +1927,9 @@ def _video_mass_analyze_panel() -> html.Details:
                             " — the detector flagged these at your cutoff. "
                             "Browse a pool and REVIEW each: score the real "
                             "events, or mark “No events seen.” "
-                            "(Different from the \U0001f6a9 Needs-scoring "
-                            "pool, which is your own onsets to finish.)",
+                            "(Different from the \U0001f6a9 Needs-more-onsets "
+                            "pool, which is your own scored events awaiting "
+                            "their remaining landmarks.)",
                             style={"color": "#a0a0b0", "fontSize": "11px"}),
                     ], style={"marginBottom": "6px", "padding": "0 2px"}),
                     html.Div([
@@ -2348,10 +2321,10 @@ def layout(store: Store, bridge: dict | None = None):
                                   "borderRadius": "6px", "padding": "4px"}),
             ),
             _details_card(
-                "🚩 Needs scoring — finish your onsets",
-                summary_sub="Files where YOU dropped an EEG onset but haven't "
-                            "fully scored it yet (type + Racine + all "
-                            "landmarks). Open one to complete it.",
+                "🚩 Needs more onsets — finish your landmarks",
+                summary_sub="Files YOU submitted with an onset (EO) + Racine "
+                            "but still missing some landmarks (LAS/BO/PID/BB). "
+                            "Open one to add the rest.",
                 open_default=False,
                 content=html.Div(
                     id="video-needs-scoring-list",
@@ -3378,35 +3351,25 @@ def layout(store: Store, bridge: dict | None = None):
                                       "1px solid rgba(255,255,255,0.04)",
                                   "borderRadius": "6px"}),
                 html.Div([
-                    # The single loud action on this step: solid success
-                    # fill + larger footprint so it's unmistakably the
-                    # next thing to do. Quick-flag recedes to secondary.
+                    # The SINGLE action on this step. Routing is decided from
+                    # the event state (video_events.submit_route): no events /
+                    # every event fully scored -> PI review; events with an
+                    # onset + Racine but missing later landmarks -> the
+                    # "Needs more onsets" pool. No second button, no early CSV
+                    # (the CSV is written only when the PI approves).
                     button(
-                        "Mark recording done",
+                        "Submit",
                         "video-review-save-btn",
                         variant="primary", tone="success",
                         icon_name="check-circle",
-                        title="Saves your decision + any onset markers. "
-                              "Removes the recording from your queue.",
+                        title="Submit this recording. No events seen -> PI "
+                              "review. Events with at least an onset (EO) + a "
+                              "Racine score submit: fully-scored -> PI review, "
+                              "otherwise -> 'Needs more onsets' to finish the "
+                              "remaining landmarks later.",
                         style={"padding": "10px 26px",
                                "fontSize": "14px", "fontWeight": "700",
                                "marginRight": "10px"}),
-                    button(
-                        "EEG onset → CSV + flag",
-                        "video-review-partial-btn",
-                        variant="secondary",
-                        icon_name="file-text",
-                        title="Write the onsets you've dropped to the "
-                              "BHZ day CSV right now (EEG/EO onset only is "
-                              "fine -- other landmarks save as NaN) so you "
-                              "can use it immediately, AND keep the file in "
-                              "the 'Needs scoring' pool for full scoring "
-                              "later. The PI's finalize (overwrite) replaces "
-                              "these preliminary rows. Your onset is in the "
-                              "EventEO / EventEO_WallClock / EO_HourOfDay "
-                              "columns; Peak_Index/Peak_Stamp stay blank "
-                              "(they're set only by the automated detector).",
-                        style={"marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
                         custom_spinner=_loading_icon(small=True),
@@ -5540,50 +5503,49 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     else no_update, *nop[1:])
         if decision not in ("no_events", "has_events"):
             return ("Pick \"No events seen\" or \"Events seen\" "
-                     "before saving.",
+                     "before submitting.",
                     *nop[1:])
         events = list(events or [])
-        if decision == "has_events":
-            if not events:
-                return ("Add at least one event with + Add event "
-                         "before saving.",
+        # Single-Submit routing (confirmed rule: EO + Racine required per
+        # event). submit_route decides the destination from the event STATE,
+        # so partial-but-scored work is SAVED to 'Needs more onsets' instead
+        # of being blocked/lost by the old all-or-nothing gate. The CSV is
+        # NOT written here -- that happens only when the PI approves in the
+        # Event Verification tab.
+        route, blocking = _events.submit_route(events)
+        if decision == "no_events":
+            # Explicit "no events" -- but never let it silently discard
+            # scored work (the historical n-hotkey / mis-click loss).
+            if _has_meaningful_edits(events):
+                n = sum(1 for e in events if _event_is_meaningful(e))
+                return (f"Not saved — you have {n} scored event"
+                         f"{'' if n == 1 else 's'} but chose \"No events "
+                         "seen\". Switch to \"Events seen\" to submit them, "
+                         "or delete them first (nothing was lost).",
                         *nop[1:])
-            # Gating: every event must be complete (type +
-            # required landmarks + Racine 1-8).
-            incomplete = [i + 1 for i, e in enumerate(events)
-                           if not _events.is_event_complete(e)]
-            if incomplete:
-                idxs = ", ".join(str(i) for i in incomplete)
-                return (f"Event{'s' if len(incomplete) > 1 else ''} "
-                         f"{idxs} still need landmarks + Racine "
-                         "before saving.",
+            target_status = "pending_pi_review"
+            markers_payload = None
+        else:                                       # "has_events"
+            if route == "no_events":
+                return ("Add at least one event (onset + Racine) with "
+                         "+ Add event before submitting.",
                         *nop[1:])
-        # SCORE-LOSS GUARD (the dominant data-loss path): a reviewer who
-        # scored events and then chose "No events seen" -- or pressed the
-        # `n` hotkey, which force-sets no_events -- would otherwise have
-        # every scored event silently dropped (markers_payload=None below)
-        # and the file auto-advanced, making it look saved. Refuse instead.
-        if decision == "no_events" and _has_meaningful_edits(events):
-            n = sum(1 for e in events if _event_is_meaningful(e))
-            return (f"Not saved — you have {n} scored event"
-                     f"{'' if n == 1 else 's'} but chose \"No events "
-                     "seen\". Switch to \"Events seen\" to submit them, or "
-                     "delete them first (nothing was lost).",
-                    *nop[1:])
+            if route is None:                       # missing EO or Racine
+                idxs = ", ".join(str(i) for i in blocking)
+                return (f"Event{'s' if len(blocking) > 1 else ''} {idxs} "
+                         "need at least an onset (EO) + a Racine score to "
+                         "submit.",
+                        *nop[1:])
+            # 'pending_pi_review' when every event is complete; else
+            # 'needs_scoring' ('Needs more onsets') -- scored, awaiting the
+            # remaining landmarks. Either way the Racine IS persisted.
+            target_status = route
+            markers_payload = events
         email = current_user_email()
         if not email:
             return ("Not signed in — can't record who reviewed "
                      "this.",
                     *nop[1:])
-        # PI verification pipeline (the BHZ event taxonomy plan):
-        # every undergrad save lands in 'pending_pi_review'.
-        # markers_json stores the canonical event list -- empty
-        # for the no-events branch, populated for the events
-        # branch. The CSV is NOT written here; that happens
-        # exclusively when the PI hits Approve in the Event
-        # Verification tab. This is the second-layer safety net
-        # the lab asked for.
-        markers_payload = events if decision == "has_events" else None
         # The review is filed against the animal whose channel was scored
         # (the onsets are on that electrode), NOT the queue picker -- and we
         # never write a file-wide (animal-less) row.
@@ -5594,7 +5556,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                      "per file.", *nop[1:])
         try:
             store.mark_review(
-                int(file_id), email, "pending_pi_review",
+                int(file_id), email, target_status,
                 markers=markers_payload,
                 note=(note or None),
                 animal_id=animal,
@@ -5610,14 +5572,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("release_claim failed: %s", e)
         from datetime import datetime as _dt
-        decision_label = ("0 events"
-                           if decision == "no_events"
-                           else f"{len(events)} event"
-                                 f"{'' if len(events) == 1 else 's'}")
-        badge = (f"✓ Saved for PI review at "
-                  f"{_dt.now().strftime('%H:%M')}  ·  "
-                  f"{decision_label}.  "
-                  f"The PI will verify before final CSV export.")
+        n_ev = sum(1 for e in events if _event_is_meaningful(e))
+        hhmm = _dt.now().strftime('%H:%M')
+        if target_status == "needs_scoring":
+            badge = (f"✓ Saved to \"Needs more onsets\" at {hhmm}  ·  "
+                      f"{n_ev} event{'' if n_ev == 1 else 's'} scored; add "
+                      "the remaining onsets later.")
+        elif markers_payload is None:
+            badge = (f"✓ Submitted (no events) for PI review at {hhmm}.")
+        else:
+            badge = (f"✓ Submitted {n_ev} event"
+                      f"{'' if n_ev == 1 else 's'} for PI review at {hhmm}. "
+                      "The PI verifies before final CSV export.")
         # Undo toast payload: the JS reads label + deadline_ms and
         # the U-hotkey / Undo-button callback reads file_id.
         import time as _time
@@ -5652,10 +5618,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return (badge, [], None, "",
                 next_session, next_file, undo_payload, no_update)
 
-    # "EEG onset -> CSV + flag": write a preliminary CSV row now (partial
-    # events tolerated) AND keep the file in the Needs-scoring pool, so an
-    # early EEG-onset read is usable immediately without shelving the file
-    # as complete.
+    # DEPRECATED / UNWIRED: the "EEG onset -> CSV + flag" button was removed
+    # in the single-Submit redesign -- Submit now routes scored-but-incomplete
+    # work to "Needs more onsets" directly, and the CSV is written only when
+    # the PI approves. This callback's trigger no longer exists in the layout
+    # (suppress_callback_exceptions=True), so it never fires; kept only to
+    # avoid churn in the shared auto-advance helpers. Safe to delete later.
     @app.callback(
         Output("video-review-status", "children",
                 allow_duplicate=True),
