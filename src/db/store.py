@@ -4779,6 +4779,25 @@ class Store:
         finally:
             conn.close()
 
+    def relocate_file_path(self, file_id: int, new_path: str) -> bool:
+        """Repoint a processed_files row to a recording found at a new location
+        (a stale mapped-drive path -> the live drive it's actually on). Updates
+        file_path + session_dir. Returns True if updated; swallows the UNIQUE
+        collision if another row already owns that path (the stale row is then a
+        harmless duplicate of a reachable one)."""
+        assert file_id is not None and new_path, "file_id + new_path required"
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE processed_files SET file_path=?, session_dir=? WHERE id=?",
+                (new_path, os.path.dirname(new_path), int(file_id)))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            conn.close()
+
     def resolve_training_file(self, file_id: int, locator) -> str | None:
         """Confirm (and if needed relocate) the recording for a Training
         example, lazily. If the stored path is a real file, return it
