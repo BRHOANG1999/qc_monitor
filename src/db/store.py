@@ -231,6 +231,16 @@ class Store:
             )
         except Exception:
             pass
+        # And the pre-ictal CWT sweep jobs.
+        try:
+            conn.execute(
+                """UPDATE preictal_job
+                   SET status='failed', error='worker restart',
+                       finished_at=datetime('now')
+                   WHERE status IN ('pending', 'running')"""
+            )
+        except Exception:
+            pass
         # One-time eviction of the envelope caches whenever the way they
         # are computed changes. PRAGMA user_version gates it to a single
         # run per bump (without the guard it would wipe the cache every
@@ -3229,6 +3239,147 @@ class Store:
                 continue
             _add(r["animal"], r["chunk_datetime"], _n_scored(r["markers_json"]))
         return out
+
+    # ==================================================================== #
+    #  Pre-ictal CWT sweep engine: job / run / scale-summary lifecycle
+    # ==================================================================== #
+
+    def enqueue_preictal_job(self, scope: str, period_start: str | None,
+                              period_end: str | None,
+                              animals: list[str] | None = None) -> int:
+        """Queue a background pre-ictal sweep for *scope* over a period. The
+        worker claims it FIFO. Returns the new job id."""
+        assert scope in ("daily", "weekly", "monthly", "adhoc"), "bad scope"
+        now = datetime.now().isoformat()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO preictal_job
+                       (scope, period_start, period_end, animals, status,
+                        created_at)
+                   VALUES (?,?,?,?, 'pending', ?)""",
+                (scope, period_start, period_end,
+                 json.dumps(animals) if animals else None, now))
+            return int(cur.lastrowid)
+
+    def claim_next_preictal_job(self) -> dict | None:
+        """Atomically claim the oldest pending job -> 'running'. Returns the
+        claimed job dict, or None when the queue is empty."""
+        now = datetime.now().isoformat()
+        with self.transaction() as conn:
+            row = conn.execute(
+                """SELECT id, scope, period_start, period_end, animals
+                   FROM preictal_job WHERE status='pending'
+                   ORDER BY created_at ASC LIMIT 1""").fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE preictal_job SET status='running', started_at=? "
+                "WHERE id=? AND status='pending'", (now, int(row["id"])))
+            if conn.total_changes == 0:      # lost a race; let caller retry
+                return None
+            return {"id": int(row["id"]), "scope": row["scope"],
+                    "period_start": row["period_start"],
+                    "period_end": row["period_end"],
+                    "animals": (json.loads(row["animals"])
+                                if row["animals"] else None)}
+
+    def preictal_job_status(self, job_id: int) -> str | None:
+        """Current status of a job (for cooperative cancel in the worker)."""
+        with self.connection() as conn:
+            row = conn.execute("SELECT status FROM preictal_job WHERE id=?",
+                               (int(job_id),)).fetchone()
+        return row["status"] if row else None
+
+    def finish_preictal_job(self, job_id: int, status: str,
+                             run_id: int | None = None,
+                             error: str | None = None) -> None:
+        assert status in ("done", "failed", "cancelled"), "bad status"
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE preictal_job SET status=?, run_id=?, error=?, "
+                "finished_at=? WHERE id=?",
+                (status, run_id, (error[:500] if error else None),
+                 datetime.now().isoformat(), int(job_id)))
+
+    def create_preictal_run(self, scope: str, period_start: str | None,
+                             period_end: str | None, animals: list[str],
+                             *, event_source: str = "behavioral",
+                             derivatives_path: str | None = None,
+                             version_id: int | None = None) -> int:
+        """Open a 'running' pre-ictal run row; returns its id."""
+        assert scope in ("daily", "weekly", "monthly", "adhoc"), "bad scope"
+        now = datetime.now().isoformat()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """INSERT INTO preictal_runs
+                       (scope, period_start, period_end, animals, event_source,
+                        derivatives_path, status, created_at, started_at,
+                        version_id)
+                   VALUES (?,?,?,?,?,?, 'running', ?, ?, ?)""",
+                (scope, period_start, period_end, json.dumps(animals or []),
+                 event_source, derivatives_path, now, now, version_id))
+            return int(cur.lastrowid)
+
+    def finish_preictal_run(self, run_id: int, status: str, *,
+                             n_seizures: int = 0, n_scales: int = 0,
+                             ceiling_stats: dict | None = None,
+                             error: str | None = None) -> None:
+        assert status in ("done", "failed"), "bad status"
+        cs = ceiling_stats or {}
+        with self.transaction() as conn:
+            conn.execute(
+                """UPDATE preictal_runs
+                   SET status=?, n_seizures=?, n_scales=?,
+                       ceiling_min_sec=?, ceiling_median_sec=?,
+                       ceiling_max_sec=?, error=?, finished_at=?
+                   WHERE id=?""",
+                (status, int(n_seizures), int(n_scales),
+                 cs.get("min"), cs.get("median"), cs.get("max"),
+                 (error[:500] if error else None),
+                 datetime.now().isoformat(), int(run_id)))
+
+    def insert_preictal_scale_summaries(self, run_id: int, rows: list[dict],
+                                         version_id: int | None = None) -> int:
+        """Bulk-insert the deliverable per-scale summary rows for a run. Each
+        dict may carry any subset of the summary columns; missing -> NULL."""
+        cols = ("feature", "channel_role", "scale_index", "scale",
+                "pseudo_freq_hz", "coeff_mean", "coeff_std", "coeff_max",
+                "n_seizures", "collapse_stat", "collapse_loso_mean",
+                "collapse_loso_ci_lo", "collapse_loso_ci_hi", "null_mean",
+                "null_std", "null_percentile", "null_p", "forecast_roc_auc",
+                "forecast_pr_auc")
+        n = 0
+        with self.transaction() as conn:
+            for i, r in enumerate(rows or []):
+                assert i < 1_000_000, "scale-summary insert runaway"
+                vals = [run_id] + [r.get(c) for c in cols] + [version_id]
+                conn.execute(
+                    f"""INSERT OR REPLACE INTO preictal_scale_summary
+                        (run_id, {', '.join(cols)}, version_id)
+                        VALUES ({', '.join('?' for _ in range(len(cols) + 2))})""",
+                    vals)
+                n += 1
+        return n
+
+    def latest_preictal_run(self, scope: str,
+                             status: str = "done") -> dict | None:
+        """The most recent run of *scope* with *status* (for digests)."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM preictal_runs WHERE scope=? AND status=? "
+                "ORDER BY finished_at DESC, id DESC LIMIT 1",
+                (scope, status)).fetchone()
+        return dict(row) if row else None
+
+    def preictal_scale_summary_for_run(self, run_id: int) -> list[dict]:
+        """All per-scale deliverable rows for a run (for digests / the pocket
+        CSV mirror)."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM preictal_scale_summary WHERE run_id=? "
+                "ORDER BY feature, channel_role, scale_index",
+                (int(run_id),)).fetchall()
+        return [dict(r) for r in rows]
 
     def flagged_files(self, *, statuses: tuple = ("needs_scoring",),
                        limit: int = 500) -> list[dict]:

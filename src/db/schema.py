@@ -766,4 +766,89 @@ CREATE TABLE IF NOT EXISTS notification_log (
     sent_at TEXT NOT NULL,
     UNIQUE(digest, sent_date)
 );
+
+-- ----------------------------------------------------------------------
+-- Pre-ictal CWT sweep engine (thesis subsystem). Discovers the time-scale
+-- at which the pre-ictal trajectory is cleanest. Heavy compute runs in a
+-- background worker (preictal_job); results are versioned here + mirrored to
+-- a BIDS derivatives/ pocket on disk. Full N*N AUC matrices live in the
+-- pocket (.npz), NOT in SQLite -- only per-scale scalar summaries here.
+-- ----------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS preictal_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL
+        CHECK(scope IN ('daily', 'weekly', 'monthly', 'adhoc')),
+    period_start TEXT,
+    period_end TEXT,
+    animals TEXT,                     -- JSON list of animal ids in scope
+    event_source TEXT DEFAULT 'behavioral',
+    n_seizures INTEGER DEFAULT 0,
+    n_scales INTEGER DEFAULT 0,
+    ceiling_min_sec REAL,             -- ISI-derived lookback ceiling stats
+    ceiling_median_sec REAL,
+    ceiling_max_sec REAL,
+    derivatives_path TEXT,            -- this run's pocket dir on disk
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running', 'done', 'failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    version_id INTEGER REFERENCES settings_versions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_preictal_runs_scope
+    ON preictal_runs(scope, status, finished_at);
+
+-- The deliverable table: per (run, feature, channel_role, CWT scale), the
+-- discriminability statistic vs. time-scale. Stage 1 fills the per-scale
+-- coefficient summaries; the collapse/LOSO/null/forecast columns are filled
+-- in stages 2-3 (nullable until then).
+CREATE TABLE IF NOT EXISTS preictal_scale_summary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES preictal_runs(id),
+    feature TEXT NOT NULL,
+    channel_role TEXT NOT NULL,
+    scale_index INTEGER NOT NULL,
+    scale REAL NOT NULL,
+    pseudo_freq_hz REAL,
+    coeff_mean REAL,
+    coeff_std REAL,
+    coeff_max REAL,
+    n_seizures INTEGER,
+    collapse_stat REAL,               -- monotonicity/gradient of the AUC matrix
+    collapse_loso_mean REAL,
+    collapse_loso_ci_lo REAL,
+    collapse_loso_ci_hi REAL,
+    null_mean REAL,
+    null_std REAL,
+    null_percentile REAL,             -- observed vs surrogate-null percentile
+    null_p REAL,                      -- empirical p
+    forecast_roc_auc REAL,            -- farthest-bin (pre-ictal vs interictal)
+    forecast_pr_auc REAL,
+    version_id INTEGER REFERENCES settings_versions(id),
+    UNIQUE(run_id, feature, channel_role, scale_index)
+);
+CREATE INDEX IF NOT EXISTS idx_preictal_scale_run
+    ON preictal_scale_summary(run_id, collapse_stat);
+
+-- Background job queue (mirrors mass_analyze_job). Store._init_db reaps rows
+-- stuck in pending/running across a worker restart.
+CREATE TABLE IF NOT EXISTS preictal_job (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL
+        CHECK(scope IN ('daily', 'weekly', 'monthly', 'adhoc')),
+    period_start TEXT,
+    period_end TEXT,
+    animals TEXT,                     -- JSON list; NULL/'' = all animals
+    status TEXT NOT NULL
+        CHECK(status IN ('pending', 'running',
+                          'done', 'failed', 'cancelled')),
+    run_id INTEGER REFERENCES preictal_runs(id),
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_preictal_job_status
+    ON preictal_job(status, created_at);
 """
