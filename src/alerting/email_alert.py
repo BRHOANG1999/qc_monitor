@@ -5,6 +5,7 @@ import os
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from datetime import datetime
 
 logger = logging.getLogger("qc_monitor.alerting")
@@ -64,10 +65,51 @@ class EmailAlerter:
         # without touching files.
         return os.environ.get(self._pw_env_var, "").strip()
 
+    @staticmethod
+    def _load_images(paths: list[str]):
+        """Load image files as (cid, MIMEImage) with inline Content-ID =
+        basename, so HTML can reference them as ``cid:<basename>``. Unreadable
+        paths are skipped."""
+        out = []
+        for p in paths or []:
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            cid = os.path.basename(p)
+            img = MIMEImage(data)
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline", filename=cid)
+            out.append((cid, img))
+        return out
+
+    @staticmethod
+    def _load_files(paths: list[str]):
+        """Load arbitrary files as downloadable attachments (Content-Disposition
+        attachment). Unreadable paths are skipped."""
+        from email.mime.application import MIMEApplication
+        out = []
+        for p in paths or []:
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            name = os.path.basename(p)
+            sub = "html" if name.lower().endswith((".html", ".htm")) else \
+                  "octet-stream"
+            part = MIMEApplication(data, _subtype=sub)
+            part.add_header("Content-Disposition", "attachment", filename=name)
+            out.append(part)
+        return out
+
     def send(self, subject: str, body: str, severity: str = "info",
              recipients: list[str] | None = None,
              body_html: str | None = None,
-             subject_prefix: bool = True) -> bool:
+             subject_prefix: bool = True,
+             attachments: list[str] | None = None,
+             file_attachments: list[str] | None = None) -> bool:
         """Send an email.
 
         *recipients* overrides the default alerting recipient list (used
@@ -76,7 +118,12 @@ class EmailAlerter:
         auto-generated severity-styled HTML; when None, the plaintext
         *body* is wrapped in a default template. *subject_prefix*
         attaches the "[INFO] QC Monitor:" prefix; set False to send a
-        bare subject (the surgery digest does).
+        bare subject (the surgery digest does). *attachments* are image
+        file paths embedded INLINE via Content-ID (referenced in the HTML
+        as ``cid:<basename>``) so figures render in the email body; a
+        client that can't render them still gets them as attachments.
+        *file_attachments* are arbitrary files (e.g. the standalone HTML
+        report) attached as downloadable, not inlined.
         """
         recipients = recipients if recipients is not None else self.recipients
         if not self.enabled or not self.password or not recipients:
@@ -90,11 +137,6 @@ class EmailAlerter:
         else:
             full_subject = subject
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = full_subject
-        msg["From"] = self.from_email
-        msg["To"] = ", ".join(recipients)
-
         if body_html is None:
             body_html = f"""
             <html><body>
@@ -106,8 +148,33 @@ class EmailAlerter:
             <small>QC Monitor - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>
             </body></html>
             """
-        msg.attach(MIMEText(body, "plain"))
-        msg.attach(MIMEText(body_html, "html"))
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain"))
+        alt.attach(MIMEText(body_html, "html"))
+
+        images = self._load_images(attachments or [])
+        if images:
+            # multipart/related so the HTML's cid: refs resolve inline.
+            content = MIMEMultipart("related")
+            content.attach(alt)
+            for cid, img in images:
+                content.attach(img)
+        else:
+            content = alt
+
+        files = self._load_files(file_attachments or [])
+        if files:
+            # multipart/mixed wraps the body (+inline images) and the
+            # downloadable attachments (the standalone HTML report).
+            msg = MIMEMultipart("mixed")
+            msg.attach(content)
+            for part in files:
+                msg.attach(part)
+        else:
+            msg = content
+        msg["Subject"] = full_subject
+        msg["From"] = self.from_email
+        msg["To"] = ", ".join(recipients)
 
         try:
             with smtplib.SMTP(self.server, self.port, timeout=30) as smtp:

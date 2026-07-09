@@ -253,8 +253,9 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
         store.finish_preictal_run(run_id, "done", n_seizures=len(seizure_rows),
                                   n_scales=n_scales, ceiling_stats=cstats)
         if root:
+            pocket_dir = None
             try:
-                _pocket.write_run_pocket(
+                pocket_dir = _pocket.write_run_pocket(
                     root, run_id, scope, period_start, period_end,
                     {"animals": animals or [], "n_seizures": len(seizure_rows),
                      "ceiling_min": cstats.get("min"),
@@ -263,6 +264,20 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
                     scale_rows, seizure_rows)
             except Exception as e:  # noqa: BLE001 -- pocket is best-effort
                 logger.warning("preictal pocket write failed: %s", e)
+            # Auto-emit the standalone HTML report into the run folder.
+            if pocket_dir and (pcfg.get("report", {}) or {}).get("enabled", True):
+                try:
+                    from src.preictal import report as _report
+                    run_row = {"id": run_id, "scope": scope,
+                               "period_start": period_start,
+                               "period_end": period_end, "status": "done",
+                               "n_seizures": len(seizure_rows),
+                               "n_scales": n_scales,
+                               "derivatives_path": pocket_dir}
+                    _report.render_run_report(store, run_row, scale_rows,
+                                              {"preictal": pcfg}, pocket_dir)
+                except Exception as e:  # noqa: BLE001 -- report is best-effort
+                    logger.warning("preictal report emit failed: %s", e)
         return run_id
     except Cancelled:
         store.finish_preictal_run(run_id, "failed", error="cancelled")
@@ -271,3 +286,95 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
         logger.exception("preictal run %s failed", run_id)
         store.finish_preictal_run(run_id, "failed", error=str(e))
         raise
+
+
+def trace_one_seizure(store, config: dict, scope: str = "daily",
+                      period_start: str | None = None,
+                      period_end: str | None = None,
+                      animals: list[str] | None = None,
+                      feature_name: str | None = None, max_probe: int = 12):
+    """Re-run the EXACT per-seizure pipeline stages the sweep uses, for ONE
+    representative in-scope seizure, and return every intermediate -- so a
+    validation figure can show raw -> feature -> robust-z -> CWT -> lead-time
+    bins and let a human spot an implementation mistake. Also computes the
+    scoring step (per-bin pool -> AUC matrix -> collapse) on the PROBED SUBSET
+    at a mid-band scale, using the same `_pool`/`auc_matrix`/`collapse_gradient`.
+    Returns a dict, or None if nothing gathers. Reuses run_sweep's parameter
+    derivation verbatim so the trace tracks the real path."""
+    pcfg = (config or {}).get("preictal", {}) or {}
+    tcfg = pcfg.get("trajectory", {}) or {}
+    ccfg = pcfg.get("cwt", {}) or {}
+    ecfg = pcfg.get("events", {}) or {}
+    wavelet = ccfg.get("wavelet", "cmor1.5-1.0")
+    step_sec = float(tcfg.get("step_sec", 1.0))
+    target_fs = float(tcfg.get("target_fs", 500.0))
+    min_lead = float(ccfg.get("min_leadtime_sec", 1.0))
+    max_lookback = float(ccfg.get("max_leadtime_sec", 21600.0))
+    spo = int(ccfg.get("scales_per_octave", 4))
+    buffer = float(ecfg.get("post_ictal_buffer_sec", 300.0))
+    if not animals:
+        try:
+            animals = store.list_all_animals()
+        except Exception:  # noqa: BLE001
+            animals = []
+    lo, hi = _period_bounds(period_start, period_end)
+    pairs, _ = _enumerate_seizures(store, animals, buffer, min_lead, lo, hi,
+                                   max_lookback)
+    if not pairs:
+        return None
+    ceilings = [c for _, c in pairs]
+    scales = _cwt.scales_for_band(step_sec, 1.0 / max(ceilings),
+                                  1.0 / min_lead, wavelet, spo)
+    freqs = _cwt.pseudo_freqs(scales, step_sec, wavelet)
+    bin_edges = np.asarray(leadtime_bins(max(ceilings), min_lead).edges_sec,
+                           dtype=float)
+    n_bins = int(len(bin_edges) - 1)
+    feats = resolve_features(pcfg.get("features", ["line_length"]))
+    feat = next((f for f in feats
+                 if feature_name is None or f.name == feature_name), feats[0])
+
+    best = None
+    mags: list = []
+    binidxs: list = []
+    for sz, ceil in pairs[:max_probe]:
+        ch = _resolve_channel_index(store, sz)
+        sig, fs = gather_leadup_signal(store, sz, ceil, ch)
+        if sig is None:
+            continue
+        t = feature_trajectory(sig, fs, feat, step_sec, target_fs)
+        if t.size < 4:
+            continue
+        z = robust_z(t)
+        coeffs, _ = pywt.cwt(z, scales, wavelet, sampling_period=step_sec)
+        mag = np.abs(coeffs)
+        lead = float(ceil) - (np.arange(t.size) + 0.5) * step_sec
+        bidx = np.clip(np.searchsorted(bin_edges, lead, side="right") - 1,
+                       0, n_bins - 1)
+        mags.append(mag[:, :])
+        binidxs.append(bidx)
+        if best is None or t.size > best["trajectory"].size:
+            best = {"animal": sz.animal_id, "file_id": sz.file_id,
+                    "racine": sz.racine, "onset_epoch": sz.onset_epoch,
+                    "ceiling_sec": float(ceil), "channel_index": int(ch),
+                    "fs": float(fs), "signal": sig, "trajectory": t, "z": z,
+                    "coeffs_abs": mag, "lead_sec": lead, "bin_idx": bidx}
+    if best is None:
+        return None
+
+    subset = None
+    if mags:
+        s = n_scales_mid = int(len(scales) // 2)
+        seizure_values = [m[s] for m in mags]
+        per_bin = [[v[bi == b] for b in range(n_bins)]
+                   for v, bi in zip(seizure_values, binidxs)]
+        pooled = _validation._pool(per_bin, range(len(mags)), n_bins)
+        auc = _scoring.auc_matrix(pooled)
+        collapse = _scoring.collapse_gradient(auc)
+        subset = {"n": len(mags), "scale_index": s, "scale": float(scales[s]),
+                  "pseudo_freq_hz": float(freqs[s]),
+                  "pooled": [p for p in pooled], "auc_matrix": auc,
+                  "collapse": float(collapse)}
+
+    return {"feature": feat.name, "step_sec": step_sec, "scales": scales,
+            "freqs": freqs, "bin_edges": bin_edges, "n_bins": n_bins,
+            "seizure": best, "subset": subset}

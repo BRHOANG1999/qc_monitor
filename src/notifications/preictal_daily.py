@@ -11,6 +11,7 @@ emailer.send. Weekly/monthly land in stage 3.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date
 
 logger = logging.getLogger(__name__)
@@ -108,16 +109,55 @@ def send_preictal_daily(today: date, config: dict, store, emailer) -> dict:
     rows = store.preictal_scale_summary_for_run(run["id"])
     lines = _lines(run, rows)
     text = "\n".join(lines)
+
+    # Figures + standalone HTML report (best-effort; only when a derivatives
+    # root is configured, so unit tests with a bare config stay text-only).
+    figs, report_path = _figures_and_report(config, store, run, rows)
+    img_html = "".join(
+        f'<div style="margin-top:14px"><img src="cid:{os.path.basename(p)}" '
+        f'style="max-width:900px;width:100%"></div>' for p in figs)
     html = ("<h3>Pre-ictal daily sweep</h3><pre>"
-            + "\n".join(lines[1:]) + "</pre>")
+            + "\n".join(lines[1:]) + "</pre>" + img_html)
+    if report_path:
+        html += ("<p style='color:#777;font-size:12px'>Full self-contained "
+                 f"report attached: {os.path.basename(report_path)}</p>")
+
     n_surv = len(_survivors(rows))
     subject = (f"Pre-ictal daily — {n_surv} scale(s) survive the null "
                f"({today.isoformat()})")
+    send_kwargs = dict(subject=subject, body=text, body_html=html,
+                       recipients=recipients, subject_prefix=False)
+    if figs:
+        send_kwargs["attachments"] = figs
+    if report_path:
+        send_kwargs["file_attachments"] = [report_path]
     try:
-        ok = emailer.send(subject=subject, body=text, body_html=html,
-                          recipients=recipients, subject_prefix=False)
+        ok = emailer.send(**send_kwargs)
     except Exception as e:  # noqa: BLE001
         logger.error("preictal daily digest send failed: %s", e)
         return {"sent": False, "reason": f"send error: {e}"}
     return {"sent": bool(ok), "recipients": len(recipients),
-            "run_id": run["id"], "survivors": n_surv}
+            "run_id": run["id"], "survivors": n_surv,
+            "figures": len(figs), "report": bool(report_path)}
+
+
+def _figures_and_report(config, store, run, rows):
+    """(inline figure PNG paths, report HTML path) for the digest, or ([], None)
+    when no derivatives root is configured or rendering isn't available."""
+    root = ((config or {}).get("preictal", {}) or {}).get("derivatives_root")
+    if not root:
+        return [], None
+    out_dir = os.path.join(root, "figures", f"run_{run['id']}")
+    figs, report_path = [], None
+    try:
+        from src.preictal import figures
+        figs = figures.render_run_figures(dict(run), rows, out_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("preictal digest figures failed: %s", e)
+    try:
+        from src.preictal import report as _report
+        report_path = _report.render_run_report(store, dict(run), rows,
+                                                 config, out_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("preictal digest report failed: %s", e)
+    return figs, report_path

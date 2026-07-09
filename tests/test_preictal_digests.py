@@ -22,9 +22,12 @@ class _Emailer:
         self.calls = []
 
     def send(self, subject, body, body_html=None, recipients=None,
-             subject_prefix=True, severity="info"):
+             subject_prefix=True, severity="info", attachments=None,
+             file_attachments=None):
         self.calls.append({"subject": subject, "body": body,
-                           "html": body_html, "recipients": recipients})
+                           "html": body_html, "recipients": recipients,
+                           "attachments": attachments,
+                           "file_attachments": file_attachments})
         return True
 
 
