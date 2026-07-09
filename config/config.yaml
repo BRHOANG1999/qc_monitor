@@ -493,3 +493,31 @@ logging:
   dir: D:/code/qc_monitor/logs
   max_file_size_mb: 10
   max_files: 5
+
+# ----------------------------------------------------------------------
+# Pre-ictal CWT sweep engine (thesis subsystem). Discovers the time-scale at
+# which the pre-ictal feature trajectory is cleanest. Stage 1 = the walking
+# skeleton: events -> decimated trajectory -> Morlet CWT -> per-scale summaries
+# in preictal_scale_summary + a BIDS derivatives/ pocket. Heavy compute runs in
+# a background worker (preictal_job). The daily/weekly/monthly digests land in
+# stage 3.
+# ----------------------------------------------------------------------
+preictal:
+  enabled: true
+  derivatives_root: "D:/code/qc_monitor/data/derivatives/preictal_cwt"
+  worker:
+    enabled: true
+    poll_interval_sec: 5
+  events:
+    event_source: behavioral            # reviewer-confirmed EO->BB seizures
+    post_ictal_buffer_sec: 300          # excluded from the ISI lookback ceiling
+  trajectory:
+    step_sec: 1.0                       # decimated feature cadence (1 value / s)
+    target_fs: 500.0                    # signal decimated to ~this pre-feature
+    channel_roles: [eeg]
+    normalize: robust_z                 # per-animal median/MAD before pooling
+  cwt:
+    wavelet: "cmor1.5-1.0"              # complex Morlet
+    min_leadtime_sec: 1.0
+    scales_per_octave: 4                # log/dyadic scale spacing
+  features: ["*"]                       # open-ended registry (Stage 1: line_length)

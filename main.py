@@ -169,6 +169,14 @@ def main():
     except Exception:
         logger.exception("mass_analyze worker start failed")
 
+    # Pre-ictal CWT sweep worker (thesis subsystem). Idempotent; a no-op when
+    # preictal is disabled in config. Heavy CWT compute runs off the main loop.
+    try:
+        from src.preictal import worker as _preictal_worker
+        _preictal_worker.start_worker(store, config)
+    except Exception:
+        logger.exception("preictal worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift

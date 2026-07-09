@@ -35,6 +35,30 @@ def make_scales(n: int, dt: float, wavelet: str = "cmor1.5-1.0",
     return np.sort(scales)
 
 
+def scales_for_band(dt: float, f_lo: float, f_hi: float,
+                     wavelet: str = "cmor1.5-1.0", scales_per_octave: int = 4,
+                     max_scales: int = 64) -> np.ndarray:
+    """A COMMON log/dyadic scale grid spanning pseudo-frequencies [f_lo, f_hi]
+    Hz, independent of any single trajectory's length. The engine runs every
+    seizure's CWT on this shared grid so per-scale summaries aggregate across
+    seizures. dt = trajectory sample period (seconds)."""
+    assert dt > 0 and f_hi > 0 and scales_per_octave >= 1
+    f_lo = max(f_lo, f_hi / 2.0 ** max_scales) if f_lo > 0 else f_hi / 2.0
+    if f_lo >= f_hi:
+        f_lo = f_hi / 2.0
+    fc = pywt.central_frequency(wavelet)
+    n_oct = max(1.0, np.log2(f_hi / f_lo))
+    k = min(max_scales, int(np.ceil(n_oct * scales_per_octave)) + 1)
+    freqs = f_hi * 2.0 ** (-np.arange(k) / scales_per_octave)
+    return np.sort(fc / (freqs * dt))
+
+
+def pseudo_freqs(scales: np.ndarray, dt: float,
+                  wavelet: str = "cmor1.5-1.0") -> np.ndarray:
+    """Pseudo-frequency (Hz) for each scale at sample period *dt*."""
+    return pywt.scale2frequency(wavelet, np.asarray(scales)) / dt
+
+
 def morlet_cwt(trajectory: np.ndarray, dt: float,
                 wavelet: str = "cmor1.5-1.0", scales_per_octave: int = 4,
                 min_leadtime_sec: float = 1.0):
