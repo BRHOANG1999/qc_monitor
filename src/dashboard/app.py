@@ -833,6 +833,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 allow_duplicate=True),
         Input("kbd-event", "data"),
         State("video-review-save-btn", "n_clicks"),
+        State("video-events-store", "data"),
         prevent_initial_call=True,
     )
 

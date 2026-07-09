@@ -84,7 +84,8 @@ SHORTCUTS: tuple[Shortcut, ...] = (
               "Queue", display="↑"),
     # Decision / review state
     Shortcut("n", "mark_no_events",
-              "Mark no events + go to next", "Decision"),
+              "Mark 'no events' + next (ignored once you've scored events)",
+              "Decision"),
     Shortcut("e", "events_mode",
               "Switch to 'events seen'", "Decision"),
     Shortcut("d", "save_decision",
@@ -451,10 +452,32 @@ function (undo) {
 # validation passes), then bump the Save button's n_clicks. The
 # server callback then handles the auto-advance + Undo wiring.
 MARK_NO_EVENTS_JS = """
-function (ev, curClicks) {
+function (ev, curClicks, events) {
+    var nu = window.dash_clientside.no_update;
     if (!ev || ev.action !== 'mark_no_events') {
-        return [window.dash_clientside.no_update,
-                window.dash_clientside.no_update];
+        return [nu, nu];
+    }
+    // Don't force 'no events' (and fire Save) when the reviewer has actually
+    // scored events -- that path silently discarded their work. Keep the
+    // radio from flipping under them; server-side _save_review also guards.
+    var evs = events || [];
+    var meaningful = evs.some(function (e) {
+        if (!e) return false;
+        if (e.type === 'LVF' || e.type === 'HYP' || e.type === 'Undefined')
+            return true;
+        if (e.racine !== null && e.racine !== undefined && e.racine !== '')
+            return true;
+        if (e.light !== null && e.light !== undefined && e.light !== '')
+            return true;
+        var secs = ['EO_sec', 'LAS_sec', 'BO_sec', 'PID_sec', 'BB_sec'];
+        for (var i = 0; i < secs.length; i++) {
+            var v = e[secs[i]];
+            if (v !== null && v !== undefined && v !== '') return true;
+        }
+        return false;
+    });
+    if (meaningful) {
+        return [nu, nu];
     }
     return ['no_events', (curClicks || 0) + 1];
 }

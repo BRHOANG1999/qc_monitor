@@ -360,6 +360,41 @@ def _animal_for_channel(store, file_id, channel) -> str | None:
     return store.animal_for_file_channel(file_id, channel)
 
 
+# Fields whose presence means an event row holds real reviewer work, so it
+# must never be silently discarded. Mirrors video_events.blank_event(). Kept
+# here (not imported) so the save guard AND the autosave flush can call it
+# without a circular import.
+_MEANINGFUL_SEC_FIELDS = ("EO_sec", "LAS_sec", "BO_sec", "PID_sec", "BB_sec")
+_MEANINGFUL_TEXT_FIELDS = ("onset_comment", "behavior_comment",
+                            "score_comment", "roomlight", "video_quality")
+
+
+def _event_is_meaningful(event) -> bool:
+    """True if *event* carries any reviewer-entered data -- a landmark time, a
+    Racine score, a seizure type, a light level, or a comment. A pristine
+    ``blank_event()`` is NOT meaningful."""
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") in ("LVF", "HYP", "Undefined"):
+        return True
+    if event.get("racine") not in (None, "", []):
+        return True
+    if event.get("light") not in (None, "", []):
+        return True
+    for _f in _MEANINGFUL_SEC_FIELDS:
+        if event.get(_f) not in (None, ""):
+            return True
+    for _f in _MEANINGFUL_TEXT_FIELDS:
+        if (event.get(_f) or "").strip():
+            return True
+    return False
+
+
+def _has_meaningful_edits(events) -> bool:
+    """True if ANY event in *events* holds reviewer-entered data."""
+    return any(_event_is_meaningful(e) for e in (events or []))
+
+
 def _pi_flag_note_for_file(store, file_id: int) -> str:
     """Return the most-recent ``pi_flag`` note for *file_id* or
     an empty string if there isn't one.
@@ -5404,6 +5439,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                          f"{idxs} still need landmarks + Racine "
                          "before saving.",
                         *nop[1:])
+        # SCORE-LOSS GUARD (the dominant data-loss path): a reviewer who
+        # scored events and then chose "No events seen" -- or pressed the
+        # `n` hotkey, which force-sets no_events -- would otherwise have
+        # every scored event silently dropped (markers_payload=None below)
+        # and the file auto-advanced, making it look saved. Refuse instead.
+        if decision == "no_events" and _has_meaningful_edits(events):
+            n = sum(1 for e in events if _event_is_meaningful(e))
+            return (f"Not saved — you have {n} scored event"
+                     f"{'' if n == 1 else 's'} but chose \"No events "
+                     "seen\". Switch to \"Events seen\" to submit them, or "
+                     "delete them first (nothing was lost).",
+                    *nop[1:])
         email = current_user_email()
         if not email:
             return ("Not signed in — can't record who reviewed "
