@@ -312,8 +312,10 @@ review_queue:
 auto_filter:
   enabled: true
   sweep_interval_sec: 300
-  # Used as the review author when a config has no updated_by.
-  system_email: hoang392@umn.edu
+  # Author attributed to the automated auto-screen sweep + its flag/clear
+  # review events. Keep this a SYSTEM identity (not a person) so the
+  # auto-screen doesn't show up as a human in the User Activity feed.
+  system_email: auto-filter@system
 
 # Training tab: students blind-re-score PI-approved recordings and get an
 # agreement score vs the validated answer. Reuses review_queue.pi_emails
