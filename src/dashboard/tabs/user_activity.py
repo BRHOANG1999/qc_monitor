@@ -19,8 +19,8 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from dash import (ALL, Input, Output, callback_context, dash_table, dcc,
-                  html, no_update)
+from dash import (ALL, Input, Output, State, callback_context, dash_table,
+                  dcc, html, no_update)
 
 from src.db.store import Store
 from src.dashboard.auth import current_user_email
@@ -60,6 +60,151 @@ _INTERACTIVE_PLOT_CONFIG = {
     "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
     "scrollZoom": True,
 }
+
+# ------------------------------------------------------------------------- #
+#  Training-review video <-> LFP/Hilbert time-lock (clientside; same scheme
+#  as the Video Review + Training tabs). The <video> DOM id is fixed so the
+#  clientside callbacks resolve it after the review panel renders on demand.
+#  Mapping: cursor_x = currentTime * (lfp_dur / video.duration) so container-
+#  FPS drift can't accumulate (both endpoints are ground truth).
+# ------------------------------------------------------------------------- #
+_UA_VIDEO_DOM_ID = "ua-train-video"
+
+_UA_POLL_JS = """
+function(_n) {
+    var v = document.getElementById('""" + _UA_VIDEO_DOM_ID + """');
+    if (!v || isNaN(v.currentTime)) { return window.dash_clientside.no_update; }
+    return v.currentTime;
+}
+"""
+
+_UA_CURSOR_JS = """
+function(currentTime, fig, lfp_dur) {
+    if (fig === undefined || fig === null) {
+        return window.dash_clientside.no_update;
+    }
+    if (currentTime === null || currentTime === undefined) {
+        return window.dash_clientside.no_update;
+    }
+    var t = currentTime;
+    var v = document.getElementById('""" + _UA_VIDEO_DOM_ID + """');
+    if (v && isFinite(v.duration) && v.duration > 0 && lfp_dur && lfp_dur > 0) {
+        t = currentTime * (lfp_dur / v.duration);
+    }
+    var keep = ((fig.layout && fig.layout.shapes) || []).slice(1);
+    var cursor = {type: 'line', xref: 'x', yref: 'paper',
+                  x0: t, x1: t, y0: 0, y1: 1,
+                  line: {color: '#ff9f0a', width: 2}};
+    return {data: fig.data,
+            layout: Object.assign({}, fig.layout,
+                                  {shapes: [cursor].concat(keep)})};
+}
+"""
+
+_UA_SEEK_JS = """
+function(clickData, lfp_dur) {
+    if (!clickData || !clickData.points || !clickData.points.length) {
+        return '';
+    }
+    var x = clickData.points[0].x;
+    var v = document.getElementById('""" + _UA_VIDEO_DOM_ID + """');
+    if (!v || !isFinite(x)) { return ''; }
+    var vt = x;
+    if (isFinite(v.duration) && v.duration > 0 && lfp_dur && lfp_dur > 0) {
+        vt = x * (v.duration / lfp_dur);
+    }
+    if (vt < 0) { vt = 0; }
+    if (isFinite(v.duration) && vt > v.duration) { vt = v.duration; }
+    v.currentTime = vt;
+    return '';
+}
+"""
+
+
+def _ua_xsync_js(target_id: str) -> str:
+    """Lock the LFP<->Hilbert x-axes: zoom/pan one, the other follows. Echo-
+    guarded; side-effects via Plotly.relayout only, so it never rewrites the
+    Dash figure prop (zoom survives the 10 Hz cursor updates)."""
+    return ("""
+        function(rel) {
+            if (!rel) { return window.dash_clientside.no_update; }
+            var hasRange = ('xaxis.range[0]' in rel
+                             && 'xaxis.range[1]' in rel);
+            var hasAuto = !!rel['xaxis.autorange'];
+            if (!hasRange && !hasAuto) {
+                return window.dash_clientside.no_update;
+            }
+            var host = document.getElementById('%s');
+            var gd = host && (host.classList
+                       && host.classList.contains('js-plotly-plot')
+                      ? host : host.querySelector('.js-plotly-plot'));
+            if (!gd || !window.Plotly) {
+                return window.dash_clientside.no_update;
+            }
+            var cur = (gd.layout && gd.layout.xaxis)
+                       ? gd.layout.xaxis.range : null;
+            if (hasRange) {
+                var x0 = rel['xaxis.range[0]'], x1 = rel['xaxis.range[1]'];
+                if (cur && Math.abs(cur[0]-x0) < 1e-6
+                        && Math.abs(cur[1]-x1) < 1e-6) {
+                    return window.dash_clientside.no_update;
+                }
+                window.Plotly.relayout(gd,
+                    {'xaxis.range[0]': x0, 'xaxis.range[1]': x1});
+            } else {
+                if (gd.layout && gd.layout.xaxis
+                        && gd.layout.xaxis.autorange === true) {
+                    return window.dash_clientside.no_update;
+                }
+                window.Plotly.relayout(gd, {'xaxis.autorange': true});
+            }
+            return window.dash_clientside.no_update;
+        }
+        """ % target_id)
+
+
+def _register_ua_train_cursor_sync(app) -> None:
+    """Time-lock the training-review <video> to the LFP + Hilbert cursors,
+    with click-to-seek and the LFP<->Hilbert x-axis lock. Registered ONCE at
+    app init; the ua-train-* components exist only while a review panel is
+    open (suppress_callback_exceptions tolerates their absence)."""
+    # Poll the <video> 10 Hz -> current-time Store.
+    app.clientside_callback(
+        _UA_POLL_JS,
+        Output("ua-train-current-time", "data"),
+        Input("ua-train-time-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    # Mirror current time onto each panel's cursor; click a panel -> seek.
+    for graph_id in ("ua-train-lfp", "ua-train-hil"):
+        app.clientside_callback(
+            _UA_CURSOR_JS,
+            Output(graph_id, "figure", allow_duplicate=True),
+            Input("ua-train-current-time", "data"),
+            State(graph_id, "figure"),
+            State("ua-train-lfp-dur", "data"),
+            prevent_initial_call=True,
+        )
+        app.clientside_callback(
+            _UA_SEEK_JS,
+            Output("ua-train-seek-sink", "children", allow_duplicate=True),
+            Input(graph_id, "clickData"),
+            State("ua-train-lfp-dur", "data"),
+            prevent_initial_call=True,
+        )
+    # Lock the two x-axes together.
+    app.clientside_callback(
+        _ua_xsync_js("ua-train-hil"),
+        Output("ua-train-xsync-sink", "data", allow_duplicate=True),
+        Input("ua-train-lfp", "relayoutData"),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        _ua_xsync_js("ua-train-lfp"),
+        Output("ua-train-xsync-sink", "data", allow_duplicate=True),
+        Input("ua-train-hil", "relayoutData"),
+        prevent_initial_call=True,
+    )
 
 
 def _can_view(store: Store, config: dict | None, email: str | None) -> bool:
@@ -267,7 +412,7 @@ def _train_review_panel(store: Store, attempt_id: int):
     else:
         channel = _first_animal_channel(store, session_dir, file_path)
         validated = store.validated_events_for_file(int(file_id))
-    lfp, hil, _dur = _build_figures(store, int(file_id), channel, "hilbert")
+    lfp, hil, dur = _build_figures(store, int(file_id), channel, "hilbert")
     try:
         answer = json.loads(a.get("submitted_json") or "{}")
     except (json.JSONDecodeError, TypeError):
@@ -321,9 +466,29 @@ def _train_review_panel(store: Store, attempt_id: int):
     if csv_info is not None:
         children.append(csv_info)
     children += [
-        dcc.Graph(figure=lfp, config=_INTERACTIVE_PLOT_CONFIG),
-        dcc.Graph(figure=hil, config=_INTERACTIVE_PLOT_CONFIG),
+        html.Div("Video ↔ LFP ↔ Hilbert are time-locked: play the video and "
+                 "the orange cursor tracks it on both plots; click a plot to "
+                 "seek the video. Scroll/drag to zoom.",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                        "margin": "8px 0 4px"}),
+        html.Video(
+            id="ua-train-video",
+            src=f"/media/video/{int(file_id)}/cam/1",
+            controls=True, preload="metadata",
+            style={"width": "100%", "maxHeight": "360px",
+                   "borderRadius": "10px", "background": "#000"}),
+        dcc.Graph(id="ua-train-lfp", figure=lfp,
+                  config=_INTERACTIVE_PLOT_CONFIG),
+        dcc.Graph(id="ua-train-hil", figure=hil,
+                  config=_INTERACTIVE_PLOT_CONFIG),
         compare,
+        # Time-lock plumbing (clientside; ids resolved by
+        # _register_ua_train_cursor_sync). Re-created fresh each panel render.
+        dcc.Interval(id="ua-train-time-tick", interval=100, n_intervals=0),
+        dcc.Store(id="ua-train-current-time", data=0.0),
+        dcc.Store(id="ua-train-lfp-dur", data=float(dur or 0)),
+        dcc.Store(id="ua-train-xsync-sink", data=None),
+        html.Div(id="ua-train-seek-sink", style={"display": "none"}),
     ]
     return html.Div(children, style={
         "marginTop": "10px", "padding": "12px",
@@ -532,3 +697,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("training review panel failed: %s", e)
             return html.Div(f"Couldn't load this recording: {e}",
                             style={"color": "#ff9f0a", "padding": "8px"})
+
+    # Time-lock the training-review <video> with the LFP + Hilbert cursors
+    # (poll, cursor-mover per panel, click-to-seek, x-axis lock).
+    _register_ua_train_cursor_sync(app)
