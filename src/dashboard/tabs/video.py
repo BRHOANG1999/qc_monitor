@@ -2426,7 +2426,8 @@ def layout(store: Store, bridge: dict | None = None):
         html.Div([
             _details_card(
                 "Show all timestamps",
-                summary_sub="full FIFO list -- click any item to load it",
+                summary_sub="every recording for this animal (all pools) -- "
+                            "click any item to load it",
                 open_default=False,
                 content=html.Div(id="video-queue-list",
                           style={"maxHeight": "220px", "overflowY": "auto",
@@ -4065,22 +4066,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         row = rows[0]                 # head of the newly-selected pool
         return row["session_dir"], int(row["id"])
 
-    # Pool LIST card header: title + sub follow the Pool dropdown.
+    # Pool LIST card: the header (title + sub) AND the file rows are rendered
+    # by ONE callback from the SAME mode, so the header can NEVER desync from
+    # the rows (the bug where it said "Needs more onsets" over Flag rows).
+    # Rows keep the video-needs-item id so a click loads via _load_from_queue
+    # (which prefills any draft events on file change).
     @app.callback(
         Output("video-pool-list-title", "children"),
         Output("video-pool-list-sub", "children"),
-        Input("video-queue-mode", "value"),
-    )
-    def _pool_list_header(mode):
-        title, sub = _POOL_LIST_HEADER.get(
-            mode or "queue", _POOL_LIST_HEADER["queue"])
-        return title, f" · {sub}"
-
-    # Pool LIST card contents: the files of the SELECTED pool (video-queue-
-    # mode), so the card follows the same source as the carousel. Rows keep
-    # the video-needs-item id type so a click loads the file through
-    # _load_from_queue (which prefills any draft events on file change).
-    @app.callback(
         Output("video-needs-scoring-list", "children"),
         Input("video-queue-animal", "value"),
         Input("video-queue-mode", "value"),
@@ -4089,9 +4082,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _render_needs_scoring(animal_value, mode, _refresh, active_file_id):
         mode = mode or "queue"
+        title, sub = _POOL_LIST_HEADER.get(mode, _POOL_LIST_HEADER["queue"])
+        sub = f" · {sub}"
         animal_ids = _animal_ids_from_picker(animal_value)
         if not animal_ids:
-            return html.Div(
+            return title, sub, html.Div(
                 "Pick an animal to see this pool.",
                 style={"color": "#888", "fontSize": "11px",
                         "padding": "8px"})
@@ -4104,7 +4099,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("pool list fetch failed: %s", e)
             rows = []
         if not rows:
-            return html.Div(
+            return title, sub, html.Div(
                 "Nothing in this pool.",
                 style={"color": "#888", "fontSize": "11px",
                         "padding": "8px"})
@@ -4160,54 +4155,40 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         "borderLeft": ("3px solid #f0b429" if is_active
                                         else "3px solid transparent"),
                         "textAlign": "left"}))
-        return items
+        return title, sub, items
 
     @app.callback(
         Output("video-queue-list", "children"),
         Input("video-queue-animal", "value"),
-        Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("video-file-dropdown", "value"),
     )
-    def _render_queue(animal_value, mode, _refresh, active_file_id):
-        """Render the per-animal queue list for the active mode. Each item is a
-        Button with a pattern-matching id so one downstream callback
-        handles all clicks. The button whose ``file_id`` matches
-        ``active_file_id`` (the dropdown's current value) gets a
-        left-border accent + a tinted background so the reviewer
-        can always tell which recording is loaded."""
+    def _render_queue(animal_value, _refresh, active_file_id):
+        """Render EVERY recording for the animal, regardless of review pool --
+        the pool-INDEPENDENT 'Show all timestamps' list. (The pool-filtered
+        view is the separate pool-list card.) Each item is a Button with a
+        pattern-matching id so one downstream callback handles all clicks; the
+        button whose file_id matches active_file_id (the loaded file) gets a
+        left-border accent + tint."""
         if not animal_value:
             return html.Div(
-                "Pick an animal above to see your queue.",
+                "Pick an animal above to see all its recordings.",
                 style={"color": "#888", "fontSize": "12px",
                         "padding": "10px"})
-        mode = mode or "queue"
-        spec = _QUEUE_MODE_BY_VALUE.get(mode, _QUEUE_MODE_BY_VALUE["queue"])
-        # Resolve animal_value to a list of animal ids (single
-        # selection or the unassigned pool sentinel).
         animal_ids = _animal_ids_from_picker(animal_value)
         if not animal_ids:
             return html.Div(
-                "Pick an animal above to see your queue.",
+                "Pick an animal above to see all its recordings.",
                 style={"color": "#888", "fontSize": "12px",
                         "padding": "10px"})
-        email = current_user_email() or ""
-        floor = store.review_backlog_floor()
-        # The "Show all timestamps" list shows the WHOLE pool, not
-        # just the first queue_limit (that cap is for the prev/next
-        # browse card). High ceiling so every recording is listed.
-        rows = _fetch_queue_by_mode(store, mode, animal_ids, email, floor,
-                                    _QUEUE_LIST_MAX)
+        # Every recording for the animal, oldest first -- pool-independent
+        # (does NOT follow the Pool dropdown).
+        rows = store.all_files_for_animal(animal_ids[0], _QUEUE_LIST_MAX)
         if not rows:
-            return html.Div([
-                html.Div("🎉  You're all caught up!"
-                         if mode == "queue" else "Nothing here",
-                         style={"color": "#00CC96", "fontWeight": "600",
-                                 "fontSize": "13px", "marginBottom": "4px"}),
-                html.Div(
-                    spec["empty"].format(a=animal_ids[0]),
-                    style={"color": "#888", "fontSize": "11px"}),
-            ], style={"padding": "14px", "textAlign": "center"})
+            return html.Div(
+                "No recordings found for this animal.",
+                style={"color": "#888", "fontSize": "11px",
+                        "padding": "14px", "textAlign": "center"})
         from datetime import datetime as _dt
         now = _dt.now()
         # Two-level grouping: day (expandable) -> hours within it.

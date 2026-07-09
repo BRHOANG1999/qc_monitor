@@ -103,6 +103,23 @@ def test_chunk_start_dt_parses_both_formats(tmp_path):
     assert _chunk_start_dt(store, 9) is None            # unparseable -> None
 
 
+def test_all_files_for_animal_is_pool_independent(tmp_path):
+    # 'Show all timestamps' lists every recording for the animal regardless
+    # of review pool.
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    _seed_multi_animal_file(store, 7)                       # BCH062 + BCH061
+    _seed_multi_animal_file(store, 8, session_dir="sessM2")
+    assert sorted(r["id"] for r in store.all_files_for_animal("BCH062")) \
+        == [7, 8]
+    # A review state on one file doesn't change the all-files listing.
+    store.upsert_scoring_draft(7, "u@lab", "BCH062",
+                               [{"type": "LVF", "EO_sec": 1.0, "racine": 3}])
+    assert sorted(r["id"] for r in store.all_files_for_animal("BCH062")) \
+        == [7, 8]
+    assert store.all_files_for_animal("BCH061")             # both animals map
+    assert store.all_files_for_animal("BCH999") == []       # unknown -> none
+
+
 def test_wall_clock_axis_labels():
     from datetime import datetime
     import plotly.graph_objects as go

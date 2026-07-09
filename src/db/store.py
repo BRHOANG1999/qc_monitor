@@ -3205,6 +3205,59 @@ class Store:
                 out.append(d)
         return out
 
+    def all_files_for_animal(self, animal_id: str,
+                             limit: int = 100000) -> list[dict]:
+        """EVERY video recording for *animal_id*, regardless of review state
+        or pool -- the 'Show all timestamps' list, which is pool-independent.
+        Same loose channel_names LIKE + precise post-filter as
+        files_needing_scoring_for_animal. Each dict: {id, session_dir,
+        file_path, chunk_datetime, duration_sec}, oldest first."""
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        if not animal_id:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT pf.id AS id, pf.session_dir, pf.file_path,
+                          pf.chunk_datetime, pf.duration_sec,
+                          sc.channel_names AS channel_names
+                   FROM processed_files pf
+                   JOIN session_config sc
+                     ON sc.session_dir = pf.session_dir
+                   WHERE sc.channel_names LIKE ?
+                     AND pf.has_video = 1
+                   ORDER BY pf.chunk_datetime ASC
+                   LIMIT ?""",
+                (f'%"{animal_id}%', int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        session_match: dict[str, bool] = {}
+        for r in rows:
+            sdir = r["session_dir"]
+            match = session_match.get(sdir)
+            if match is None:
+                match = False
+                try:
+                    names = json.loads(r["channel_names"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    names = []
+                for n in names:
+                    if isinstance(n, str) and is_animal_channel(n):
+                        a, _ = split_animal_electrode(n)
+                        if a == animal_id:
+                            match = True
+                            break
+                session_match[sdir] = match
+            if match:
+                d = dict(r)
+                d.pop("channel_names", None)
+                out.append(d)
+        return out
+
     def animals_with_needs_scoring(self) -> list[str]:
         """Distinct animals with >=1 file whose LATEST review is needs_scoring
         (the quick-flag pool). A DB fallback for the Video Review animal picker
