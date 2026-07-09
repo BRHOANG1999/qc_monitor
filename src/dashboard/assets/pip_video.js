@@ -10,11 +10,11 @@
  * ``video.py`` can call it on store change.
  *
  * Toggle paths:
- *   * Refresh-bar "PiP" button in ``app.py``.
  *   * "x Dock" button rendered inside the floating .qc-pip-grid.
  *   * ``P`` hotkey (routed through the kbd-event bus).
+ *   (The refresh-bar "PiP" button was removed.)
  *
- * All three flip the ``video-pip-state`` Store; the clientside
+ * Both flip the ``video-pip-state`` Store; the clientside
  * callback observes that Store and calls this helper.
  */
 (function () {
