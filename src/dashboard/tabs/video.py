@@ -789,10 +789,13 @@ def _fmt_time(sec) -> str:
     return f"{s:.1f} s · {_mmss(s)}"
 
 
-def _apply_mmss_xaxis(fig: go.Figure, t_max: float) -> None:
-    """Relabel a seconds x-axis with ~8 nice mm:ss ticks across
-    ``[0, t_max]``. Data stays in seconds (cursor/seek math untouched);
-    only the tick *labels* change. No-op for tiny/invalid spans."""
+def _apply_mmss_xaxis(fig: go.Figure, t_max: float, start_dt=None) -> None:
+    """Relabel a seconds x-axis with ~8 nice ticks across ``[0, t_max]``.
+    Data stays in seconds (cursor/seek math untouched); only the tick
+    *labels* change. When *start_dt* (the recording's wall-clock start) is
+    given the labels show TIME OF DAY (HH:MM:SS) so a reviewer can read when
+    a seizure occurred; otherwise mm:ss elapsed. No-op for tiny/invalid
+    spans."""
     assert fig is not None, "fig required"
     try:
         span = float(t_max)
@@ -810,13 +813,40 @@ def _apply_mmss_xaxis(fig: go.Figure, t_max: float) -> None:
     step = max(1.0, step)
     n_ticks = int(span // step) + 1
     vals = [i * step for i in range(n_ticks + 1) if i * step <= span + step]
-    fig.update_xaxes(tickmode="array", tickvals=vals,
-                      ticktext=[_mmss(v) for v in vals])
+    if start_dt is not None:
+        from datetime import timedelta
+        ticktext = [(start_dt + timedelta(seconds=v)).strftime("%H:%M:%S")
+                    for v in vals]
+    else:
+        ticktext = [_mmss(v) for v in vals]
+    fig.update_xaxes(tickmode="array", tickvals=vals, ticktext=ticktext)
+
+
+def _chunk_start_dt(store, file_id):
+    """Parse a file's recording start (processed_files.chunk_datetime) into a
+    datetime, or None. Handles both the underscore ('YYYY_MM_DD__HH_MM_SS')
+    and ISO ('YYYY-MM-DDTHH:MM:SS') stamps seen in the DB. Used to label the
+    LFP x-axis with wall-clock time of day."""
+    try:
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT chunk_datetime FROM processed_files WHERE id = ?",
+                (int(file_id),)).fetchone()
+    except Exception:
+        return None
+    raw = ((row["chunk_datetime"] if row else "") or "")[:19]
+    for fmt in ("%Y_%m_%d__%H_%M_%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
                        uirevision: str | None = None,
-                       title: str | None = None) -> go.Figure:
+                       title: str | None = None,
+                       start_dt=None) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scattergl(
         x=t, y=signal,
@@ -847,7 +877,9 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
         # It changes when the file/channel changes, so a new recording
         # resets to full view.
         uirevision=uirevision,
-        xaxis=dict(title="Time (mm:ss)", showgrid=True,
+        xaxis=dict(title=("Time of day (hh:mm:ss)" if start_dt is not None
+                          else "Time (mm:ss)"),
+                   showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
         yaxis=dict(title="μV", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)", zeroline=False),
@@ -866,10 +898,11 @@ def _build_lfp_figure(t: np.ndarray, signal: np.ndarray, label: str,
             title=dict(text=title, x=0.5, xanchor="center", y=0.98,
                        yanchor="top", font=dict(size=12, color="#cfd0d6")),
             margin=dict(l=60, r=20, t=26, b=40))
-    # mm:ss tick labels so long recordings stay readable; hover still
-    # shows exact seconds via the per-trace hovertemplate.
+    # Tick labels: wall-clock time-of-day when we know the recording's start
+    # (so a reviewer can read WHEN a seizure happened), else mm:ss elapsed.
+    # Data stays in seconds; hover still shows exact seconds for video seek.
     if t is not None and len(t):
-        _apply_mmss_xaxis(fig, float(t[-1]))
+        _apply_mmss_xaxis(fig, float(t[-1]), start_dt=start_dt)
     return fig
 
 
@@ -1988,7 +2021,7 @@ def _video_mass_analyze_panel() -> html.Details:
                             " — the detector flagged these at your cutoff. "
                             "Browse a pool and REVIEW each: score the real "
                             "events, or mark “No events seen.” "
-                            "(Different from the \U0001f6a9 Needs-more-onsets "
+                            "(Different from the ⚠️ Needs-more-onsets "
                             "pool, which is your own scored events awaiting "
                             "their remaining landmarks.)",
                             style={"color": "#a0a0b0", "fontSize": "11px"}),
@@ -2382,7 +2415,7 @@ def layout(store: Store, bridge: dict | None = None):
                                   "borderRadius": "6px", "padding": "4px"}),
             ),
             _details_card(
-                "🚩 Needs more onsets — finish your landmarks",
+                "⚠️ Needs more onsets — finish your landmarks",
                 summary_sub="Files YOU submitted with an onset (EO) + Racine "
                             "but still missing some landmarks (LAS/BO/PID/BB). "
                             "Open one to add the rest.",
@@ -3951,6 +3984,35 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     {"source": "queue_card_load"})
         return row["session_dir"], int(row["id"])
 
+    # Switching the pool mode (Queue <-> Flag <-> Needs more onsets) LOADS a
+    # recording from that pool, so the video/LFP reflect the new pool right
+    # away. Queue and Flag are different file sets -- Queue = the FIFO of
+    # recordings with nothing threshold-flagged; Flag = the ones the auto-
+    # filter / Mass Analyze detected events on -- so the loaded recording
+    # must change with the mode, not stay on the previous pool's file. Loads
+    # the head (position 0, which _on_queue_arrow resets to on a mode change).
+    @app.callback(
+        Output("video-session-dropdown", "value", allow_duplicate=True),
+        Output("video-file-dropdown", "value", allow_duplicate=True),
+        Input("video-queue-mode", "value"),
+        State("video-queue-animal", "value"),
+        prevent_initial_call=True,
+    )
+    def _autoload_on_mode_change(mode, animal_value):
+        if not animal_value:
+            return no_update, no_update
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
+            return no_update, no_update
+        email = current_user_email() or ""
+        floor = store.review_backlog_floor()
+        rows = _fetch_queue_by_mode(store, mode or "queue", animal_ids, email,
+                                    floor, queue_limit)
+        if not rows:
+            return no_update, no_update
+        row = rows[0]                 # head of the newly-selected pool
+        return row["session_dir"], int(row["id"])
+
     # The "Needs scoring" pool: quick-flagged files awaiting full
     # scoring. Reuses the video-queue-item id type so a click loads the
     # file through the existing _load_from_queue handler (which prefills
@@ -5356,15 +5418,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         events = list(events or [])
         meaningful = [e for e in events if _event_is_meaningful(e)]
         route, blocking = _events.submit_route(events)
-        # Pill + destination. When events exist we ALWAYS surface them (and
-        # the routing), even if the radio still says "No events" -- that
-        # conflict is exactly what confused reviewers before.
-        if meaningful:
-            if decision == "no_events":
-                pill_label, pill_color = "Conflict", "#ff453a"
-                dest = (f"→ blocked: you chose \"No events\" but "
-                        f"{len(meaningful)} scored")
-            elif route is None:
+        # What the preview shows + where Submit routes. "No events seen" takes
+        # priority: preview AS no-events (onsets hidden) even if some are
+        # scored -- they stay in memory (the autosaved draft) for a
+        # mind-change, and Submit writes no-events.
+        show_events = []          # per-event CSV breakdown to display
+        kept_note = None
+        if decision == "no_events":
+            pill_label, pill_color = "No events", "#30d158"
+            dest = "→ PI review (no events)"
+            if meaningful:
+                kept_note = (f"{len(meaningful)} onset"
+                             f"{'' if len(meaningful) == 1 else 's'} kept in "
+                             "memory — switch to \"Events seen\" to submit")
+        elif meaningful:
+            show_events = meaningful
+            if route is None:
                 pill_label, pill_color = "Incomplete", "#ff453a"
                 dest = (f"→ blocked: event{'s' if len(blocking) > 1 else ''} "
                         f"{', '.join(map(str, blocking))} need EO + Racine")
@@ -5374,9 +5443,6 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             else:                                   # pending_pi_review
                 pill_label, pill_color = "Events", "#30d158"
                 dest = "→ PI review (all complete)"
-        elif decision == "no_events":
-            pill_label, pill_color = "No events", "#30d158"
-            dest = "→ PI review (no events)"
         else:
             pill_label, pill_color = "Not picked yet", "#a0a0b0"
             dest = ""
@@ -5409,18 +5475,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                         "fontWeight": "600"}))
         header_children += [
             html.Span("·"),
-            html.Span(f"{len(meaningful)} event"
-                       f"{'' if len(meaningful) == 1 else 's'}"),
+            html.Span(f"{len(show_events)} event"
+                       f"{'' if len(show_events) == 1 else 's'}"),
             html.Span("·"),
             html.Span(note_label),
             html.Span("·"),
             html.Span(file_label, style={"color": "#888"}),
         ]
+        if kept_note:
+            header_children.append(
+                html.Span(kept_note, style={"color": "#ff9f0a"}))
         header = html.Div(
             header_children,
             style={"display": "flex", "gap": "6px", "flexWrap": "wrap",
                     "alignItems": "center"})
-        if not meaningful:
+        if not show_events:
             return header
         # Per-event CSV-style breakdown: exactly what would be written.
         rows = [html.Div(
@@ -5428,7 +5497,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             style={"fontFamily": "ui-monospace, SF Mono, monospace",
                     "fontSize": "11px", "color": "#cfd0d6",
                     "padding": "1px 0"})
-            for i, e in enumerate(meaningful, 1)]
+            for i, e in enumerate(show_events, 1)]
         return [header,
                 html.Div(rows, style={"marginTop": "4px", "width": "100%"})]
 
@@ -5606,15 +5675,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Event Verification tab.
         route, blocking = _events.submit_route(events)
         if decision == "no_events":
-            # Explicit "no events" -- but never let it silently discard
-            # scored work (the historical n-hotkey / mis-click loss).
-            if _has_meaningful_edits(events):
-                n = sum(1 for e in events if _event_is_meaningful(e))
-                return (f"Not saved — you have {n} scored event"
-                         f"{'' if n == 1 else 's'} but chose \"No events "
-                         "seen\". Switch to \"Events seen\" to submit them, "
-                         "or delete them first (nothing was lost).",
-                        *nop[1:])
+            # Intentional "No events seen": write no-events regardless of any
+            # onsets in the editor. Those onsets remain in the autosaved
+            # ('needs_scoring') draft -- kept in memory -- until this
+            # no-events row supersedes them, so a mind-change BEFORE
+            # submitting keeps them and the preview shows them again. The
+            # `n` hotkey (no preview, one keystroke) stays neutered when
+            # events exist; this radio path is the deliberate, previewed one.
             target_status = "pending_pi_review"
             markers_payload = None
         else:                                       # "has_events"
@@ -6118,7 +6185,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             filtered = signal
 
         fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}",
-                                 uirevision=f"{file_id}:{channel}")
+                                 uirevision=f"{file_id}:{channel}",
+                                 start_dt=_chunk_start_dt(store, file_id))
         # Draw the CURRENT file's onsets so they survive this rebuild. On a
         # file/channel switch the live store lags (still the previous file),
         # so _landmarks_for_rebuild reads the new file's saved draft instead.

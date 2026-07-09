@@ -86,5 +86,35 @@ def test_csv_preview_line_reflects_structured_event():
     assert "EO=3220.7s" in l2 and "Score=—" in l2 and "Light=—" in l2
 
 
+def test_chunk_start_dt_parses_both_formats(tmp_path):
+    from datetime import datetime
+    from src.dashboard.tabs.video import _chunk_start_dt
+    store = Store(str(tmp_path / "data" / "monitor.db"))
+    _seed_multi_animal_file(store, 7)   # chunk_datetime '2026_01_01__00_00_00'
+    assert _chunk_start_dt(store, 7) == datetime(2026, 1, 1, 0, 0, 0)
+    with store.connection() as conn:
+        conn.execute("INSERT INTO processed_files (id, file_path, "
+                     "chunk_datetime) VALUES (8, '/f/8.mat', "
+                     "'2026-06-04T03:41:00')")          # ISO variant
+        conn.execute("INSERT INTO processed_files (id, file_path, "
+                     "chunk_datetime) VALUES (9, '/f/9.mat', NULL)")
+        conn.commit()
+    assert _chunk_start_dt(store, 8) == datetime(2026, 6, 4, 3, 41, 0)
+    assert _chunk_start_dt(store, 9) is None            # unparseable -> None
+
+
+def test_wall_clock_axis_labels():
+    from datetime import datetime
+    import plotly.graph_objects as go
+    from src.dashboard.tabs.video import _apply_mmss_xaxis
+    fig = go.Figure()
+    _apply_mmss_xaxis(fig, 3600.0, start_dt=datetime(2026, 6, 4, 3, 41, 0))
+    assert list(fig.layout.xaxis.ticktext)[0] == "03:41:00"
+    # Without a start time we keep mm:ss elapsed (other views unchanged).
+    fig2 = go.Figure()
+    _apply_mmss_xaxis(fig2, 3600.0)
+    assert list(fig2.layout.xaxis.ticktext)[0] == "00:00"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
