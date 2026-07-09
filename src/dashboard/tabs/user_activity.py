@@ -50,6 +50,17 @@ _AREA_OPTIONS = [
 ]
 _PRESENCE_MIN = 15
 
+# Interactive plot config for the training-review LFP/Hilbert plots so the PI
+# can zoom + pan them (scroll to zoom, drag to box-zoom, double-click to
+# reset) -- mirrors the Video Review LFP trace config.
+_INTERACTIVE_PLOT_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "doubleClick": "reset",
+    "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"],
+    "scrollZoom": True,
+}
+
 
 def _can_view(store: Store, config: dict | None, email: str | None) -> bool:
     if not email:
@@ -310,8 +321,8 @@ def _train_review_panel(store: Store, attempt_id: int):
     if csv_info is not None:
         children.append(csv_info)
     children += [
-        dcc.Graph(figure=lfp, config={"displayModeBar": False}),
-        dcc.Graph(figure=hil, config={"displayModeBar": False}),
+        dcc.Graph(figure=lfp, config=_INTERACTIVE_PLOT_CONFIG),
+        dcc.Graph(figure=hil, config=_INTERACTIVE_PLOT_CONFIG),
         compare,
     ]
     return html.Div(children, style={
