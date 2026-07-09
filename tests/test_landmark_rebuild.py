@@ -68,5 +68,23 @@ def test_saved_landmarks_empty_when_no_draft(tmp_path):
     assert _saved_landmarks_for(store, 7, 0) == []
 
 
+def test_csv_preview_line_reflects_structured_event():
+    """The Submit preview shows the structured event as it would hit the CSV
+    (not the legacy '0 markers'), including em-dashes for unset fields."""
+    from src.dashboard.tabs.video import _csv_preview_line, _fmt_sec
+    from src.dashboard.tabs.video_events import blank_event
+    assert _fmt_sec(3220.71) == "3220.7s"
+    assert _fmt_sec(None) == "—" and _fmt_sec("") == "—"
+    scored = {**blank_event(), "type": "LVF", "EO_sec": 3220.71,
+              "racine": 4, "light": 2}
+    line = _csv_preview_line(1, scored)
+    assert "Onset=LVF" in line and "EO=3220.7s" in line
+    assert "Score=4" in line and "Light=2" in line
+    # An EO-only draft (the screenshot case): onset shows, rest are dashes.
+    eo_only = {**blank_event(), "type": "LVF", "EO_sec": 3220.71}
+    l2 = _csv_preview_line(1, eo_only)
+    assert "EO=3220.7s" in l2 and "Score=—" in l2 and "Light=—" in l2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

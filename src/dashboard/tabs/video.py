@@ -208,6 +208,29 @@ def _landmarks_for_rebuild(store, file_id, channel, live_events):
     return live_events
 
 
+def _fmt_sec(v) -> str:
+    """A landmark time in seconds for the CSV-style preview, or an em-dash
+    when unset."""
+    try:
+        return f"{float(v):.1f}s"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _csv_preview_line(i: int, event: dict) -> str:
+    """One event rendered as it would land in the BHZ CSV: type -> Onset,
+    the five landmark times, Racine -> Score, and Light."""
+    def g(k):
+        v = event.get(k)
+        return v if v not in (None, "", []) else "—"
+    return (f"#{i}  Onset={g('type')}  EO={_fmt_sec(event.get('EO_sec'))}  "
+            f"LAS={_fmt_sec(event.get('LAS_sec'))}  "
+            f"BO={_fmt_sec(event.get('BO_sec'))}  "
+            f"PID={_fmt_sec(event.get('PID_sec'))}  "
+            f"BB={_fmt_sec(event.get('BB_sec'))}  "
+            f"Score={g('racine')}  Light={g('light')}")
+
+
 # Stim-blanking lives in src/utils/stim_blank.py so the Mass Analyze
 # scan computes the envelope on the exact same blanked signal. These
 # thin wrappers keep the existing call sites.
@@ -5316,34 +5339,48 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             f"{m['peak_time_sec']:.2f}s" for m in markers)
 
     # ---- Decision preview row (P1-3) ---- #
-    # Live mirror of what the Mark-done button is about to save.
-    # Pure read of three existing Stores plus the file dropdown
-    # label; zero new state. Fires on any input change so the row
-    # stays in sync as the reviewer edits.
+    # Live mirror of what Submit is about to write: reads the STRUCTURED
+    # events (video-events-store) -- NOT the legacy quick-marks store -- and
+    # shows each event as it would land in the BHZ CSV, plus where Submit
+    # will route it (submit_route). Fires on any edit so it stays in sync.
     @app.callback(
         Output("video-review-preview", "children"),
         Input("video-review-decision", "value"),
-        Input("video-review-marker-store", "data"),
+        Input("video-events-store", "data"),
         Input("video-review-note", "value"),
         Input("video-file-dropdown", "value"),
     )
-    def _render_preview(decision, markers, note, file_id):
+    def _render_preview(decision, events, note, file_id):
         if not file_id:
             return ""
-        if decision == "no_events":
-            pill_label = "No events"
-            pill_color = "#30d158"
-        elif decision == "has_events":
-            pill_label = "Events"
-            pill_color = "#ff9f0a"
+        events = list(events or [])
+        meaningful = [e for e in events if _event_is_meaningful(e)]
+        route, blocking = _events.submit_route(events)
+        # Pill + destination. When events exist we ALWAYS surface them (and
+        # the routing), even if the radio still says "No events" -- that
+        # conflict is exactly what confused reviewers before.
+        if meaningful:
+            if decision == "no_events":
+                pill_label, pill_color = "Conflict", "#ff453a"
+                dest = (f"→ blocked: you chose \"No events\" but "
+                        f"{len(meaningful)} scored")
+            elif route is None:
+                pill_label, pill_color = "Incomplete", "#ff453a"
+                dest = (f"→ blocked: event{'s' if len(blocking) > 1 else ''} "
+                        f"{', '.join(map(str, blocking))} need EO + Racine")
+            elif route == "needs_scoring":
+                pill_label, pill_color = "Events", "#ff9f0a"
+                dest = "→ Needs more onsets"
+            else:                                   # pending_pi_review
+                pill_label, pill_color = "Events", "#30d158"
+                dest = "→ PI review (all complete)"
+        elif decision == "no_events":
+            pill_label, pill_color = "No events", "#30d158"
+            dest = "→ PI review (no events)"
         else:
-            pill_label = "Not picked yet"
-            pill_color = "#a0a0b0"
-        n_markers = len(markers or [])
-        note_label = (f"note: {len(note)} chars"
-                       if note else "no note")
-        # Lightweight file label (chunk id + datetime if we can
-        # pull it cheaply).
+            pill_label, pill_color = "Not picked yet", "#a0a0b0"
+            dest = ""
+        note_label = (f"note: {len(note)} chars" if note else "no note")
         file_label = f"#{int(file_id)}"
         try:
             with store.connection() as conn:
@@ -5356,27 +5393,44 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                    f"{row['chunk_datetime'][:16]}")
         except Exception:
             pass  # cheap preview; don't crash on a transient DB read
-        return [
+        header_children = [
             html.Span("Preview:",
-                       style={"color": "#6c6c80",
-                               "marginRight": "4px"}),
+                       style={"color": "#6c6c80", "marginRight": "4px"}),
             html.Span([
                 html.Span("●  ",
-                           style={"color": pill_color,
-                                   "fontSize": "12px"}),
+                           style={"color": pill_color, "fontSize": "12px"}),
                 html.Span(pill_label,
-                           style={"color": "#f0f0f5",
-                                   "fontWeight": "600"}),
+                           style={"color": "#f0f0f5", "fontWeight": "600"}),
             ]),
+        ]
+        if dest:
+            header_children.append(
+                html.Span(dest, style={"color": pill_color,
+                                        "fontWeight": "600"}))
+        header_children += [
             html.Span("·"),
-            html.Span(f"{n_markers} marker"
-                       f"{'' if n_markers == 1 else 's'}"),
+            html.Span(f"{len(meaningful)} event"
+                       f"{'' if len(meaningful) == 1 else 's'}"),
             html.Span("·"),
             html.Span(note_label),
             html.Span("·"),
-            html.Span(file_label,
-                       style={"color": "#888"}),
+            html.Span(file_label, style={"color": "#888"}),
         ]
+        header = html.Div(
+            header_children,
+            style={"display": "flex", "gap": "6px", "flexWrap": "wrap",
+                    "alignItems": "center"})
+        if not meaningful:
+            return header
+        # Per-event CSV-style breakdown: exactly what would be written.
+        rows = [html.Div(
+            _csv_preview_line(i, e),
+            style={"fontFamily": "ui-monospace, SF Mono, monospace",
+                    "fontSize": "11px", "color": "#cfd0d6",
+                    "padding": "1px 0"})
+            for i, e in enumerate(meaningful, 1)]
+        return [header,
+                html.Div(rows, style={"marginTop": "4px", "width": "100%"})]
 
     MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
 
