@@ -2624,7 +2624,8 @@ def _build_behavioral_seizure_status_card(store, config=None):
         dcc.RadioItems(
             id="bsz-view-toggle",
             options=[{"label": " Cards", "value": "cards"},
-                      {"label": " Charts", "value": "charts"}],
+                      {"label": " Charts", "value": "charts"},
+                      {"label": " Calendar", "value": "calendar"}],
             value="cards", inline=True,
             style={"margin": "2px 0 4px", "fontSize": "11px"},
             labelStyle={"color": "#cfd0d6", "marginRight": "14px",
@@ -2801,6 +2802,79 @@ def _bsz_charts(rows):
     return dcc.Graph(
         figure=fig, config={"displayModeBar": False},
         style={"padding": "8px 6px"})
+
+
+def _bsz_calendar(cal: dict):
+    """Per-animal seizure calendar (GitHub-contribution style): one grid per
+    animal, columns = weeks, rows = weekday, cell colour = number of scored
+    seizures (EEG onset + Racine) that day. All animals share ONE week axis so
+    the reviewer can compare WHEN across animals at a glance.
+
+    *cal* is ``{animal: {'YYYY-MM-DD': n_seizures}}`` from
+    ``Store.seizure_days_per_animal``."""
+    if not cal:
+        return html.Div(
+            "No scored seizures yet — the calendar fills in as EEG onsets get "
+            "an onset time + Racine score.",
+            style={"padding": "12px", "color": "#a0a0b0", "fontSize": "12px"})
+    from datetime import datetime as _dt, timedelta as _td
+    animals = sorted(cal.keys())
+    all_days = sorted({d for m in cal.values() for d in m})
+    d0 = _dt.strptime(all_days[0], "%Y-%m-%d")
+    d1 = _dt.strptime(all_days[-1], "%Y-%m-%d")
+    start = d0 - _td(days=d0.weekday())          # Monday on/before first day
+    n_weeks = ((d1 - start).days // 7) + 1
+    weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    # A month label at the first week-column of each month.
+    ticks, labels, seen = [], [], set()
+    for w in range(n_weeks):
+        wk = start + _td(days=7 * w)
+        key = (wk.year, wk.month)
+        if key not in seen:
+            seen.add(key)
+            ticks.append(w)
+            labels.append(wk.strftime("%b %y"))
+    zmax = max(2, max((c for m in cal.values() for c in m.values()),
+                       default=1))
+    n = len(animals)
+    fig = make_subplots(rows=n, cols=1, subplot_titles=animals,
+                         vertical_spacing=(0.11 if n > 1 else 0.0))
+    for i, a in enumerate(animals):
+        z = [[None] * n_weeks for _ in range(7)]
+        cd = [[""] * n_weeks for _ in range(7)]
+        for day, cnt in cal[a].items():
+            dd = _dt.strptime(day, "%Y-%m-%d")
+            w = (dd - start).days // 7
+            if 0 <= w < n_weeks:
+                z[dd.weekday()][w] = cnt
+                cd[dd.weekday()][w] = day
+        fig.add_trace(go.Heatmap(
+            z=z, x=list(range(n_weeks)), y=weekdays, customdata=cd,
+            zmin=1, zmax=zmax, xgap=2, ygap=2,
+            colorscale=[[0.0, "#f0b429"], [1.0, "#ff453a"]],   # amber -> red
+            showscale=(i == 0),
+            colorbar=(dict(title=dict(text="seizures/day", side="right"),
+                           thickness=10, len=0.85, tickfont=dict(size=9))
+                      if i == 0 else None),
+            hovertemplate="%{customdata} · %{z} seizure(s)<extra>"
+                          + a + "</extra>"),
+            i + 1, 1)
+        fig.update_xaxes(tickvals=ticks, ticktext=labels, tickangle=0,
+                         tickfont=dict(size=8), showgrid=False,
+                         row=i + 1, col=1)
+        fig.update_yaxes(autorange="reversed", tickfont=dict(size=8),
+                         showgrid=False, row=i + 1, col=1)
+    for ann in fig.layout.annotations[:n]:       # left-align animal titles
+        ann.font.size = 12
+        ann.font.color = "#f0f0f5"
+        ann.x = 0
+        ann.xanchor = "left"
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=70 + 120 * n, margin=dict(l=34, r=10, t=28, b=16),
+        font=dict(color="#cfd0d6"))
+    return dcc.Graph(figure=fig, config={"displayModeBar": False},
+                     style={"padding": "8px 6px"})
 
 
 
@@ -4034,6 +4108,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def _bsz_view(view):
+        if view == "calendar":
+            # Its own data source (per-animal per-day scored seizures), NOT the
+            # 7-day status rows -- so the whole seizure history shows.
+            return _bsz_calendar(store.seizure_days_per_animal(
+                exclude=_excluded_animals(config)))
         rows = store.behavioral_seizure_status_per_animal(
             days=7, exclude=_excluded_animals(config))
         if not rows:

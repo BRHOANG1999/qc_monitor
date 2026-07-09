@@ -3159,6 +3159,77 @@ class Store:
             conn.close()
         return sorted(r["animal_id"] for r in rows if r["animal_id"])
 
+    def seizure_days_per_animal(self, exclude: list[str] | None = None
+                                 ) -> dict:
+        """Per animal, ``{'YYYY-MM-DD': n_seizures}`` for the Overview seizure
+        calendar. A 'seizure' = any scored event carrying BOTH an EEG onset
+        (``EO_sec``) AND a Racine score -- counted at ANY scored status (the
+        latest review per (file, animal): needs_scoring / pending_pi_review /
+        has_events / pi_approved), dated by the recording's chunk_datetime.
+        Historical imported examples (training_external_example) are folded in
+        for files with no live review, so the pre-app scored history still
+        shows. Case-insensitive substring *exclude* drops subjects."""
+        excl = [e.lower() for e in (exclude or []) if e]
+
+        def _n_scored(markers_json) -> int:
+            try:
+                evs = json.loads(markers_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                return 0
+            return sum(1 for e in evs
+                       if isinstance(e, dict)
+                       and e.get("EO_sec") not in (None, "")
+                       and e.get("racine") not in (None, ""))
+
+        latest = self._sql_latest_row_correlated("rs.file_id")
+        conn = self._connect()
+        try:
+            rs_rows = conn.execute(
+                f"""SELECT rs.file_id, rs.animal_id, pf.chunk_datetime,
+                           rs.markers_json
+                    FROM review_state rs
+                    JOIN processed_files pf ON pf.id = rs.file_id
+                    WHERE rs.animal_id IS NOT NULL
+                      AND pf.chunk_datetime IS NOT NULL
+                      AND rs.markers_json IS NOT NULL
+                      AND {latest}""").fetchall()
+            ext_rows = conn.execute(
+                """SELECT e.file_id, e.animal, pf.chunk_datetime, e.markers_json
+                   FROM training_external_example e
+                   JOIN processed_files pf ON pf.id = e.file_id
+                   WHERE e.has_seizure = 1
+                     AND pf.chunk_datetime IS NOT NULL""").fetchall()
+        finally:
+            conn.close()
+
+        out: dict[str, dict] = {}
+        seen_files: set = set()   # file_ids covered by a live review
+
+        def _add(animal, chunk_dt, n) -> None:
+            if not (animal and n):
+                return
+            if excl and any(e in animal.lower() for e in excl):
+                return
+            # "2026_05_27__08_20_12" -> ISO day "2026-05-27".
+            day = (chunk_dt or "")[:10].replace("_", "-")
+            if len(day) != 10:
+                return
+            per = out.setdefault(animal, {})
+            per[day] = per.get(day, 0) + n
+
+        for i, r in enumerate(rs_rows):
+            assert i < 5_000_000, "seizure-calendar scan runaway"
+            seen_files.add(int(r["file_id"]))
+            _add(r["animal_id"], r["chunk_datetime"],
+                 _n_scored(r["markers_json"]))
+        # A live review supersedes the imported copy for the same file.
+        for i, r in enumerate(ext_rows):
+            assert i < 5_000_000, "seizure-calendar external scan runaway"
+            if int(r["file_id"]) in seen_files:
+                continue
+            _add(r["animal"], r["chunk_datetime"], _n_scored(r["markers_json"]))
+        return out
+
     def flagged_files(self, *, statuses: tuple = ("needs_scoring",),
                        limit: int = 500) -> list[dict]:
         """Files whose LATEST review_state status is in *statuses* (default the
