@@ -83,6 +83,70 @@ def load_mat(path: str) -> ChunkData:
     )
 
 
+def _orient_dims(shape) -> tuple[int, int]:
+    """(num_samples, num_channels) from a raw array shape, mirroring load_mat's
+    orientation rule: samples always far outnumber channels, so the LONGER axis
+    is samples. 1-D -> single channel."""
+    if len(shape) == 1:
+        return int(shape[0]), 1
+    a, b = int(shape[0]), int(shape[1])
+    return (a, b) if a >= b else (b, a)
+
+
+def read_mat_header(path: str) -> tuple[int, int, float]:
+    """Cheaply read ``(num_samples, num_channels, fs)`` from a KMrecorder /
+    STiM-NET .mat WITHOUT loading the full signal array -- used by the duration
+    backfill so it doesn't pull megabytes per file across the network. Mirrors
+    load_mat's format detection + [samples x channels] orientation. Raises on
+    unknown format or unreadable file (caller decides how to count it)."""
+    path = str(path)
+    try:
+        import scipy.io
+        info = scipy.io.whosmat(path)          # [(name, shape, dtype)]; no data
+    except NotImplementedError:
+        return _read_hdf5_header(path)          # v7.3 (HDF5)
+    shapes = {name: shape for (name, shape, _dt) in info}
+    if "sbuf" in shapes:
+        shape = shapes["sbuf"]
+        small = scipy.io.loadmat(path, variable_names=["fs"], squeeze_me=True)
+        raw_fs = small.get("fs")
+        fs = float(raw_fs) if raw_fs is not None else 20000.0
+    elif "data" in shapes:
+        shape = shapes["data"]
+        small = scipy.io.loadmat(path, variable_names=["chunkInfo"],
+                                 squeeze_me=True, struct_as_record=False)
+        ci = small.get("chunkInfo", None)
+        if isinstance(ci, dict):
+            fs = float(ci.get("samplingRate", 20000))
+        elif ci is not None:
+            fs = float(getattr(ci, "samplingRate", 20000))
+        else:
+            fs = 20000.0
+    else:
+        raise ValueError(f"Unknown .mat format. Vars: {list(shapes)}")
+    num_samples, num_channels = _orient_dims(shape)
+    return num_samples, num_channels, (fs if fs and fs > 0 else 20000.0)
+
+
+def _read_hdf5_header(path: str) -> tuple[int, int, float]:
+    """Header-only ``(num_samples, num_channels, fs)`` for a v7.3 (HDF5) .mat:
+    h5py exposes dataset .shape as metadata, so no signal array is read."""
+    import h5py
+    with h5py.File(path, "r") as f:
+        key = "sbuf" if "sbuf" in f else ("data" if "data" in f else None)
+        if key is None:
+            raise ValueError(f"Unknown v7.3 .mat format. Keys: {list(f.keys())}")
+        shape = f[key].shape                    # metadata only -- no data read
+        fs = None
+        if "fs" in f:
+            fs = float(np.squeeze(f["fs"][()]))
+        elif ("chunkInfo" in f and isinstance(f["chunkInfo"], h5py.Group)
+              and "samplingRate" in f["chunkInfo"]):
+            fs = float(np.squeeze(f["chunkInfo"]["samplingRate"][()]))
+    num_samples, num_channels = _orient_dims(shape)
+    return num_samples, num_channels, (fs if fs and fs > 0 else 20000.0)
+
+
 def _parse_fnstr(fnstr, num_channels: int) -> list:
     """Extract per-channel names from a MATLAB fnstr field. Trim to num_channels."""
     if fnstr is None:

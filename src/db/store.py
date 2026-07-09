@@ -4749,6 +4749,36 @@ class Store:
         finally:
             conn.close()
 
+    def set_file_dimensions(self, file_id: int, num_samples: int | None = None,
+                            sampling_rate: float | None = None,
+                            duration_sec: float | None = None,
+                            overwrite: bool = False) -> bool:
+        """Backfill num_samples / sampling_rate / duration_sec on a
+        processed_files row. By DEFAULT only fills rows still missing a duration
+        (idempotent -- safe to re-run, never clobbers a good value); pass
+        overwrite=True to replace. Returns True if a row was updated."""
+        assert file_id is not None, "file_id required"
+        updates: dict = {}
+        if num_samples is not None:
+            updates["num_samples"] = int(num_samples)
+        if sampling_rate is not None and sampling_rate > 0:
+            updates["sampling_rate"] = float(sampling_rate)
+        if duration_sec is not None and duration_sec > 0:
+            updates["duration_sec"] = float(duration_sec)
+        if not updates:
+            return False
+        guard = "" if overwrite else " AND (duration_sec IS NULL OR duration_sec<=0)"
+        sets = ", ".join(f"{k}=?" for k in updates)
+        vals = list(updates.values()) + [int(file_id)]
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                f"UPDATE processed_files SET {sets} WHERE id=?{guard}", vals)
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def resolve_training_file(self, file_id: int, locator) -> str | None:
         """Confirm (and if needed relocate) the recording for a Training
         example, lazily. If the stored path is a real file, return it
