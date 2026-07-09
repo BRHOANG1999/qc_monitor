@@ -35,11 +35,12 @@ _PERIOD = 40.0                        # trajectory oscillation period (seconds)
 
 def _planted_chunk(_path):
     """A 700 s single-channel chunk whose 100 s..600 s span carries a 40 s
-    oscillation in its per-1 s-window mean; elsewhere zero."""
+    oscillation in its per-1 s-window mean, with amplitude GROWING toward the
+    end (onset) -- a pre-ictal ramp at the 40 s scale. Elsewhere zero."""
     n = 700 * _FS
     sig = np.zeros((n, 1), dtype=float)
     for i in range(500):              # windows over [100 s, 600 s]
-        v = np.sin(2 * np.pi * i / _PERIOD)
+        v = ((i + 1) / 500.0) * np.sin(2 * np.pi * i / _PERIOD)   # growing amp
         sig[10000 + i * 100:10000 + (i + 1) * 100, 0] = v
     return ChunkData(signal=sig, fs=float(_FS), num_channels=1, num_samples=n,
                      duration_sec=700.0, source_path=_path)
@@ -53,6 +54,7 @@ def _config(root):
         "cwt": {"wavelet": "cmor1.5-1.0", "min_leadtime_sec": 1.0,
                 "scales_per_octave": 6},
         "events": {"event_source": "behavioral", "post_ictal_buffer_sec": 0.0},
+        "validation": {"seed": 0, "surrogate_null": {"n_surrogates": 60}},
     }}
 
 
@@ -86,9 +88,21 @@ def test_engine_end_to_end_planted_scale(tmp_path, monkeypatch):
     rows = store.preictal_scale_summary_for_run(run_id)
     assert rows and all(r["feature"] == "_win_mean" for r in rows)
     assert all(r["n_seizures"] == 1 for r in rows)
-    # The planted 40 s oscillation must be the dominant scale.
+    # The planted 40 s oscillation must be the dominant scale (Stage 1 property).
     peak = max(rows, key=lambda r: r["coeff_mean"])
     assert abs(peak["pseudo_freq_hz"] - 1.0 / _PERIOD) < 0.3 / _PERIOD
+
+    # Stage 2: every scale row carries the scored columns (not NULL), and the
+    # GROWING-amplitude pre-ictal ramp shows a positive, null-significant
+    # collapse gradient at some scale with a forecasting edge over chance.
+    for r in rows:
+        assert r["collapse_stat"] is not None
+        assert r["null_p"] is not None and r["forecast_roc_auc"] is not None
+        assert r["collapse_loso_mean"] is not None      # S<2 -> all-seizure val
+    best = max(rows, key=lambda r: (r["collapse_stat"] or -9))
+    assert best["collapse_stat"] > 0.1                  # coeff ramps to onset
+    assert best["null_p"] < 0.1                          # seizure-locked
+    assert best["forecast_roc_auc"] > 0.6                # near beats far
 
     # Pocket written + queryable.
     runs_dir = os.path.join(root, "runs")

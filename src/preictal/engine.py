@@ -17,8 +17,10 @@ import pywt
 
 from src.preictal import cwt as _cwt
 from src.preictal import pocket as _pocket
-from src.preictal.isi import (inter_seizure_intervals, lookback_ceilings,
-                               scored_seizures)
+from src.preictal import scoring as _scoring
+from src.preictal import validation as _validation
+from src.preictal.isi import (inter_seizure_intervals, leadtime_bins,
+                               lookback_ceilings, scored_seizures)
 from src.preictal.registry import resolve_features
 from src.preictal.trajectory import (feature_trajectory, gather_leadup_signal,
                                       robust_z)
@@ -96,6 +98,85 @@ def _enumerate_seizures(store, animals: list[str], buffer_sec: float,
     return pairs, rows
 
 
+def _f(x):
+    """Float, with NaN -> None so unscoreable scales store as SQL NULL."""
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if xf != xf else xf
+
+
+def _score_feature(store, feat, pairs, scales, freqs, bin_edges, step_sec,
+                    target_fs, wavelet, channel_role, n_surrogates, rng,
+                    cancel_fn):
+    """Per-scale deliverable rows for ONE feature. Builds each seizure's
+    lead-time-binned CWT coefficients, then per scale: the bin-vs-bin AUC matrix
+    -> collapse gradient, leave-one-seizure-out CI, surrogate-null percentile/p,
+    and the nearest-vs-farthest forecasting ROC/PR. Returns (rows, used_files).
+    bin_idx is scale-independent (per-sample lead-time), computed once."""
+    n_scales = int(len(scales))
+    n_bins = int(len(bin_edges) - 1)
+    seizure_mags: list = []        # each |W| array [n_scales, L] (float32)
+    seizure_binidx: list = []      # each [L] lead-time bin index (nearest=0)
+    used_files: set = set()
+    for sz, ceil in pairs:
+        if cancel_fn and cancel_fn():
+            raise Cancelled()
+        ch = _resolve_channel_index(store, sz)
+        sig, fs = gather_leadup_signal(store, sz, ceil, ch)
+        if sig is None:
+            continue
+        t = feature_trajectory(sig, fs, feat, step_sec, target_fs)
+        if t.size < 4:
+            continue
+        coeffs, _ = pywt.cwt(robust_z(t), scales, wavelet,
+                             sampling_period=step_sec)
+        seizure_mags.append(np.abs(coeffs).astype(np.float32))
+        # Sample k covers time onset-ceiling + k*step; lead-time (before onset)
+        # = ceiling - (k+0.5)*step. Assign to common bins (edges ascending ->
+        # nearest-onset bin = index 0).
+        lead = float(ceil) - (np.arange(t.size) + 0.5) * step_sec
+        bidx = np.clip(np.searchsorted(bin_edges, lead, side="right") - 1,
+                       0, n_bins - 1)
+        seizure_binidx.append(bidx)
+        used_files.add(sz.file_id)
+
+    n_used = len(seizure_mags)
+    rows: list = []
+    if n_used == 0:
+        return rows, used_files
+    for s in range(n_scales):
+        seizure_values = [m[s] for m in seizure_mags]
+        per_seizure_bins = [[v[bi == b] for b in range(n_bins)]
+                            for v, bi in zip(seizure_values, seizure_binidx)]
+        pooled = _validation._pool(per_seizure_bins, range(n_used), n_bins)
+        collapse = _scoring.collapse_gradient(_scoring.auc_matrix(pooled))
+        loso = _validation.loso_collapse(per_seizure_bins)
+        surr = _validation.circular_shift_null(seizure_values, seizure_binidx,
+                                               n_bins, n_surrogates, rng)
+        nstat = _validation.null_stats(collapse, surr)
+        near = pooled[0]
+        far = next((pooled[b] for b in range(n_bins - 1, -1, -1)
+                    if pooled[b].size), np.array([], dtype=float))
+        roc, pr = _scoring.forecasting_scores(near, far)
+        allmag = np.concatenate(seizure_values)
+        rows.append({
+            "feature": feat.name, "channel_role": channel_role,
+            "scale_index": s, "scale": float(scales[s]),
+            "pseudo_freq_hz": float(freqs[s]),
+            "coeff_mean": float(allmag.mean()), "coeff_std": float(allmag.std()),
+            "coeff_max": float(allmag.max()), "n_seizures": n_used,
+            "collapse_stat": _f(collapse),
+            "collapse_loso_mean": _f(loso["mean"]),
+            "collapse_loso_ci_lo": _f(loso["ci_lo"]),
+            "collapse_loso_ci_hi": _f(loso["ci_hi"]),
+            "null_mean": _f(nstat["mean"]), "null_std": _f(nstat["std"]),
+            "null_percentile": _f(nstat["percentile"]), "null_p": _f(nstat["p"]),
+            "forecast_roc_auc": _f(roc), "forecast_pr_auc": _f(pr)})
+    return rows, used_files
+
+
 def run_sweep(store, config: dict, scope: str = "adhoc",
                period_start: str | None = None, period_end: str | None = None,
                animals: list[str] | None = None, cancel_fn=None) -> int:
@@ -140,37 +221,23 @@ def run_sweep(store, config: dict, scope: str = "adhoc",
                                           1.0 / min_lead, wavelet, spo)
             freqs = _cwt.pseudo_freqs(scales, step_sec, wavelet)
             n_scales = int(len(scales))
+            # Common lead-time bins (nearest-onset first) up to the LONGEST
+            # ceiling; short-ISI seizures only reach the nearer bins.
+            bin_edges = np.asarray(leadtime_bins(max(ceilings), min_lead).edges_sec,
+                                   dtype=float)
+            vcfg = (pcfg.get("validation", {}) or {})
+            n_surr = int((vcfg.get("surrogate_null", {}) or {})
+                         .get("n_surrogates", 200))
+            rng = np.random.default_rng(int(vcfg.get("seed", 0)))
             used_files: set = set()
             for feat in resolve_features(pcfg.get("features", ["line_length"])):
-                acc: list[list] = [[] for _ in range(n_scales)]
-                used = 0
-                for sz, ceil in pairs:
-                    if cancel_fn and cancel_fn():
-                        raise Cancelled()
-                    ch = _resolve_channel_index(store, sz)
-                    sig, fs = gather_leadup_signal(store, sz, ceil, ch)
-                    if sig is None:
-                        continue
-                    t = feature_trajectory(sig, fs, feat, step_sec, target_fs)
-                    if t.size < 4:
-                        continue
-                    coeffs, _ = pywt.cwt(robust_z(t), scales, wavelet,
-                                         sampling_period=step_sec)
-                    mag = np.abs(coeffs)
-                    for s in range(n_scales):
-                        acc[s].append(mag[s])
-                    used += 1
-                    used_files.add(sz.file_id)
-                for s in range(n_scales):
-                    if not acc[s]:
-                        continue
-                    m = np.concatenate(acc[s])
-                    scale_rows.append({
-                        "feature": feat.name, "channel_role": channel_role,
-                        "scale_index": s, "scale": float(scales[s]),
-                        "pseudo_freq_hz": float(freqs[s]),
-                        "coeff_mean": float(m.mean()), "coeff_std": float(m.std()),
-                        "coeff_max": float(m.max()), "n_seizures": used})
+                if cancel_fn and cancel_fn():
+                    raise Cancelled()
+                frows, ufiles = _score_feature(
+                    store, feat, pairs, scales, freqs, bin_edges, step_sec,
+                    target_fs, wavelet, channel_role, n_surr, rng, cancel_fn)
+                scale_rows.extend(frows)
+                used_files |= ufiles
             for r in seizure_rows:
                 if r["file_id"] in used_files:
                     r["used"] = 1

@@ -15,23 +15,28 @@ Bin convention: index 0 = NEAREST to onset, increasing index = farther back
 from __future__ import annotations
 
 import numpy as np
-from scipy.stats import mannwhitneyu
+from scipy.stats import rankdata
 
 
 def rank_auc(a, b) -> float:
-    """Rank AUC = P(a > b) (+ 0.5 P(tie)) via Mann-Whitney U. 0.5 = no
-    difference, 1 = a strictly above b, 0 = below. NaN if either side empty."""
+    """Rank AUC = P(a > b) (+ 0.5 P(tie)), the Mann-Whitney U statistic
+    normalized. 0.5 = no difference, 1 = a strictly above b, 0 = below. NaN if
+    either side empty.
+
+    Computed directly from tie-corrected ranks (U_a = R_a - n_a(n_a+1)/2), NOT
+    via scipy.mannwhitneyu -- we call this in the innermost loop (per bin pair,
+    per scale, per surrogate) and skipping the p-value machinery is a large
+    speedup."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
-    if a.size == 0 or b.size == 0:
+    na, nb = a.size, b.size
+    if na == 0 or nb == 0:
         return float("nan")
-    try:
-        u, _ = mannwhitneyu(a, b, alternative="greater")
-    except ValueError:                      # all-equal within/between -> tie
-        return 0.5
-    return float(u / (a.size * b.size))
+    ranks = rankdata(np.concatenate([a, b]))     # average ranks (ties handled)
+    u_a = ranks[:na].sum() - na * (na + 1) / 2.0
+    return float(u_a / (na * nb))
 
 
 def auc_matrix(bin_values: list) -> np.ndarray:
