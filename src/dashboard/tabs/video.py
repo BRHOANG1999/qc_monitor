@@ -2346,18 +2346,25 @@ def layout(store: Store, bridge: dict | None = None):
                 ], style={"display": "flex", "alignItems": "center",
                            "gap": "10px", "flexWrap": "wrap",
                            "marginBottom": "6px"}),
-                # Navigation mode: browse the normal queue, the auto-filter
-                # has-events flag pool, or the needs-scoring pool. Same
-                # carousel + Load below, different source list.
-                dcc.RadioItems(
-                    id="video-queue-mode",
-                    options=[{"label": f" {m['label']}", "value": m["value"]}
-                             for m in _QUEUE_MODES],
-                    value="queue", inline=True,
-                    labelStyle={"color": "#ddd", "fontSize": "12px",
-                                "marginRight": "14px", "cursor": "pointer"},
-                    inputStyle={"marginRight": "4px"},
-                    style={"marginBottom": "6px"}),
+                # Pool selector: one dropdown to browse the normal queue, the
+                # auto-filter has-events Flag pool, or the Needs-more-onsets
+                # pool. Picking a pool loads + browses it via the same
+                # carousel + Load below (_autoload_on_mode_change loads its
+                # head; different source list per pool).
+                html.Div([
+                    html.Span("Pool",
+                               style={"color": "#a0a0b0", "fontSize": "11px",
+                                       "marginRight": "8px",
+                                       "whiteSpace": "nowrap"}),
+                    dcc.Dropdown(
+                        id="video-queue-mode",
+                        options=[{"label": m["label"], "value": m["value"]}
+                                 for m in _QUEUE_MODES],
+                        value="queue", clearable=False,
+                        style={"width": "260px"},
+                        className="dark-dropdown"),
+                ], style={"display": "flex", "alignItems": "center",
+                           "gap": "4px", "marginBottom": "6px"}),
                 html.Div(id="video-queue-card-title",
                           style={"color": "#a0a0b0", "fontSize": "11px",
                                   "marginBottom": "6px"}),
