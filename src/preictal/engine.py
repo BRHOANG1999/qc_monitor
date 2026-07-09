@@ -17,8 +17,8 @@ import pywt
 
 from src.preictal import cwt as _cwt
 from src.preictal import pocket as _pocket
-from src.preictal.isi import (behavioral_seizures, inter_seizure_intervals,
-                               lookback_ceilings)
+from src.preictal.isi import (inter_seizure_intervals, lookback_ceilings,
+                               scored_seizures)
 from src.preictal.registry import resolve_features
 from src.preictal.trajectory import (feature_trajectory, gather_leadup_signal,
                                       robust_z)
@@ -77,7 +77,7 @@ def _enumerate_seizures(store, animals: list[str], buffer_sec: float,
     ceiling_sec) with a real pre-ictal window."""
     pairs, rows = [], []
     for a in (animals or []):
-        szs = behavioral_seizures(store, a)                 # full history
+        szs = scored_seizures(store, a)                     # full history
         isis = inter_seizure_intervals(szs)
         ceils = lookback_ceilings(szs, buffer_sec)
         for sz, isi_v, ceil in zip(szs, isis, ceils):

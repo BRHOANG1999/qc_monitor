@@ -105,6 +105,87 @@ def behavioral_seizures(store, animal_id: str,
     return out
 
 
+def _load_markers(markers_json) -> list:
+    try:
+        return json.loads(markers_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _mk_seizure(animal_id, file_id, file_path, session_dir, chunk_datetime,
+                 ev) -> Seizure | None:
+    """Build a Seizure from one qualifying (EO+Racine) marker + its file's
+    absolute start, or None if the timestamp/onset can't be resolved."""
+    dt = parse_chunk_datetime(chunk_datetime)
+    if dt is None or not _event_is_seizure(ev):
+        return None
+    try:
+        eo = float(ev["EO_sec"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    bb = ev.get("BB_sec")
+    try:
+        bb = float(bb) if bb not in (None, "") else None
+    except (TypeError, ValueError):
+        bb = None
+    try:
+        rac = int(ev["racine"])
+    except (TypeError, ValueError, KeyError):
+        rac = None
+    return Seizure(animal_id=animal_id, file_id=int(file_id),
+                   file_path=file_path, session_dir=session_dir,
+                   chunk_datetime=chunk_datetime, eo_sec=eo, bb_sec=bb,
+                   racine=rac, seizure_type=ev.get("type"),
+                   onset_epoch=dt.timestamp() + eo)
+
+
+def scored_seizures(store, animal_id: str) -> list[Seizure]:
+    """Every scored seizure (EO + Racine) for an animal on the TIMELINE, from
+    the live review (ANY status -- how a seizure was scored doesn't change WHEN
+    it happened) UNION the historical imported examples, deduped by file (a live
+    review supersedes its imported copy). Chronological by absolute onset. This
+    is the temporal series the rolling daily/weekly/monthly sweep scopes by
+    date."""
+    assert animal_id, "animal_id required"
+    latest = store._sql_latest_row_correlated("pf.id")
+    out: list[Seizure] = []
+    seen_files: set = set()
+    with store.connection() as conn:
+        live = conn.execute(
+            f"""SELECT rs.file_id, rs.markers_json, pf.file_path,
+                       pf.session_dir, pf.chunk_datetime
+                FROM review_state rs
+                JOIN processed_files pf ON pf.id = rs.file_id
+                WHERE rs.animal_id = ?
+                  AND rs.markers_json IS NOT NULL
+                  AND pf.chunk_datetime IS NOT NULL
+                  AND {latest}""", (animal_id,)).fetchall()
+        for r in live:
+            seen_files.add(int(r["file_id"]))
+            for ev in _load_markers(r["markers_json"]):
+                s = _mk_seizure(animal_id, r["file_id"], r["file_path"],
+                                r["session_dir"], r["chunk_datetime"], ev)
+                if s is not None:
+                    out.append(s)
+        ext = conn.execute(
+            """SELECT e.file_id, e.markers_json, pf.file_path,
+                      pf.session_dir, pf.chunk_datetime
+               FROM training_external_example e
+               JOIN processed_files pf ON pf.id = e.file_id
+               WHERE e.animal = ? AND e.has_seizure = 1
+                 AND pf.chunk_datetime IS NOT NULL""", (animal_id,)).fetchall()
+        for r in ext:
+            if int(r["file_id"]) in seen_files:
+                continue
+            for ev in _load_markers(r["markers_json"]):
+                s = _mk_seizure(animal_id, r["file_id"], r["file_path"],
+                                r["session_dir"], r["chunk_datetime"], ev)
+                if s is not None:
+                    out.append(s)
+    out.sort(key=lambda s: s.onset_epoch)
+    return out
+
+
 def inter_seizure_intervals(seizures: list[Seizure]) -> list[float | None]:
     """Seconds from the previous seizure's onset to each seizure's onset.
     Element 0 is None (no predecessor). Same length as *seizures*."""
