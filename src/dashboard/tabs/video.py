@@ -2612,6 +2612,24 @@ def layout(store: Store, bridge: dict | None = None):
                           style={"color": "#ff9f0a", "fontSize": "11px",
                                  "marginLeft": "12px",
                                  "fontVariantNumeric": "tabular-nums"}),
+                # X-axis time base toggle: wall-clock time of day (default, so
+                # a reviewer can read WHEN a seizure occurred) or elapsed
+                # mm:ss from the recording start (like the video clock).
+                html.Div(
+                    dcc.RadioItems(
+                        id="video-lfp-timebase",
+                        options=[
+                            {"label": " Time of day", "value": "clock"},
+                            {"label": " Elapsed (mm:ss)", "value": "elapsed"},
+                        ],
+                        value="clock", inline=True,
+                        labelStyle={"color": "#9a9aa8", "fontSize": "11px",
+                                     "marginRight": "10px"},
+                        inputStyle={"marginRight": "4px"},
+                    ),
+                    style={"marginLeft": "12px"},
+                    title="X-axis time base: wall-clock time of day, or "
+                          "elapsed from the recording start (like the video)."),
                 # Modeless interaction (no Seek/Zoom toggle): click the
                 # trace to seek the video, scroll to zoom, drag to pan,
                 # double-click to reset. Removing the mode kills the classic
@@ -6119,11 +6137,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-filter-notch", "value"),
         State("video-filter-smooth", "value"),
         Input("video-blank-raw", "value"),
+        Input("video-lfp-timebase", "value"),
         State("video-events-store", "data"),
         prevent_initial_call="initial_duplicate",
     )
     def _update_lfp(file_id, channel, _n_apply,
-                     hp, lp, notch, smooth_ms, blank_raw, events):
+                     hp, lp, notch, smooth_ms, blank_raw, timebase, events):
         # Fresh token each fire so the load-pill done-watcher
         # triggers even when the human-readable status string is
         # identical to the previous recording (fixed-length rig).
@@ -6184,9 +6203,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             logger.warning("Video filter failed (using unfiltered): %s", e)
             filtered = signal
 
+        # X-axis time base: wall-clock time of day (default) or elapsed mm:ss
+        # (start_dt=None) per the header toggle.
+        start_dt = (None if timebase == "elapsed"
+                    else _chunk_start_dt(store, file_id))
         fig = _build_lfp_figure(t, filtered, label=f"Ch{channel}",
                                  uirevision=f"{file_id}:{channel}",
-                                 start_dt=_chunk_start_dt(store, file_id))
+                                 start_dt=start_dt)
         # Draw the CURRENT file's onsets so they survive this rebuild. On a
         # file/channel switch the live store lags (still the previous file),
         # so _landmarks_for_rebuild reads the new file's saved draft instead.

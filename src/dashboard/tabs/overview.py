@@ -2610,7 +2610,7 @@ def _build_behavioral_seizure_status_card(store, config=None):
             html.Span(f"🔬 {total_threshold} threshold  ·  ",
                        style={"color": "#5e7ce2" if total_threshold
                               else "#cfd0d6"}),
-            html.Span(f"🚩 {total_needs} needs scoring",
+            html.Span(f"⚠️ {total_needs} needs more onsets",
                        style={"color": "#ff9f0a" if total_needs
                               else "#cfd0d6"}),
         ], style={"fontSize": "12px", "marginTop": "2px"}),
@@ -2707,7 +2707,7 @@ def _bsz_cards(rows):
                                       "fontWeight": "600"}),
                 ]),
                 html.Div([
-                    html.Span("🚩 needs scoring",
+                    html.Span("⚠️ needs more onsets",
                                style={"color": "#888",
                                        "fontSize": "10px",
                                        "textTransform": "uppercase",
@@ -2761,7 +2761,7 @@ def _bsz_charts(rows):
     needs scoring), with the total in the centre. Colours match the cards.
     (Threshold detections are a detector metric that overlaps the queue, so
     they are shown on the cards but not in this pipeline-composition pie.)"""
-    labels = ["queue", "pending PI", "approved", "needs scoring"]
+    labels = ["queue", "pending PI", "approved", "needs more onsets"]
     colors = ["#8a8a99", "#5e7ce2", "#30d158", "#ff9f0a"]
     n = len(rows)
     cols = min(n, 5) if n else 1

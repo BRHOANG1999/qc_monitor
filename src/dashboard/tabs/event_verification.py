@@ -230,7 +230,7 @@ def _flagged_scored_section() -> html.Details:
         html.Div(
             "Files you flagged with an EEG onset. A file is ready when every "
             "onset also has a Racine score ('✓ scored'); onset-without-Racine "
-            "stays in Needs scoring. Tick the scored ones and Submit — they "
+            "stays in ⚠️ Needs more onsets. Tick the scored ones and Submit — they "
             "flip to pi_approved and their onsets are written to the per-animal "
             "day CSV. Click Open to finish scoring one in Video Review.",
             style={"color": "#a0a0b0", "fontSize": "12px",
@@ -1172,7 +1172,7 @@ def register_callbacks(app, store, config: dict) -> None:
         msg = f"Submitted {submitted} file(s) → pi_approved + CSV."
         if skipped:
             msg += (f" Skipped {skipped} still missing a Racine "
-                    "(left in Needs scoring).")
+                    "(left in ⚠️ Needs more onsets).")
         rows = _flagged_scored_rows(store)
         sig = "|".join(f"{x['id']}={x['scored']}" for x in rows)
         return rows, [], msg, fin, sig
