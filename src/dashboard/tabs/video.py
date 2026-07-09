@@ -395,6 +395,14 @@ def _has_meaningful_edits(events) -> bool:
     return any(_event_is_meaningful(e) for e in (events or []))
 
 
+def _events_digest(events) -> str:
+    """Stable hash of the event list so autosave only writes the DB when the
+    scored data actually changed (no per-tick write)."""
+    import hashlib
+    payload = json.dumps(events or [], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _pi_flag_note_for_file(store, file_id: int) -> str:
     """Return the most-recent ``pi_flag`` note for *file_id* or
     an empty string if there isn't one.
@@ -4380,9 +4388,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         new_key = f"{int(file_id)}:{animal}"
         if new_key == cur_key:
             return no_update, no_update, no_update
-        # Stash the outgoing draft under its key.
+        # Stash the outgoing draft under its key...
         if cur_key:
             by_animal[cur_key] = list(cur_events or [])
+            # ...and FLUSH it to the DB so scored work survives a reload
+            # after navigation, not just an in-session channel/file switch.
+            # Guarded by _has_meaningful_edits so a terminal Submit that
+            # cleared the store + advanced can't blank a just-saved draft;
+            # upsert_scoring_draft also 'skip's when the latest row is a
+            # submitted status, so it never resurrects finalised work.
+            if _has_meaningful_edits(cur_events):
+                cf, _, ca = cur_key.partition(":")
+                email = current_user_email()
+                if email and cf and ca:
+                    try:
+                        store.upsert_scoring_draft(
+                            int(cf), email, ca, list(cur_events or []))
+                    except Exception as e:      # never break navigation
+                        logger.warning("rescope draft flush failed: %s", e)
         # Restore: in-session stash first, else the saved needs_scoring draft.
         if new_key in by_animal:
             new_events = by_animal[new_key]
@@ -4401,6 +4424,102 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 if isinstance(drafts, list):
                     new_events = drafts
         return new_events, by_animal, new_key
+
+    # ---- Autosave: durable draft persistence (score-loss safety net) --- #
+    # A gentle interval flushes the in-editor event list to the DB via
+    # Store.upsert_scoring_draft so a reload / navigation / forgotten Submit
+    # can't lose scored work. Reads the events store as State ONLY (never
+    # writes it), so it can't race the Patch-based field setters. Writes the
+    # DB at most once per interval, and only when the scored data changed.
+    @app.callback(
+        Output("video-autosave-state", "data"),
+        Input("video-autosave-tick", "n_intervals"),
+        State("video-events-store", "data"),
+        State("video-file-dropdown", "value"),
+        State("video-channel-dropdown", "value"),
+        State("video-autosave-state", "data"),
+        prevent_initial_call=True,
+    )
+    def _autosave_draft(_tick, events, file_id, channel, prev):
+        if not file_id:
+            return no_update
+        events = list(events or [])
+        if not _has_meaningful_edits(events):
+            return no_update            # nothing worth persisting yet
+        animal = _animal_for_channel(store, file_id, channel)
+        if not animal:
+            return no_update            # no animal channel -> can't file it
+        key = f"{int(file_id)}:{animal}"
+        digest = _events_digest(events)
+        if prev and prev.get("key") == key and prev.get("hash") == digest:
+            return no_update            # unchanged since last flush
+        email = current_user_email()
+        if not email:
+            return no_update
+        try:
+            result = store.upsert_scoring_draft(
+                int(file_id), email, animal, events)
+        except Exception as e:          # never crash the tab on a flush
+            logger.warning("autosave draft failed: %s", e)
+            return no_update
+        if result == "skipped":
+            # Latest row is submitted/closed -> record the hash so we stop
+            # re-attempting every tick, but signal no fresh save (ts=None).
+            return {"key": key, "hash": digest, "ts": None}
+        from datetime import datetime as _dt
+        return {"key": key, "hash": digest,
+                 "ts": _dt.now().strftime("%H:%M:%S")}
+
+    # Autosave feedback pill (clientside): "Unsaved changes…" the moment the
+    # reviewer edits, "All changes saved · HH:MM:SS" once the flush lands.
+    # Also arms window.onbeforeunload while unsaved so a reload inside the
+    # ~4 s flush window prompts before discarding.
+    app.clientside_callback(
+        """
+        function (events, saveState) {
+            var nu = window.dash_clientside.no_update;
+            var ctx = window.dash_clientside.callback_context;
+            var trig = (ctx && ctx.triggered && ctx.triggered.length)
+                ? ctx.triggered[0].prop_id : '';
+            function meaningful(evs) {
+                return (evs || []).some(function (e) {
+                    if (!e) return false;
+                    if (e.type === 'LVF' || e.type === 'HYP'
+                        || e.type === 'Undefined') return true;
+                    if (e.racine != null && e.racine !== '') return true;
+                    if (e.light != null && e.light !== '') return true;
+                    var s = ['EO_sec','LAS_sec','BO_sec','PID_sec','BB_sec'];
+                    for (var i = 0; i < s.length; i++) {
+                        if (e[s[i]] != null && e[s[i]] !== '') return true;
+                    }
+                    return false;
+                });
+            }
+            if (trig.indexOf('video-autosave-state') === 0) {
+                if (saveState && saveState.ts) {
+                    try { window.onbeforeunload = null; } catch (err) {}
+                    return '\\u2713 All changes saved \\u00b7 ' + saveState.ts;
+                }
+                return nu;
+            }
+            // events store changed
+            if (!meaningful(events)) {
+                try { window.onbeforeunload = null; } catch (err) {}
+                return '';
+            }
+            try {
+                window.onbeforeunload = function () {
+                    return 'You have unsaved scores.';
+                };
+            } catch (err) {}
+            return '\\u25cf Unsaved changes\\u2026 (autosaving)';
+        }
+        """,
+        Output("video-autosave-pill", "children"),
+        Input("video-events-store", "data"),
+        Input("video-autosave-state", "data"),
+        prevent_initial_call=True,
+    )
 
     # ---- Track D: multi-camera focus selector ---- #
     # The focused-cam index (1-based) lives in video-focus-cam.

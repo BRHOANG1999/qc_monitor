@@ -2725,6 +2725,60 @@ class Store:
             animal_id=animal)
         return int(cur.lastrowid)
 
+    def upsert_scoring_draft(self, file_id: int, user_email: str,
+                             animal_id: str, markers: list[dict],
+                             note: str | None = None) -> str:
+        """Durable autosave of an in-progress score for one (file, animal).
+
+        Persists *markers* WITHOUT growing review_state per edit and WITHOUT
+        spamming review_event_log, by branching on the latest row for the
+        (file, animal):
+
+        - latest is ``needs_scoring`` -> **in-place UPDATE** of
+          markers_json/updated_at. Keeps ``MAX(id)`` so it is still the
+          "latest" row, bumps updated_at so ORDER BY updated_at DESC readers
+          see it; writes NO new review_state row and NO audit row. Returns
+          ``'updated'``.
+        - no row yet (fresh queue file) -> seed exactly ONE ``needs_scoring``
+          row via ``_mark_review_conn`` (one ``quick_flag`` audit event);
+          subsequent autosaves take the UPDATE branch. Returns ``'seeded'``.
+        - latest is any other status (``pending_pi_review`` / ``pi_approved``
+          / ``pi_flagged`` / ``abandoned`` ...) -> **do nothing**: never
+          resurrect or un-finalise submitted/closed work. Returns
+          ``'skipped'``.
+
+        Insert-only "latest wins" stays intact: an in-place UPDATE preserves
+        the row's id, and a later ``mark_review`` INSERT (a real state
+        transition) gets a higher id that correctly supersedes the draft.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        assert user_email, "user_email required"
+        assert animal_id, "animal_id required (drafts are per-(file, animal))"
+        now = datetime.now().isoformat()
+        markers_json = json.dumps(markers or [])
+        with self.transaction() as conn:
+            row = conn.execute(
+                """SELECT id, status FROM review_state
+                   WHERE file_id = ? AND animal_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (int(file_id), animal_id)).fetchone()
+            if row is not None and row["status"] == "needs_scoring":
+                conn.execute(
+                    """UPDATE review_state
+                       SET markers_json = ?, updated_at = ?,
+                           note = COALESCE(?, note)
+                       WHERE id = ?""",
+                    (markers_json, now, note, row["id"]))
+                return "updated"
+            if row is not None:
+                # Latest is submitted/closed -> never overwrite or un-finalise.
+                return "skipped"
+            # Fresh file: seed one needs_scoring draft (+ one audit event).
+            self._mark_review_conn(
+                conn, int(file_id), user_email, "needs_scoring",
+                markers=markers, note=note, animal_id=animal_id)
+            return "seeded"
+
     # ------------------------------------------------------------------ #
     # Soft-claim: file_claim table (see schema.py). Keeps two reviewers
     # off the same recording without a hard lock.

@@ -553,6 +553,19 @@ def render_events_panel() -> html.Div:
         # onsets separate within a session. Keyed "<file_id>:<animal>".
         dcc.Store(id="video-events-by-animal", data={}),
         dcc.Store(id="video-events-current-key", data=None),
+        # ---- Autosave: durable per-(file, animal) draft persistence ----
+        # A gentle interval flushes scored-but-unsubmitted work to the DB so
+        # a reload / navigation / forgotten Submit can't lose it (see
+        # video._autosave_draft + Store.upsert_scoring_draft). This is the
+        # safety net for the historical silent score-loss.
+        dcc.Interval(id="video-autosave-tick", interval=4000,
+                      n_intervals=0),
+        # Last successful autosave: {"key", "hash", "ts"}; drives the pill.
+        dcc.Store(id="video-autosave-state", data=None),
+        html.Div(id="video-autosave-pill",
+                  style={"marginTop": SPACE_2,
+                          "fontSize": FONT_SIZE_CAPTION,
+                          "color": COLOR_TEXT_TERTIARY}),
     ])
 
 
