@@ -52,7 +52,7 @@ class _FakeValues:
         self.updates: list = []
         self.appends: list = []
 
-    def get(self, spreadsheetId, range):
+    def get(self, spreadsheetId, range, valueRenderOption=None):
         outer = self
 
         class _Exec:
