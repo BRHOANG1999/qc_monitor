@@ -195,6 +195,65 @@ def _a1_row(tab_name: str, row_1indexed: int) -> str:
     return f"{_q(tab_name)}!A{row_1indexed}"
 
 
+def _col_letter(n: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA (A1 column label for *n* columns)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def dedupe_tab(svc, sheet_id: str, tab_name: str, key_columns: list[str],
+                dry_run: bool = True) -> dict:
+    """Collapse rows sharing the same canonical key into ONE (merging the
+    first non-empty value per column, keeping first-seen order), removing the
+    surplus duplicate rows. Idempotent + safe to re-run. ``dry_run=True``
+    computes the effect without writing. Returns
+    ``{"tab","rows_before","rows_after","removed"}``."""
+    from collections import OrderedDict
+    grid = read_grid(svc, sheet_id, tab_name, unformatted=True)
+    n_body = max(0, len(grid) - 1)
+    if len(grid) < 2:
+        return {"tab": tab_name, "rows_before": n_body,
+                 "rows_after": n_body, "removed": 0}
+    header, body = grid[0], grid[1:]
+    ncol = len(header)
+    key_idx = _key_index(header, key_columns)
+    if any(i < 0 for i in key_idx):
+        raise ValueError(
+            f"key columns {key_columns} not all in header {header}")
+    groups: "OrderedDict[tuple, list]" = OrderedDict()
+    for vals in body:
+        row = (list(vals) + [""] * ncol)[:ncol]
+        k = tuple(_canon_key(row[i]) for i in key_idx)
+        if k in groups:
+            merged = groups[k]
+            for i in range(ncol):
+                if merged[i] in (None, "") and row[i] not in (None, ""):
+                    merged[i] = row[i]
+        else:
+            groups[k] = row
+    new_body = list(groups.values())
+    removed = len(body) - len(new_body)
+    res = {"tab": tab_name, "rows_before": len(body),
+            "rows_after": len(new_body), "removed": removed}
+    if dry_run or removed <= 0:
+        return res
+    last = _col_letter(ncol)
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{_q(tab_name)}!A2:{last}{1 + len(new_body)}",
+        valueInputOption="RAW", body={"values": new_body},
+    ).execute()
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sheet_id,
+        range=f"{_q(tab_name)}!A{2 + len(new_body)}:{last}{1 + len(body)}",
+        body={},
+    ).execute()
+    return res
+
+
 def sheet_titles(svc, sheet_id: str) -> set[str]:
     """Existing tab titles in the spreadsheet."""
     meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()

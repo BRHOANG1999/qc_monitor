@@ -46,13 +46,23 @@ class _Values:
 
     def update(self, spreadsheetId=None, range=None, valueInputOption=None,
                body=None):
-        tab, row = self.ss._tab(range), self.ss._row(range)
+        tab, start = self.ss._tab(range), self.ss._row(range)
+        vals = body["values"]
 
         def eff():
             grid = self.ss.data.setdefault(tab, [])
-            while len(grid) < row:
-                grid.append([])
-            grid[row - 1] = list(body["values"][0])
+            for k, rowvals in enumerate(vals):
+                r = start + k
+                while len(grid) < r:
+                    grid.append([])
+                grid[r - 1] = list(rowvals)
+        return _Req({}, eff)
+
+    def clear(self, spreadsheetId=None, range=None, body=None):
+        tab, start = self.ss._tab(range), self.ss._row(range)
+
+        def eff():
+            self.ss.data[tab] = self.ss.data.get(tab, [])[:start - 1]
         return _Req({}, eff)
 
     def append(self, spreadsheetId=None, range=None, valueInputOption=None,
@@ -207,6 +217,27 @@ def test_upsert_day_rows_skips_when_create_missing_false(monkeypatch):
         ["Date"], create_missing=False)
     assert res["skipped_tabs"] == ["BCH999"]
     assert res["created_tabs"] == [] and "BCH999" not in svc.data
+
+
+def test_dedupe_tab_collapses_same_date(monkeypatch):
+    svc = FakeSheets(initial={"BCH062": [
+        ["Date", "# Seizures", "Notes"],
+        ["2026-05-27", 5, ""],          # first-seen (lab-ish, real count)
+        ["2026-05-27", 0, "hand"],       # dup of same date; different cols
+        ["2026-05-28", 1, ""],
+    ]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    dry = sw.dedupe_tab(svc, "SID", "BCH062", ["Date"], dry_run=True)
+    assert dry == {"tab": "BCH062", "rows_before": 3,
+                   "rows_after": 2, "removed": 1}
+    assert len(svc.data["BCH062"]) == 4               # unchanged (dry run)
+    res = sw.dedupe_tab(svc, "SID", "BCH062", ["Date"], dry_run=False)
+    assert res["removed"] == 1
+    body = svc.data["BCH062"][1:]
+    assert len(body) == 2
+    # 2026-05-27 merged: keep first-seen 5, fill Notes from the dup.
+    assert body[0] == ["2026-05-27", 5, "hand"]
+    assert body[1] == ["2026-05-28", 1, ""]
 
 
 if __name__ == "__main__":
