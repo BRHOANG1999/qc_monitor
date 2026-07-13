@@ -5692,6 +5692,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("kbd-undo", "data", allow_duplicate=True),
         Output("video-ma-pool-cursor", "data",
                 allow_duplicate=True),
+        # Terminal submit clears the structured events editor + its scope key
+        # so the just-submitted file's onsets can't linger on the next file.
+        # (_save_review previously only cleared the legacy quick-marks store,
+        # leaving video-events-store to _rescope_events -- which bails when the
+        # next file's channel has no animal, so the old onsets persisted.)
+        Output("video-events-store", "data", allow_duplicate=True),
+        Output("video-events-current-key", "data", allow_duplicate=True),
         Input("video-review-save-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-review-decision", "value"),
@@ -5707,7 +5714,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _save_review(n_clicks, file_id, decision, markers, note,
                       animal_value, events, channel,
                       pools_view, pool_cursor):
-        nop = (no_update,) * 8
+        nop = (no_update,) * 10
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
                     else no_update, *nop[1:])
@@ -5812,7 +5819,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if pooled is not None:
             p_session, p_file, new_cursor = pooled
             return (badge, [], None, "",
-                    p_session, p_file, undo_payload, new_cursor)
+                    p_session, p_file, undo_payload, new_cursor, [], None)
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
             queue_limit=queue_limit,
@@ -5822,9 +5829,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # state via _render_queue.
         if next_file is None:
             return (badge, [], None, "",
-                    no_update, no_update, undo_payload, no_update)
+                    no_update, no_update, undo_payload, no_update, [], None)
         return (badge, [], None, "",
-                next_session, next_file, undo_payload, no_update)
+                next_session, next_file, undo_payload, no_update, [], None)
 
     # DEPRECATED / UNWIRED: the "EEG onset -> CSV + flag" button was removed
     # in the single-Submit redesign -- Submit now routes scored-but-incomplete
