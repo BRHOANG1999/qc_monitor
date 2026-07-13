@@ -468,6 +468,12 @@ google_sheets:
   # event (Date | Onset (clock) | Racine | Type | Light | File).
   events_tab_suffix: " Events"
   events_key_columns: ["File", "Onset (clock)"]
+  # Auto-create a NEW animal's summary tab (header copied from an existing
+  # animal tab) instead of skipping it -- so a new subject gets its own tab.
+  create_missing_tabs: true
+  # Optional: tab whose header is copied for new animal tabs. Blank =
+  # auto-detect (first existing tab with a Date column).
+  summary_template_tab: ""
 
 surgery_digest:
   enabled: true

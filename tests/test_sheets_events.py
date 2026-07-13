@@ -157,5 +157,32 @@ def test_event_sheet_row_wall_clock_and_fields():
     assert blank["Onset (clock)"] == "" and blank["Racine"] == ""
 
 
+def test_upsert_day_rows_creates_new_animal_tab(monkeypatch):
+    # BCH062 exists (its header is the template); BCH999 is a new animal.
+    tmpl = ["Date", "MouseID", "Number of Behavioral Events"]
+    svc = FakeSheets(initial={"BCH062": [tmpl]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    res = sw.upsert_day_rows(
+        "sa.json", "SID",
+        {"BCH999": [{"date": "2026-07-01", "animal": "BCH999",
+                     "n_events": 2}]},
+        ["Date"], create_missing=True)
+    assert "BCH999" in res["created_tabs"] and res["appended"] == 1
+    assert svc.data["BCH999"][0] == tmpl               # header copied
+    body = svc.data["BCH999"][1]
+    assert body[0] == "2026-07-01"                      # Date
+    assert body[2] == 2                                 # mapped n_events
+
+
+def test_upsert_day_rows_skips_when_create_missing_false(monkeypatch):
+    svc = FakeSheets(initial={"BCH062": [["Date"]]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    res = sw.upsert_day_rows(
+        "sa.json", "SID", {"BCH999": [{"date": "2026-07-01"}]},
+        ["Date"], create_missing=False)
+    assert res["skipped_tabs"] == ["BCH999"]
+    assert res["created_tabs"] == [] and "BCH999" not in svc.data
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

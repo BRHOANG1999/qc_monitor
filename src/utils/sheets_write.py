@@ -68,6 +68,16 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Fallback header for a brand-new animal summary tab when there's no existing
+# tab to copy from. Column names normalize onto the canonical stat keys (see
+# _ALIASES) so map_cells fills them.
+_DEFAULT_SUMMARY_HEADER = (
+    "Date", "MouseID", "CSV File Name", "Number of Behavioral Events",
+    "Max Racine", "Who Completed Analysis", "Recording Location",
+    "Channel(s)", "Type of Recording", "More Settings",
+)
+
+
 def _norm(s: str) -> str:
     """Lowercase + strip everything but a-z0-9 for fuzzy header match."""
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
@@ -230,44 +240,54 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
 
 def upsert_day_rows(service_account_file: str, sheet_id: str,
                       rows_by_tab: dict, key_columns: list[str],
-                      column_map: dict | None = None) -> dict:
-    """Upsert per-tab day rows. *rows_by_tab* maps a tab title (the
-    animal's MouseID tab) to its list of canonical day-stat dicts.
+                      column_map: dict | None = None,
+                      create_missing: bool = False,
+                      template_tab: str | None = None) -> dict:
+    """Upsert per-tab day rows. *rows_by_tab* maps a tab title (the animal's
+    MouseID tab) to its list of canonical day-stat dicts.
 
-    Tabs that don't exist in the spreadsheet are skipped with a warning
-    (we never auto-create a tab in the lab's log). Returns
-    ``{"updated", "appended", "skipped_tabs"}``. Raises on auth/API
-    error -- the finalize hook wraps this non-fatally.
+    When *create_missing* is True a NEW animal's tab is created (header
+    copied from *template_tab*, else an existing animal tab, else a canonical
+    default) so a new subject gets its own tab automatically. When False the
+    missing tab is skipped with a warning (the legacy behavior). Returns
+    ``{"updated", "appended", "skipped_tabs", "created_tabs"}``. Raises on
+    auth/API error -- the caller wraps this non-fatally.
     """
     assert sheet_id, "sheet_id required"
     if not rows_by_tab:
-        return {"updated": 0, "appended": 0, "skipped_tabs": []}
+        return {"updated": 0, "appended": 0,
+                 "skipped_tabs": [], "created_tabs": []}
     svc = _sheets_api_rw(service_account_file)
     titles = sheet_titles(svc, sheet_id)
+    header_for_new = None
+    if create_missing and any(t not in titles for t in rows_by_tab):
+        header_for_new = _resolve_summary_header(
+            svc, sheet_id, titles, template_tab)
     updated = appended = 0
     skipped: list[str] = []
+    created: list[str] = []
     for tab, rows in rows_by_tab.items():
         if tab not in titles:
-            logger.warning("no tab %r in sheet; skipping %d row(s)",
-                            tab, len(rows))
-            skipped.append(tab)
-            continue
+            if create_missing and header_for_new:
+                _create_tab_with_header(svc, sheet_id, tab, header_for_new)
+                titles.add(tab)
+                created.append(tab)
+            else:
+                logger.warning("no tab %r in sheet; skipping %d row(s)",
+                                tab, len(rows))
+                skipped.append(tab)
+                continue
         res = upsert_rows_into_tab(
             svc, sheet_id, tab, key_columns, rows, column_map)
         updated += res["updated"]
         appended += res["appended"]
     return {"updated": updated, "appended": appended,
-             "skipped_tabs": skipped}
+             "skipped_tabs": skipped, "created_tabs": created}
 
 
-def ensure_tab(svc, sheet_id: str, tab_name: str,
-                header: list[str]) -> bool:
-    """Ensure *tab_name* exists with *header* as row 1. Creates it (empty +
-    header) when missing. Returns True if it was created, False if it already
-    existed. Unlike the MouseID summary tabs (hand-maintained, never
-    auto-created), the per-animal 'Events' tabs are ours to create."""
-    if tab_name in sheet_titles(svc, sheet_id):
-        return False
+def _create_tab_with_header(svc, sheet_id: str, tab_name: str,
+                             header: list[str]) -> None:
+    """Create worksheet *tab_name* and write *header* as row 1."""
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
         body={"requests": [
@@ -279,7 +299,33 @@ def ensure_tab(svc, sheet_id: str, tab_name: str,
         valueInputOption="USER_ENTERED",
         body={"values": [list(header)]},
     ).execute()
+
+
+def ensure_tab(svc, sheet_id: str, tab_name: str,
+                header: list[str]) -> bool:
+    """Ensure *tab_name* exists with *header* as row 1. Creates it when
+    missing. Returns True if it was created, False if it already existed."""
+    if tab_name in sheet_titles(svc, sheet_id):
+        return False
+    _create_tab_with_header(svc, sheet_id, tab_name, header)
     return True
+
+
+def _resolve_summary_header(svc, sheet_id: str, titles,
+                             template_tab: str | None) -> list:
+    """Header row for a NEWLY-created animal summary tab, so it matches the
+    lab's existing tabs: the explicit *template_tab*'s header if given, else
+    the first existing tab that has a 'Date' column, else a canonical
+    default."""
+    if template_tab and template_tab in titles:
+        g = read_grid(svc, sheet_id, template_tab)
+        if g and g[0]:
+            return list(g[0])
+    for t in sorted(t for t in titles if t):
+        g = read_grid(svc, sheet_id, t)
+        if g and g[0] and any(_norm(c) == "date" for c in g[0]):
+            return list(g[0])
+    return list(_DEFAULT_SUMMARY_HEADER)
 
 
 def upsert_event_rows(service_account_file: str, sheet_id: str,

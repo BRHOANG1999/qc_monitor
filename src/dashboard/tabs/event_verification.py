@@ -2176,8 +2176,12 @@ def _push_scored_to_sheet(store, config: dict,
         from src.utils import sheets_write
         s = sheets_write.upsert_day_rows(
             gs["service_account_file"], gs["spreadsheet_id"], rows_by_tab,
-            gs.get("key_columns", ["Date"]), gs.get("column_map"))
+            gs.get("key_columns", ["Date"]), gs.get("column_map"),
+            create_missing=gs.get("create_missing_tabs", True),
+            template_tab=gs.get("summary_template_tab"))
         note = f"summary {s['updated']}u/{s['appended']}a"
+        if s.get("created_tabs"):
+            note += f" (+{len(s['created_tabs'])} new animal tab)"
         if s.get("skipped_tabs"):
             note += f" (no tab: {', '.join(s['skipped_tabs'])})"
         notes.append(note)
