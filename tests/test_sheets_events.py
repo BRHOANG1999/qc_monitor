@@ -40,7 +40,7 @@ class _Values:
     def __init__(self, ss):
         self.ss = ss
 
-    def get(self, spreadsheetId=None, range=None):
+    def get(self, spreadsheetId=None, range=None, valueRenderOption=None):
         tab = self.ss._tab(range)
         return _Req({"values": [list(r) for r in self.ss.data.get(tab, [])]})
 
@@ -155,6 +155,31 @@ def test_event_sheet_row_wall_clock_and_fields():
     # Unscored / no-onset fields degrade to "".
     blank = _event_sheet_row({"type": "", "EO_sec": None}, file_meta, 20000.0)
     assert blank["Onset (clock)"] == "" and blank["Racine"] == ""
+
+
+def test_canon_key_serial_vs_iso():
+    # Google date serial 46168 == 2026-05-26.
+    assert sw._canon_key(46168) == "2026-05-26"
+    assert sw._canon_key("2026-05-26") == "2026-05-26"
+    # Datetime serial + string collapse to the same second.
+    assert sw._canon_key("2026-03-02 17:20:31.710") == "2026-03-02 17:20:31"
+    # Non-dates fall back to _norm (racine stays comparable).
+    assert sw._canon_key(4) == sw._norm(4)
+    assert sw._canon_key("rec.mat") == sw._norm("rec.mat")
+
+
+def test_upsert_idempotent_across_date_formats(monkeypatch):
+    # The tab already stores the date as a Google SERIAL (46168), the way
+    # USER_ENTERED writes it -- an ISO-string upsert must UPDATE, not append.
+    svc = FakeSheets(initial={
+        "BCH062": [["Date", "Number of Behavioral Events"], [46168, 3]]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    res = sw.upsert_day_rows(
+        "sa.json", "SID",
+        {"BCH062": [{"date": "2026-05-26", "n_events": 7}]}, ["Date"])
+    assert res["updated"] == 1 and res["appended"] == 0
+    assert len(svc.data["BCH062"]) == 2          # header + 1 row, no dup
+    assert svc.data["BCH062"][1][1] == 7         # n_events updated in place
 
 
 def test_upsert_day_rows_creates_new_animal_tab(monkeypatch):

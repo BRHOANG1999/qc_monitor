@@ -108,14 +108,47 @@ def _sheets_api_rw(service_account_file: str):
     return svc
 
 
-def read_grid(svc, sheet_id: str, tab_name: str) -> list[list[str]]:
+def read_grid(svc, sheet_id: str, tab_name: str,
+               unformatted: bool = False) -> list[list]:
     """Return the tab as a list of rows (row 0 = header). The title is
-    A1-quoted so cell-like titles ('BCH039') resolve to the whole
-    sheet, not a bogus cell range."""
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=sheet_id, range=_q(tab_name),
-    ).execute()
+    A1-quoted so cell-like titles ('BCH039') resolve to the whole sheet, not a
+    bogus cell range. *unformatted* reads UNFORMATTED_VALUE (dates come back as
+    Google serial numbers, not display strings) -- required for a stable key
+    match against date-formatted columns."""
+    kw = {"spreadsheetId": sheet_id, "range": _q(tab_name)}
+    if unformatted:
+        kw["valueRenderOption"] = "UNFORMATTED_VALUE"
+    resp = svc.spreadsheets().values().get(**kw).execute()
     return resp.get("values", []) or []
+
+
+def _canon_key(v) -> str:
+    """Canonicalize a key cell so a date/datetime matches whether the sheet
+    stored it as a Google serial number, an ISO string, or a reformatted
+    display value -- e.g. the serial 46168 and the string '2026-05-26' both
+    canonicalize to '2026-05-26'. Non-date values fall back to _norm. This is
+    what makes the upsert idempotent against date-formatted columns."""
+    from datetime import datetime, timedelta
+    if isinstance(v, bool):
+        return _norm(v)
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if 20000 <= f <= 80000:            # plausible Sheets date-serial window
+            dt = datetime(1899, 12, 30) + timedelta(days=f)
+            if f.is_integer():
+                return dt.strftime("%Y-%m-%d")
+            return (dt + timedelta(seconds=0.5)).strftime("%Y-%m-%d %H:%M:%S")
+        return _norm(v)
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                 "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return (dt.strftime("%Y-%m-%d") if fmt == "%Y-%m-%d"
+                     else dt.strftime("%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+    return _norm(s)
 
 
 def map_cells(header: list[str], stats: dict,
@@ -172,14 +205,19 @@ def sheet_titles(svc, sheet_id: str) -> set[str]:
 def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
                            key_columns: list[str],
                            stats_rows: list[dict],
-                           column_map: dict | None = None) -> dict:
+                           column_map: dict | None = None,
+                           value_input_option: str = "USER_ENTERED") -> dict:
     """Upsert *stats_rows* into one tab, keyed on *key_columns*.
 
     MERGE semantics on update: only the columns we have a value for are
     written; every other cell keeps its existing content, so columns the
-    lab fills by hand (Recording Location, etc.) are never blanked.
+    lab fills by hand (Recording Location, etc.) are never blanked. Keys are
+    canonicalized (_canon_key) so date columns match whether stored as a
+    serial or a string -- this is what keeps the upsert idempotent.
+    ``value_input_option='RAW'`` (used for the Events tabs we own) keeps
+    dates/onsets as exact text so they round-trip without reformatting.
     """
-    grid = read_grid(svc, sheet_id, tab_name)
+    grid = read_grid(svc, sheet_id, tab_name, unformatted=True)
     if not grid:
         raise ValueError(
             f"tab {tab_name!r} is empty (needs a header row)")
@@ -194,7 +232,7 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
     existing: dict[tuple, tuple] = {}
     for r, vals in enumerate(body):
         ktuple = tuple(
-            _norm(vals[i]) if i < len(vals) else "" for i in key_idx)
+            _canon_key(vals[i]) if i < len(vals) else "" for i in key_idx)
         existing[ktuple] = (r + 2, vals)
 
     updated = appended = 0
@@ -208,7 +246,7 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
             logger.warning("row missing key column(s) %s; skipped",
                             key_columns)
             continue
-        ktuple = tuple(_norm(cells[i]) for i in key_idx)
+        ktuple = tuple(_canon_key(cells[i]) for i in key_idx)
         hit = existing.get(ktuple)
         if hit is not None:
             sheet_row, exrow = hit
@@ -221,7 +259,7 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
             svc.spreadsheets().values().update(
                 spreadsheetId=sheet_id,
                 range=_a1_row(tab_name, sheet_row),
-                valueInputOption="USER_ENTERED",
+                valueInputOption=value_input_option,
                 body={"values": [merged]},
             ).execute()
             updated += 1
@@ -231,7 +269,7 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
     if appends:
         svc.spreadsheets().values().append(
             spreadsheetId=sheet_id, range=_q(tab_name),
-            valueInputOption="USER_ENTERED",
+            valueInputOption=value_input_option,
             insertDataOption="INSERT_ROWS",
             body={"values": appends},
         ).execute()
@@ -356,7 +394,8 @@ def upsert_event_rows(service_account_file: str, sheet_id: str,
         if ensure_tab(svc, sheet_id, tab, header):
             created.append(tab)
         res = upsert_rows_into_tab(
-            svc, sheet_id, tab, key_columns, rows, cmap)
+            svc, sheet_id, tab, key_columns, rows, cmap,
+            value_input_option="RAW")
         updated += res["updated"]
         appended += res["appended"]
     return {"updated": updated, "appended": appended,
