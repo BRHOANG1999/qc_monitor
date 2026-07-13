@@ -302,6 +302,7 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
 
     updated = appended = 0
     appends: list[list] = []
+    batch: list[dict] = []          # batched in-place updates -> 1 API call
     max_iter = len(stats_rows) + 1
     for n, stats in enumerate(stats_rows):
         assert n < max_iter, "upsert runaway"
@@ -321,16 +322,19 @@ def upsert_rows_into_tab(svc, sheet_id: str, tab_name: str,
                     merged.append(cells[i])
                 else:
                     merged.append(exrow[i] if i < len(exrow) else "")
-            svc.spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=_a1_row(tab_name, sheet_row),
-                valueInputOption=value_input_option,
-                body={"values": [merged]},
-            ).execute()
+            batch.append({"range": _a1_row(tab_name, sheet_row),
+                          "values": [merged]})
             updated += 1
         else:
             appends.append(["" if c is None else c for c in cells])
             appended += 1
+    if batch:
+        # One batched write for all in-place updates -> stays well under the
+        # 60 write-requests/min/user Sheets quota even on a bulk approve.
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": value_input_option, "data": batch},
+        ).execute()
     if appends:
         svc.spreadsheets().values().append(
             spreadsheetId=sheet_id, range=_q(tab_name),

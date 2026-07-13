@@ -68,6 +68,15 @@ class _FakeValues:
                 return {}
         return _Exec()
 
+    def batchUpdate(self, spreadsheetId, body):
+        for d in body["data"]:
+            self.updates.append((d["range"], d["values"]))
+
+        class _Exec:
+            def execute(self_inner):
+                return {}
+        return _Exec()
+
     def append(self, spreadsheetId, range, valueInputOption,
                 insertDataOption, body):
         self.appends.append(body["values"])

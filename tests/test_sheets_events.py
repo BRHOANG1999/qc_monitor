@@ -58,6 +58,18 @@ class _Values:
                 grid[r - 1] = list(rowvals)
         return _Req({}, eff)
 
+    def batchUpdate(self, spreadsheetId=None, body=None):
+        def eff():
+            for d in body["data"]:
+                tab, start = self.ss._tab(d["range"]), self.ss._row(d["range"])
+                grid = self.ss.data.setdefault(tab, [])
+                for k, rv in enumerate(d["values"]):
+                    r = start + k
+                    while len(grid) < r:
+                        grid.append([])
+                    grid[r - 1] = list(rv)
+        return _Req({}, eff)
+
     def clear(self, spreadsheetId=None, range=None, body=None):
         tab, start = self.ss._tab(range), self.ss._row(range)
 
