@@ -461,6 +461,13 @@ google_sheets:
   # Optional explicit header->stat-key overrides, e.g.
   #   {"Channel(s)": "channels", "Type of Recording": "n_during_stim_events"}
   column_map: {}
+  # Auto-push scored seizures the moment the PI approves (not only on the
+  # manual "Finalize -> CSV" button). Set false to keep it finalize-only.
+  push_on_approve: true
+  # Per-animal "<MouseID> Events" tab (auto-created): one row per seizure
+  # event (Date | Onset (clock) | Racine | Type | Light | File).
+  events_tab_suffix: " Events"
+  events_key_columns: ["File", "Onset (clock)"]
 
 surgery_digest:
   enabled: true

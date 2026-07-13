@@ -1045,9 +1045,17 @@ def register_callbacks(app, store, config: dict) -> None:
             return no_update, no_update, no_update, no_update
         trig = callback_context.triggered_id
         # "Approve ALL pending" ignores the table selection/pagination.
+        # Auto-collect scored seizures into the Google Sheet on approve
+        # (non-fatal; toggle with google_sheets.push_on_approve).
+        _auto_sheet = (config or {}).get(
+            "google_sheets", {}).get("push_on_approve", True)
         if trig == "evtv-approve-all-btn":
             n = store.pi_approve_all_pending(email)
             msg = f"Approved ALL {n} pending file{'' if n == 1 else 's'}."
+            sn = (_push_scored_to_sheet(store, config)
+                  if _auto_sheet else "")
+            if sn:
+                msg += f"  ·  {sn}"
         else:
             targets = [int(x) for x in (selected_ids or [])]
             if not targets:
@@ -1056,6 +1064,10 @@ def register_callbacks(app, store, config: dict) -> None:
             if trig == "evtv-approve-sel-btn":
                 n = store.pi_bulk_approve(targets, email)
                 msg = f"Approved {n} file{'' if n == 1 else 's'}."
+                sn = (_push_scored_to_sheet(store, config, file_ids=targets)
+                      if _auto_sheet else "")
+                if sn:
+                    msg += f"  ·  {sn}"
             elif trig == "evtv-flag-sel-btn":
                 n = store.pi_bulk_flag(targets, email,
                                          note=(note or ""))
@@ -1901,16 +1913,12 @@ def _finalize_approved_to_csv(store, config: dict,
     # exactly WHICH files got what (instead of a giant one-line string).
     entries: list[dict] = []
     base_dir = bhz_cfg.get("base_dir", "")
-    # One day-row per animal tab: {animal_tab: [day_stat_dict, ...]}.
-    rows_by_tab: dict[str, list[dict]] = {}
     for (animal, day), items in sorted(bucket.items()):
         csv_path = _bhz_csv.resolve_csv_path(
             base_dir,
             bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
             day, animal,
         )
-        rows_by_tab.setdefault(animal, []).append(
-            _day_stats(store, animal, day, items, csv_path.name))
         events_by_fn: dict[str, list[dict]] = {}
         meta_by_fn: dict[str, dict] = {}
         for r in items:
@@ -1938,27 +1946,10 @@ def _finalize_approved_to_csv(store, config: dict,
                     fs=meta_by_fn[fn].get("fs") or 20000.0)
             entry["n_rows"] = n_total
         entries.append(entry)
-    # Daily Google-Sheet upsert (non-fatal): one row per day in each
-    # animal's own tab (MouseID). Merge-update never blanks the lab's
-    # hand-filled columns.
-    sheet_note = ""
-    gs = (config or {}).get("google_sheets", {}) or {}
-    if gs.get("enabled") and rows_by_tab:
-        try:
-            from src.utils import sheets_write
-            res = sheets_write.upsert_day_rows(
-                gs["service_account_file"], gs["spreadsheet_id"],
-                rows_by_tab,
-                gs.get("key_columns", ["Date"]),
-                gs.get("column_map"))
-            sheet_note = (f"Google Sheet: {res['updated']} updated, "
-                          f"{res['appended']} appended")
-            if res.get("skipped_tabs"):
-                sheet_note += (f" (no tab for: "
-                               f"{', '.join(res['skipped_tabs'])})")
-        except Exception as e:
-            logger.warning("Google Sheet upsert failed: %s", e)
-            sheet_note = f"Google Sheet sync FAILED: {e}"
+    # Google-Sheet push (non-fatal): per-(animal, day) summary into each
+    # MouseID tab AND one row per seizure into the "<MouseID> Events" tab.
+    # (The same push also runs automatically on PI approve.)
+    sheet_note = _push_scored_to_sheet(store, config)
     return _finalize_summary_block(base_dir, entries, overwrite, sheet_note)
 
 
@@ -2109,6 +2100,101 @@ def _day_stats(store, animal: str, day, items: list[dict],
         "more_settings": stim_settings if is_stim else "",
         "exported_at": _dt.now().isoformat(timespec="seconds"),
     }
+
+
+# One row per SEIZURE EVENT in each animal's "<MouseID> Events" tab. Columns
+# match the confirmed layout; values match the BHZ CSV (same wall-clock).
+_EVENT_SHEET_HEADER = ["Date", "Onset (clock)", "Racine", "Type",
+                       "Light", "File"]
+_EVENT_SHEET_KEY = ["File", "Onset (clock)"]   # unique per event -> idempotent
+
+
+def _event_sheet_row(event: dict, file_meta: dict, fs: float) -> dict:
+    """One seizure event as a row for its animal's Events tab. Wall-clock
+    onset + date come from the same bhz_csv helpers the CSV uses, so the two
+    outputs never drift."""
+    wall = _bhz_csv._wall_clock_eo(event.get("EO_sec"), file_meta, fs)
+    racine = event.get("racine")
+    light = event.get("light")
+    return {
+        "Date": file_meta.get("Peak_Date") or "",
+        "Onset (clock)": wall or "",
+        "Racine": "" if racine in (None, "") else racine,
+        "Type": event.get("type") or "",
+        "Light": "" if light in (None, "") else light,
+        "File": file_meta.get("filename") or "",
+    }
+
+
+def _push_scored_to_sheet(store, config: dict,
+                           file_ids=None) -> str:
+    """Push scored seizures to the Google Sheet (non-fatal): the per-(animal,
+    day) summary into each MouseID tab AND one row per seizure event into the
+    animal's "<MouseID> Events" tab. Scoped to *file_ids* when given (the
+    just-approved files), else every pi_approved file. Returns a status note.
+    """
+    gs = (config or {}).get("google_sheets", {}) or {}
+    if not gs.get("enabled"):
+        return ""
+    rows = _fetch_approved_rows(store)
+    if file_ids is not None:
+        want = {int(x) for x in file_ids}
+        rows = [r for r in rows if int(r["file_id"]) in want]
+    if not rows:
+        return ""
+    bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
+    base_dir = bhz_cfg.get("base_dir", "")
+    suffix = gs.get("events_tab_suffix", " Events")
+    bucket: dict = {}
+    for r in rows:
+        animal, chunk_dt = _animal_and_date(store, r)
+        if not (animal and chunk_dt):
+            continue
+        bucket.setdefault((animal, chunk_dt.date()), []).append(r)
+    rows_by_tab: dict = {}     # MouseID -> [day summary]
+    events_by_tab: dict = {}   # "MouseID Events" -> [event rows]
+    for (animal, day), items in sorted(bucket.items()):
+        csv_name = (_bhz_csv.resolve_csv_path(
+            base_dir,
+            bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
+            day, animal).name if base_dir else "")
+        rows_by_tab.setdefault(animal, []).append(
+            _day_stats(store, animal, day, items, csv_name))
+        ev_tab = f"{animal}{suffix}"
+        for r in items:
+            file_meta = _file_meta_for_row(store, r, bhz_cfg)
+            if file_meta is None:
+                continue
+            fs = float(file_meta.get("fs") or 20000.0)
+            for e in (r.get("events") or []):
+                if not isinstance(e, dict) or e.get("EO_sec") in (None, ""):
+                    continue     # only real seizure onsets
+                events_by_tab.setdefault(ev_tab, []).append(
+                    _event_sheet_row(e, file_meta, fs))
+    notes: list[str] = []
+    try:
+        from src.utils import sheets_write
+        s = sheets_write.upsert_day_rows(
+            gs["service_account_file"], gs["spreadsheet_id"], rows_by_tab,
+            gs.get("key_columns", ["Date"]), gs.get("column_map"))
+        note = f"summary {s['updated']}u/{s['appended']}a"
+        if s.get("skipped_tabs"):
+            note += f" (no tab: {', '.join(s['skipped_tabs'])})"
+        notes.append(note)
+        if events_by_tab:
+            ev = sheets_write.upsert_event_rows(
+                gs["service_account_file"], gs["spreadsheet_id"],
+                events_by_tab,
+                gs.get("events_key_columns", _EVENT_SHEET_KEY),
+                _EVENT_SHEET_HEADER)
+            enote = f"events {ev['updated']}u/{ev['appended']}a"
+            if ev.get("created_tabs"):
+                enote += f" (+{len(ev['created_tabs'])} tab)"
+            notes.append(enote)
+    except Exception as e:  # noqa: BLE001 -- Sheets must never block review
+        logger.warning("Google Sheet push failed: %s", e)
+        return f"Google Sheet sync FAILED: {e}"
+    return "Google Sheet: " + "; ".join(notes) if notes else ""
 
 
 def _fetch_approved_rows(store) -> list[dict]:

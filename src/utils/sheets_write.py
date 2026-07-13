@@ -258,3 +258,60 @@ def upsert_day_rows(service_account_file: str, sheet_id: str,
         appended += res["appended"]
     return {"updated": updated, "appended": appended,
              "skipped_tabs": skipped}
+
+
+def ensure_tab(svc, sheet_id: str, tab_name: str,
+                header: list[str]) -> bool:
+    """Ensure *tab_name* exists with *header* as row 1. Creates it (empty +
+    header) when missing. Returns True if it was created, False if it already
+    existed. Unlike the MouseID summary tabs (hand-maintained, never
+    auto-created), the per-animal 'Events' tabs are ours to create."""
+    if tab_name in sheet_titles(svc, sheet_id):
+        return False
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [
+            {"addSheet": {"properties": {"title": tab_name}}}]},
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{_q(tab_name)}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": [list(header)]},
+    ).execute()
+    return True
+
+
+def upsert_event_rows(service_account_file: str, sheet_id: str,
+                       events_by_tab: dict, key_columns: list[str],
+                       header: list[str],
+                       column_map: dict | None = None) -> dict:
+    """Upsert one row per seizure event into each animal's 'Events' tab.
+
+    *events_by_tab* maps a tab title (e.g. ``"BCH062 Events"``) to a list of
+    event-row dicts whose keys are the *header* column names. The tab is
+    created with *header* if it doesn't exist yet, then rows are upserted
+    keyed on *key_columns* (default (File, Onset) => idempotent, no dupes on
+    re-approve). Returns ``{"updated", "appended", "created_tabs"}``. Raises
+    on auth/API error -- callers wrap non-fatally.
+    """
+    assert sheet_id, "sheet_id required"
+    if not events_by_tab:
+        return {"updated": 0, "appended": 0, "created_tabs": []}
+    svc = _sheets_api_rw(service_account_file)
+    # Identity map: each header column pulls its own same-named key out of the
+    # event-row dict (we own both the header and the dict, so no aliasing).
+    cmap = column_map or {h: h for h in header}
+    updated = appended = 0
+    created: list[str] = []
+    for tab, rows in events_by_tab.items():
+        if not rows:
+            continue
+        if ensure_tab(svc, sheet_id, tab, header):
+            created.append(tab)
+        res = upsert_rows_into_tab(
+            svc, sheet_id, tab, key_columns, rows, cmap)
+        updated += res["updated"]
+        appended += res["appended"]
+    return {"updated": updated, "appended": appended,
+             "created_tabs": created}
