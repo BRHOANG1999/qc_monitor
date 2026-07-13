@@ -2607,8 +2607,8 @@ def _build_behavioral_seizure_status_card(store, config=None):
                        style={"color": "#cfd0d6"}),
             html.Span(f"{total_pending} pending PI  ·  ",
                        style={"color": "#cfd0d6"}),
-            html.Span(f"🔬 {total_threshold} threshold  ·  ",
-                       style={"color": "#5e7ce2" if total_threshold
+            html.Span(f"🚩 {total_threshold} threshold  ·  ",
+                       style={"color": "#f0b429" if total_threshold
                               else "#cfd0d6"}),
             html.Span(f"⚠️ {total_needs} needs more onsets",
                        style={"color": "#ff9f0a" if total_needs
@@ -2694,13 +2694,13 @@ def _bsz_cards(rows):
                                       "fontWeight": "600"}),
                 ]),
                 html.Div([
-                    html.Span("🔬 threshold",
+                    html.Span("🚩 threshold",
                                style={"color": "#888",
                                        "fontSize": "10px",
                                        "textTransform": "uppercase",
                                        "letterSpacing": "0.5px"}),
                     html.Div(f"{r.get('n_threshold', 0)}",
-                              style={"color": "#5e7ce2"
+                              style={"color": "#f0b429"
                                      if r.get("n_threshold")
                                      else "#cfd0d6",
                                       "fontSize": "16px",

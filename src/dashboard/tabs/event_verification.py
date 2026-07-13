@@ -2113,14 +2113,21 @@ def _day_stats(store, animal: str, day, items: list[dict],
 # One row per SEIZURE EVENT in each animal's "<MouseID> Events" tab. Columns
 # match the confirmed layout; values match the BHZ CSV (same wall-clock).
 _EVENT_SHEET_HEADER = ["Date", "Onset (clock)", "Racine", "Type",
-                       "Light", "File"]
+                       "Light", "File", "Status"]
 _EVENT_SHEET_KEY = ["File", "Onset (clock)"]   # unique per event -> idempotent
 
+# Status marks whether an event's scoring is final. Approved events are done;
+# the 'Needs more onsets' pool is scored (onset + Racine) but still awaiting
+# the remaining landmarks, so the sheet shows it isn't a finished row yet.
+_STATUS_APPROVED = "✅ Approved"
+_STATUS_NEEDS = "⚠️ Needs more onsets"
 
-def _event_sheet_row(event: dict, file_meta: dict, fs: float) -> dict:
+
+def _event_sheet_row(event: dict, file_meta: dict, fs: float,
+                      status: str = "") -> dict:
     """One seizure event as a row for its animal's Events tab. Wall-clock
     onset + date come from the same bhz_csv helpers the CSV uses, so the two
-    outputs never drift."""
+    outputs never drift. *status* flags approved vs 'needs more onsets'."""
     wall = _bhz_csv._wall_clock_eo(event.get("EO_sec"), file_meta, fs)
     racine = event.get("racine")
     light = event.get("light")
@@ -2131,7 +2138,29 @@ def _event_sheet_row(event: dict, file_meta: dict, fs: float) -> dict:
         "Type": event.get("type") or "",
         "Light": "" if light in (None, "") else light,
         "File": file_meta.get("filename") or "",
+        "Status": status,
     }
+
+
+def _collect_event_rows(store, rows: list[dict], bhz_cfg: dict,
+                         suffix: str, status: str,
+                         events_by_tab: dict) -> None:
+    """Append one Events-tab row per real seizure onset in *rows* (each tagged
+    with *status*) into *events_by_tab*, keyed by '<animal> Events'."""
+    for r in rows:
+        animal, _dt = _animal_and_date(store, r)
+        if not animal:
+            continue
+        file_meta = _file_meta_for_row(store, r, bhz_cfg)
+        if file_meta is None:
+            continue
+        fs = float(file_meta.get("fs") or 20000.0)
+        ev_tab = f"{animal}{suffix}"
+        for e in (r.get("events") or []):
+            if not isinstance(e, dict) or e.get("EO_sec") in (None, ""):
+                continue     # only real seizure onsets
+            events_by_tab.setdefault(ev_tab, []).append(
+                _event_sheet_row(e, file_meta, fs, status))
 
 
 def _push_scored_to_sheet(store, config: dict,
@@ -2144,23 +2173,27 @@ def _push_scored_to_sheet(store, config: dict,
     gs = (config or {}).get("google_sheets", {}) or {}
     if not gs.get("enabled"):
         return ""
-    rows = _fetch_approved_rows(store)
+    approved = _fetch_approved_rows(store)
     if file_ids is not None:
         want = {int(x) for x in file_ids}
-        rows = [r for r in rows if int(r["file_id"]) in want]
-    if not rows:
+        approved = [r for r in approved if int(r["file_id"]) in want]
+    # 'Needs more onsets' events sync on a FULL push (finalize / backfill),
+    # not on every scoped single-approve -- that keeps rapid approvals under
+    # the Sheets write quota. They carry a Status marker so the sheet shows
+    # they're still awaiting the remaining onsets.
+    needs = _fetch_needs_scoring_rows(store) if file_ids is None else []
+    if not approved and not needs:
         return ""
     bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
     base_dir = bhz_cfg.get("base_dir", "")
     suffix = gs.get("events_tab_suffix", " Events")
+    # Per-(animal, day) summary: approved events only.
     bucket: dict = {}
-    for r in rows:
+    for r in approved:
         animal, chunk_dt = _animal_and_date(store, r)
-        if not (animal and chunk_dt):
-            continue
-        bucket.setdefault((animal, chunk_dt.date()), []).append(r)
+        if animal and chunk_dt:
+            bucket.setdefault((animal, chunk_dt.date()), []).append(r)
     rows_by_tab: dict = {}     # MouseID -> [day summary]
-    events_by_tab: dict = {}   # "MouseID Events" -> [event rows]
     for (animal, day), items in sorted(bucket.items()):
         csv_name = (_bhz_csv.resolve_csv_path(
             base_dir,
@@ -2168,17 +2201,12 @@ def _push_scored_to_sheet(store, config: dict,
             day, animal).name if base_dir else "")
         rows_by_tab.setdefault(animal, []).append(
             _day_stats(store, animal, day, items, csv_name))
-        ev_tab = f"{animal}{suffix}"
-        for r in items:
-            file_meta = _file_meta_for_row(store, r, bhz_cfg)
-            if file_meta is None:
-                continue
-            fs = float(file_meta.get("fs") or 20000.0)
-            for e in (r.get("events") or []):
-                if not isinstance(e, dict) or e.get("EO_sec") in (None, ""):
-                    continue     # only real seizure onsets
-                events_by_tab.setdefault(ev_tab, []).append(
-                    _event_sheet_row(e, file_meta, fs))
+    # One row per event: approved (done) + needs_scoring (incomplete).
+    events_by_tab: dict = {}   # "MouseID Events" -> [event rows]
+    _collect_event_rows(store, approved, bhz_cfg, suffix,
+                         _STATUS_APPROVED, events_by_tab)
+    _collect_event_rows(store, needs, bhz_cfg, suffix,
+                         _STATUS_NEEDS, events_by_tab)
     notes: list[str] = []
     try:
         from src.utils import sheets_write
@@ -2222,6 +2250,39 @@ def _fetch_approved_rows(store) -> list[dict]:
                JOIN processed_files pf
                  ON pf.id = rs.file_id
                WHERE rs.status = 'pi_approved'
+               ORDER BY rs.updated_at ASC"""
+        ).fetchall()
+    import json as _json
+    out: list[dict] = []
+    for r in rows:
+        try:
+            evs = _json.loads(r["markers_json"] or "[]")
+        except _json.JSONDecodeError:
+            evs = []
+        d = dict(r)
+        d["events"] = evs
+        out.append(d)
+    return out
+
+
+def _fetch_needs_scoring_rows(store) -> list[dict]:
+    """The LATEST needs_scoring review per (file, animal) + its events -- the
+    'Needs more onsets' pool (scored, awaiting the remaining onsets). Filtered
+    to the latest row so a file since approved is NOT re-pushed as incomplete;
+    ``animal_id IS`` is SQLite's null-safe match (legacy whole-file rows)."""
+    with store.connection() as conn:
+        rows = conn.execute(
+            """SELECT rs.id AS state_id, rs.file_id, rs.animal_id,
+                      rs.user_email, rs.markers_json,
+                      pf.file_path, pf.session_dir,
+                      pf.chunk_datetime, pf.sampling_rate
+               FROM review_state rs
+               JOIN processed_files pf
+                 ON pf.id = rs.file_id
+               WHERE rs.status = 'needs_scoring'
+                 AND rs.id = (SELECT MAX(rs2.id) FROM review_state rs2
+                              WHERE rs2.file_id = rs.file_id
+                                AND rs2.animal_id IS rs.animal_id)
                ORDER BY rs.updated_at ASC"""
         ).fetchall()
     import json as _json

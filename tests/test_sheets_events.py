@@ -270,5 +270,53 @@ def test_dedupe_tab_protects_keys(monkeypatch):
     assert sum(1 for r in body if r[0] == "2026-05-01") == 1
 
 
+def test_event_sheet_row_status():
+    from src.dashboard.tabs.event_verification import (
+        _event_sheet_row, _STATUS_NEEDS)
+    file_meta = {"Peak_Date": "2026-06-04", "Peak_Time": "03:41:00",
+                 "Peak_Index": None, "filename": "rec.mat"}
+    event = {"type": "LVF", "EO_sec": 10.0, "racine": 3}
+    r = _event_sheet_row(event, file_meta, 20000.0, status=_STATUS_NEEDS)
+    assert r["Status"] == _STATUS_NEEDS
+    # Default (no status arg) -> blank Status cell (approved backfill etc.).
+    assert _event_sheet_row(event, file_meta, 20000.0)["Status"] == ""
+
+
+def test_ensure_header_columns_appends_missing():
+    # A tab created before the "Status" column: extension adds it at the end,
+    # existing columns/order untouched, and it's idempotent.
+    old = ["Date", "Onset (clock)", "Racine", "Type", "Light", "File"]
+    svc = FakeSheets(initial={"BCH062 Events": [
+        list(old), ["2026-06-04", "x", 3, "LVF", 2, "rec.mat"]]})
+    added = sw._ensure_header_columns(svc, "SID", "BCH062 Events",
+                                       old + ["Status"])
+    assert added == 1
+    assert svc.data["BCH062 Events"][0] == old + ["Status"]
+    assert sw._ensure_header_columns(svc, "SID", "BCH062 Events",
+                                      old + ["Status"]) == 0
+
+
+def test_upsert_event_rows_extends_old_header(monkeypatch):
+    # Existing Events tab has the OLD 6-column header. Upserting the same
+    # event (File+Onset) with a Status value must extend the header and write
+    # Status in place, not drop it or duplicate the row.
+    from src.dashboard.tabs.event_verification import (
+        _EVENT_SHEET_HEADER, _EVENT_SHEET_KEY, _STATUS_NEEDS)
+    old = ["Date", "Onset (clock)", "Racine", "Type", "Light", "File"]
+    svc = FakeSheets(initial={"BCH062 Events": [
+        list(old), ["2026-06-04", "2026-06-04 04:34:40.710", 4, "LVF", 2,
+                    "rec.mat"]]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    row = {"Date": "2026-06-04", "Onset (clock)": "2026-06-04 04:34:40.710",
+           "Racine": 4, "Type": "LVF", "Light": 2, "File": "rec.mat",
+           "Status": _STATUS_NEEDS}
+    res = sw.upsert_event_rows("sa.json", "SID", {"BCH062 Events": [row]},
+                               _EVENT_SHEET_KEY, _EVENT_SHEET_HEADER)
+    assert res["updated"] == 1 and res["appended"] == 0
+    hdr = svc.data["BCH062 Events"][0]
+    assert "Status" in hdr and len(svc.data["BCH062 Events"]) == 2
+    assert svc.data["BCH062 Events"][1][hdr.index("Status")] == _STATUS_NEEDS
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

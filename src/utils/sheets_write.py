@@ -435,6 +435,31 @@ def _resolve_summary_header(svc, sheet_id: str, titles,
     return list(_DEFAULT_SUMMARY_HEADER)
 
 
+def _ensure_header_columns(svc, sheet_id: str, tab_name: str,
+                            header: list[str],
+                            value_input_option: str = "RAW") -> int:
+    """Make an EXISTING tab's header row contain every column in *header*,
+    appending any missing ones at the end. Existing columns and their order
+    are untouched, so a tab created before a column was added just gains it
+    (older rows leave the new cell blank until re-upserted). Returns the count
+    of columns added. Events-tabs only -- never call this on the lab's
+    hand-maintained summary tabs."""
+    grid = read_grid(svc, sheet_id, tab_name, unformatted=True)
+    existing = list(grid[0]) if grid else []
+    have = {_norm(c) for c in existing}
+    missing = [c for c in header if _norm(c) not in have]
+    if not missing:
+        return 0
+    new_header = existing + missing
+    svc.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=f"{_q(tab_name)}!A1",
+        valueInputOption=value_input_option,
+        body={"values": [new_header]},
+    ).execute()
+    return len(missing)
+
+
 def upsert_event_rows(service_account_file: str, sheet_id: str,
                        events_by_tab: dict, key_columns: list[str],
                        header: list[str],
@@ -462,6 +487,10 @@ def upsert_event_rows(service_account_file: str, sheet_id: str,
             continue
         if ensure_tab(svc, sheet_id, tab, header):
             created.append(tab)
+        else:
+            # Tab predates a header column (e.g. "Status") -> add it so the
+            # keyed upsert can write that cell instead of silently dropping it.
+            _ensure_header_columns(svc, sheet_id, tab, header)
         res = upsert_rows_into_tab(
             svc, sheet_id, tab, key_columns, rows, cmap,
             value_input_option="RAW")
