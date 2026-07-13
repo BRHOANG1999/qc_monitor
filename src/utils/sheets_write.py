@@ -205,13 +205,14 @@ def _col_letter(n: int) -> str:
 
 
 def dedupe_tab(svc, sheet_id: str, tab_name: str, key_columns: list[str],
-                dry_run: bool = True) -> dict:
+                dry_run: bool = True, protect_keys=None) -> dict:
     """Collapse rows sharing the same canonical key into ONE (merging the
     first non-empty value per column, keeping first-seen order), removing the
-    surplus duplicate rows. Idempotent + safe to re-run. ``dry_run=True``
-    computes the effect without writing. Returns
+    surplus duplicate rows. Rows whose key touches *protect_keys* (a set of
+    canonical key values, e.g. dates with genuine per-event rows) are LEFT
+    ALONE -- never merged. Idempotent + safe to re-run. ``dry_run=True``
+    computes without writing. Returns
     ``{"tab","rows_before","rows_after","removed"}``."""
-    from collections import OrderedDict
     grid = read_grid(svc, sheet_id, tab_name, unformatted=True)
     n_body = max(0, len(grid) - 1)
     if len(grid) < 2:
@@ -223,18 +224,23 @@ def dedupe_tab(svc, sheet_id: str, tab_name: str, key_columns: list[str],
     if any(i < 0 for i in key_idx):
         raise ValueError(
             f"key columns {key_columns} not all in header {header}")
-    groups: "OrderedDict[tuple, list]" = OrderedDict()
+    protect = set(protect_keys or [])
+    new_body: list = []      # final rows, in order (protected kept individually)
+    anchor: dict = {}        # canon key -> its merge-anchor row (mutated live)
     for vals in body:
         row = (list(vals) + [""] * ncol)[:ncol]
         k = tuple(_canon_key(row[i]) for i in key_idx)
-        if k in groups:
-            merged = groups[k]
+        if any(kc in protect for kc in k):
+            new_body.append(row)          # protected -> keep as its own row
+            continue
+        if k in anchor:
+            m = anchor[k]
             for i in range(ncol):
-                if merged[i] in (None, "") and row[i] not in (None, ""):
-                    merged[i] = row[i]
+                if m[i] in (None, "") and row[i] not in (None, ""):
+                    m[i] = row[i]
         else:
-            groups[k] = row
-    new_body = list(groups.values())
+            anchor[k] = row
+            new_body.append(row)          # first-seen anchor (mutated in place)
     removed = len(body) - len(new_body)
     res = {"tab": tab_name, "rows_before": len(body),
             "rows_after": len(new_body), "removed": removed}

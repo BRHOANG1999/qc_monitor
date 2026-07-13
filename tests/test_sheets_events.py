@@ -240,5 +240,23 @@ def test_dedupe_tab_collapses_same_date(monkeypatch):
     assert body[1] == ["2026-05-28", 1, ""]
 
 
+def test_dedupe_tab_protects_keys(monkeypatch):
+    svc = FakeSheets(initial={"BCH040": [
+        ["Date", "# Seizures", "RecFile"],
+        ["2026-03-19", 0, ""],            # my dup (day row)
+        ["2026-03-19", 2, "rec_v1.mat"],   # genuine per-event row -> protect
+        ["2026-05-01", 0, ""],            # my dup
+        ["2026-05-01", 0, ""],            # my dup, same date, no per-event
+    ]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    res = sw.dedupe_tab(svc, "SID", "BCH040", ["Date"], dry_run=False,
+                        protect_keys={"2026-03-19"})
+    body = svc.data["BCH040"][1:]
+    assert res["removed"] == 1
+    # Protected date keeps BOTH rows; the other date collapses to one.
+    assert sum(1 for r in body if r[0] == "2026-03-19") == 2
+    assert sum(1 for r in body if r[0] == "2026-05-01") == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
