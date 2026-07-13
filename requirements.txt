@@ -7,6 +7,9 @@ psutil>=5.9
 pyyaml>=6.0
 numpy>=1.24
 scipy>=1.11
+# Imported by src/evoked_figures/render.py (Agg backend) for the headless
+# scatter + percentile-band PNGs of evoked metrics over time.
+matplotlib>=3.7
 # Imported by src/utils/wavelet.py + src/analyzers/wavelet.py for
 # complex-Morlet CWT scalograms and wavelet band power.
 PyWavelets>=1.4
