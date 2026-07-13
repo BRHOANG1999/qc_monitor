@@ -993,7 +993,7 @@ def register_callbacks(app, store, config: dict) -> None:
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return [], "", no_update
-        rows = store.pi_pending_files(limit=500)
+        rows = store.pi_pending_files(limit=100000)   # all pending, not a page
         sig = _pending_signature(rows)
         # The 10s refresh-trigger fires whether or not the pending
         # set changed. Skip pushing identical data so the table
@@ -1016,7 +1016,15 @@ def register_callbacks(app, store, config: dict) -> None:
         trig = callback_context.triggered_id
         if trig == "evtv-clear-sel-btn":
             return []
-        return [r["id"] for r in (data or [])]
+        # Select EVERY pending (file, animal) from the DB -- NOT just the rows
+        # currently loaded/paginated in the table -- so "Select all → Approve
+        # selected" covers the whole backlog, matching "Approve ALL pending".
+        # (Reading the table `data` capped selection at the display limit.)
+        try:
+            rows = store.pi_pending_files(limit=100000)
+            return [int(r["state_id"]) for r in rows]
+        except Exception:                       # noqa: BLE001 -- fall back to loaded
+            return [r["id"] for r in (data or [])]
 
     @app.callback(
         Output("evtv-pending-table", "data",
@@ -1074,7 +1082,7 @@ def register_callbacks(app, store, config: dict) -> None:
                 msg = f"Flagged {n} file{'' if n == 1 else 's'}."
             else:
                 return no_update, no_update, no_update, no_update
-        rows = store.pi_pending_files(limit=500)
+        rows = store.pi_pending_files(limit=100000)   # all pending, not a page
         return (_pending_table_rows(store, rows), [], msg,
                 _pending_signature(rows))
 
@@ -1812,7 +1820,7 @@ def register_callbacks(app, store, config: dict) -> None:
                 "pending_pi_review. Approve them in the list "
                 "below.")
         # Refresh the table so the new pending files show up.
-        rows = store.pi_pending_files(limit=500)
+        rows = store.pi_pending_files(limit=100000)   # all pending, not a page
         return (msg, "", [], None,
                  _pending_table_rows(store, rows),
                  _pending_signature(rows))

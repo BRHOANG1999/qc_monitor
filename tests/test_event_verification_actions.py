@@ -156,5 +156,38 @@ def test_approve_all_pending_covers_every_file(tmp_path):
     assert store.pi_approve_all_pending("pi@lab") == 0
 
 
+def test_select_all_uses_full_pending_not_display_cap(tmp_path):
+    """"Select all" now pulls every pending state_id from the DB, so a display
+    cap can't leave part of the backlog unselected (the bug: select-all read the
+    capped table `data`, so Approve-selected only hit the loaded page)."""
+    db = str(tmp_path / "data" / "monitor.db")
+    store = Store(db)
+    n_files = 30
+    with store.connection() as conn:
+        conn.execute(
+            """INSERT INTO session_config
+               (session_dir, channel_names, eeg_channels, discovered_at)
+               VALUES ('S1', ?, ?, '2026-01-01T00:00:00')""",
+            (json.dumps(["stimCopy", "BCH061SR"]), json.dumps([1])))
+        for i in range(1, n_files + 1):
+            conn.execute(
+                "INSERT INTO processed_files (id, file_path, session_dir, "
+                "chunk_datetime) VALUES (?, ?, 'S1', '2026_03_10__04_59_00')",
+                (i, f"/f/{i}.mat"))
+        conn.commit()
+    for i in range(1, n_files + 1):
+        store.mark_review(i, "u@lab", "pending_pi_review",
+                          markers=[{"type": "sz"}])
+
+    # A small display limit truncates (the page); the high limit select-all now
+    # uses returns the WHOLE backlog.
+    assert len(store.pi_pending_files(limit=5)) == 5
+    all_pending = store.pi_pending_files(limit=100000)
+    assert len(all_pending) == n_files
+    # every returned row exposes a state_id (what select-all collects).
+    assert all(isinstance(r["state_id"], int) for r in all_pending)
+    assert len({r["state_id"] for r in all_pending}) == n_files
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
