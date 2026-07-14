@@ -92,16 +92,27 @@ class _Spreadsheets:
         self.ss = ss
 
     def get(self, spreadsheetId=None):
-        return _Req({"sheets": [{"properties": {"title": t}}
-                                 for t in self.ss.data]})
+        # Tab ORDER is the dict order; sheetId is stable across renames.
+        return _Req({"sheets": [
+            {"properties": {"title": t, "sheetId": self.ss.sids[t],
+                             "index": i}}
+            for i, t in enumerate(self.ss.data)]})
 
     def batchUpdate(self, spreadsheetId=None, body=None):
         def eff():
             for req in (body or {}).get("requests", []):
-                title = (req.get("addSheet", {}).get("properties", {})
-                          .get("title"))
-                if title:
+                if "addSheet" in req:
+                    title = req["addSheet"]["properties"]["title"]
                     self.ss.data.setdefault(title, [])
+                    self.ss.sids.setdefault(title, self.ss._new_id())
+                elif "updateSheetProperties" in req:
+                    up = req["updateSheetProperties"]
+                    props, fields = up["properties"], up.get("fields", "")
+                    title = self.ss._title_of(props["sheetId"])
+                    if "title" in fields:
+                        self.ss._rename(title, props["title"])
+                    if "index" in fields:
+                        self.ss._move(title, props["index"])
         return _Req({}, eff)
 
     def values(self):
@@ -112,9 +123,37 @@ class FakeSheets:
     def __init__(self, initial=None):
         self.data = {t: [list(r) for r in rows]
                      for t, rows in (initial or {}).items()}
+        self._next_id = 1
+        self.sids = {t: self._new_id() for t in self.data}
 
     def spreadsheets(self):
         return _Spreadsheets(self)
+
+    # -- helpers the fake's batchUpdate leans on ------------------------- #
+    def _new_id(self):
+        i, self._next_id = self._next_id, self._next_id + 1
+        return i
+
+    def _title_of(self, sheet_id):
+        for t, i in self.sids.items():
+            if i == sheet_id:
+                return t
+        raise KeyError(sheet_id)
+
+    def _rename(self, old, new):
+        """Rename in place -- a real rename keeps the tab's position + id."""
+        self.data = {(new if t == old else t): r
+                     for t, r in self.data.items()}
+        self.sids = {(new if t == old else t): i
+                     for t, i in self.sids.items()}
+
+    def _move(self, title, index):
+        order = [t for t in self.data if t != title]
+        order.insert(index, title)
+        self.data = {t: self.data[t] for t in order}
+
+    def order(self):
+        return list(self.data)
 
     @staticmethod
     def _tab(rng):
@@ -316,6 +355,79 @@ def test_upsert_event_rows_extends_old_header(monkeypatch):
     hdr = svc.data["BCH062 Events"][0]
     assert "Status" in hdr and len(svc.data["BCH062 Events"]) == 2
     assert svc.data["BCH062 Events"][1][hdr.index("Status")] == _STATUS_NEEDS
+
+
+# --- tab housekeeping: rename + canonical order + the pending column ------ #
+
+def test_target_tab_order_groups_and_sorts():
+    # Insertion order is a mess; the flow is: other (relative order kept),
+    # then summaries sorted, then events sorted.
+    got = sw._target_tab_order(
+        ["BCH062 Daily", "Fall 25", "BCH040 Events", "BCH040 Daily",
+         "BCH062 Events", "BCH039 Daily"], " Daily", " Events")
+    assert got == ["Fall 25",
+                   "BCH039 Daily", "BCH040 Daily", "BCH062 Daily",
+                   "BCH040 Events", "BCH062 Events"]
+
+
+def test_rename_tab_is_idempotent():
+    svc = FakeSheets(initial={"BCH111": [["Date"]], "Fall 25": [["Folder"]]})
+    assert sw.rename_tab(svc, "SID", "BCH111", "BCH111 Daily") is True
+    assert "BCH111 Daily" in svc.data and "BCH111" not in svc.data
+    # Re-run: source gone -> no-op, not an error (migration is re-runnable).
+    assert sw.rename_tab(svc, "SID", "BCH111", "BCH111 Daily") is False
+
+
+def test_reorder_tabs_applies_canonical_order():
+    svc = FakeSheets(initial={
+        "BCH062 Daily": [["Date"]], "Fall 25": [["Folder"]],
+        "BCH040 Events": [["Date"]], "BCH040 Daily": [["Date"]]})
+    final = sw.reorder_tabs(svc, "SID", " Daily", " Events")
+    assert final == ["Fall 25", "BCH040 Daily", "BCH062 Daily",
+                     "BCH040 Events"]
+    assert svc.order() == final     # the fake actually moved the sheets
+
+
+def test_reorder_tabs_noop_on_empty_summary_suffix():
+    # Every title endswith "" -> classification would collapse; must bail out.
+    svc = FakeSheets(initial={"BCH040": [["Date"]], "Fall 25": [["F"]]})
+    assert sw.reorder_tabs(svc, "SID", "", " Events") == []
+
+
+def test_upsert_day_rows_ensure_columns_adds_pending(monkeypatch):
+    # A lab summary tab with no pending column: the column is APPENDED and the
+    # hand-filled cell ("hand") survives the merge-update.
+    svc = FakeSheets(initial={"BCH111 Daily": [
+        ["Date", "Number of Behavioral Events", "Notes"],
+        ["2026-07-02", 0, "hand"]]})
+    monkeypatch.setattr(sw, "_sheets_api_rw", lambda _p: svc)
+    res = sw.upsert_day_rows(
+        "sa.json", "SID",
+        {"BCH111 Daily": [{"date": "2026-07-02", "n_events": 0,
+                            "n_pending_events": 4}]},
+        ["Date"], ensure_columns=["Events Needing Onsets"])
+    assert res["updated"] == 1 and res["appended"] == 0
+    hdr = svc.data["BCH111 Daily"][0]
+    assert hdr == ["Date", "Number of Behavioral Events", "Notes",
+                   "Events Needing Onsets"]
+    row = svc.data["BCH111 Daily"][1]
+    assert row[hdr.index("Events Needing Onsets")] == 4
+    assert row[hdr.index("Number of Behavioral Events")] == 0   # approved tally
+    assert row[hdr.index("Notes")] == "hand"                    # not blanked
+
+
+def test_resolve_summary_header_skips_events_tabs():
+    # An Events tab also has a "Date" column -- it must NOT be picked as the
+    # header template for a brand-new animal's summary tab.
+    svc = FakeSheets(initial={
+        "AAA Events": [["Date", "Onset (clock)", "Racine"]],
+        "BCH040 Daily": [["Date", "MouseID", "Number of Behavioral Events"]]})
+    hdr = sw._resolve_summary_header(
+        svc, "SID", set(svc.data), None, exclude_suffix=" Events")
+    assert hdr == ["Date", "MouseID", "Number of Behavioral Events"]
+    # Without the exclusion the Events tab wins the alphabetical scan (the bug).
+    assert sw._resolve_summary_header(
+        svc, "SID", set(svc.data), None)[1] == "Onset (clock)"
 
 
 if __name__ == "__main__":

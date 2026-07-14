@@ -2013,53 +2013,12 @@ def _finalize_summary_block(base_dir: str, entries: list[dict],
     return html.Div(children)
 
 
-def _day_stats(store, animal: str, day, items: list[dict],
-                 csv_name: str = "") -> dict:
-    """Canonical one-row-per-(animal, day) summary for the Sheet.
-
-    *items* are the pi_approved rows for this (animal, day); each has a
-    decoded ``events`` list + ``file_id`` / ``session_dir`` /
-    ``user_email``.
+def _session_meta(store, animal: str, sessions: list[str]) -> dict:
+    """Per-animal recording metadata from the session config(s):
+    Recording Location = electrode suffix(es) (SR / SLM / ...)
+    Channel(s)         = the animal's electrode channel index(es)
+    More Settings      = the stim parameters
     """
-    from datetime import datetime as _dt
-    from src.utils import mass_analyze as _ma
-    n_files = len(items)
-    n_with = n_events = max_racine = n_no_event = 0
-    n_stim_files = n_during = 0
-    reviewers: list[str] = []
-    sessions: list[str] = []
-    for r in items:
-        ue = (r.get("user_email") or "").strip()
-        if ue and ue not in reviewers:
-            reviewers.append(ue)
-        sd = r.get("session_dir")
-        if sd and sd not in sessions:
-            sessions.append(sd)
-        evs = r.get("events") or []
-        n_ev = len(evs) if isinstance(evs, list) else 0
-        if n_ev > 0:
-            n_with += 1
-            n_events += n_ev
-            for e in evs:
-                try:
-                    max_racine = max(max_racine,
-                                      int((e or {}).get("racine") or 0))
-                except (TypeError, ValueError):
-                    pass
-        else:
-            n_no_event += 1
-        try:
-            if _ma.has_stim_for_file(store, int(r["file_id"]),
-                                       r.get("session_dir")):
-                n_stim_files += 1
-                n_during += n_ev
-        except Exception:
-            pass
-
-    # Per-animal recording metadata from the session config(s):
-    #  Recording Location = electrode suffix(es) (SR / SLM / ...)
-    #  Channel(s)         = the animal's electrode channel index(es)
-    #  More Settings      = the stim parameters
     locations: list[str] = []
     channels: list[str] = []
     stim_settings = ""
@@ -2086,26 +2045,107 @@ def _day_stats(store, animal: str, day, items: list[dict],
                 stim_settings = ", ".join(bits)
         except Exception:
             pass
+    return {
+        "recording_location": ", ".join(locations),
+        "channels": ", ".join(
+            sorted(channels,
+                    key=lambda x: int(x) if x.isdigit() else 0)),
+        "more_settings": stim_settings,
+    }
 
-    is_stim = n_stim_files > 0
+
+def _approved_tally(store, items: list[dict]) -> dict:
+    """FINAL counts for one (animal, day) from its pi_approved rows only --
+    these drive 'Number of Behavioral Events', 'Max Racine' and 'Who Completed
+    Analysis', so they stay a clean approved tally."""
+    from src.utils import mass_analyze as _ma
+    t = {"n_files": len(items), "n_with": 0, "n_events": 0, "max_racine": 0,
+         "n_no_event": 0, "n_stim_files": 0, "n_during": 0}
+    reviewers: list[str] = []
+    sessions: list[str] = []
+    for r in items:
+        ue = (r.get("user_email") or "").strip()
+        if ue and ue not in reviewers:
+            reviewers.append(ue)
+        sd = r.get("session_dir")
+        if sd and sd not in sessions:
+            sessions.append(sd)
+        evs = r.get("events") or []
+        n_ev = len(evs) if isinstance(evs, list) else 0
+        if n_ev > 0:
+            t["n_with"] += 1
+            t["n_events"] += n_ev
+            for e in evs:
+                try:
+                    t["max_racine"] = max(
+                        t["max_racine"], int((e or {}).get("racine") or 0))
+                except (TypeError, ValueError):
+                    pass
+        else:
+            t["n_no_event"] += 1
+        try:
+            if _ma.has_stim_for_file(store, int(r["file_id"]),
+                                       r.get("session_dir")):
+                t["n_stim_files"] += 1
+                t["n_during"] += n_ev
+        except Exception:
+            pass
+    t["reviewers"] = reviewers
+    t["sessions"] = sessions
+    return t
+
+
+def _day_stats(store, animal: str, day, items: list[dict],
+                 csv_name: str = "",
+                 pending_items: list[dict] | None = None) -> dict:
+    """Canonical one-row-per-(animal, day) summary for the Sheet.
+
+    *items* are the pi_approved rows for this (animal, day) and alone drive the
+    final tally. *pending_items* are the needs_scoring ('Needs more onsets')
+    rows: they contribute ONLY `n_pending_events` -- the 'Events Needing Onsets'
+    column -- plus their session metadata, so a day whose events are all still
+    pending is a useful row instead of a blank one.
+    """
+    from datetime import datetime as _dt
+    from src.utils import mass_analyze as _ma
+    pending_items = pending_items or []
+    t = _approved_tally(store, items)
+    sessions = list(t["sessions"])
+    # Pending: count only real onsets -- this equals the number of "needs more
+    # onsets" rows in the animal's Events tab for this date.
+    n_pending = 0
+    for r in pending_items:
+        sd = r.get("session_dir")
+        if sd and sd not in sessions:
+            sessions.append(sd)
+        for e in (r.get("events") or []):
+            if isinstance(e, dict) and e.get("EO_sec") not in (None, ""):
+                n_pending += 1
+        try:    # a pending-only day is still a stim day if its file is one
+            if _ma.has_stim_for_file(store, int(r["file_id"]),
+                                       r.get("session_dir")):
+                t["n_stim_files"] += 1
+        except Exception:
+            pass
+    meta = _session_meta(store, animal, sessions)
+    is_stim = t["n_stim_files"] > 0
     return {
         "date": day.isoformat() if hasattr(day, "isoformat")
                  else str(day),
         "animal": animal,
         "csv_filename": csv_name,
-        "n_files": n_files,
-        "n_files_with_events": n_with,
-        "n_events": n_events,
-        "max_racine": max_racine,
-        "n_during_stim_events": n_during,
-        "n_no_event_files": n_no_event,
-        "reviewers": ", ".join(reviewers),
-        "recording_location": ", ".join(locations),
-        "channels": ", ".join(
-            sorted(channels,
-                    key=lambda x: int(x) if x.isdigit() else 0)),
+        "n_files": t["n_files"],
+        "n_files_with_events": t["n_with"],
+        "n_events": t["n_events"],
+        "n_pending_events": n_pending,
+        "max_racine": t["max_racine"],
+        "n_during_stim_events": t["n_during"],
+        "n_no_event_files": t["n_no_event"],
+        "reviewers": ", ".join(t["reviewers"]),
+        "recording_location": meta["recording_location"],
+        "channels": meta["channels"],
         "type_of_recording": "stim" if is_stim else "baseline",
-        "more_settings": stim_settings if is_stim else "",
+        "more_settings": meta["more_settings"] if is_stim else "",
         "exported_at": _dt.now().isoformat(timespec="seconds"),
     }
 
@@ -2185,36 +2225,28 @@ def _push_scored_to_sheet(store, config: dict,
     if not approved and not needs:
         return ""
     bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
-    base_dir = bhz_cfg.get("base_dir", "")
-    suffix = gs.get("events_tab_suffix", " Events")
-    # Per-(animal, day) summary: approved events only.
-    bucket: dict = {}
-    for r in approved:
-        animal, chunk_dt = _animal_and_date(store, r)
-        if animal and chunk_dt:
-            bucket.setdefault((animal, chunk_dt.date()), []).append(r)
-    rows_by_tab: dict = {}     # MouseID -> [day summary]
-    for (animal, day), items in sorted(bucket.items()):
-        csv_name = (_bhz_csv.resolve_csv_path(
-            base_dir,
-            bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
-            day, animal).name if base_dir else "")
-        rows_by_tab.setdefault(animal, []).append(
-            _day_stats(store, animal, day, items, csv_name))
+    ev_suffix = gs.get("events_tab_suffix", " Events")
+    sum_suffix = gs.get("summary_tab_suffix", "")
+    pending_col = gs.get("summary_pending_column", "Events Needing Onsets")
+    rows_by_tab = _summary_rows_by_tab(store, approved, needs, bhz_cfg,
+                                        sum_suffix)
     # One row per event: approved (done) + needs_scoring (incomplete).
-    events_by_tab: dict = {}   # "MouseID Events" -> [event rows]
-    _collect_event_rows(store, approved, bhz_cfg, suffix,
+    events_by_tab: dict = {}   # "<animal> Events" -> [event rows]
+    _collect_event_rows(store, approved, bhz_cfg, ev_suffix,
                          _STATUS_APPROVED, events_by_tab)
-    _collect_event_rows(store, needs, bhz_cfg, suffix,
+    _collect_event_rows(store, needs, bhz_cfg, ev_suffix,
                          _STATUS_NEEDS, events_by_tab)
     notes: list[str] = []
+    created: list[str] = []
     try:
         from src.utils import sheets_write
         s = sheets_write.upsert_day_rows(
             gs["service_account_file"], gs["spreadsheet_id"], rows_by_tab,
             gs.get("key_columns", ["Date"]), gs.get("column_map"),
             create_missing=gs.get("create_missing_tabs", True),
-            template_tab=gs.get("summary_template_tab"))
+            template_tab=gs.get("summary_template_tab"),
+            ensure_columns=[pending_col], events_suffix=ev_suffix)
+        created += list(s.get("created_tabs") or [])
         note = f"summary {s['updated']}u/{s['appended']}a"
         if s.get("created_tabs"):
             note += f" (+{len(s['created_tabs'])} new animal tab)"
@@ -2227,14 +2259,51 @@ def _push_scored_to_sheet(store, config: dict,
                 events_by_tab,
                 gs.get("events_key_columns", _EVENT_SHEET_KEY),
                 _EVENT_SHEET_HEADER)
+            created += list(ev.get("created_tabs") or [])
             enote = f"events {ev['updated']}u/{ev['appended']}a"
             if ev.get("created_tabs"):
                 enote += f" (+{len(ev['created_tabs'])} tab)"
             notes.append(enote)
+        # A brand-new tab is appended at the END of the spreadsheet -- re-assert
+        # the canonical flow (index, then summaries, then events) so the tab bar
+        # never drifts back into creation order.
+        if created and sum_suffix:
+            svc = sheets_write._sheets_api_rw(gs["service_account_file"])
+            sheets_write.reorder_tabs(svc, gs["spreadsheet_id"],
+                                       sum_suffix, ev_suffix)
+            notes.append("tabs reordered")
     except Exception as e:  # noqa: BLE001 -- Sheets must never block review
         logger.warning("Google Sheet push failed: %s", e)
         return f"Google Sheet sync FAILED: {e}"
     return "Google Sheet: " + "; ".join(notes) if notes else ""
+
+
+def _summary_rows_by_tab(store, approved: list[dict], needs: list[dict],
+                           bhz_cfg: dict, summary_suffix: str) -> dict:
+    """One day-summary row per (animal, day), keyed by the animal's summary tab.
+
+    Buckets the approved AND needs_scoring rows and UNIONS their days, so a day
+    whose events are all still pending still gets a row (carrying its 'Events
+    Needing Onsets' count) instead of being absent from the sheet entirely."""
+    base_dir = bhz_cfg.get("base_dir", "")
+    appr_by: dict = {}
+    pend_by: dict = {}
+    for rows, sink in ((approved, appr_by), (needs, pend_by)):
+        for r in rows:
+            animal, chunk_dt = _animal_and_date(store, r)
+            if animal and chunk_dt:
+                sink.setdefault((animal, chunk_dt.date()), []).append(r)
+    rows_by_tab: dict = {}
+    for animal, day in sorted(set(appr_by) | set(pend_by)):
+        key = (animal, day)
+        csv_name = (_bhz_csv.resolve_csv_path(
+            base_dir,
+            bhz_cfg.get("filename_template", "{date}_{animal}.csv"),
+            day, animal).name if base_dir else "")
+        rows_by_tab.setdefault(f"{animal}{summary_suffix}", []).append(
+            _day_stats(store, animal, day, appr_by.get(key, []), csv_name,
+                        pending_items=pend_by.get(key, [])))
+    return rows_by_tab
 
 
 def _fetch_approved_rows(store) -> list[dict]:

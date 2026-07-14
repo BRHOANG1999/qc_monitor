@@ -442,17 +442,21 @@ bhz_csv:
   filename_template: "{date}_{animal}.csv"
   append: true
 
-# Daily Google-Sheet sync: on CSV finalize, upsert one row PER DAY into
-# the animal's own tab (each MouseID is a tab in "BHZ Analysis Log").
+# Google-Sheet sync into "BHZ Analysis Log". Each animal gets TWO tabs:
+#   "<MouseID> Daily"  -- one row PER DAY (the rollup summary)
+#   "<MouseID> Events" -- one row PER SEIZURE EVENT (the detail)
 # Update is a MERGE -- only the columns we compute are written; the
 # lab's hand-filled columns (Recording Location, etc.) are left intact.
 # PRECONDITION: the spreadsheet is shared (Editor) with the
 # service-account email + the Sheets API is enabled for its project.
 # Auto-maps these stat keys onto the tab header by name:
 #   date, animal (MouseID), csv_filename (CSV File Name),
-#   n_events (Number of Behavioral Events), reviewers (Who Completed
-#   Analysis), max_racine, n_during_stim_events, n_files, ...
-# Tabs that don't exist are skipped (we never create a tab).
+#   n_events (Number of Behavioral Events), n_pending_events (Events
+#   Needing Onsets), reviewers (Who Completed Analysis), max_racine,
+#   n_during_stim_events, n_files, ...
+# A missing animal tab is CREATED (create_missing_tabs) and the tab order
+# is re-asserted afterwards, so the tab bar follows a flow, not creation
+# order. Run tools/sheets_reorganize.py to re-assert it by hand.
 google_sheets:
   enabled: true
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
@@ -464,15 +468,22 @@ google_sheets:
   # Auto-push scored seizures the moment the PI approves (not only on the
   # manual "Finalize -> CSV" button). Set false to keep it finalize-only.
   push_on_approve: true
+  # Per-animal summary tab: "<MouseID> Daily" (one row per day). Blank ""
+  # means the tab is titled the bare MouseID (the pre-2026-07 layout).
+  summary_tab_suffix: " Daily"
+  # Column holding the count of events still in the "Needs more onsets"
+  # pool for that day -- kept OUT of "Number of Behavioral Events" so that
+  # column stays a clean APPROVED tally. Added to a tab if absent.
+  summary_pending_column: "Events Needing Onsets"
   # Per-animal "<MouseID> Events" tab (auto-created): one row per seizure
-  # event (Date | Onset (clock) | Racine | Type | Light | File).
+  # event (Date | Onset (clock) | Racine | Type | Light | File | Status).
   events_tab_suffix: " Events"
   events_key_columns: ["File", "Onset (clock)"]
   # Auto-create a NEW animal's summary tab (header copied from an existing
   # animal tab) instead of skipping it -- so a new subject gets its own tab.
   create_missing_tabs: true
   # Optional: tab whose header is copied for new animal tabs. Blank =
-  # auto-detect (first existing tab with a Date column).
+  # auto-detect (first existing summary tab with a Date column).
   summary_template_tab: ""
 
 surgery_digest:

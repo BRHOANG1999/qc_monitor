@@ -54,6 +54,10 @@ _ALIASES: dict[str, tuple[str, ...]] = {
                               "stimevents", "eventsduringstim"),
     "n_no_event_files": ("noeventfiles", "nnoevents"),
     "n_needs_scoring": ("needsscoring", "flagged"),
+    # Events scored but still in the 'Needs more onsets' pool -- kept OUT of
+    # n_events so the approved tally stays a clean final count.
+    "n_pending_events": ("eventsneedingonsets", "pendingevents",
+                          "needsonsets", "eventspending"),
     "reviewers": ("whocompletedanalysis", "reviewer", "reviewers",
                    "analyst", "scoredby", "completedby"),
     "channels": ("channels", "channel", "chans"),
@@ -73,8 +77,9 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 # _ALIASES) so map_cells fills them.
 _DEFAULT_SUMMARY_HEADER = (
     "Date", "MouseID", "CSV File Name", "Number of Behavioral Events",
-    "Max Racine", "Who Completed Analysis", "Recording Location",
-    "Channel(s)", "Type of Recording", "More Settings",
+    "Events Needing Onsets", "Max Racine", "Who Completed Analysis",
+    "Recording Location", "Channel(s)", "Type of Recording",
+    "More Settings",
 )
 
 
@@ -349,16 +354,24 @@ def upsert_day_rows(service_account_file: str, sheet_id: str,
                       rows_by_tab: dict, key_columns: list[str],
                       column_map: dict | None = None,
                       create_missing: bool = False,
-                      template_tab: str | None = None) -> dict:
+                      template_tab: str | None = None,
+                      ensure_columns: list[str] | None = None,
+                      events_suffix: str | None = None) -> dict:
     """Upsert per-tab day rows. *rows_by_tab* maps a tab title (the animal's
-    MouseID tab) to its list of canonical day-stat dicts.
+    summary tab) to its list of canonical day-stat dicts.
 
     When *create_missing* is True a NEW animal's tab is created (header
-    copied from *template_tab*, else an existing animal tab, else a canonical
+    copied from *template_tab*, else an existing summary tab, else a canonical
     default) so a new subject gets its own tab automatically. When False the
-    missing tab is skipped with a warning (the legacy behavior). Returns
-    ``{"updated", "appended", "skipped_tabs", "created_tabs"}``. Raises on
-    auth/API error -- the caller wraps this non-fatally.
+    missing tab is skipped with a warning (the legacy behavior).
+
+    *ensure_columns* names columns an EXISTING tab must have; any that are
+    absent are appended to its header (see _ensure_header_columns) so a newly
+    added stat lands in a real column instead of being silently dropped.
+    *events_suffix* keeps the header auto-detect off the per-event tabs.
+
+    Returns ``{"updated", "appended", "skipped_tabs", "created_tabs"}``. Raises
+    on auth/API error -- the caller wraps this non-fatally.
     """
     assert sheet_id, "sheet_id required"
     if not rows_by_tab:
@@ -369,7 +382,8 @@ def upsert_day_rows(service_account_file: str, sheet_id: str,
     header_for_new = None
     if create_missing and any(t not in titles for t in rows_by_tab):
         header_for_new = _resolve_summary_header(
-            svc, sheet_id, titles, template_tab)
+            svc, sheet_id, titles, template_tab,
+            exclude_suffix=events_suffix)
     updated = appended = 0
     skipped: list[str] = []
     created: list[str] = []
@@ -384,6 +398,9 @@ def upsert_day_rows(service_account_file: str, sheet_id: str,
                                 tab, len(rows))
                 skipped.append(tab)
                 continue
+        elif ensure_columns:
+            _ensure_header_columns(svc, sheet_id, tab, ensure_columns,
+                                    value_input_option="USER_ENTERED")
         res = upsert_rows_into_tab(
             svc, sheet_id, tab, key_columns, rows, column_map)
         updated += res["updated"]
@@ -419,16 +436,22 @@ def ensure_tab(svc, sheet_id: str, tab_name: str,
 
 
 def _resolve_summary_header(svc, sheet_id: str, titles,
-                             template_tab: str | None) -> list:
+                             template_tab: str | None,
+                             exclude_suffix: str | None = None) -> list:
     """Header row for a NEWLY-created animal summary tab, so it matches the
     lab's existing tabs: the explicit *template_tab*'s header if given, else
-    the first existing tab that has a 'Date' column, else a canonical
-    default."""
+    the first existing tab that has a 'Date' column, else a canonical default.
+
+    *exclude_suffix* (the per-event tabs' suffix) is skipped by the auto-detect
+    -- those tabs ALSO carry a 'Date' column, so without this an Events tab can
+    win the scan and hand a brand-new animal the wrong header."""
     if template_tab and template_tab in titles:
         g = read_grid(svc, sheet_id, template_tab)
         if g and g[0]:
             return list(g[0])
     for t in sorted(t for t in titles if t):
+        if exclude_suffix and t.endswith(exclude_suffix):
+            continue
         g = read_grid(svc, sheet_id, t)
         if g and g[0] and any(_norm(c) == "date" for c in g[0]):
             return list(g[0])
@@ -442,8 +465,12 @@ def _ensure_header_columns(svc, sheet_id: str, tab_name: str,
     appending any missing ones at the end. Existing columns and their order
     are untouched, so a tab created before a column was added just gains it
     (older rows leave the new cell blank until re-upserted). Returns the count
-    of columns added. Events-tabs only -- never call this on the lab's
-    hand-maintained summary tabs."""
+    of columns added.
+
+    Safe on the lab's hand-maintained summary tabs PROVIDED the caller passes
+    only the columns it actually owns (e.g. ["Events Needing Onsets"]) -- pass
+    a whole default header and you'd graft every absent column onto their
+    tab."""
     grid = read_grid(svc, sheet_id, tab_name, unformatted=True)
     existing = list(grid[0]) if grid else []
     have = {_norm(c) for c in existing}
@@ -498,3 +525,83 @@ def upsert_event_rows(service_account_file: str, sheet_id: str,
         appended += res["appended"]
     return {"updated": updated, "appended": appended,
              "created_tabs": created}
+
+
+# ---------------------------------------------------------------- #
+#  Tab housekeeping: rename + stable ordering
+# ---------------------------------------------------------------- #
+
+def _sheet_ids_by_title(svc, sheet_id: str) -> dict:
+    """Tab title -> (sheetId, index), from the spreadsheet metadata."""
+    meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    out = {}
+    for s in meta.get("sheets", []):
+        p = s.get("properties", {})
+        out[p.get("title")] = (p.get("sheetId"), p.get("index"))
+    return out
+
+
+def rename_tab(svc, sheet_id: str, old_title: str, new_title: str) -> bool:
+    """Rename a tab. No-op (False) when *old_title* is absent or *new_title*
+    already exists -- so a re-run of the migration is safe. A rename does NOT
+    change the tab's sheetId, so #gid= links keep working."""
+    assert old_title and new_title, "both titles required"
+    ids = _sheet_ids_by_title(svc, sheet_id)
+    if old_title not in ids or new_title in ids:
+        return False
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ids[old_title][0],
+                            "title": new_title},
+            "fields": "title"}}]},
+    ).execute()
+    return True
+
+
+def _target_tab_order(titles_in_order: list[str], summary_suffix: str,
+                       events_suffix: str) -> list[str]:
+    """Desired tab flow: everything else first (keeping its current relative
+    order -- e.g. a cohort index tab), then every summary tab sorted, then
+    every per-event tab sorted. Pure function so it's directly testable."""
+    other, summaries, events = [], [], []
+    for t in titles_in_order:
+        if events_suffix and t.endswith(events_suffix):
+            events.append(t)
+        elif summary_suffix and t.endswith(summary_suffix):
+            summaries.append(t)
+        else:
+            other.append(t)
+    return other + sorted(summaries) + sorted(events)
+
+
+def reorder_tabs(svc, sheet_id: str, summary_suffix: str,
+                  events_suffix: str) -> list[str]:
+    """Re-apply the canonical tab order (see _target_tab_order) so tabs follow
+    a flow instead of the order they happened to be created in. Returns the
+    resulting title order.
+
+    Each move sets ``index: 0`` and the moves are issued in REVERSE target
+    order: moving to 0 always means "put it first", which sidesteps the Sheets
+    quirk where moving to a HIGHER index removes-then-inserts (landing the
+    sheet one slot early). Requests in one batchUpdate apply in order.
+    """
+    assert sheet_id, "sheet_id required"
+    if not summary_suffix:
+        # Every title endswith "" -> the classification would collapse.
+        logger.warning("reorder_tabs: empty summary_suffix; skipping")
+        return []
+    ids = _sheet_ids_by_title(svc, sheet_id)
+    current = [t for t, _ in sorted(ids.items(), key=lambda kv: kv[1][1])]
+    target = _target_tab_order(current, summary_suffix, events_suffix)
+    if target == current:
+        return target
+    requests = [
+        {"updateSheetProperties": {
+            "properties": {"sheetId": ids[t][0], "index": 0},
+            "fields": "index"}}
+        for t in reversed(target)
+    ]
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests}).execute()
+    return target
