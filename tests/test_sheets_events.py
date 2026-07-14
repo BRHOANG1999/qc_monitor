@@ -489,14 +489,16 @@ class _FakeConn:
 
 
 class _FakeStore:
-    """Minimal store for _session_meta / _day_stats: one animal on two 0-based
-    channels, plus canned stim_qc rows (the real 'More Settings' source)."""
-    def __init__(self, electrodes, cfg=None, stim_rows=None):
+    """Minimal store for _session_meta / _day_stats. *electrodes_by_animal*
+    maps an animal -> its electrode dicts; *cfg* is the session_config row."""
+    def __init__(self, electrodes, cfg=None, stim_rows=None,
+                  electrodes_by_animal=None):
         self._e, self._cfg = electrodes, cfg or {}
         self._stim = stim_rows or []
+        self._eba = electrodes_by_animal or {}
 
     def electrodes_for_animal_in_session(self, sd, animal):
-        return self._e
+        return self._eba.get(animal, self._e)
 
     def get_session_config(self, sd):
         return self._cfg
@@ -505,22 +507,44 @@ class _FakeStore:
         return _FakeConn(self._stim)
 
 
-def test_stim_settings_come_from_the_stim_report_not_session_config():
-    # session_config.stim_charge_nC DEFAULTS to 14.0, which stamped
-    # "14nC, 150us, 0.5Hz" on every animal -- even days whose protocol is
-    # literally chronicStim-5nC-2nC. The truth is the per-file STIM_REPORT.
-    from src.dashboard.tabs.event_verification import _stim_settings_for_files
-    st = _FakeStore([], stim_rows=[
-        {"charge_nC": 2.0, "pulse_width_us": 150.0, "frequency_hz": 0.5},
-        {"charge_nC": 5.0, "pulse_width_us": 150.0, "frequency_hz": 0.5},
-    ])
-    # A day that ran two amplitudes lists both, joined the lab's way.
-    assert _stim_settings_for_files(st, [1, 2]) == \
-        "2nC, 150us, 0.5Hz + 5nC, 150us, 0.5Hz"
-    # No files -> no invented settings.
-    assert _stim_settings_for_files(st, []) == ""
-    # No stim report -> blank, NOT a fabricated 14nC default.
-    assert _stim_settings_for_files(_FakeStore([]), [1]) == ""
+def test_animal_stim_outputs_are_channel_specific():
+    # chronicStim-5nC-2nC drives BCH110 (BCH110SLM, pos 1) on stim output 1 and
+    # BCH111 (BCH111SR, pos 3) on output 2; BCH061 (pos 4) is recording-only.
+    # Wiring: each stimCopy drives the NEXT channel; stim_copy_channels=[0,2].
+    from src.dashboard.tabs.event_verification import _animal_stim_outputs
+    cfg = {"stim_copy_channels": "[0, 2]",
+           "channel_names": '["stimCopy","BCH110SLM","stimCopy","BCH111SR",'
+                            '"BCH061SLM","BCH114SLM"]'}
+    st = _FakeStore([], cfg=cfg, electrodes_by_animal={
+        "BCH110": [{"channel_index": 1}],
+        "BCH111": [{"channel_index": 3}],
+        "BCH061": [{"channel_index": 4}]})
+    assert _animal_stim_outputs(st, "BCH110", "sd") == [1]   # 5nC output
+    assert _animal_stim_outputs(st, "BCH111", "sd") == [2]   # 2nC output
+    assert _animal_stim_outputs(st, "BCH061", "sd") == []    # not stimmed
+    # A baseline session (no stim copies) yields no outputs.
+    st2 = _FakeStore([], cfg={"stim_copy_channels": "[]"},
+                      electrodes_by_animal={"BCH062": [{"channel_index": 1}]})
+    assert _animal_stim_outputs(st2, "BCH062", "sd") == []
+
+
+def test_stim_settings_pick_only_the_animals_output(monkeypatch):
+    # The box ran 5nC (output 1) and 2nC (output 2); BCH111 is on output 2, so
+    # its More Settings is 2nC ONLY -- not "2nC + 5nC".
+    from src.dashboard.tabs import event_verification as ev
+    cfg = {"stim_copy_channels": "[0, 2]"}
+    st = _FakeStore([], cfg=cfg, electrodes_by_animal={
+        "BCH111": [{"channel_index": 3}]},   # -> output 2
+        stim_rows=[{"charge_nC": 2.0, "pulse_width_us": 150.0,
+                     "frequency_hz": 0.5}])   # fake conn already filtered to o2
+    # Force the output mapping so the test doesn't depend on the fake conn's
+    # (deliberately loose) SQL: BCH111 -> output 2 only.
+    monkeypatch.setattr(ev, "_animal_stim_outputs", lambda s, a, sd: [2])
+    rows = [{"file_id": 1, "session_dir": "sd"}]
+    assert ev._stim_settings_for_animal(st, "BCH111", rows) == \
+        "2nC, 150us, 0.5Hz"
+    # No files / no session -> blank, never a fabricated default.
+    assert ev._stim_settings_for_animal(st, "BCH111", []) == ""
 
 
 def test_session_meta_channels_are_1_based_and_text():

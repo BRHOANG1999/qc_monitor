@@ -2041,39 +2041,86 @@ def _protocol_from_session(session_dir: str) -> str:
     return proto
 
 
-def _stim_settings_for_files(store, file_ids: list) -> str:
-    """'More Settings' -- the commanded stim parameters for a day, read from the
-    per-file STIM_REPORT.txt (the `stim_qc` table), which is the real value.
+def _animal_stim_outputs(store, animal: str, session_dir: str) -> list[int]:
+    """The 1-based stim-output number(s) (``stim_qc.stim_channel``) wired to
+    *animal*'s electrode(s) in this session.
 
-    NOT from session_config: `SessionConfig.stim_charge_nC` DEFAULTS to 14.0
-    (src/utils/session_config.py:23) whenever the .mat carries no
-    chargePerPhase, so that source stamped "14nC, 150us, 0.5Hz" on every animal
-    -- including days whose protocol is literally chronicStim-5nC-2nC. A day
-    that ran more than one amplitude lists them all (joined the lab's way).
+    On a multi-animal recording each stimulator output can run a DIFFERENT
+    amplitude, so 'More Settings' has to pick the output for this animal, not
+    every output on the box. The wiring is in session_config: each ``stimCopy``
+    channel drives the electrode in the NEXT channel slot, and the k-th stimCopy
+    (by position) is DAQ output k == stim_qc.stim_channel k. So an electrode at
+    0-based position ``ci`` is stimulated iff ``ci-1`` is a stimCopy channel;
+    its output number is that stimCopy's index among ``stim_copy_channels`` + 1.
+    An electrode with no preceding stimCopy is recording-only -> no output.
+    (Verified against the STIM_REPORT: chronicStim-5nC-2nC drives BCH110 at 5nC
+    on output 1 and BCH111 at 2nC on output 2.)
     """
-    ids = [int(f) for f in (file_ids or [])]
-    if not ids:
-        return ""
-    q = ",".join("?" * len(ids))
-    with store.connection() as conn:
-        rows = conn.execute(
-            f"""SELECT DISTINCT charge_nC, pulse_width_us, frequency_hz
-                FROM stim_qc
-                WHERE file_id IN ({q}) AND charge_nC > 0
-                ORDER BY charge_nC""", ids).fetchall()
-    out: list[str] = []
+    import json as _json
+    cfg = store.get_session_config(session_dir) or {}
+    try:
+        copies = _json.loads(cfg.get("stim_copy_channels") or "[]")
+    except (ValueError, TypeError):
+        copies = []
+    if not copies:
+        return []
+    outs: list[int] = []
+    try:
+        for e in store.electrodes_for_animal_in_session(session_dir, animal):
+            ci = e.get("channel_index")
+            if ci is None:
+                continue
+            preceding = int(ci) - 1
+            if preceding in copies:
+                n = copies.index(preceding) + 1
+                if n not in outs:
+                    outs.append(n)
+    except Exception:
+        return []
+    return outs
+
+
+def _stim_settings_for_animal(store, animal: str, rows: list[dict]) -> str:
+    """'More Settings' -- the commanded stim for THIS animal's electrode, read
+    from each file's STIM_REPORT (the ``stim_qc`` table), which is the real
+    value. Channel-specific (see _animal_stim_outputs).
+
+    NOT from session_config: ``SessionConfig.stim_charge_nC`` DEFAULTS to 14.0
+    (src/utils/session_config.py:23) whenever the .mat carries no chargePerPhase,
+    so that source stamped a fake "14nC, 150us, 0.5Hz" on every animal. An
+    animal with two stimulated electrodes at different amplitudes lists both.
+    """
+    by_session: dict = {}
     for r in rows:
-        bits = []
-        if r["charge_nC"]:
-            bits.append(f"{float(r['charge_nC']):g}nC")
-        if r["pulse_width_us"]:
-            bits.append(f"{float(r['pulse_width_us']):g}us")
-        if r["frequency_hz"]:
-            bits.append(f"{float(r['frequency_hz']):g}Hz")
-        s = ", ".join(bits)
-        if s and s not in out:
-            out.append(s)
-    return " + ".join(out)
+        sd, fid = r.get("session_dir"), r.get("file_id")
+        if sd and fid is not None:
+            by_session.setdefault(sd, []).append(int(fid))
+    settings: list[str] = []
+    for sd, fids in by_session.items():
+        outputs = _animal_stim_outputs(store, animal, sd)
+        if not outputs:
+            continue     # this animal is recording-only in this session
+        fq = ",".join("?" * len(fids))
+        oq = ",".join("?" * len(outputs))
+        with store.connection() as conn:
+            srows = conn.execute(
+                f"""SELECT DISTINCT charge_nC, pulse_width_us, frequency_hz
+                    FROM stim_qc
+                    WHERE file_id IN ({fq}) AND stim_channel IN ({oq})
+                      AND charge_nC > 0
+                    ORDER BY charge_nC""", (*fids, *outputs)).fetchall()
+        for r in srows:
+            bits = []
+            if r["charge_nC"]:
+                bits.append(f"{float(r['charge_nC']):g}nC")
+            if r["pulse_width_us"]:
+                bits.append(f"{float(r['pulse_width_us']):g}us")
+            if r["frequency_hz"]:
+                bits.append(f"{float(r['frequency_hz']):g}Hz")
+            s = ", ".join(bits)
+            if s and s not in settings:
+                settings.append(s)
+    return " + ".join(settings)
 
 
 def _session_meta(store, animal: str, sessions: list[str]) -> dict:
@@ -2203,11 +2250,11 @@ def _day_stats(store, animal: str, day, items: list[dict],
     # Confirmed seizures = approved + still-awaiting-landmarks.
     t["n_events"] += n_pending
     meta = _session_meta(store, animal, sessions)
-    # Real commanded stim, from each file's STIM_REPORT (see the docstring on
-    # _stim_settings_for_files for why session_config can't be trusted here).
-    stim_settings = _stim_settings_for_files(
-        store, [r.get("file_id") for r in (list(items) + list(pending_items))
-                if r.get("file_id") is not None])
+    # Real commanded stim for THIS animal's electrode, from each file's
+    # STIM_REPORT (see _stim_settings_for_animal for why it's channel-specific
+    # and why session_config can't be trusted).
+    stim_settings = _stim_settings_for_animal(
+        store, animal, list(items) + list(pending_items))
     is_stim = t["n_stim_files"] > 0
     return {
         "date": day.isoformat() if hasattr(day, "isoformat")
