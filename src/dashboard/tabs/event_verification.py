@@ -2041,18 +2041,53 @@ def _protocol_from_session(session_dir: str) -> str:
     return proto
 
 
+def _stim_settings_for_files(store, file_ids: list) -> str:
+    """'More Settings' -- the commanded stim parameters for a day, read from the
+    per-file STIM_REPORT.txt (the `stim_qc` table), which is the real value.
+
+    NOT from session_config: `SessionConfig.stim_charge_nC` DEFAULTS to 14.0
+    (src/utils/session_config.py:23) whenever the .mat carries no
+    chargePerPhase, so that source stamped "14nC, 150us, 0.5Hz" on every animal
+    -- including days whose protocol is literally chronicStim-5nC-2nC. A day
+    that ran more than one amplitude lists them all (joined the lab's way).
+    """
+    ids = [int(f) for f in (file_ids or [])]
+    if not ids:
+        return ""
+    q = ",".join("?" * len(ids))
+    with store.connection() as conn:
+        rows = conn.execute(
+            f"""SELECT DISTINCT charge_nC, pulse_width_us, frequency_hz
+                FROM stim_qc
+                WHERE file_id IN ({q}) AND charge_nC > 0
+                ORDER BY charge_nC""", ids).fetchall()
+    out: list[str] = []
+    for r in rows:
+        bits = []
+        if r["charge_nC"]:
+            bits.append(f"{float(r['charge_nC']):g}nC")
+        if r["pulse_width_us"]:
+            bits.append(f"{float(r['pulse_width_us']):g}us")
+        if r["frequency_hz"]:
+            bits.append(f"{float(r['frequency_hz']):g}Hz")
+        s = ", ".join(bits)
+        if s and s not in out:
+            out.append(s)
+    return " + ".join(out)
+
+
 def _session_meta(store, animal: str, sessions: list[str]) -> dict:
     """Per-animal recording metadata from the session(s):
     Recording Location = electrode suffix(es) (SR / SLM / ...)
     Channel(s)         = the animal's electrode channel number(s), 1-BASED
     Type of Recording  = the protocol name(s)
-    More Settings      = the stim parameters
+
+    'More Settings' is NOT derived here -- see _stim_settings_for_files.
     """
     from src.utils import sheets_write as _sw
     locations: list[str] = []
     channels: list[int] = []
     protocols: list[str] = []
-    stim_settings = ""
     for sd in sessions:
         proto = _protocol_from_session(sd)
         if proto and proto not in protocols:
@@ -2070,18 +2105,6 @@ def _session_meta(store, animal: str, sessions: list[str]) -> dict:
                 ci = e.get("channel_index")
                 if ci is not None and int(ci) + 1 not in channels:
                     channels.append(int(ci) + 1)
-            if not stim_settings:
-                cfg = store.get_session_config(sd) or {}
-                bits = []
-                if cfg.get("stim_charge_nC"):
-                    bits.append(f"{float(cfg['stim_charge_nC']):g}nC")
-                if cfg.get("stim_pulse_width_us"):
-                    bits.append(
-                        f"{float(cfg['stim_pulse_width_us']):g}us")
-                if cfg.get("stim_frequency_hz"):
-                    bits.append(
-                        f"{float(cfg['stim_frequency_hz']):g}Hz")
-                stim_settings = ", ".join(bits)
         except Exception:
             pass
     return {
@@ -2092,7 +2115,6 @@ def _session_meta(store, animal: str, sessions: list[str]) -> dict:
         # " + " is the lab's own join for a multi-protocol day ("baseline +
         # stim", "chronicEvoked + baseline") -- match it rather than ", ".
         "type_of_recording": " + ".join(protocols),
-        "more_settings": stim_settings,
     }
 
 
@@ -2181,6 +2203,11 @@ def _day_stats(store, animal: str, day, items: list[dict],
     # Confirmed seizures = approved + still-awaiting-landmarks.
     t["n_events"] += n_pending
     meta = _session_meta(store, animal, sessions)
+    # Real commanded stim, from each file's STIM_REPORT (see the docstring on
+    # _stim_settings_for_files for why session_config can't be trusted here).
+    stim_settings = _stim_settings_for_files(
+        store, [r.get("file_id") for r in (list(items) + list(pending_items))
+                if r.get("file_id") is not None])
     is_stim = t["n_stim_files"] > 0
     return {
         "date": day.isoformat() if hasattr(day, "isoformat")
@@ -2201,7 +2228,7 @@ def _day_stats(store, animal: str, day, items: list[dict],
         # the lab writes -- NOT a stim-vs-baseline binary, which would flatten
         # their label to "stim" on every row we touch.
         "type_of_recording": meta["type_of_recording"],
-        "more_settings": meta["more_settings"] if is_stim else "",
+        "more_settings": stim_settings if is_stim else "",
         "exported_at": _dt.now().isoformat(timespec="seconds"),
     }
 

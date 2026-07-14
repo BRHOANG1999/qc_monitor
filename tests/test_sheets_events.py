@@ -470,16 +470,57 @@ def test_session_meta_joins_multi_protocol_days_the_lab_way():
     assert meta["type_of_recording"] == "baseline + stimBaseline"
 
 
+class _FakeConn:
+    """Stands in for store.connection(): serves canned stim_qc rows."""
+    def __init__(self, stim_rows):
+        self._rows = stim_rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
 class _FakeStore:
-    """Minimal store for _session_meta: one animal on two 0-based channels."""
-    def __init__(self, electrodes, cfg=None):
+    """Minimal store for _session_meta / _day_stats: one animal on two 0-based
+    channels, plus canned stim_qc rows (the real 'More Settings' source)."""
+    def __init__(self, electrodes, cfg=None, stim_rows=None):
         self._e, self._cfg = electrodes, cfg or {}
+        self._stim = stim_rows or []
 
     def electrodes_for_animal_in_session(self, sd, animal):
         return self._e
 
     def get_session_config(self, sd):
         return self._cfg
+
+    def connection(self):
+        return _FakeConn(self._stim)
+
+
+def test_stim_settings_come_from_the_stim_report_not_session_config():
+    # session_config.stim_charge_nC DEFAULTS to 14.0, which stamped
+    # "14nC, 150us, 0.5Hz" on every animal -- even days whose protocol is
+    # literally chronicStim-5nC-2nC. The truth is the per-file STIM_REPORT.
+    from src.dashboard.tabs.event_verification import _stim_settings_for_files
+    st = _FakeStore([], stim_rows=[
+        {"charge_nC": 2.0, "pulse_width_us": 150.0, "frequency_hz": 0.5},
+        {"charge_nC": 5.0, "pulse_width_us": 150.0, "frequency_hz": 0.5},
+    ])
+    # A day that ran two amplitudes lists both, joined the lab's way.
+    assert _stim_settings_for_files(st, [1, 2]) == \
+        "2nC, 150us, 0.5Hz + 5nC, 150us, 0.5Hz"
+    # No files -> no invented settings.
+    assert _stim_settings_for_files(st, []) == ""
+    # No stim report -> blank, NOT a fabricated 14nC default.
+    assert _stim_settings_for_files(_FakeStore([]), [1]) == ""
 
 
 def test_session_meta_channels_are_1_based_and_text():
