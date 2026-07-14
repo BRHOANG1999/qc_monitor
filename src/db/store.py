@@ -3276,6 +3276,41 @@ class Store:
             conn.close()
         return sorted(r["animal_id"] for r in rows if r["animal_id"])
 
+    def animals_with_flagged_work(self) -> list[str]:
+        """Distinct animals with >=1 file in the auto-filter FLAG pool still
+        awaiting review. Sibling of animals_with_needs_scoring for the Video
+        Review animal picker: an animal whose only queued work is FLAGGED (no
+        needs_scoring) must still be pickable, or the reviewer can't reach its
+        flagged files -- e.g. BCH060 (364 flagged, 0 needs_scoring) was absent
+        from the picker whenever the assignment sheet was down."""
+        return sorted(a for a, n in self.flagged_pool_counts_per_animal().items()
+                      if n > 0 and a)
+
+    def animals_with_review_files(self) -> list[str]:
+        """Every animal that has >=1 video recording in the review universe --
+        the FULL set the picker should offer, regardless of whether the animal
+        currently has flagged / needs_scoring / queue work. The picker must not
+        limit the reviewer to a work-type; this is the 'pick any animal'
+        fallback when the assignment sheet is unavailable."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT sc.channel_names, sc.eeg_channels
+                   FROM processed_files pf
+                   JOIN session_config sc ON sc.session_dir = pf.session_dir
+                   WHERE pf.has_video = 1
+                     AND sc.channel_names IS NOT NULL
+                     AND sc.eeg_channels IS NOT NULL""").fetchall()
+        finally:
+            conn.close()
+        out: set = set()
+        for r in rows:
+            for a in self._animal_ids_for_config(r["channel_names"],
+                                                 r["eeg_channels"]):
+                if a:
+                    out.add(a)
+        return sorted(out)
+
     def seizure_days_per_animal(self, exclude: list[str] | None = None
                                  ) -> dict:
         """Per animal, ``{'YYYY-MM-DD': n_seizures}`` for the Overview seizure

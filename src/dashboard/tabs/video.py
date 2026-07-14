@@ -3746,27 +3746,46 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "label": a,
                     "value": f"_pool_{a}",
                 })
-        # DB fallback: an animal with real needs_scoring work must ALWAYS be
-        # pickable, even if the Google Sheet dropped it (reassigned to someone
-        # else, or the warmer cache missed so it fell out of BOTH my_animals AND
-        # the unassigned pool). Without this, a reviewer gets locked out of
-        # finishing onsets they already flagged -- the "animal vanished from the
-        # picker" bug that stranded 58 BCH062 files mid-scoring.
-        try:
-            need_work = store.animals_with_needs_scoring()
-        except Exception as e:  # noqa: BLE001 -- fallback must never break picker
-            logger.debug("needs-scoring picker fallback failed: %s", e)
-            need_work = []
+        # DB fallback: an animal with real REVIEW work -- either needs_scoring
+        # (finish onsets) OR an auto-filter FLAG backlog -- must ALWAYS be
+        # pickable, even if the Google Sheet dropped it (reassigned, or the
+        # warmer cache missed so it fell out of BOTH my_animals AND the
+        # unassigned pool). Flagged-only animals were the gap: BCH060 (364
+        # flagged, 0 needs_scoring) had no way into the picker when the sheet
+        # was down, so its whole flagged queue was unreachable.
+        def _safe_list(fn):
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001 -- fallback must never break picker
+                logger.debug("picker fallback %s failed: %s", fn.__name__, e)
+                return []
+        all_animals = _safe_list(store.animals_with_review_files)
+        need_set = set(_safe_list(store.animals_with_needs_scoring))
+        flag_set = set(_safe_list(store.animals_with_flagged_work))
         have = {o["value"] for o in options}
-        extra = [a for a in need_work
+        # Order: animals with actionable work first (finish-scoring / flagged),
+        # then everyone else -- but NOTHING is excluded. The reviewer can pick
+        # ANY animal, including one whose files are only in the pre-analysis
+        # queue; the picker never limits by work-type.
+        worked = [a for a in all_animals if a in need_set or a in flag_set]
+        plain = [a for a in all_animals
+                 if a not in need_set and a not in flag_set]
+        extra = [a for a in (worked + plain)
                  if a not in have and f"_pool_{a}" not in have]
+        n_work = sum(1 for a in extra if a in need_set or a in flag_set)
         if extra:
-            options.append({"label": "── Has scoring work ──",
-                            "value": "__NEEDS__", "disabled": True})
+            options.append({"label": "── All animals (pick any) ──",
+                            "value": "__ALL__", "disabled": True})
             for a in extra:
-                options.append({
-                    "label": f"⚠️  {a}  (finish scoring)",
-                    "value": f"_pool_{a}"})
+                if a in need_set and a in flag_set:
+                    lbl = f"⚠️  {a}  (finish scoring + 🚩 flagged)"
+                elif a in need_set:
+                    lbl = f"⚠️  {a}  (finish scoring)"
+                elif a in flag_set:
+                    lbl = f"🚩  {a}  (flagged to review)"
+                else:
+                    lbl = f"   {a}"
+                options.append({"label": lbl, "value": f"_pool_{a}"})
         # Blank on first load. The reviewer explicitly picks an
         # animal each session -- no auto-default ever (caveat #6
         # of the queue-card plan). We only preserve the current
@@ -3779,14 +3798,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Friendlier status copy: don't shout "no animals
         # assigned" at the user when the lab simply hasn't
         # filled in the sheet yet.
-        scoring_note = (f"  ⚠️ {len(extra)} animal"
-                        f"{'' if len(extra) == 1 else 's'} still have scoring "
-                        "work (shown below)." if extra else "")
+        scoring_note = (f"  ⚠️ {n_work} animal"
+                        f"{'' if n_work == 1 else 's'} have review "
+                        "work (listed first)." if n_work else "")
         if not my_animals and not unassigned and not extra:
             status = "No animals in the DB yet."
         elif not my_animals and not unassigned:
-            status = ("Assignment sheet unavailable — showing animals with "
-                      "pending scoring work below.")
+            status = ("Assignment sheet unavailable — showing all animals "
+                      "(any is pickable); those with review work are first.")
         elif not my_animals:
             status = (f"Sheet has no assignments yet. "
                        f"Showing all {len(unassigned)} "

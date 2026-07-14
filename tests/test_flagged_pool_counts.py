@@ -89,6 +89,47 @@ def test_queue_is_pre_mass_analysis_backlog(tmp_path):
     assert slot["n_pending_pi"] == 1         # f3
 
 
+def test_flagged_only_animal_is_pickable(tmp_path):
+    """animals_with_flagged_work surfaces an animal whose only queued work is
+    FLAGGED (no needs_scoring) -- the picker fallback was needs-scoring-only, so
+    a flagged-only animal (e.g. BCH060) was unreachable."""
+    store = Store(str(tmp_path / "data" / "m.db"))
+    with store.connection() as conn:
+        conn.execute("INSERT INTO processed_files (id, file_path, session_dir, "
+                     "has_video) VALUES (1,'/f1.mat','/s',1)")
+        conn.execute(
+            "INSERT INTO review_event_log (file_id, user_email, action, "
+            "payload_json, animal_id, at) VALUES "
+            "(1,'auto','auto_filter_flag','{}','BCH060','2026-01-01')")
+        conn.commit()
+    assert store.animals_with_needs_scoring() == []       # no scoring work
+    assert store.animals_with_flagged_work() == ["BCH060"]  # but flagged -> pickable
+    # once reviewed, it drops out of the flagged set...
+    store.mark_review(1, "u@x", "has_events",
+                      markers=[{"EO_sec": 1.0, "racine": 3}], animal_id="BCH060")
+    assert store.animals_with_flagged_work() == []
+
+
+def test_all_animals_pickable_regardless_of_work(tmp_path):
+    """The picker universe = every animal with a video recording, even one whose
+    files are ONLY in the pre-analysis queue (no flag, no needs_scoring). The
+    reviewer must never be limited to a work-type."""
+    store = Store(str(tmp_path / "data" / "m.db"))
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO session_config (session_dir, channel_names, "
+            "eeg_channels, discovered_at) VALUES ('/s', ?, ?, 't')",
+            ('["stimCopy","BCH040SR"]', "[1]"))
+        # a plain video recording, never analyzed or reviewed
+        conn.execute("INSERT INTO processed_files (id, file_path, session_dir, "
+                     "has_video) VALUES (1,'/f1.mat','/s',1)")
+        conn.commit()
+    assert store.animals_with_needs_scoring() == []
+    assert store.animals_with_flagged_work() == []
+    # ...but it IS pickable
+    assert "BCH040" in store.animals_with_review_files()
+
+
 def test_overview_card_uses_flag_pool(tmp_path):
     """behavioral_seizure_status_per_animal.n_flag_pool == the flagged pool
     (the Overview card + Video Review now read the same number)."""
