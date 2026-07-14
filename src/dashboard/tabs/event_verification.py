@@ -2142,11 +2142,14 @@ def _day_stats(store, animal: str, day, items: list[dict],
                  pending_items: list[dict] | None = None) -> dict:
     """Canonical one-row-per-(animal, day) summary for the Sheet.
 
-    *items* are the pi_approved rows for this (animal, day) and alone drive the
-    final tally. *pending_items* are the needs_scoring ('Needs more onsets')
-    rows: they contribute ONLY `n_pending_events` -- the 'Events Needing Onsets'
-    column -- plus their session metadata, so a day whose events are all still
-    pending is a useful row instead of a blank one.
+    *items* are the pi_approved rows for this (animal, day); *pending_items* are
+    the needs_scoring ('Needs more onsets') rows.
+
+    An event in the needs_scoring pool is a CONFIRMED seizure -- it was scored
+    from video; what it still lacks is the remaining EEG landmarks. So it counts
+    toward 'Number of Behavioral Events' and 'Max Racine' just like an approved
+    one. 'Events Needing Onsets' then says how many of that total are still
+    awaiting landmarks (it is a SUBSET of the count, not a separate bucket).
     """
     from datetime import datetime as _dt
     from src.utils import mass_analyze as _ma
@@ -2161,14 +2164,22 @@ def _day_stats(store, animal: str, day, items: list[dict],
         if sd and sd not in sessions:
             sessions.append(sd)
         for e in (r.get("events") or []):
-            if isinstance(e, dict) and e.get("EO_sec") not in (None, ""):
-                n_pending += 1
+            if not isinstance(e, dict) or e.get("EO_sec") in (None, ""):
+                continue
+            n_pending += 1
+            try:
+                t["max_racine"] = max(t["max_racine"],
+                                       int(e.get("racine") or 0))
+            except (TypeError, ValueError):
+                pass
         try:    # a pending-only day is still a stim day if its file is one
             if _ma.has_stim_for_file(store, int(r["file_id"]),
                                        r.get("session_dir")):
                 t["n_stim_files"] += 1
         except Exception:
             pass
+    # Confirmed seizures = approved + still-awaiting-landmarks.
+    t["n_events"] += n_pending
     meta = _session_meta(store, animal, sessions)
     is_stim = t["n_stim_files"] > 0
     return {

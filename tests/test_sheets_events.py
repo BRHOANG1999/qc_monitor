@@ -501,6 +501,27 @@ def test_session_meta_channels_are_1_based_and_text():
     assert _session_meta(st0, "BCH040", ["baseline__x_"])["channels"] == "1"
 
 
+def test_day_stats_counts_pending_seizures():
+    # A needs_scoring event is a CONFIRMED seizure (scored from video, missing
+    # only the remaining EEG landmarks) -- it must count toward "Number of
+    # Behavioral Events" and Max Racine, not sit in a separate bucket. Before
+    # this, every BCH062 day read 0 events while Events Needing Onsets read 5-7.
+    import datetime
+    from src.dashboard.tabs.event_verification import _day_stats
+    st = _FakeStore([{"channel_index": 1, "location": "SR"}])
+    pending = [{"file_id": 1, "session_dir": "20260527_stimTest-40nC__x_",
+                "user_email": "a@b.c",
+                "events": [{"EO_sec": 10.0, "racine": 4},
+                            {"EO_sec": 20.0, "racine": 3},
+                            {"EO_sec": None, "racine": 2}]}]   # no onset
+    row = _day_stats(st, "BCH062", datetime.date(2026, 5, 27), [],
+                      "20260527_BCH062.csv", pending_items=pending)
+    assert row["n_events"] == 2           # the two real onsets are counted
+    assert row["n_pending_events"] == 2   # ...and both still need landmarks
+    assert row["max_racine"] == 4         # Racine picked up from pending too
+    assert row["type_of_recording"] == "stimTest-40nC"
+
+
 def test_repair_tool_sheet_row_mapping():
     # REGRESSION: this off-by-one wrote/deleted the NEIGHBOURING row and
     # damaged PM's hand-entered rows in BCH040/052/053. grid[0] is the header
