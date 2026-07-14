@@ -55,19 +55,36 @@ def test_primary_channel_and_series(tmp_path):
             + [_row("BCH062SLM", i, line_length=float(i)) for i in range(5)])
     _seed(str(ev), "BCH062", rows)
 
-    got, inputs = _data.animal_rows("BCH062", str(ev))
-    assert len(got) == 25 and len(inputs) == 1
+    series, inputs = _data.animal_series("BCH062", str(ev), ["line_length"])
+    assert set(series) == {"BCH062SR", "BCH062SLM"} and len(inputs) == 1
+    assert series["BCH062SR"]["secs"].size == 20
     # SR has more finite points -> primary
-    assert _data.primary_channel("BCH062", got, ["line_length"]) == "BCH062SR"
+    assert _data.primary_channel(
+        "BCH062", series, ["line_length"]) == "BCH062SR"
 
-    dts, secs, vals = _data.series_for(got, "BCH062SR", "line_length")
+    dts, secs, vals = _data.finite_series(series, "BCH062SR", "line_length")
     assert vals.size == 20 and list(vals) == [float(i) for i in range(20)]
     assert secs[0] < secs[-1]                          # sorted ascending
+    assert len(dts) == 20
 
     bands = _data.rolling_percentiles(secs, vals, win=11)
     assert bands is not None
     bsec, p10, p25, p50, p75, p90 = bands
     assert bsec.size == p50.size and (p10 <= p90).all() and (p25 <= p75).all()
+
+
+def test_series_is_nan_filled_and_finite_filtered(tmp_path):
+    """A metric with no data for the animal comes back as an all-NaN column
+    (stable declared set), and finite_series drops it to an empty series."""
+    ev = tmp_path / "evoked"; ev.mkdir()
+    _seed(str(ev), "BCH062",
+          [_row("BCH062SR", i, line_length=float(i)) for i in range(12)])
+    series, _ = _data.animal_series("BCH062", str(ev),
+                                    ["line_length", "rms_amplitude"])
+    import numpy as np
+    assert np.isnan(series["BCH062SR"]["metrics"]["rms_amplitude"]).all()
+    _d, _s, v = _data.finite_series(series, "BCH062SR", "rms_amplitude")
+    assert v.size == 0                                  # -> reported "missing"
 
 
 # ------------------------------------------------------------------ #
@@ -93,6 +110,26 @@ def test_epoch_roundtrip_through_csv():
 # ------------------------------------------------------------------ #
 #  rendering writes real PNGs
 # ------------------------------------------------------------------ #
+
+def test_gap_break_inserts_nan_across_silence():
+    """The rolling percentile uses a COUNT window, so consecutive band samples
+    can be weeks apart; without a break, matplotlib draws a confident line
+    through a period with no recordings. Assert a >24h gap becomes a NaN break
+    (and that a continuous run is left untouched)."""
+    import numpy as np
+    base = datetime(2026, 1, 1)
+    # 3 points, then a 10-day hole, then 3 more
+    dts = [base + timedelta(hours=i) for i in range(3)]
+    dts += [base + timedelta(days=10, hours=i) for i in range(3)]
+    vals = np.arange(6, dtype=float)
+    nd, (nv,) = _render._break_gaps(dts, (vals,), gap_sec=24 * 3600)
+    assert len(nd) == 7 and nv.size == 7          # one NaN sample inserted
+    assert np.isnan(nv).sum() == 1
+    assert np.isnan(nv[3])                        # break sits in the hole
+    # a continuous run is untouched
+    nd2, (nv2,) = _render._break_gaps(dts[:3], (vals[:3],), gap_sec=24 * 3600)
+    assert len(nd2) == 3 and not np.isnan(nv2).any()
+
 
 def test_render_writes_pngs(tmp_path):
     dts = [_BASE + timedelta(seconds=60 * i) for i in range(30)]

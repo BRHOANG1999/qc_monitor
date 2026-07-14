@@ -38,6 +38,16 @@ def roll_window(config: dict) -> int:
         return 301
 
 
+def gap_break_sec(config: dict) -> float:
+    """Break the percentile bands/median across gaps longer than this, so a
+    stretch with no recordings shows as a gap instead of an interpolated
+    trend. 0 disables. Default 24 h."""
+    try:
+        return max(0.0, float(_cfg(config).get("gap_break_hours", 24.0))) * 3600.0
+    except (TypeError, ValueError):
+        return 24 * 3600.0
+
+
 def primary_overrides(config: dict) -> dict:
     return dict(_cfg(config).get("primary_channel", {}) or {})
 

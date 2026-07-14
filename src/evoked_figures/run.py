@@ -99,25 +99,28 @@ def build_animal(animal: str, config: dict, *, apply: bool = True,
     win = _cfg.roll_window(config)
     override = _cfg.primary_overrides(config).get(animal)
 
-    rows, inputs = _data.animal_rows(animal, evoked_dir)
-    if not rows:
+    # ONE pass -> float arrays per (channel, metric). Never holds the row dicts,
+    # so a 2.3M-epoch animal (BCH040) costs ~400 MB, not GBs.
+    series, inputs = _data.animal_series(animal, evoked_dir, metrics)
+    if not series:
         return {"animal": animal, "channel": None, "rendered": 0,
                 "missing": list(metrics), "pruned": 0, "n_rows": 0,
                 "inputs_sig": inputs_signature(inputs), "note": "no fresh rows"}
-    channel = _data.primary_channel(animal, rows, metrics, override)
-    ch_rows = [r for r in rows if r.get("channel") == channel]
+    channel = _data.primary_channel(animal, series, metrics, override)
     animal_dir = os.path.join(root, _safe(animal))
 
+    n_rows = 0
     if apply:
         os.makedirs(animal_dir, exist_ok=True)
-        _data.write_rows_csv_gz(
-            ch_rows,
+        # streamed: the CSV for a big animal is >1 GB raw
+        n_rows = _data.stream_channel_csv_gz(
+            animal, evoked_dir, channel,
             os.path.join(animal_dir, f"{_safe(animal)}_evoked_timeseries.csv.gz"))
 
     rendered: list = []
     missing: list = []
     for m in metrics:
-        dts, secs, vals = _data.series_for(rows, channel, m)
+        dts, secs, vals = _data.finite_series(series, channel, m)
         if vals.size == 0:
             missing.append(m)
             continue
@@ -138,7 +141,8 @@ def build_animal(animal: str, config: dict, *, apply: bool = True,
             _render.render_percentile(
                 bdts, p10, p25, p50, p75, p90,
                 f"{title} — percentiles (win {win})", m, pct_png,
-                pts_dts=dts, pts_vals=vals)
+                pts_dts=dts, pts_vals=vals,
+                gap_sec=_cfg.gap_break_sec(config))
         else:                                          # too few for a band
             _render.render_scatter(
                 dts, vals, f"{title} — percentiles (too few points)", m, pct_png)
@@ -148,6 +152,9 @@ def build_animal(animal: str, config: dict, *, apply: bool = True,
         pruned = _prune_stale(animal_dir, {_safe(m) for m in rendered})
         _write_manifest(animal_dir, animal, channel, metrics, rendered, missing,
                         inputs, config, now_iso)
+    else:                                   # dry-run: report the epoch count
+        d = series.get(channel) or {}
+        n_rows = int((d.get("secs") is not None) and d["secs"].size or 0)
     return {"animal": animal, "channel": channel, "rendered": len(rendered),
-            "missing": missing, "pruned": pruned, "n_rows": len(ch_rows),
+            "missing": missing, "pruned": pruned, "n_rows": n_rows,
             "inputs_sig": inputs_signature(inputs)}
