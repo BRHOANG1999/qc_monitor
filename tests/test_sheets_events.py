@@ -453,6 +453,21 @@ def test_protocol_from_session_matches_lab_labels():
     assert f("20240206_baseline__BCH039stimSRRecSLM_NULL_") == "baseline"
     assert f("baseline-salineTest__x_") == "baseline-salineTest"
     assert f("") == ""
+    # Typo'd 9-digit date prefix -- a \d{8} strip would report the DATE as the
+    # protocol.
+    assert f("G:\\BHZ\\JANUARY_2026\\292601012_stimBaseline-salineTest__x_") \
+        == "stimBaseline-salineTest"
+    # Deleted recordings linger as $RECYCLE.BIN paths -- never a protocol.
+    assert f("//host/database/$RECYCLE.BIN\\S-1-5-21-1005\\$RD7H40J") == ""
+
+
+def test_session_meta_joins_multi_protocol_days_the_lab_way():
+    from src.dashboard.tabs.event_verification import _session_meta
+    st = _FakeStore([{"channel_index": 1, "location": "SR"}])
+    meta = _session_meta(st, "BCH040",
+                          ["20260101_baseline__x_", "20260101_stimBaseline__x_"])
+    # The lab writes "baseline + stim", not "baseline, stim".
+    assert meta["type_of_recording"] == "baseline + stimBaseline"
 
 
 class _FakeStore:

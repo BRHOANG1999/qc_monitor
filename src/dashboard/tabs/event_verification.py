@@ -2023,13 +2023,22 @@ def _protocol_from_session(session_dir: str) -> str:
 
     Matches what the lab writes by hand (baseline / stimBaseline /
     chronicEvoked / baseline-salineTest), instead of a coarse stim-vs-baseline
-    flag that would overwrite their richer label.
+    flag that would overwrite their richer label. Returns "" when the folder
+    isn't a real session.
     """
     import re as _re
     name = _re.split(r"[\\/]", str(session_dir or ""))[-1]
     head = name.split("__")[0]
-    head = _re.sub(r"^\d{8}_", "", head)      # drop a leading YYYYMMDD_
-    return head.split("_")[0]
+    # Drop the leading date token. NOT \d{8} -- the lab has typo'd folders like
+    # "292601012_stimBaseline-salineTest__...", which would otherwise report the
+    # date as the protocol.
+    head = _re.sub(r"^\d+_", "", head)
+    proto = head.split("_")[0]
+    # Deleted recordings live on as $RECYCLE.BIN paths ("$RD7H40J"); those are
+    # never a protocol name.
+    if proto.startswith("$"):
+        return ""
+    return proto
 
 
 def _session_meta(store, animal: str, sessions: list[str]) -> dict:
@@ -2080,7 +2089,9 @@ def _session_meta(store, animal: str, sessions: list[str]) -> dict:
         # force_text: "2, 3" would otherwise be re-parsed by Sheets as Feb 3.
         "channels": _sw.force_text(
             ", ".join(str(c) for c in sorted(channels))),
-        "type_of_recording": ", ".join(protocols),
+        # " + " is the lab's own join for a multi-protocol day ("baseline +
+        # stim", "chronicEvoked + baseline") -- match it rather than ", ".
+        "type_of_recording": " + ".join(protocols),
         "more_settings": stim_settings,
     }
 
