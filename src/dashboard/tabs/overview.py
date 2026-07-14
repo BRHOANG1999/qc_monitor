@@ -2565,7 +2565,7 @@ def _build_behavioral_seizure_status_card(store, config=None):
     total_queue = sum(r["n_queue"] for r in rows)
     total_pending = sum(r["n_pending_pi"] for r in rows)
     total_needs = sum(r.get("n_needs_scoring", 0) for r in rows)
-    total_threshold = sum(r.get("n_threshold", 0) for r in rows)
+    total_threshold = sum(r.get("n_flag_pool", 0) for r in rows)
     rate_delta = total_created - total_approved
     rate_per_day = rate_delta / 7.0
     if rate_per_day > 5:
@@ -2607,7 +2607,7 @@ def _build_behavioral_seizure_status_card(store, config=None):
                        style={"color": "#cfd0d6"}),
             html.Span(f"{total_pending} pending PI  ·  ",
                        style={"color": "#cfd0d6"}),
-            html.Span(f"🚩 {total_threshold} threshold  ·  ",
+            html.Span(f"🚩 {total_threshold} flagged  ·  ",
                        style={"color": "#f0b429" if total_threshold
                               else "#cfd0d6"}),
             html.Span(f"⚠️ {total_needs} needs more onsets",
@@ -2694,14 +2694,14 @@ def _bsz_cards(rows):
                                       "fontWeight": "600"}),
                 ]),
                 html.Div([
-                    html.Span("🚩 threshold",
+                    html.Span("🚩 flagged",
                                style={"color": "#888",
                                        "fontSize": "10px",
                                        "textTransform": "uppercase",
                                        "letterSpacing": "0.5px"}),
-                    html.Div(f"{r.get('n_threshold', 0)}",
+                    html.Div(f"{r.get('n_flag_pool', 0)}",
                               style={"color": "#f0b429"
-                                     if r.get("n_threshold")
+                                     if r.get("n_flag_pool")
                                      else "#cfd0d6",
                                       "fontSize": "16px",
                                       "fontWeight": "600"}),

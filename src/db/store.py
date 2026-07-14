@@ -5321,6 +5321,38 @@ class Store:
         return sorted(by_animal.values(),
                        key=lambda d: -d["n_unreviewed"])
 
+    def flagged_pool_counts_per_animal(self) -> dict[str, int]:
+        """Per-animal count of the AUTO-FILTER FLAG backlog still awaiting
+        review -- the SAME set the Video Review "Flag" queue shows: a video
+        recording the animal's auto-filter flagged ('auto_filter_flag' event)
+        that the animal hasn't been finalised or parked on
+        (no_events / has_events / pending_pi_review / pi_approved /
+        needs_scoring). This is the single source of truth for the flagged
+        pool so the Overview card and the Video Review queue agree. Global (not
+        per-reviewer): the Video Review count additionally hides files another
+        reviewer is actively claiming, so its per-animal number is <= this."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT rel.animal_id AS a,
+                          COUNT(DISTINCT rel.file_id) AS n
+                   FROM review_event_log rel
+                   JOIN processed_files pf ON pf.id = rel.file_id
+                   WHERE rel.action = 'auto_filter_flag'
+                     AND pf.has_video = 1
+                     AND rel.animal_id IS NOT NULL
+                     AND NOT EXISTS (
+                       SELECT 1 FROM review_state rs
+                       WHERE rs.file_id = rel.file_id
+                         AND rs.animal_id = rel.animal_id
+                         AND rs.status IN ('no_events', 'has_events',
+                                           'pending_pi_review', 'pi_approved',
+                                           'needs_scoring'))
+                   GROUP BY rel.animal_id""").fetchall()
+            return {r["a"]: int(r["n"]) for r in rows}
+        finally:
+            conn.close()
+
     def behavioral_seizure_status_per_animal(self,
                                                   days: int = 7,
                                                   exclude: list[str] | None = None
@@ -5381,27 +5413,15 @@ class Store:
                    WHERE pf.has_video = 1
                      AND sc.eeg_channels IS NOT NULL"""
             ).fetchall()
-            # Threshold-detection pool per animal: the envelope-peak count
-            # (n_with_peaks) from each animal's MOST-RECENT completed Mass
-            # Analyze scan. These are the auto-detector candidates awaiting
-            # review -- a different axis from the review-pipeline statuses
-            # above, so it lives in its own column on the Overview card.
-            ma_jobs = conn.execute(
-                """SELECT animal_id, n_with_peaks, finished_at, created_at
-                   FROM mass_analyze_job
-                   WHERE status = 'done'"""
-            ).fetchall()
         finally:
             conn.close()
-        # Keep only the latest done job per animal (by finished/created).
-        threshold_by_animal: dict[str, int] = {}
-        _latest_key: dict[str, str] = {}
-        for j in ma_jobs:
-            a = j["animal_id"]
-            key = (j["finished_at"] or "") + "|" + (j["created_at"] or "")
-            if key >= _latest_key.get(a, ""):
-                _latest_key[a] = key
-                threshold_by_animal[a] = int(j["n_with_peaks"] or 0)
+        # The Overview "flagged" pool = the auto-filter FLAG backlog still
+        # awaiting review, per animal -- the SAME set Video Review's "Flag"
+        # queue shows, so the two surfaces agree. (Formerly the raw
+        # mass_analyze n_with_peaks detector count, which never subtracted
+        # reviewed files and used different criteria, so it didn't match the
+        # review queue at all -- e.g. BCH062 showed 290 vs an actual 12.)
+        flag_pool = self.flagged_pool_counts_per_animal()
         # Index review rows by file for a per-(file, animal) latest lookup.
         rev_by_file: dict[int, list] = {}
         for rr in rev:
@@ -5434,7 +5454,7 @@ class Store:
                     "n_approved": 0,
                     "n_flagged": 0,
                     "n_needs_scoring": 0,
-                    "n_threshold": 0,
+                    "n_flag_pool": 0,
                     "created_window": 0,
                     "approved_window": 0,
                     "last_activity_at": "",
@@ -5465,8 +5485,7 @@ class Store:
                     slot["last_activity_at"] = updated_at
         # Attach the auto-detector threshold-pool count per animal.
         for slot in per_animal.values():
-            slot["n_threshold"] = threshold_by_animal.get(
-                slot["animal_id"], 0)
+            slot["n_flag_pool"] = flag_pool.get(slot["animal_id"], 0)
         out = list(per_animal.values())
         # Sort: animals with growing backlog first (positive
         # net delta), then by queue size descending.
