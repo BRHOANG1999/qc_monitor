@@ -486,5 +486,21 @@ def test_session_meta_channels_are_1_based_and_text():
     assert _session_meta(st0, "BCH040", ["baseline__x_"])["channels"] == "1"
 
 
+def test_repair_tool_sheet_row_mapping():
+    # REGRESSION: this off-by-one wrote/deleted the NEIGHBOURING row and
+    # damaged PM's hand-entered rows in BCH040/052/053. grid[0] is the header
+    # (sheet row 1), so grid[1] -- the first DATA row -- is sheet row 2.
+    from tools.sheets_repair_channels import _sheet_row, _recover
+    assert _sheet_row(1) == 2      # NOT 3
+    assert _sheet_row(2) == 3
+    with pytest.raises(AssertionError):
+        _sheet_row(0)              # the header is not a data row
+    # _recover strips a year the cell's date format tacked on ("3, 4, 2005").
+    assert _recover(38415, "3, 4, 2005") == "3, 4"
+    assert _recover(46056, "2, 3") == "2, 3"
+    assert _recover(45720, "3/4") == "3/4"
+    assert _recover(46056, "not a channel list") == ""   # skipped, not written
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
