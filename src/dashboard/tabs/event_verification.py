@@ -2013,24 +2013,54 @@ def _finalize_summary_block(base_dir: str, entries: list[dict],
     return html.Div(children)
 
 
+def _protocol_from_session(session_dir: str) -> str:
+    """The lab's 'Type of Recording' -- the protocol token in the session folder
+    name, which is the only place it's recorded (there is no DB column):
+
+        20260318_stimBaseline__stimCopy_BCH040SR_...  -> stimBaseline
+        baseline__BCH061SLM_BCH061SR_                 -> baseline
+        chronicEvoked_15-4nC_150us__stimCopy-...      -> chronicEvoked
+
+    Matches what the lab writes by hand (baseline / stimBaseline /
+    chronicEvoked / baseline-salineTest), instead of a coarse stim-vs-baseline
+    flag that would overwrite their richer label.
+    """
+    import re as _re
+    name = _re.split(r"[\\/]", str(session_dir or ""))[-1]
+    head = name.split("__")[0]
+    head = _re.sub(r"^\d{8}_", "", head)      # drop a leading YYYYMMDD_
+    return head.split("_")[0]
+
+
 def _session_meta(store, animal: str, sessions: list[str]) -> dict:
-    """Per-animal recording metadata from the session config(s):
+    """Per-animal recording metadata from the session(s):
     Recording Location = electrode suffix(es) (SR / SLM / ...)
-    Channel(s)         = the animal's electrode channel index(es)
+    Channel(s)         = the animal's electrode channel number(s), 1-BASED
+    Type of Recording  = the protocol name(s)
     More Settings      = the stim parameters
     """
+    from src.utils import sheets_write as _sw
     locations: list[str] = []
-    channels: list[str] = []
+    channels: list[int] = []
+    protocols: list[str] = []
     stim_settings = ""
     for sd in sessions:
+        proto = _protocol_from_session(sd)
+        if proto and proto not in protocols:
+            protocols.append(proto)
         try:
             for e in store.electrodes_for_animal_in_session(sd, animal):
                 loc = e.get("location")
                 if loc and loc not in locations:
                     locations.append(loc)
-                ch = str(e.get("channel_index"))
-                if ch not in channels:
-                    channels.append(ch)
+                # channel_index is 0-BASED (it's the position in
+                # session_config.channel_names). The lab counts channels from
+                # 1, so the sheet must show index + 1 -- otherwise every row is
+                # off by one and multi-electrode animals even report a
+                # "channel 0", which cannot exist in their notation.
+                ci = e.get("channel_index")
+                if ci is not None and int(ci) + 1 not in channels:
+                    channels.append(int(ci) + 1)
             if not stim_settings:
                 cfg = store.get_session_config(sd) or {}
                 bits = []
@@ -2047,9 +2077,10 @@ def _session_meta(store, animal: str, sessions: list[str]) -> dict:
             pass
     return {
         "recording_location": ", ".join(locations),
-        "channels": ", ".join(
-            sorted(channels,
-                    key=lambda x: int(x) if x.isdigit() else 0)),
+        # force_text: "2, 3" would otherwise be re-parsed by Sheets as Feb 3.
+        "channels": _sw.force_text(
+            ", ".join(str(c) for c in sorted(channels))),
+        "type_of_recording": ", ".join(protocols),
         "more_settings": stim_settings,
     }
 
@@ -2144,7 +2175,10 @@ def _day_stats(store, animal: str, day, items: list[dict],
         "reviewers": ", ".join(t["reviewers"]),
         "recording_location": meta["recording_location"],
         "channels": meta["channels"],
-        "type_of_recording": "stim" if is_stim else "baseline",
+        # The protocol name (stimBaseline / chronicEvoked / ...), matching what
+        # the lab writes -- NOT a stim-vs-baseline binary, which would flatten
+        # their label to "stim" on every row we touch.
+        "type_of_recording": meta["type_of_recording"],
         "more_settings": meta["more_settings"] if is_stim else "",
         "exported_at": _dt.now().isoformat(timespec="seconds"),
     }

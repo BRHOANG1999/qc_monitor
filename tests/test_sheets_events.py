@@ -430,5 +430,61 @@ def test_resolve_summary_header_skips_events_tabs():
         svc, "SID", set(svc.data), None)[1] == "Onset (clock)"
 
 
+# --- lab-column correctness: text coercion, 1-based channels, protocol ---- #
+
+def test_force_text_guards_date_shaped_values():
+    # These are the real corruptions: Sheets read "2, 3" as Feb 3 (serial
+    # 46056) and "3/4" as Mar 4 (45720) under USER_ENTERED.
+    assert sw.force_text("2, 3") == "'2, 3"
+    assert sw.force_text("3/4") == "'3/4"
+    # Plain integers can't be misread as a date -> left numeric-looking, so
+    # they match the lab's own hand-typed cells.
+    assert sw.force_text("2") == "2"
+    assert sw.force_text("") == "" and sw.force_text(None) == ""
+
+
+def test_protocol_from_session_matches_lab_labels():
+    from src.dashboard.tabs.event_verification import _protocol_from_session
+    f = _protocol_from_session
+    assert f("//host/db/MARCH_2026\\20260318_stimBaseline__stimCopy_BCH040SR_"
+             "stimCopy_saline_") == "stimBaseline"
+    assert f("baseline__BCH061SLM_BCH061SR_") == "baseline"
+    assert f("chronicEvoked_15-4nC_150us__stimCopy-BCH040SR_") == "chronicEvoked"
+    assert f("20240206_baseline__BCH039stimSRRecSLM_NULL_") == "baseline"
+    assert f("baseline-salineTest__x_") == "baseline-salineTest"
+    assert f("") == ""
+
+
+class _FakeStore:
+    """Minimal store for _session_meta: one animal on two 0-based channels."""
+    def __init__(self, electrodes, cfg=None):
+        self._e, self._cfg = electrodes, cfg or {}
+
+    def electrodes_for_animal_in_session(self, sd, animal):
+        return self._e
+
+    def get_session_config(self, sd):
+        return self._cfg
+
+
+def test_session_meta_channels_are_1_based_and_text():
+    from src.dashboard.tabs.event_verification import _session_meta
+    # channel_index is the 0-based position in channel_names; the lab counts
+    # from 1. 0-based (1, 2) must surface as "2, 3" -- and as TEXT, since
+    # USER_ENTERED would otherwise store "2, 3" as the date Feb 3.
+    st = _FakeStore([{"channel_index": 1, "location": "SR"},
+                     {"channel_index": 2, "location": "SLM"}])
+    meta = _session_meta(st, "BCH040", ["20260318_stimBaseline__x_"])
+    assert meta["channels"] == "'2, 3"          # 1-based + force-text
+    assert meta["recording_location"] == "SR, SLM"
+    assert meta["type_of_recording"] == "stimBaseline"
+    # Single channel stays a bare number (can't be misread as a date).
+    st1 = _FakeStore([{"channel_index": 1, "location": "SR"}])
+    assert _session_meta(st1, "BCH040", ["baseline__x_"])["channels"] == "2"
+    # A 0-based "channel 0" -- impossible in the lab's notation -- becomes 1.
+    st0 = _FakeStore([{"channel_index": 0, "location": "SR"}])
+    assert _session_meta(st0, "BCH040", ["baseline__x_"])["channels"] == "1"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -88,6 +88,22 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
 
+def force_text(value) -> str:
+    """Make a USER_ENTERED value stick as TEXT instead of being re-parsed.
+
+    Sheets silently coerces date-shaped strings: a channel list "2, 3" becomes
+    Feb 3 (serial 46056) and "3/4" becomes Mar 4 (45720) -- the cell still
+    *displays* "2, 3", so the corruption is invisible until something reads the
+    raw value. A leading apostrophe is Sheets' force-text escape and is stripped
+    from the stored value. Plain integers are safe (a bare number can't be read
+    as a date), so they're left alone and stay numeric like the lab's own cells.
+    """
+    s = "" if value is None else str(value)
+    if not s or s.isdigit():
+        return s
+    return "'" + s
+
+
 def _q(tab_name: str) -> str:
     """A1-quote a tab title. Titles like 'BCH039' collide with cell
     refs, so they MUST be single-quoted in a range; embedded quotes
