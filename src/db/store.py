@@ -5413,8 +5413,22 @@ class Store:
                    WHERE pf.has_video = 1
                      AND sc.eeg_channels IS NOT NULL"""
             ).fetchall()
+            # (file, animal) pairs the auto-filter has FLAGGED. A flag writes
+            # only an event-log row (no review_state), so a flagged file still
+            # reads status=None -- without this it would be double-counted in
+            # the "queue" bucket as well as the flagged pool.
+            flag_rows = conn.execute(
+                """SELECT DISTINCT animal_id, file_id
+                   FROM review_event_log
+                   WHERE action = 'auto_filter_flag'
+                     AND animal_id IS NOT NULL"""
+            ).fetchall()
         finally:
             conn.close()
+        flagged_files: dict[str, set] = {}
+        for fr in flag_rows:
+            flagged_files.setdefault(fr["animal_id"], set()).add(
+                int(fr["file_id"]))
         # The Overview "flagged" pool = the auto-filter FLAG backlog still
         # awaiting review, per animal -- the SAME set Video Review's "Flag"
         # queue shows, so the two surfaces agree. (Formerly the raw
@@ -5459,8 +5473,18 @@ class Store:
                     "approved_window": 0,
                     "last_activity_at": "",
                 })
-                # Status buckets.
-                if status is None or status == "pi_flagged":
+                # QUEUE = the pre-mass-analysis backlog: files awaiting (or
+                # ready for) auto mass analysis. A file LEAVES the queue as
+                # soon as it has been analyzed or dispositioned:
+                #   * auto-FLAGGED -> an 'auto_filter_flag' event (status stays
+                #     None, so it must be excluded explicitly or it double-counts
+                #     against the flagged pool);
+                #   * auto-CLEARED -> review_state 'pending_pi_review';
+                #   * any human/PI disposition (needs_scoring, has_events,
+                #     no_events, pi_approved, pi_flagged) -> a status is set.
+                # So: no status AND not auto-flagged.
+                if (status is None
+                        and int(r["file_id"]) not in flagged_files.get(a, ())):
                     slot["n_queue"] += 1
                 if status == "pending_pi_review":
                     slot["n_pending_pi"] += 1
