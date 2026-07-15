@@ -52,6 +52,7 @@ from src.periictal import trajectory as _traj
 from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
                                     sliding_trial_average)
 from src.periictal.selection import summarize_selection
+from src.periictal import trendtest as _tt
 from src.preictal.isi import scored_seizures
 from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
@@ -142,6 +143,7 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
         ro = confound_readout(res["emb"], sub)
         _finish(job_id, {"empty": False, "emb": res["emb"], "sub": sub,
                          "full": df.reset_index(drop=True),
+                         "metrics": list(_cfg.metrics_for_variant(variant)),
                          "readout": ro, "meta": res["meta"],
                          "method": res["method"],
                          "n_seizures": int(pre["seizure_idx"].nunique())})
@@ -690,6 +692,179 @@ def _render_trajectory(tr, ylabel, hi) -> go.Figure:
                    tickvals=tv, ticktext=tt, autorange="reversed"),
         yaxis=dict(title=ylabel), uirevision="pex-traj")
     return fig
+
+
+# --------------------------------------------------------------------- #
+#  Per-seizure trend test (Trend & test lens) — synchronous, from the cache
+# --------------------------------------------------------------------- #
+
+def _seizure_labels(full) -> dict:
+    """{seizure_idx: 'R{racine} · MM-DD HH:MM'} from the matrix, for the forest
+    row labels."""
+    out: dict = {}
+    g = full.groupby("seizure_idx")[["seizure_onset_epoch",
+                                     "seizure_racine"]].first()
+    for sid, row in g.iterrows():
+        try:
+            when = datetime.fromtimestamp(
+                float(row["seizure_onset_epoch"])).strftime("%m-%d %H:%M")
+        except (ValueError, OverflowError, OSError):
+            when = "?"
+        rac = row["seizure_racine"]
+        rac = int(rac) if np.isfinite(rac) else "?"
+        out[int(sid)] = f"R{rac} · {when}"
+    return out
+
+
+def _forest_fig(per_sz, summary, labels) -> go.Figure:
+    """One marker per seizure at its Spearman rho (diverging colour at 0, size ∝
+    √n), a dotted null line at 0, and a dashed median line annotated with the
+    across-seizure p."""
+    if not per_sz:
+        return empty_fig("Not enough per-seizure data to test this feature")
+    per_sz = sorted(per_sz, key=lambda r: r["rho"])
+    rhos = [r["rho"] for r in per_sz]
+    ys = [labels.get(r["seizure_idx"], f"sz {r['seizure_idx']}") for r in per_sz]
+    ns = [r["n"] for r in per_sz]
+    hrs = [r["hour_rho"] for r in per_sz]
+    # size ∝ √n, but scaled RELATIVE to the busiest seizure (n is thousands of
+    # stimuli here) so markers stay ~10–26 px, not giant overlapping blobs.
+    mx = np.sqrt(max(ns)) if ns else 1.0
+    sizes = [10.0 + 16.0 * np.sqrt(max(n, 1)) / mx for n in ns]
+    fig = go.Figure()
+    fig.add_vline(x=0, line=dict(width=1, color="rgba(160,160,176,0.55)",
+                                 dash="dot"))
+    med = summary["median_rho"]
+    if np.isfinite(med):
+        fig.add_vline(x=med, line=dict(width=2, color=COLOR_ACCENT, dash="dash"),
+                      annotation_text=f"median ρ={med:+.2f} · p={_fmt_p(summary['p'])}",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=COLOR_ACCENT))
+    fig.add_trace(go.Scatter(
+        x=rhos, y=ys, mode="markers",
+        marker=dict(size=sizes,
+                    color=rhos, colorscale="RdBu", reversescale=True,
+                    cmin=-1, cmax=1, line=dict(width=1, color="rgba(20,20,28,0.85)"),
+                    colorbar=dict(title=dict(text="ρ", font=dict(size=9)),
+                                  thickness=10, len=0.7)),
+        customdata=np.column_stack([ns, hrs]),
+        hovertemplate="ρ %{x:.2f} · n=%{customdata[0]:d} · circadian ρ="
+                      "%{customdata[1]:.2f}<extra>%{y}</extra>", showlegend=False))
+    fig.update_layout(
+        height=max(200, 34 * len(per_sz) + 96),
+        margin=dict(l=150, r=20, t=36, b=44),
+        xaxis=dict(title="Spearman ρ  (feature vs lead-time, per seizure)",
+                   range=[-1.05, 1.05], zeroline=False),
+        yaxis=dict(title="", automargin=True), uirevision="pex-forest")
+    return fig
+
+
+def _verdict_view(summary, control, circadian, feature):
+    """A plain-language verdict: consistency + significance, the post-ictal
+    positive control, and the circadian caveat."""
+    n = summary["n_seizures"]
+    if n == 0:
+        return _callout("Not enough per-seizure data to test this feature "
+                        "(each seizure needs several pre-onset stimuli).",
+                        COLOR_WARNING, "⚠")
+    p, med = summary["p"], summary["median_rho"]
+    sig = p < 0.05
+    dom = max(summary["n_neg"], summary["n_pos"])
+    lead = "rises" if med < 0 else "falls" if med > 0 else "is flat"
+    main = (f"{dom}/{n} seizures trend the same way; median ρ={med:+.2f} → the "
+            f"feature {lead} toward onset; signed-rank p={_fmt_p(p)} — "
+            f"{'SIGNIFICANT' if sig else 'not significant'}.")
+    if not control.get("available") or control["n_seizures"] == 0:
+        pc = "Post-ictal control: n/a (no post-onset rows for this selection)."
+    else:
+        pcp = control["p"]
+        pc = ("Post-ictal positive control p=" + _fmt_p(pcp) + " — "
+              + ("method is sensitive (it detects the known post-ictal effect)."
+                 if pcp < 0.05 else
+                 "not significant either (low power or weak post-ictal effect)."))
+    cir = (f"Circadian: median |ρ| vs hour-of-day = "
+           f"{circadian:.2f}" if np.isfinite(circadian) else
+           "Circadian: n/a")
+    if np.isfinite(circadian) and circadian >= 0.5:
+        cir += " ⚠ — the trend may be time-of-day, not pre-ictal."
+    else:
+        cir += "."
+    tone = COLOR_SUCCESS if sig else COLOR_TEXT_SECONDARY
+    return html.Div([
+        html.Div(main, style={"color": tone, "fontWeight": "600",
+                              "fontSize": FONT_SIZE_BODY, "marginBottom": SPACE_1}),
+        html.Div(pc, style={"color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION}),
+        html.Div(cir, style={"color": COLOR_TEXT_SECONDARY,
+                             "fontSize": FONT_SIZE_CAPTION}),
+    ], style={"background": COLOR_SURFACE_2, "padding": f"{SPACE_2} {SPACE_3}",
+              "borderRadius": RADIUS_SM})
+
+
+_TREND_TH = {"textAlign": "left", "padding": f"{SPACE_1} {SPACE_3}",
+             "color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+             "borderBottom": f"1px solid {COLOR_DIVIDER}", "whiteSpace": "nowrap"}
+_TREND_TD = {"padding": f"{SPACE_1} {SPACE_3}", "color": COLOR_TEXT_SECONDARY,
+             "fontSize": FONT_SIZE_CAPTION, "whiteSpace": "nowrap"}
+
+
+def _scan_table(rows):
+    """All-features BH-FDR scan as a ranked table; q<0.05 rows highlighted."""
+    if not rows:
+        return html.Div("No features to scan.",
+                        style={"color": COLOR_TEXT_TERTIARY,
+                               "fontSize": FONT_SIZE_CAPTION})
+    head = ["feature", "dir", "n sz", "p", "q (BH)", "circadian |ρ|",
+            "post-ictal p"]
+    header = html.Tr([html.Th(h, style=_TREND_TH) for h in head])
+    body = []
+    for r in rows:
+        q = r["q"]
+        hot = np.isfinite(q) and q < 0.05
+        direction = ("↑ onset" if r["median_rho"] < 0 else
+                     "↓ onset" if r["median_rho"] > 0 else "—")
+        cells = [r["feature"], direction, r["n_seizures"], _fmt_p(r["p"]),
+                 _fmt_p(q),
+                 f"{r['circadian']:.2f}" if np.isfinite(r["circadian"]) else "—",
+                 _fmt_p(r["post_p"]) if r["post_available"] else "n/a"]
+        rstyle = {"background": "rgba(94,124,226,0.16)"} if hot else {}
+        body.append(html.Tr([html.Td(str(c), style=_TREND_TD) for c in cells],
+                            style=rstyle))
+    return html.Table([html.Thead(header), html.Tbody(body)],
+                      style={"borderCollapse": "collapse", "width": "100%",
+                             "marginTop": SPACE_2})
+
+
+def _fmt_p(p) -> str:
+    if p is None or not np.isfinite(p):
+        return "—"
+    if p < 0.001:
+        return "<0.001"
+    return f"{p:.3f}"
+
+
+def _trend_test_views(cached, feature):
+    """(forest fig, verdict view, scan table) for the trend-test card — computed
+    synchronously from the cached full (pre+post) matrix."""
+    full = cached.get("full")
+    if full is None or cached.get("empty"):
+        return (empty_fig("Build to run the per-seizure trend test"), "", None)
+    table = _scan_table(_tt.scan_all_features(full, cached.get("metrics") or []))
+    if feature not in full.columns:      # PC coordinates aren't matrix columns
+        note = _callout("The per-seizure forest needs a feature column — PC "
+                        "coordinates aren't in the matrix. Pick a metric above.",
+                        COLOR_TEXT_SECONDARY, "ℹ")
+        return (empty_fig("Pick a metric to see its per-seizure forest"),
+                note, table)
+    pre = full[full["phase"] == "pre"]
+    per = _tt.per_seizure_trend(pre, feature)
+    summary = _tt.across_seizure_test([r["rho"] for r in per])
+    control = _tt.positive_control(full, feature)
+    circ = (float(np.nanmedian([abs(r["hour_rho"]) for r in per]))
+            if per else float("nan"))
+    forest = _forest_fig(per, summary, _seizure_labels(full))
+    verdict = _verdict_view(summary, control, circ, feature)
+    return forest, verdict, table
 
 
 # --------------------------------------------------------------------- #
@@ -1365,18 +1540,24 @@ def register_callbacks(app, store, config):
 
     @app.callback(
         Output("pex-traj", "figure"),
+        Output("pex-trend-forest", "figure"),
+        Output("pex-trend-verdict", "children"),
+        Output("pex-trend-table", "children"),
         Input("pex-job", "data"),
         Input("pex-traj-y", "value"),
         prevent_initial_call=False,
     )
     def _trend_render(jid, traj_y):
-        """Draw the Trend lens (trajectory) from cache on the job pulse or a
-        y-selector change. (The forest + verdict + FDR table attach here in the
-        trend-test step.)"""
+        """Draw the Trend lens from cache on the job pulse or a y-selector change:
+        the lead-time trajectory (visual) + the per-seizure trend test (forest +
+        verdict + all-features FDR table), computed synchronously."""
         cached = _CACHE.get(jid) if jid else None
         if cached is None:
-            return no_update
-        return _trajectory_fig(cached, traj_y or "peak_to_trough")
+            return no_update, no_update, no_update, no_update
+        feature = traj_y or "peak_to_trough"
+        traj = _trajectory_fig(cached, feature)
+        forest, verdict, table = _trend_test_views(cached, feature)
+        return traj, forest, verdict, table
 
     @app.callback(
         Output("pex-details", "children"),

@@ -235,6 +235,52 @@ def test_nav_group_promoted_to_top_level():
     assert _app.SUBTAB_TO_GROUP["periictal_waveform"] == "periictal"
 
 
+# ------------------------------------------------------------------ #
+#  Trend & test lens: forest plot + synchronous views from the cache
+# ------------------------------------------------------------------ #
+
+def _cached_full(n_sz=8, per=40, seed=0):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for sid in range(n_sz):
+        onset = 1.7e9 + sid * 86400
+        for phase, sign in (("pre", 1.0), ("post", -1.0)):
+            tto = np.sort(rng.uniform(1.0, 3600.0, per)) * sign
+            for k in range(per):
+                rows.append({
+                    "seizure_idx": sid, "phase": phase,
+                    "time_to_onset_sec": float(tto[k]),
+                    "seizure_onset_epoch": onset, "seizure_racine": 3,
+                    "hour_of_day": float(rng.uniform(0, 24)),
+                    "line_length": float(-np.log10(abs(tto[k]))
+                                         + rng.normal(0, 0.05)),
+                    "rms_amplitude": float(rng.normal())})
+    return {"empty": False, "full": pd.DataFrame(rows),
+            "metrics": ["line_length", "rms_amplitude"]}
+
+
+def test_forest_fig_diverging_with_null_and_median_lines():
+    from src.periictal import trendtest as tt
+    cached = _cached_full()
+    pre = cached["full"][cached["full"]["phase"] == "pre"]
+    per = tt.per_seizure_trend(pre, "line_length")
+    summ = tt.across_seizure_test([r["rho"] for r in per])
+    fig = pex._forest_fig(per, summ, pex._seizure_labels(cached["full"]))
+    assert len(fig.data) == 1                              # one seizure-marker trace
+    mk = fig.data[0].marker
+    assert mk.reversescale is True and mk.cmin == -1 and mk.cmax == 1
+    assert len(fig.layout.shapes) >= 2                     # null(0) + median vlines
+
+
+def test_trend_test_views_render_and_pc_placeholder():
+    cached = _cached_full()
+    forest, verdict, table = pex._trend_test_views(cached, "line_length")
+    assert len(forest.data) == 1 and verdict is not None and table is not None
+    # a PC coordinate isn't a matrix column -> forest is a placeholder, table stays
+    f2, v2, t2 = pex._trend_test_views(cached, "__pc1__")
+    assert t2 is not None and v2 is not None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
