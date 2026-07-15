@@ -162,6 +162,79 @@ def test_selected_indices_defensive():
                                             {"foo": 1}]}) == [3, 7]
 
 
+# ------------------------------------------------------------------ #
+#  Nav-group split: three sub-tab layouts share a scope bar
+# ------------------------------------------------------------------ #
+
+def _all_ids(node, acc):
+    i = getattr(node, "id", None)
+    if isinstance(i, str):
+        acc.append(i)
+    kids = getattr(node, "children", None)
+    if kids is None:
+        return
+    if not isinstance(kids, (list, tuple)):
+        kids = [kids]
+    for k in kids:
+        if k is not None:
+            _all_ids(k, acc)
+
+
+def _find(node, target):
+    """First component with id==target in the tree (or None)."""
+    if getattr(node, "id", None) == target:
+        return node
+    kids = getattr(node, "children", None)
+    if kids is None:
+        return None
+    if not isinstance(kids, (list, tuple)):
+        kids = [kids]
+    for k in kids:
+        if k is not None:
+            hit = _find(k, target)
+            if hit is not None:
+                return hit
+    return None
+
+
+def test_three_sub_tab_layouts_build_with_scope_and_lens_ids(tmp_path):
+    store = Store(str(tmp_path / "m.db"))
+    scope = {"pex-animal", "pex-protocol", "pex-variant", "pex-window-h",
+             "pex-method", "pex-build", "pex-job", "pex-poll", "pex-preview",
+             "pex-status"}
+    lens = {"layout_embedding": {"pex-graph", "pex-reading", "pex-colorby",
+                                 "pex-details"},
+            "layout_trend": {"pex-traj", "pex-traj-y", "pex-trend-forest",
+                             "pex-trend-verdict", "pex-trend-table"},
+            "layout_waveform": {"pex-erp", "pex-erp-wave", "pex-erp-seizure",
+                                "pex-erp-job", "pex-erp-col"}}
+    for name, want in lens.items():
+        acc: list = []
+        _all_ids(getattr(pex, name)(store), acc)
+        ids = set(acc)
+        assert len(acc) == len(ids), f"{name} has duplicate ids"
+        assert scope <= ids, f"{name} missing scope ids: {scope - ids}"
+        assert want <= ids, f"{name} missing lens ids: {want - ids}"
+
+
+def test_job_store_persists_across_sub_tab_swaps(tmp_path):
+    store = Store(str(tmp_path / "m.db"))
+    job = _find(pex.scope_bar(store), "pex-job")
+    assert job is not None and job.storage_type == "session"
+
+
+def test_nav_group_promoted_to_top_level():
+    from src.dashboard import app as _app
+    grp = next((g for g in _app.NAV_GROUPS if g["id"] == "periictal"), None)
+    assert grp is not None
+    assert [s["id"] for s in grp["subs"]] == [
+        "periictal_embedding", "periictal_trend", "periictal_waveform"]
+    # the old single sub-tab is gone from every group
+    assert all(s["id"] != "periictal_explorer"
+               for g in _app.NAV_GROUPS for s in g["subs"])
+    assert _app.SUBTAB_TO_GROUP["periictal_waveform"] == "periictal"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

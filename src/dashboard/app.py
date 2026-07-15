@@ -113,11 +113,15 @@ NAV_GROUPS = [
         {"id": "waveforms", "label": "Evoked waveforms"},
         {"id": "evoked", "label": "Evoked features"},
         {"id": "chronic_evoked", "label": "Chronic Evoked Analyzer"},
-        {"id": "periictal_explorer", "label": "Peri-ictal Explorer"},
         {"id": "criticality", "label": "Criticality"},
         {"id": "lfp", "label": "LFP browser"},
         {"id": "video", "label": "Video review"},
         {"id": "training", "label": "Training"},
+    ]},
+    {"id": "periictal", "label": "Peri-ictal", "subs": [
+        {"id": "periictal_embedding", "label": "Embedding"},
+        {"id": "periictal_trend", "label": "Trend & test"},
+        {"id": "periictal_waveform", "label": "Waveform"},
     ]},
     {"id": "quality", "label": "Quality", "subs": [
         {"id": "signal", "label": "Signal quality"},
@@ -1043,9 +1047,15 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "chronic_evoked":
                 return _enable_persistence(
                     tabs_chronic_evoked.layout(store))
-            elif tab == "periictal_explorer":
+            elif tab == "periictal_embedding":
                 return _enable_persistence(
-                    tabs_periictal_explorer.layout(store))
+                    tabs_periictal_explorer.layout_embedding(store))
+            elif tab == "periictal_trend":
+                return _enable_persistence(
+                    tabs_periictal_explorer.layout_trend(store))
+            elif tab == "periictal_waveform":
+                return _enable_persistence(
+                    tabs_periictal_explorer.layout_waveform(store))
             elif tab == "jobs_monitor":
                 return _enable_persistence(tabs_jobs_monitor.layout(store))
             elif tab == "workers_monitor":
@@ -1231,7 +1241,9 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
         tabs_evoked.layout, tabs_chronic_evoked.layout,
-        tabs_periictal_explorer.layout,
+        tabs_periictal_explorer.layout_embedding,
+        tabs_periictal_explorer.layout_trend,
+        tabs_periictal_explorer.layout_waveform,
         tabs_jobs_monitor.layout,
         tabs_workers_monitor.layout,
         tabs_settings.layout,

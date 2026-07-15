@@ -181,14 +181,43 @@ def _default_protocol(store, animal) -> str:
     return chronic[0] if chronic else ""
 
 
-def layout(store):
+def _animals_a0(store):
     animals = list_animals(_evoked_dir(store))
     a0 = "BCH111" if "BCH111" in animals else (animals[0] if animals else None)
+    return animals, a0
+
+
+def scope_bar(store):
+    """The shared scope header present on EVERY peri-ictal sub-tab: selection +
+    feature window + build + preview + status, plus the build job store/poll.
+
+    The scope controls persist across sub-tab swaps via the app's automatic
+    session-persistence (``_enable_persistence``); the job Store persists
+    explicitly (Stores are skipped by that walk) so each lens can redraw from the
+    module cache on remount."""
+    animals, a0 = _animals_a0(store)
     return html.Div([
         _title_block(),
         card(section_header("Selection"), _controls(store, animals, a0),
              _window_panel()),
-        card(html.Div(id="pex-preview", style={"marginBottom": SPACE_3}),
+        card(html.Div(id="pex-preview", style={"marginBottom": SPACE_2}),
+             html.Div(id="pex-status", style={"color": COLOR_TEXT_SECONDARY,
+                                              "fontSize": FONT_SIZE_CAPTION,
+                                              "minHeight": "14px"}),
+             style={"marginTop": SPACE_3}),
+        dcc.Interval(id="pex-poll", interval=1200, disabled=True),
+        # storage_type="session" is how a dcc.Store persists its data across
+        # sub-tab swaps (Store has no `persistence` prop) — so a lens can redraw
+        # from the module cache on remount using the retained job id.
+        dcc.Store(id="pex-job", storage_type="session"),
+    ])
+
+
+def layout_embedding(store):
+    """Embedding lens: the PCA/UMAP scatter (+ confound strip) and lasso details."""
+    return html.Div([
+        scope_bar(store),
+        card(_embed_colorby_ctl(),
              dcc.Loading(
                  custom_spinner=loading_icon("Building…"),
                  overlay_style={"visibility": "visible", "opacity": 0.4},
@@ -198,12 +227,19 @@ def layout(store):
                      figure=empty_fig("Press ▶ Build to embed the lead-up stimuli",
                                       hint="Pick an animal and protocol above."))),
              _explainer(),
-             html.Div(id="pex-status", style={"color": COLOR_TEXT_SECONDARY,
-                                              "fontSize": FONT_SIZE_CAPTION,
-                                              "minHeight": "14px",
-                                              "marginTop": SPACE_2}),
              html.Div(id="pex-reading", style={"marginTop": SPACE_3}),
              style={"marginTop": SPACE_4}),
+        card(section_header("Selected points — details on demand"),
+             html.Div(id="pex-details", children=_details_view(None)),
+             style={"marginTop": SPACE_4}),
+    ], style={"padding": SPACE_4})
+
+
+def layout_trend(store):
+    """Trend & test lens: the lead-time trajectory (visual) + the per-seizure
+    trend test (quantitative — attached in the trend-test step)."""
+    return html.Div([
+        scope_bar(store),
         card(section_header("Lead-time trajectory"),
              html.Div([
                  html.Div("Median value per dyadic log-lead-time bin — one point "
@@ -225,16 +261,57 @@ def layout(store):
              dcc.Graph(id="pex-traj", config={"displaylogo": False},
                        figure=empty_fig("Build to see the lead-time trajectory")),
              style={"marginTop": SPACE_4}),
-        card(section_header("Selected points — details on demand"),
-             html.Div(id="pex-details", children=_details_view(None)),
-             style={"marginTop": SPACE_4}),
+        _trend_test_card(),
+    ], style={"padding": SPACE_4})
+
+
+def layout_waveform(store):
+    """Waveform lens: the evoked ERP-image + click-a-column ERP."""
+    _animals, a0 = _animals_a0(store)
+    return html.Div([
+        scope_bar(store),
         _erp_card(store, a0),
-        dcc.Interval(id="pex-poll", interval=1200, disabled=True),
         dcc.Interval(id="pex-erp-poll", interval=1500, disabled=True),
-        dcc.Store(id="pex-job"),
         dcc.Store(id="pex-erp-job"),
         dcc.Store(id="pex-erp-col"),
     ], style={"padding": SPACE_4})
+
+
+def _embed_colorby_ctl() -> html.Div:
+    """The Colour-by dropdown — lives on the Embedding lens (recolours instantly,
+    no rebuild)."""
+    return html.Div(_ctl("Colour by", dcc.Dropdown(
+        id="pex-colorby", clearable=False,
+        style={**DROPDOWN_STYLE, "minWidth": "220px"}),
+        "Recolour instantly (no rebuild). Try hour-of-day and stim fingerprint "
+        "as confound checks."),
+        style={"marginBottom": SPACE_3})
+
+
+def _trend_test_card() -> object:
+    """Per-seizure trend-test card (Trend & test lens): a plain-language verdict,
+    a forest of per-seizure Spearman rho, and an all-features BH-FDR scan. Reads
+    the cached matrix synchronously (no background job)."""
+    return card(
+        section_header("Per-seizure trend test"),
+        html.Div("Collapses each seizure to ONE number — the Spearman correlation "
+                 "of the selected feature with lead-time over that seizure's "
+                 "pre-onset stimuli — then tests whether those per-seizure trends "
+                 "are consistent across seizures (the seizure is the unit of "
+                 "replication, not the stimulus). The post-onset window is a "
+                 "built-in positive control; hour-of-day is the circadian check.",
+                 style={"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+                        "maxWidth": "95ch", "marginBottom": SPACE_3}),
+        html.Div(id="pex-trend-verdict", style={"marginBottom": SPACE_3}),
+        dcc.Graph(id="pex-trend-forest", config={"displaylogo": False},
+                  figure=empty_fig("Build to run the per-seizure trend test")),
+        html.Div("Scanning every feature? Control the false-discovery rate — one "
+                 "p<0.05 across ~22 features is expected by chance. The table "
+                 "below reports Benjamini–Hochberg q-values.",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                        "margin": f"{SPACE_3} 0 {SPACE_2}", "maxWidth": "95ch"}),
+        html.Div(id="pex-trend-table"),
+        style={"marginTop": SPACE_4})
 
 
 def _erp_card(store, a0) -> object:
@@ -421,11 +498,6 @@ def _controls(store, animals, a0) -> html.Div:
                      {"label": "UMAP", "value": "umap"}]),
             "PCA: honest linear projection (axes carry variance). UMAP: "
             "non-linear, distances not meaningful — a figure only."),
-        _ctl("Colour by", dcc.Dropdown(
-            id="pex-colorby", clearable=False,
-            style={**DROPDOWN_STYLE, "minWidth": "220px"}),
-            "Recolour instantly (no rebuild). Try hour-of-day and stim "
-            "fingerprint as confound checks."),
         html.Div(button("▶ Build", "pex-build", icon_name="play",
                         **{"title": "Embed the lead-up stimuli for the current "
                                     "selection. Runs in the background."}),
@@ -1142,27 +1214,17 @@ def register_callbacks(app, store, config):
     @app.callback(
         Output("pex-protocol", "options"),
         Output("pex-protocol", "value"),
-        Output("pex-colorby", "options"),
-        Output("pex-colorby", "value"),
         Output("pex-winmode", "value"),
         Output("pex-win-from", "value"),
         Output("pex-win-to", "value"),
-        Output("pex-traj-y", "options"),
-        Output("pex-traj-y", "value"),
         Input("pex-animal", "value"),
         Input("pex-variant", "value"),
-        State("pex-colorby", "value"),
-        State("pex-traj-y", "value"),
     )
-    def _on_animal(animal, variant, cur_color, cur_traj):
+    def _on_animal(animal, variant):
+        """Scope-only: protocol options + the variant's default feature window.
+        The colour-by and trajectory-y options live with their own lenses."""
         opts = _protocol_options(store, animal)
         pval = _default_protocol(store, animal)
-        copts = _colorby_options(variant or "evoked")
-        cvals = {o["value"] for o in copts}
-        cval = cur_color if cur_color in cvals else "time_to_onset_sec"
-        topts = _traj_y_options(variant or "evoked")
-        tvals = {o["value"] for o in topts}
-        tval = cur_traj if cur_traj in tvals else "peak_to_trough"
         trig = callback_context.triggered_id
         # Reset the feature window to the variant's default when the variant
         # flips (passive needs pre-stim bounds, evoked post-stim).
@@ -1171,11 +1233,40 @@ def register_callbacks(app, store, config):
         else:
             wm, w0, w1 = "full", *_cfg.DEFAULT_EVOKED_WINDOW_MS
         win_reset = trig == "pex-variant"
-        return (opts, (pval if trig == "pex-animal" else no_update), copts, cval,
+        return (opts, (pval if trig == "pex-animal" else no_update),
                 wm if win_reset else no_update,
                 w0 if win_reset else no_update,
-                w1 if win_reset else no_update,
-                topts, tval)
+                w1 if win_reset else no_update)
+
+    @app.callback(
+        Output("pex-colorby", "options"),
+        Output("pex-colorby", "value"),
+        Input("pex-animal", "value"),
+        Input("pex-variant", "value"),
+        State("pex-colorby", "value"),
+        prevent_initial_call=False,
+    )
+    def _embed_colorby_opts(_animal, variant, cur):
+        """Populate the Embedding lens's colour-by dropdown (on mount + on
+        animal/variant change)."""
+        copts = _colorby_options(variant or "evoked")
+        cvals = {o["value"] for o in copts}
+        return copts, (cur if cur in cvals else "time_to_onset_sec")
+
+    @app.callback(
+        Output("pex-traj-y", "options"),
+        Output("pex-traj-y", "value"),
+        Input("pex-animal", "value"),
+        Input("pex-variant", "value"),
+        State("pex-traj-y", "value"),
+        prevent_initial_call=False,
+    )
+    def _trend_traj_opts(_animal, variant, cur):
+        """Populate the Trend lens's trajectory-y dropdown (on mount + on
+        animal/variant change)."""
+        topts = _traj_y_options(variant or "evoked")
+        tvals = {o["value"] for o in topts}
+        return topts, (cur if cur in tvals else "peak_to_trough")
 
     @app.callback(
         Output("pex-preview", "children"),
@@ -1257,7 +1348,7 @@ def register_callbacks(app, store, config):
         cached = _CACHE.get(jid) if jid else None
         if cached is None:
             return no_update, no_update
-        return _embed_fig_reading(cached, color_by)
+        return _embed_fig_reading(cached, color_by or "time_to_onset_sec")
 
     @app.callback(
         Output("pex-graph", "figure", allow_duplicate=True),
