@@ -113,17 +113,27 @@ def test_cache_eviction_bound():
 
 
 def test_render_cached_empty_and_ready_paths():
-    fig, reading, status, disabled, jid = pex._render_cached(
-        {"empty": True}, "time_to_onset_sec", "j")
-    assert disabled is True and jid == "j"
+    fig, reading, status, disabled, jid, traj = pex._render_cached(
+        {"empty": True}, "time_to_onset_sec", "j", "line_length")
+    assert disabled is True and jid == "j" and traj is not None
     sub = _sub()
     ready = {"empty": False, "emb": np.zeros((len(sub), 2)), "sub": sub,
              "readout": {"time_of_day": 0.1, "stim_fingerprint": None},
              "meta": {"n_points": len(sub), "n_total": len(sub),
                       "explained_var": [0.3, 0.2]}, "method": "pca", "n_seizures": 3}
-    fig, reading, status, disabled, jid = pex._render_cached(
-        ready, "time_to_onset_sec", "j2")
-    assert disabled is True and len(fig.data) == 1
+    fig, reading, status, disabled, jid, traj = pex._render_cached(
+        ready, "time_to_onset_sec", "j2", "line_length")
+    assert disabled is True and len(fig.data) == 1 and traj is not None
+
+
+def test_trajectory_fig_from_cache():
+    sub = _sub()
+    cached = {"empty": False, "emb": np.random.default_rng(0).random((len(sub), 2)),
+              "sub": sub}
+    # a feature column, a PC coordinate, and hour-of-day all render.
+    for y in ("line_length", "__pc1__", "__pc2__", "hour_of_day"):
+        assert pex._trajectory_fig(cached, y) is not None
+    assert pex._trajectory_fig({"empty": True}, "line_length") is not None
 
 
 def test_resolve_window_modes():

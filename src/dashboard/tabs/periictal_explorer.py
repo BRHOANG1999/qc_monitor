@@ -46,6 +46,7 @@ from src.periictal import passive as _passive
 from src.periictal import stim_map as _sm
 from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
+from src.periictal import trajectory as _traj
 from src.periictal.selection import summarize_selection
 from src.preictal.isi import scored_seizures
 from src.utils.evoked_output import list_animals
@@ -190,6 +191,27 @@ def layout(store):
                                               "minHeight": "14px",
                                               "marginTop": SPACE_2}),
              html.Div(id="pex-reading", style={"marginTop": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Lead-time trajectory"),
+             html.Div([
+                 html.Div("Median value per dyadic log-lead-time bin — one point "
+                          "per bin, so every time-scale has equal weight and the "
+                          "count imbalance (near-onset is sparse, far-onset "
+                          "abundant) can't distort it. Faint lines = individual "
+                          "seizures (a trend is credible only if consistent "
+                          "across them); hollow markers = low-n bins.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 html.Div(_ctl("Trajectory y", dcc.Dropdown(
+                     id="pex-traj-y", clearable=False,
+                     style={**DROPDOWN_STYLE, "minWidth": "240px"}),
+                     "Which value to trace against lead-time: any feature "
+                     "(median + IQR per bin), a PC embedding coordinate, or "
+                     "hour-of-day as a confound check."),
+                          style={"marginTop": SPACE_3}),
+             ]),
+             dcc.Graph(id="pex-traj", config={"displaylogo": False},
+                       figure=empty_fig("Build to see the lead-time trajectory")),
              style={"marginTop": SPACE_4}),
         card(section_header("Selected points — details on demand"),
              html.Div(id="pex-details", children=_details_view(None)),
@@ -424,6 +446,80 @@ def _pretty(color_by: str) -> str:
     return {"time_to_onset_sec": "time to onset", "hour_of_day": "hour of day",
             "stim_key": "stim fingerprint", "seizure_idx": "seizure",
             "channel": "channel"}.get(color_by, color_by)
+
+
+# --------------------------------------------------------------------- #
+#  Lead-time trajectory (count-agnostic: median per log-lead-time bin)
+# --------------------------------------------------------------------- #
+
+def _traj_y_options(variant: str):
+    opts = [{"label": f"metric: {m}", "value": m}
+            for m in _cfg.metrics_for_variant(variant)]
+    return opts + [{"label": "PC1 (embedding position)", "value": "__pc1__"},
+                   {"label": "PC2 (embedding position)", "value": "__pc2__"},
+                   {"label": "hour of day (confound check)", "value": "hour_of_day"}]
+
+
+def _traj_values(cached, y_key):
+    """(values, y_label) for the chosen trajectory y -- a feature/hour column of
+    the cached subsample, or a PC coordinate of the cached embedding."""
+    sub, emb = cached["sub"], cached["emb"]
+    if y_key == "__pc1__":
+        return emb[:, 0], "PC1 (embedding)"
+    if y_key == "__pc2__" and emb.shape[1] > 1:
+        return emb[:, 1], "PC2 (embedding)"
+    if y_key in sub.columns:
+        return sub[y_key].to_numpy(dtype=float), _pretty(y_key)
+    return None, y_key
+
+
+def _trajectory_fig(cached, y_key) -> go.Figure:
+    if not cached or cached.get("empty"):
+        return empty_fig("Build to see the lead-time trajectory")
+    values, ylabel = _traj_values(cached, y_key)
+    if values is None:
+        return empty_fig("Pick a trajectory metric")
+    sub = cached["sub"]
+    tto = sub["time_to_onset_sec"].to_numpy(dtype=float)
+    hi = float(np.nanmax(tto)) if tto.size else 21600.0
+    edges = _traj.default_edges(hi)
+    tr = _traj.lead_time_trajectory(tto, values,
+                                    sub["seizure_idx"].to_numpy(), edges)
+    return _render_trajectory(tr, ylabel, hi)
+
+
+def _render_trajectory(tr, ylabel, hi) -> go.Figure:
+    c, med = tr["centers"], tr["median"]
+    ok = np.isfinite(med)
+    if not ok.any():
+        return empty_fig("Not enough points to bin a trajectory")
+    fig = go.Figure()
+    for m in tr["per_seizure"].values():                 # faint per-seizure lines
+        fig.add_trace(go.Scatter(
+            x=c, y=m, mode="lines", connectgaps=False, hoverinfo="skip",
+            showlegend=False, line=dict(width=1, color="rgba(160,160,176,0.22)")))
+    xb = np.concatenate([c[ok], c[ok][::-1]])            # IQR band
+    yb = np.concatenate([tr["p75"][ok], tr["p25"][ok][::-1]])
+    fig.add_trace(go.Scatter(x=xb, y=yb, fill="toself", mode="lines",
+                             line=dict(width=0), hoverinfo="skip", showlegend=False,
+                             fillcolor="rgba(94,124,226,0.16)"))
+    low = tr["low_n"][ok]
+    fig.add_trace(go.Scatter(                            # aggregate median
+        x=c[ok], y=med[ok], mode="lines+markers", showlegend=False,
+        line=dict(width=2, color=COLOR_ACCENT),
+        marker=dict(size=[6 if lo else 9 for lo in low], color=COLOR_ACCENT,
+                    symbol=["circle-open" if lo else "circle" for lo in low],
+                    line=dict(width=1.5, color=COLOR_ACCENT)),
+        customdata=tr["n"][ok],
+        hovertemplate="lead %{x:.3s}s · median %{y:.3g} · n=%{customdata}"
+                      "<extra></extra>"))
+    tv, tt = _pal.time_axis_ticks(hi)
+    fig.update_layout(
+        height=300, margin=dict(l=54, r=20, t=22, b=40),
+        xaxis=dict(title="lead time before onset (log)", type="log",
+                   tickvals=tv, ticktext=tt, autorange="reversed"),
+        yaxis=dict(title=ylabel), uirevision="pex-traj")
+    return fig
 
 
 # --------------------------------------------------------------------- #
@@ -706,15 +802,17 @@ def _default_cache_dir() -> str:
     return os.path.join(root, "data", "derivatives", "periictal", "cache")
 
 
-def _render_cached(cached, color_by, jid):
-    """(figure, reading, status, poll_disabled, job) for a ready build."""
+def _render_cached(cached, color_by, jid, traj_y):
+    """(figure, reading, status, poll_disabled, job, trajectory) for a ready
+    build."""
     if cached.get("empty"):
         msg = ("No lead-up stimuli — fewer than 2 seizures, none in this protocol, "
                "or no fresh sidecars for this animal.")
-        return empty_fig(msg), "", msg, True, jid
+        return empty_fig(msg), "", msg, True, jid, empty_fig(msg)
     fig = _figure(cached["emb"], cached["sub"], color_by,
                   cached.get("method", "pca"), cached.get("meta"))
-    return fig, _reading_strip(cached), "✓ built", True, jid
+    traj = _trajectory_fig(cached, traj_y or "peak_to_trough")
+    return fig, _reading_strip(cached), "✓ built", True, jid, traj
 
 
 def register_callbacks(app, store, config):
@@ -730,16 +828,22 @@ def register_callbacks(app, store, config):
         Output("pex-winmode", "value"),
         Output("pex-win-from", "value"),
         Output("pex-win-to", "value"),
+        Output("pex-traj-y", "options"),
+        Output("pex-traj-y", "value"),
         Input("pex-animal", "value"),
         Input("pex-variant", "value"),
         State("pex-colorby", "value"),
+        State("pex-traj-y", "value"),
     )
-    def _on_animal(animal, variant, cur_color):
+    def _on_animal(animal, variant, cur_color, cur_traj):
         opts = _protocol_options(store, animal)
         pval = _default_protocol(store, animal)
         copts = _colorby_options(variant or "evoked")
         cvals = {o["value"] for o in copts}
         cval = cur_color if cur_color in cvals else "time_to_onset_sec"
+        topts = _traj_y_options(variant or "evoked")
+        tvals = {o["value"] for o in topts}
+        tval = cur_traj if cur_traj in tvals else "peak_to_trough"
         trig = callback_context.triggered_id
         # Reset the feature window to the variant's default when the variant
         # flips (passive needs pre-stim bounds, evoked post-stim).
@@ -751,7 +855,8 @@ def register_callbacks(app, store, config):
         return (opts, (pval if trig == "pex-animal" else no_update), copts, cval,
                 wm if win_reset else no_update,
                 w0 if win_reset else no_update,
-                w1 if win_reset else no_update)
+                w1 if win_reset else no_update,
+                topts, tval)
 
     @app.callback(
         Output("pex-preview", "children"),
@@ -782,6 +887,7 @@ def register_callbacks(app, store, config):
         Output("pex-status", "children"),
         Output("pex-poll", "disabled"),
         Output("pex-job", "data"),
+        Output("pex-traj", "figure"),
         Input("pex-build", "n_clicks"),
         Input("pex-poll", "n_intervals"),
         State("pex-animal", "value"),
@@ -794,17 +900,19 @@ def register_callbacks(app, store, config):
         State("pex-win-from", "value"),
         State("pex-win-to", "value"),
         State("pex-win-guard", "value"),
+        State("pex-traj-y", "value"),
         prevent_initial_call=True,
     )
     def _build_or_poll(_n, _iv, animal, protocol, variant, window_h,
-                       method, color_by, winmode, wf, wt, wg):
+                       method, color_by, winmode, wf, wt, wg, traj_y):
         if not animal:
-            return no_update, no_update, "Pick an animal.", True, no_update
+            return (no_update, no_update, "Pick an animal.", True, no_update,
+                    no_update)
         try:
             sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
         except ValueError as e:
             return (empty_fig("Invalid feature window", hint=str(e)),
-                    "", f"⚠ Feature window: {e}", True, no_update)
+                    "", f"⚠ Feature window: {e}", True, no_update, no_update)
         window_h = float(window_h or 6.0)
         cap = _cfg.INTERACTIVE_POINT_CAP
         jid = _job_id(animal, protocol or "", variant, window_h, method, cap,
@@ -813,14 +921,14 @@ def register_callbacks(app, store, config):
             cached = _CACHE.get(jid)
             state = dict(_JOBS.get(jid) or {})
         if cached is not None:
-            return _render_cached(cached, color_by, jid)
+            return _render_cached(cached, color_by, jid, traj_y)
         if state.get("status") == "error":
             return (empty_fig("Build failed", hint=state.get("progress", "")),
-                    "", state.get("progress", "error"), True, no_update)
+                    "", state.get("progress", "error"), True, no_update, no_update)
         _kick(store, evoked_dir, jid, animal, protocol or "", variant,
               window_h, method, cap, sv, cfg)
         prog = (_JOBS.get(jid) or {}).get("progress", "starting…")
-        return no_update, no_update, f"⏳ {prog}", False, no_update
+        return no_update, no_update, f"⏳ {prog}", False, no_update, no_update
 
     @app.callback(
         Output("pex-graph", "figure", allow_duplicate=True),
@@ -834,6 +942,18 @@ def register_callbacks(app, store, config):
             return no_update
         return _figure(cached["emb"], cached["sub"], color_by,
                        cached.get("method", "pca"), cached.get("meta"))
+
+    @app.callback(
+        Output("pex-traj", "figure", allow_duplicate=True),
+        Input("pex-traj-y", "value"),
+        State("pex-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _retraj(traj_y, jid):
+        cached = _CACHE.get(jid) if jid else None
+        if not cached or cached.get("empty"):
+            return no_update
+        return _trajectory_fig(cached, traj_y or "peak_to_trough")
 
     @app.callback(
         Output("pex-details", "children"),

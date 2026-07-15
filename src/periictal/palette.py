@@ -36,6 +36,37 @@ METRIC_SCALE = "Viridis"            # perceptually uniform (feature magnitude)
 _ALWAYS_CATEGORICAL = ("stim_key", "channel", "stim_status")
 
 
+# Human-readable lead-time gridmarks -- one source of truth for the
+# '1s / 10s / 1m / 10m / 1h …' ticks on the colourbar AND the trajectory axis.
+_TIME_MARKS = [(1, "1s"), (10, "10s"), (60, "1m"), (600, "10m"), (3600, "1h"),
+               (21600, "6h"), (86400, "1d"), (604800, "1w")]
+
+
+def _time_marks(hi_sec: float):
+    hi = float(hi_sec) if hi_sec else 1.0
+    return [(s, lbl) for s, lbl in _TIME_MARKS if s <= hi * 1.2]
+
+
+def log_time_ticks(hi_sec: float):
+    """(log10-second tickvals, labels) for a COLOUR axis whose values are already
+    log10(seconds) -- e.g. the time-to-onset colourbar."""
+    keep = _time_marks(hi_sec)
+    if not keep:
+        return [], []
+    tv, tt = zip(*[(np.log10(s), lbl) for s, lbl in keep])
+    return list(tv), list(tt)
+
+
+def time_axis_ticks(hi_sec: float):
+    """(second tickvals, labels) for a plotly log AXIS whose data is in seconds
+    -- e.g. the trajectory x-axis (``xaxis.type='log'``)."""
+    keep = _time_marks(hi_sec)
+    if not keep:
+        return [], []
+    sv, tt = zip(*keep)
+    return list(sv), list(tt)
+
+
 def cyclic_scale() -> list:
     """Perceptually-uniform CYCLIC colourscale (Twilight) as a plotly colorscale
     list. Endpoints coincide, so hour 0 and hour 24 render identically."""
@@ -93,10 +124,7 @@ def continuous_spec(color_by: str, values) -> dict:
         # log10(seconds) spreads 1s / 10s / 1min / 10min / 1h across the map.
         sec = np.maximum(v, 1.0)                         # floor at 1 s (no log 0)
         hi = float(sec.max()) if sec.size else 1.0
-        marks = [(1, "1s"), (10, "10s"), (60, "1m"), (600, "10m"),
-                 (3600, "1h"), (21600, "6h"), (86400, "1d"), (604800, "1w")]
-        tv = [np.log10(s) for s, _ in marks if s <= hi * 1.2]
-        tt = [lbl for s, lbl in marks if s <= hi * 1.2]
+        tv, tt = log_time_ticks(hi)
         return {"vals": np.log10(sec), "scale": SEQUENTIAL_SCALE, "reverse": True,
                 "label": "time to onset (log)", "cmin": None, "cmax": None,
                 "ticks": (tv, tt) if tv else None}
