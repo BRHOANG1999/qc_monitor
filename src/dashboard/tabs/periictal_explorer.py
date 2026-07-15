@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import OrderedDict
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -47,8 +48,11 @@ from src.periictal import stim_map as _sm
 from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
 from src.periictal import trajectory as _traj
+from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
+                                    sliding_trial_average)
 from src.periictal.selection import summarize_selection
 from src.preictal.isi import scored_seizures
+from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
 
 # Where the signature-keyed matrix cache lives.
@@ -216,9 +220,72 @@ def layout(store):
         card(section_header("Selected points — details on demand"),
              html.Div(id="pex-details", children=_details_view(None)),
              style={"marginTop": SPACE_4}),
+        _erp_card(store, a0),
         dcc.Interval(id="pex-poll", interval=1200, disabled=True),
+        dcc.Interval(id="pex-erp-poll", interval=1500, disabled=True),
         dcc.Store(id="pex-job"),
+        dcc.Store(id="pex-erp-job"),
     ], style={"padding": SPACE_4})
+
+
+def _erp_card(store, a0) -> object:
+    """The ERP-image card: raw evoked waveforms of the trials leading into one
+    selected seizure, stacked as a heatmap (columns = trials, rows = post-stim
+    ms, colour = signed amplitude)."""
+    controls = html.Div([
+        _ctl("Seizure", dcc.Dropdown(
+            id="pex-erp-seizure", clearable=False,
+            style={**DROPDOWN_STYLE, "minWidth": "220px"}),
+            "Which seizure's lead-up to show (the trials lead into its onset)."),
+        _ctl("Lookback (min)", dcc.Input(
+            id="pex-erp-lookback", type="number", value=60, min=1, max=360,
+            step="any", debounce=True, style=_WIN_INP),
+            "How far before onset to read trials. ~1 h ≈ one recording."),
+        _ctl("Window from (ms)", dcc.Input(
+            id="pex-erp-from", type="number", value=1, step="any", debounce=True,
+            style=_WIN_INP), "Post-stim window start (excludes the t=0 artifact)."),
+        _ctl("to (ms)", dcc.Input(
+            id="pex-erp-to", type="number", value=200, step="any", debounce=True,
+            style=_WIN_INP), "Post-stim window end."),
+        _ctl("Avg trials (N)", dcc.Input(
+            id="pex-erp-n", type="number", value=20, min=1, max=500, step=1,
+            debounce=True, style=_WIN_INP),
+            "Sliding trial-average window: each column = mean of N trials."),
+        _ctl("Overlap (%)", dcc.Input(
+            id="pex-erp-overlap", type="number", value=50, min=0, max=95, step=1,
+            debounce=True, style=_WIN_INP),
+            "Overlap between successive N-trial windows."),
+        _ctl("Contrast (pct)", dcc.Input(
+            id="pex-erp-contrast", type="number", value=99, min=80, max=100,
+            step="any", debounce=True, style=_WIN_INP),
+            "Colour range = ± this percentile of |amplitude| (clips outliers)."),
+        html.Div(button("▶ Build ERP", "pex-erp-build", icon_name="play",
+                        **{"title": "Read the raw traces for this seizure's "
+                                    "lead-up and stack them. Runs in the "
+                                    "background (~15 s per recording)."}),
+                 style={"alignSelf": "flex-end"}),
+    ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+              "alignItems": "flex-start"})
+    return card(
+        section_header("Evoked ERP-image — trials into onset"),
+        html.Div("Each column is an evoked-response trial (smoothed by the "
+                 "N-trial sliding average), ordered so they lead into the "
+                 "seizure — onset at the RIGHT. Rows are post-stim samples; "
+                 "colour is signed amplitude (diverging at 0), so the biphasic "
+                 "waveform is visible. Reads raw traces on demand.",
+                 style={"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+                        "maxWidth": "95ch", "marginBottom": SPACE_3}),
+        controls,
+        html.Div(id="pex-erp-warn", style={"marginTop": SPACE_2}),
+        dcc.Loading(
+            custom_spinner=loading_icon("Reading traces…"),
+            overlay_style={"visibility": "visible", "opacity": 0.4},
+            children=dcc.Graph(id="pex-erp", config={"displaylogo": False},
+                               figure=empty_fig("Pick a seizure, then ▶ Build ERP"))),
+        html.Div(id="pex-erp-status", style={"color": COLOR_TEXT_SECONDARY,
+                                             "fontSize": FONT_SIZE_CAPTION,
+                                             "minHeight": "14px", "marginTop": SPACE_2}),
+        style={"marginTop": SPACE_4})
 
 
 _EXPLAIN_P = {"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
@@ -815,6 +882,134 @@ def _render_cached(cached, color_by, jid, traj_y):
     return fig, _reading_strip(cached), "✓ built", True, jid, traj
 
 
+# --------------------------------------------------------------------- #
+#  ERP-image: raw-trace gather job + heatmap
+# --------------------------------------------------------------------- #
+
+_ERP_JOBS: dict = {}
+_ERP_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_ERP_CACHE_MAX = 4
+
+
+def _scoped_seizures(store, animal, protocol):
+    if not animal:
+        return []
+    szs = scored_seizures(store, animal)
+    if protocol:
+        szs = [s for s in szs if protocol in _tok(s.session_dir)]
+    return szs
+
+
+def _erp_seizure_options(store, animal, protocol):
+    out = []
+    for i, s in enumerate(_scoped_seizures(store, animal, protocol)):
+        dt = datetime.fromtimestamp(s.onset_epoch)
+        rac = s.racine if s.racine is not None else "?"
+        out.append({"label": f"{dt:%Y-%m-%d %H:%M} · R{rac}", "value": i})
+    return out
+
+
+def _erp_key(animal, protocol, sz, lookback, frm, to) -> str:
+    return f"{animal}|{protocol}|{sz}|{lookback}|{frm}|{to}"
+
+
+def _erp_set(key, **kw):
+    with _LOCK:
+        _ERP_JOBS.setdefault(key, {}).update(kw)
+
+
+def _erp_finish(key, result):
+    with _LOCK:
+        _ERP_CACHE[key] = result
+        while len(_ERP_CACHE) > _ERP_CACHE_MAX:
+            _ERP_CACHE.popitem(last=False)
+        _ERP_JOBS[key] = {"status": "done", "progress": "done"}
+
+
+def _erp_kick(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to):
+    with _LOCK:
+        if key in _ERP_CACHE:
+            return
+        st = _ERP_JOBS.get(key)
+        if st and st.get("status") == "running":
+            return
+        _ERP_JOBS[key] = {"status": "running", "progress": "starting…"}
+    threading.Thread(
+        target=_erp_worker, name=f"erp-{key}", daemon=True,
+        args=(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)
+    ).start()
+
+
+def _erp_worker(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to):
+    """Gather the seizure's lead-up traces (heavy) and cache them. Never raises."""
+    try:
+        szs = _scoped_seizures(store, animal, protocol)
+        if sz is None or sz >= len(szs):
+            _erp_finish(key, {"empty": True})
+            return
+        s = szs[sz]
+        rec_only = False
+        try:
+            rec_only = _sm.resolve_fingerprint(
+                store, s.session_dir, animal).status == "record_only"
+        except Exception:                                     # noqa: BLE001
+            pass
+        cfg = FeatureConfig(window_start_ms=float(frm), window_end_ms=float(to))
+        res = gather_leadup_trials(
+            evoked_dir, animal, s.onset_epoch, float(lookback) * 60.0, cfg=cfg,
+            progress=lambda i, n, fp: _erp_set(
+                key, progress=f"reading traces… ({i + 1}/{n})"))
+        res["empty"] = int(res["trials"].shape[0]) == 0
+        res["record_only"] = rec_only
+        _erp_finish(key, res)
+    except Exception as e:                                    # noqa: BLE001
+        _erp_set(key, status="error", progress=f"error: {e}")
+
+
+def _erp_figure(gathered, n, overlap, contrast) -> go.Figure:
+    if not gathered or gathered.get("empty"):
+        return empty_fig("No trials in this lead-up window")
+    trials, row_ms, tto = gathered["trials"], gathered["row_ms"], gathered["tto"]
+    step = max(1, round(float(n) * (1.0 - float(overlap) / 100.0)))
+    z, col_tto = sliding_trial_average(trials, tto, int(n), step)
+    z, rm = decimate_rows(z, row_ms, 300)
+    absz = np.abs(z[np.isfinite(z)])
+    zmax = float(np.percentile(absz, float(contrast))) if absz.size else 1.0
+    zmax = zmax or 1.0
+    ncol = z.shape[1]
+    x = np.arange(ncol)
+    ti = np.linspace(0, ncol - 1, min(7, ncol)).astype(int) if ncol else []
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x, y=rm, colorscale="RdBu", reversescale=True, zmid=0,
+        zmin=-zmax, zmax=zmax,
+        colorbar=dict(title=dict(text="amplitude", font=dict(size=9)),
+                      thickness=10, len=0.85, x=1.005),
+        hovertemplate="%{y:.0f} ms · %{z:.3g}<extra></extra>"))
+    fig.update_layout(
+        height=420, margin=dict(l=56, r=20, t=22, b=44),
+        xaxis=dict(title="trial windows  (far ← → onset)",
+                   tickvals=[x[k] for k in ti],
+                   ticktext=[_fmt_dur(col_tto[k]) for k in ti]),
+        yaxis=dict(title="post-stim time (ms)"), uirevision="pex-erp")
+    return fig
+
+
+def _erp_render(gathered, n, overlap, contrast, key):
+    """(figure, status, poll_disabled, job, warn) for a ready ERP gather."""
+    if gathered.get("empty"):
+        msg = "No trials in this seizure's lead-up (unreachable traces or none in window)."
+        return empty_fig(msg), msg, True, key, ""
+    warn = ""
+    if gathered.get("record_only"):
+        warn = _callout("This animal was record-only in this session (not "
+                        "stimulated) — these traces are the passive LFP around "
+                        "another animal's pulses, not true evoked responses.",
+                        COLOR_WARNING, "⚠")
+    nt = int(gathered["trials"].shape[0])
+    return (_erp_figure(gathered, n, overlap, contrast),
+            f"✓ built from {nt:,} trials", True, key, warn)
+
+
 def register_callbacks(app, store, config):
     global _CACHE_DIR
     _CACHE_DIR = _default_cache_dir()
@@ -967,3 +1162,70 @@ def register_callbacks(app, store, config):
             return _details_view(None)
         idx = _selected_indices(selected)
         return _details_view(summarize_selection(cached["sub"], idx))
+
+    # --- ERP-image callbacks --- #
+
+    @app.callback(
+        Output("pex-erp-seizure", "options"),
+        Output("pex-erp-seizure", "value"),
+        Input("pex-animal", "value"),
+        Input("pex-protocol", "value"),
+        State("pex-erp-seizure", "value"),
+    )
+    def _erp_seizures(animal, protocol, cur):
+        opts = _erp_seizure_options(store, animal, protocol or "")
+        vals = {o["value"] for o in opts}
+        val = cur if cur in vals else (opts[-1]["value"] if opts else None)
+        return opts, val
+
+    @app.callback(
+        Output("pex-erp", "figure"),
+        Output("pex-erp-status", "children"),
+        Output("pex-erp-poll", "disabled"),
+        Output("pex-erp-job", "data"),
+        Output("pex-erp-warn", "children"),
+        Input("pex-erp-build", "n_clicks"),
+        Input("pex-erp-poll", "n_intervals"),
+        State("pex-animal", "value"),
+        State("pex-protocol", "value"),
+        State("pex-erp-seizure", "value"),
+        State("pex-erp-lookback", "value"),
+        State("pex-erp-from", "value"),
+        State("pex-erp-to", "value"),
+        State("pex-erp-n", "value"),
+        State("pex-erp-overlap", "value"),
+        State("pex-erp-contrast", "value"),
+        prevent_initial_call=True,
+    )
+    def _erp_build_or_poll(_n, _iv, animal, protocol, sz, lookback, frm, to,
+                           navg, overlap, contrast):
+        if not animal or sz is None:
+            return no_update, "Pick a seizure.", True, no_update, no_update
+        lookback = float(lookback or 60.0)
+        key = _erp_key(animal, protocol or "", sz, lookback, frm, to)
+        with _LOCK:
+            gathered = _ERP_CACHE.get(key)
+            state = dict(_ERP_JOBS.get(key) or {})
+        if gathered is not None:
+            return _erp_render(gathered, navg, overlap, contrast, key)
+        if state.get("status") == "error":
+            return (empty_fig("ERP build failed", hint=state.get("progress", "")),
+                    state.get("progress", "error"), True, no_update, no_update)
+        _erp_kick(store, evoked_dir, key, animal, protocol or "", sz, lookback,
+                  frm, to)
+        prog = (_ERP_JOBS.get(key) or {}).get("progress", "starting…")
+        return no_update, f"⏳ {prog}", False, no_update, no_update
+
+    @app.callback(
+        Output("pex-erp", "figure", allow_duplicate=True),
+        Input("pex-erp-n", "value"),
+        Input("pex-erp-overlap", "value"),
+        Input("pex-erp-contrast", "value"),
+        State("pex-erp-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _erp_rerender(navg, overlap, contrast, key):
+        gathered = _ERP_CACHE.get(key) if key else None
+        if not gathered or gathered.get("empty"):
+            return no_update
+        return _erp_figure(gathered, navg, overlap, contrast)
