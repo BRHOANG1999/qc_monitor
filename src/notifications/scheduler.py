@@ -37,6 +37,7 @@ from src.notifications.eod_digest import send_eod_digest
 from src.notifications.video_weekly import send_video_weekly
 from src.notifications.evoked_weekly import send_evoked_weekly
 from src.notifications.review_weekly import send_review_weekly
+from src.notifications.coverage_monitor import send_coverage_digest
 from src.notifications import queue_watch
 
 logger = logging.getLogger("qc_monitor.notifications.scheduler")
@@ -55,6 +56,7 @@ class NotificationState:
     video_weekly: str = ""
     evoked_weekly: str = ""
     review_weekly: str = ""
+    coverage: str = ""
     queue_stuck: bool = False
 
 
@@ -122,6 +124,7 @@ class DigestScheduler:
                 # send-once date never round-tripped -> the weekly review
                 # digest could re-send after a restart. Round-trip it.
                 review_weekly=str(raw.get("review_weekly") or ""),
+                coverage=str(raw.get("coverage") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
             )
         except (FileNotFoundError, json.JSONDecodeError):
@@ -207,6 +210,7 @@ class DigestScheduler:
             self._tick_video_weekly(now, fired)
             self._tick_evoked_weekly(now, fired)
             self._tick_review_weekly(now, fired)
+            self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
             if fired:
                 self._save_state()
@@ -261,6 +265,33 @@ class DigestScheduler:
         self._state.eod = now.date().isoformat()
         fired["eod"] = bool(result.get("sent"))
         logger.info("EOD digest result: %s", result)
+
+    def _tick_coverage(self, now: datetime, fired: dict) -> None:
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("coverage_digest", {}) or {}
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        hour = int(cfg.get("hour", 8))
+        if not self._due_daily(now, hour, self._state.coverage):
+            return
+        if not self._claim("coverage", now):
+            self._state.coverage = now.date().isoformat()
+            return
+        logger.info("Coverage digest fire: %s %02d:%02d",
+                     now.date().isoformat(), now.hour, now.minute)
+        try:
+            result = send_coverage_digest(now.date(), self._config,
+                                          self._store, self._emailer)
+        except Exception as e:
+            logger.error("Coverage digest raised: %s", e, exc_info=True)
+            self._release("coverage", now)
+            return
+        # Mark sent for the day whether or not it emailed -- a HEALTHY day
+        # legitimately returns sent=False, and we don't want to re-run the
+        # (heavy) scan every tick for the rest of the day.
+        self._state.coverage = now.date().isoformat()
+        fired["coverage"] = bool(result.get("sent"))
+        logger.info("Coverage digest result: %s", result)
 
     def _tick_video_weekly(self, now: datetime, fired: dict) -> None:
         cfg = (self._config.get("notifications", {}) or {}) \

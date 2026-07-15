@@ -851,4 +851,34 @@ CREATE TABLE IF NOT EXISTS preictal_job (
 );
 CREATE INDEX IF NOT EXISTS idx_preictal_job_status
     ON preictal_job(status, created_at);
+
+-- coverage_ack: a PI/operator acknowledgement that a specific coverage gap is
+-- EXPECTED (a legit zero-epoch recording, an intentionally-skipped animal, a
+-- metric never computed for that file). The coverage digest reports only
+-- UNACKED gaps, so its false-positive rate stays near zero (a digest full of
+-- known-fine gaps gets filtered inside two weeks). Scoped to the exact
+-- (file_path, gap_class): if the file's gap class later changes (an 'errored'
+-- file you acked goes 'done', or a 'done' file later errors), the old ack no
+-- longer matches and the NEW gap re-surfaces -- a stale ack can never silently
+-- swallow a genuinely new problem on the same path.
+CREATE TABLE IF NOT EXISTS coverage_ack (
+    file_path TEXT NOT NULL,
+    gap_class TEXT NOT NULL,
+    reason TEXT,
+    acked_by TEXT,
+    acked_at TEXT NOT NULL,
+    PRIMARY KEY (file_path, gap_class)
+);
+
+-- job_heartbeat: the non-circular dead-man's-switch. A standing job writes
+-- tick_fired_at BEFORE it runs (so it's recorded even if the run then throws)
+-- and last_success_at only on a clean finish. Liveness is judged from the GAP
+-- between the two -- never reported from inside the run it measures -- so a scan
+-- that dies still surfaces instead of going silent.
+CREATE TABLE IF NOT EXISTS job_heartbeat (
+    job TEXT PRIMARY KEY,
+    tick_fired_at TEXT,
+    last_success_at TEXT,
+    note TEXT
+);
 """

@@ -5356,6 +5356,117 @@ class Store:
         return sorted(by_animal.values(),
                        key=lambda d: -d["n_unreviewed"])
 
+    # ---- coverage monitor: gap acks + job heartbeat ------------------ #
+
+    def coverage_ack(self, file_path: str, gap_class: str, *,
+                     reason: str = "", acked_by: str = "") -> None:
+        """Mark a (file_path, gap_class) coverage gap as expected/OK so the
+        coverage digest stops reporting it. Re-acking updates the reason."""
+        assert file_path and gap_class, "file_path + gap_class required"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO coverage_ack
+                       (file_path, gap_class, reason, acked_by, acked_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(file_path, gap_class) DO UPDATE SET
+                       reason=excluded.reason, acked_by=excluded.acked_by,
+                       acked_at=excluded.acked_at""",
+                (file_path, gap_class, reason, acked_by,
+                 datetime.now().isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def coverage_unack(self, file_path: str, gap_class: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM coverage_ack "
+                         "WHERE file_path=? AND gap_class=?",
+                         (file_path, gap_class))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def coverage_acked_set(self) -> set:
+        """{(file_path, gap_class)} the operator has acknowledged as expected."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT file_path, gap_class FROM coverage_ack").fetchall()
+            return {(r["file_path"], r["gap_class"]) for r in rows}
+        finally:
+            conn.close()
+
+    def coverage_pipeline_gaps(self, cap: int = 1000) -> dict:
+        """processed_files pipeline gap classes -> {class: {count, paths}} where
+        paths is up to *cap* offending file_paths (so the caller can ack-filter
+        precisely for the common small case). Cheap; catches an ingest stall
+        even though these are currently zero."""
+        classes = {
+            "stuck_pending": "status='pending'",
+            "stale_processing": "status='processing'",
+            "errored": "status IN ('error','matlab_error')",
+            "missing_duration":
+                "status='done' AND (duration_sec IS NULL OR duration_sec<=0)",
+        }
+        out: dict = {}
+        conn = self._connect()
+        try:
+            for cls, where in classes.items():
+                n = conn.execute(
+                    f"SELECT COUNT(*) FROM processed_files WHERE {where}"
+                ).fetchone()[0]
+                paths = [r["file_path"] for r in conn.execute(
+                    f"SELECT file_path FROM processed_files WHERE {where} "
+                    f"LIMIT ?", (int(cap),)).fetchall()]
+                out[cls] = {"count": int(n), "paths": paths}
+            return out
+        finally:
+            conn.close()
+
+    def heartbeat_tick(self, job: str) -> None:
+        """Record that *job* fired NOW -- written BEFORE the run, so a run that
+        then throws still leaves a tick timestamp. The dead-man's-switch keys off
+        the gap between this and last_success, never from inside the run."""
+        assert job, "job required"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO job_heartbeat (job, tick_fired_at) VALUES (?,?)
+                   ON CONFLICT(job) DO UPDATE SET
+                       tick_fired_at=excluded.tick_fired_at""",
+                (job, datetime.now().isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def heartbeat_success(self, job: str, note: str = "") -> None:
+        """Record a CLEAN completion of *job* NOW (only on success)."""
+        assert job, "job required"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO job_heartbeat (job, last_success_at, note)
+                   VALUES (?,?,?)
+                   ON CONFLICT(job) DO UPDATE SET
+                       last_success_at=excluded.last_success_at,
+                       note=excluded.note""",
+                (job, datetime.now().isoformat(), note))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def heartbeat_get(self, job: str) -> dict | None:
+        conn = self._connect()
+        try:
+            r = conn.execute(
+                "SELECT job, tick_fired_at, last_success_at, note "
+                "FROM job_heartbeat WHERE job=?", (job,)).fetchone()
+            return dict(r) if r else None
+        finally:
+            conn.close()
+
     def flagged_pool_counts_per_animal(self) -> dict[str, int]:
         """Per-animal count of the AUTO-FILTER FLAG backlog still awaiting
         review -- the SAME set the Video Review "Flag" queue shows: a video

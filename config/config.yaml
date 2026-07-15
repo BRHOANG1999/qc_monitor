@@ -267,6 +267,17 @@ notifications:
   preictal_daily:
     enabled: true
     hour: 20
+  # Coverage monitor: daily scan for recordings that fell through the cracks --
+  # evoked *_evoked.mat with no feature sidecar (the gap that starved the evoked
+  # figures) + processed_files pipeline stalls. Silent on a healthy day. Only
+  # counts an evoked recording as a real gap once it's been unanalyzed longer
+  # than stale_hours (fresh arrivals are a healthy backlog, not a failure).
+  # allowlist: substrings (animal ids / path fragments) whose gaps are expected.
+  coverage_digest:
+    enabled: true
+    hour: 8
+    stale_hours: 48
+    allowlist: []
 review_queue:
   # Per-undergrad behavioral review queue. Pulls a list of
   # unreviewed recordings for the user's assigned animals from
