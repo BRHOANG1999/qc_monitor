@@ -30,6 +30,18 @@ _MAX_FILES = 2_000_000        # NASA Rule 2.
 _MAX_TRIALS = 2_000_000
 
 
+def window_starts(n_trials: int, n: int, step: int) -> list:
+    """Start indices of the sliding trial windows (one per output column). The
+    last window is always included so the nearest-onset trials are never
+    dropped."""
+    n = int(max(1, min(n, max(1, n_trials))))
+    step = int(max(1, step))
+    starts = list(range(0, max(1, n_trials - n + 1), step))
+    if starts and starts[-1] != n_trials - n and n_trials - n > 0:
+        starts.append(n_trials - n)
+    return starts
+
+
 def sliding_trial_average(trials: np.ndarray, tto: np.ndarray, n: int,
                           step: int):
     """Moving average across ordered trials: each output column is the mean of a
@@ -45,18 +57,34 @@ def sliding_trial_average(trials: np.ndarray, tto: np.ndarray, n: int,
     assert trials.shape[0] == tto.shape[0], "trials/tto length mismatch"
     nt = trials.shape[0]
     n = int(max(1, min(n, nt)))
-    step = int(max(1, step))
-    starts = list(range(0, max(1, nt - n + 1), step))
-    if starts and starts[-1] != nt - n and nt - n > 0:
-        starts.append(nt - n)                       # always include the last window
+    starts = window_starts(nt, n, step)
     cols, col_tto = [], []
     for s in starts:
         assert len(cols) < _MAX_TRIALS, "sliding-average runaway"
-        seg = trials[s:s + n]
-        cols.append(np.nanmean(seg, axis=0))
+        cols.append(np.nanmean(trials[s:s + n], axis=0))
         col_tto.append(float(np.nanmedian(tto[s:s + n])))
     z = np.array(cols).T if cols else np.empty((trials.shape[1], 0))
     return z, np.array(col_tto)
+
+
+def column_waveform(trials: np.ndarray, tto: np.ndarray, n: int, step: int,
+                    col: int):
+    """The *col*-th sliding window's averaged ERP + its trial spread: returns
+    ``(mean[n_samples], sd[n_samples], col_tto, n_cols, n_in_window)``. This is
+    the full-resolution waveform behind one heatmap column (for the click-to-see
+    drill-down)."""
+    trials = np.asarray(trials, dtype=np.float64)
+    tto = np.asarray(tto, dtype=np.float64)
+    nt = trials.shape[0]
+    n = int(max(1, min(n, max(1, nt))))
+    starts = window_starts(nt, n, step)
+    if not starts:
+        return (np.empty(0), np.empty(0), float("nan"), 0, 0)
+    col = int(min(max(int(col), 0), len(starts) - 1))
+    s = starts[col]
+    seg = trials[s:s + n]
+    return (np.nanmean(seg, axis=0), np.nanstd(seg, axis=0),
+            float(np.nanmedian(tto[s:s + n])), len(starts), int(seg.shape[0]))
 
 
 def decimate_rows(z: np.ndarray, row_ms: np.ndarray, max_rows: int = 300):
@@ -90,15 +118,19 @@ def _channel_traces(rec, animal: str):
 
 def gather_leadup_trials(evoked_dir: str, animal: str, onset_epoch: float,
                          lookback_sec: float, cfg: FeatureConfig | None = None,
-                         progress=None) -> dict:
-    """Read the *animal*'s evoked trials in ``[onset - lookback, onset]`` from the
-    raw ``*_evoked.mat`` traces, windowed by *cfg*, ordered by descending
-    time-to-onset (nearest onset last). Returns ``{"trials": [n_trials x
-    n_samples], "row_ms": [n_samples], "tto": [n_trials]}`` (empty arrays when
-    nothing is found). Heavy: reads trace matrices; call off the render thread."""
+                         progress=None, post_sec: float | None = None) -> dict:
+    """Read the *animal*'s evoked trials in the PERI-onset window
+    ``[onset - lookback, onset + post]`` (``post`` defaults to ``lookback`` — an
+    equal window after the onset, so the response during/after the seizure is
+    shown too) from the raw ``*_evoked.mat`` traces, windowed by *cfg*, ordered
+    by descending time-to-onset (so left→right = before → onset → after). Each
+    trial's ``tto = onset − abs_dt`` (positive before onset, negative after).
+    Returns ``{"trials": [n_trials x n_samples], "row_ms": [n_samples], "tto":
+    [n_trials]}`` (empty when nothing found). Heavy: reads trace matrices."""
     assert evoked_dir and animal, "evoked_dir and animal required"
     assert lookback_sec > 0, "lookback_sec must be > 0"
-    t_lo, t_hi = onset_epoch - lookback_sec, onset_epoch
+    post = float(post_sec) if post_sec is not None else float(lookback_sec)
+    t_lo, t_hi = onset_epoch - lookback_sec, onset_epoch + post
     files = _candidate_files(evoked_dir, animal, t_lo, t_hi)
     rows_ms = None
     trial_rows, trial_tto = [], []
@@ -144,12 +176,13 @@ def _candidate_files(evoked_dir, animal, t_lo, t_hi) -> list:
 
 
 def _order_by_onset(trial_rows, trial_tto, rows_ms) -> dict:
-    """Sort trials by DESCENDING time-to-onset (nearest onset last = rightmost)."""
+    """Sort trials by DESCENDING time-to-onset so left→right is chronological:
+    far-before → onset (tto=0) → after (tto<0)."""
     if not trial_rows or rows_ms is None:
         return {"trials": np.empty((0, 0)), "row_ms": np.empty(0),
                 "tto": np.empty(0)}
     tto = np.array(trial_tto, dtype=np.float64)
-    order = np.argsort(-tto)                         # far first, near-onset last
+    order = np.argsort(-tto)                         # before first, after last
     trials = np.array(trial_rows, dtype=np.float64)[order]
     return {"trials": trials, "row_ms": np.asarray(rows_ms, float),
             "tto": tto[order]}

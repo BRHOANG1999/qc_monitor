@@ -16,9 +16,9 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.periictal.erpimage import (decimate_rows,  # noqa: E402
-                                    gather_leadup_trials,
-                                    sliding_trial_average)
+from src.periictal.erpimage import (column_waveform,  # noqa: E402
+                                    decimate_rows, gather_leadup_trials,
+                                    sliding_trial_average, window_starts)
 from src.utils.evoked_features import FeatureConfig  # noqa: E402
 
 
@@ -48,6 +48,20 @@ def test_sliding_clamps_n_to_trial_count():
     trials = np.ones((3, 5))
     z, ct = sliding_trial_average(trials, np.array([3., 2., 1.]), n=99, step=1)
     assert z.shape == (5, 1) and ct.shape == (1,)     # one column = all trials
+
+
+def test_window_starts_and_column_waveform():
+    assert window_starts(10, 3, 4) == [0, 4, 7]       # last window always included
+    assert window_starts(3, 99, 1) == [0]             # n clamped to trial count
+    trials = np.array([[1., 1], [3, 3], [5, 5], [7, 7]])
+    tto = np.array([4., 3, 2, 1])
+    mean, sd, ctto, ncol, nin = column_waveform(trials, tto, n=2, step=2, col=0)
+    assert np.allclose(mean, [2, 2]) and nin == 2 and ncol == 2   # trials 0,1
+    mean2, _, _, _, _ = column_waveform(trials, tto, 2, 2, 1)
+    assert np.allclose(mean2, [6, 6])                 # col 1 = trials 2,3
+    # out-of-range col is clamped, not an error.
+    m3, _, _, _, _ = column_waveform(trials, tto, 2, 2, 99)
+    assert np.allclose(m3, [6, 6])
 
 
 # ------------------------------------------------------------------ #
@@ -103,6 +117,18 @@ def test_gather_orders_and_windows(tmp_path):
     assert np.all(np.diff(res["tto"]) < 0)
     assert res["trials"][0, 0] == 0.0 and res["trials"][-1, 0] == 2.0
     assert res["row_ms"].min() >= 1.0 and res["row_ms"].max() <= 200.0   # windowed
+
+
+def test_gather_symmetric_spans_onset(tmp_path):
+    # Trials before AND after onset; the default window is symmetric, so the
+    # gather includes post-onset trials (negative time-to-onset).
+    evoked_dir = str(tmp_path / "evoked")
+    _seed_mat(evoked_dir, times_sec=[1800.0, 3000.0, 3600.0, 4200.0, 5400.0])
+    base = datetime.fromisoformat("2026-03-02T00:00:00").timestamp()
+    onset = base + 3600.0
+    res = gather_leadup_trials(evoked_dir, "BCH040", onset, lookback_sec=1800.0)
+    assert res["trials"].shape[0] == 5                # window [onset-30m, onset+30m]
+    assert res["tto"].min() < 0 < res["tto"].max()    # spans the onset (tto=0)
 
 
 def test_gather_empty_when_outside_window(tmp_path):

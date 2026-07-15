@@ -47,6 +47,7 @@ from src.periictal import passive as _passive
 from src.periictal import stim_map as _sm
 from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
+from src.periictal import erpimage as _erp
 from src.periictal import trajectory as _traj
 from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
                                     sliding_trial_average)
@@ -225,6 +226,7 @@ def layout(store):
         dcc.Interval(id="pex-erp-poll", interval=1500, disabled=True),
         dcc.Store(id="pex-job"),
         dcc.Store(id="pex-erp-job"),
+        dcc.Store(id="pex-erp-col"),
     ], style={"padding": SPACE_4})
 
 
@@ -267,12 +269,13 @@ def _erp_card(store, a0) -> object:
     ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
               "alignItems": "flex-start"})
     return card(
-        section_header("Evoked ERP-image — trials into onset"),
+        section_header("Evoked ERP-image — trials around onset"),
         html.Div("Each column is an evoked-response trial (smoothed by the "
-                 "N-trial sliding average), ordered so they lead into the "
-                 "seizure — onset at the RIGHT. Rows are post-stim samples; "
-                 "colour is signed amplitude (diverging at 0), so the biphasic "
-                 "waveform is visible. Reads raw traces on demand.",
+                 "N-trial sliding average), ordered chronologically: before → "
+                 "ONSET (dashed line) → after (an equal window past onset). Rows "
+                 "are post-stim samples; colour is signed amplitude (diverging at "
+                 "0), so the biphasic waveform is visible. Click a column (or use "
+                 "◀ ▶) to see its averaged ERP below. Reads raw traces on demand.",
                  style={"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
                         "maxWidth": "95ch", "marginBottom": SPACE_3}),
         controls,
@@ -282,6 +285,18 @@ def _erp_card(store, a0) -> object:
             overlay_style={"visibility": "visible", "opacity": 0.4},
             children=dcc.Graph(id="pex-erp", config={"displaylogo": False},
                                figure=empty_fig("Pick a seizure, then ▶ Build ERP"))),
+        html.Div([
+            button("◀ Prev", "pex-erp-prev", variant="secondary"),
+            html.Span(id="pex-erp-navlabel",
+                      style={"color": COLOR_TEXT_SECONDARY,
+                             "fontSize": FONT_SIZE_CAPTION,
+                             "margin": f"0 {SPACE_3}", "minWidth": "22ch",
+                             "display": "inline-block", "textAlign": "center"}),
+            button("Next ▶", "pex-erp-next", variant="secondary"),
+        ], style={"display": "flex", "alignItems": "center", "gap": SPACE_2,
+                  "marginTop": SPACE_3, "flexWrap": "wrap"}),
+        dcc.Graph(id="pex-erp-wave", config={"displaylogo": False},
+                  figure=empty_fig("Click a column (or use ◀ ▶) to see its ERP")),
         html.Div(id="pex-erp-status", style={"color": COLOR_TEXT_SECONDARY,
                                              "fontSize": FONT_SIZE_CAPTION,
                                              "minHeight": "14px", "marginTop": SPACE_2}),
@@ -978,20 +993,75 @@ def _erp_figure(gathered, n, overlap, contrast) -> go.Figure:
     zmax = zmax or 1.0
     ncol = z.shape[1]
     x = np.arange(ncol)
-    ti = np.linspace(0, ncol - 1, min(7, ncol)).astype(int) if ncol else []
+    ti = np.linspace(0, ncol - 1, min(9, ncol)).astype(int) if ncol else []
     fig = go.Figure(go.Heatmap(
         z=z, x=x, y=rm, colorscale="RdBu", reversescale=True, zmid=0,
         zmin=-zmax, zmax=zmax,
         colorbar=dict(title=dict(text="amplitude", font=dict(size=9)),
                       thickness=10, len=0.85, x=1.005),
         hovertemplate="%{y:.0f} ms · %{z:.3g}<extra></extra>"))
+    if ncol and col_tto.min() <= 0.0 <= col_tto.max():      # mark onset (tto≈0)
+        oc = int(np.argmin(np.abs(col_tto)))
+        fig.add_vline(x=oc, line=dict(color="#f0f0f5", width=1.5, dash="dash"),
+                      annotation_text="onset", annotation_position="top",
+                      annotation_font=dict(size=9, color="#f0f0f5"))
     fig.update_layout(
         height=420, margin=dict(l=56, r=20, t=22, b=44),
-        xaxis=dict(title="trial windows  (far ← → onset)",
+        xaxis=dict(title="time relative to onset  (− before · + after)",
                    tickvals=[x[k] for k in ti],
-                   ticktext=[_fmt_dur(col_tto[k]) for k in ti]),
+                   ticktext=[_fmt_from_onset(col_tto[k]) for k in ti]),
         yaxis=dict(title="post-stim time (ms)"), uirevision="pex-erp")
     return fig
+
+
+def _fmt_from_onset(tto) -> str:
+    """Signed time relative to onset: '−30m' before, 'onset', '+20m' after."""
+    tto = float(tto)
+    if abs(tto) < 2.0:
+        return "onset"
+    return ("−" if tto > 0 else "+") + _fmt_dur(abs(tto))
+
+
+def _erp_wave_figure(gathered, n, overlap, col):
+    """(figure, nav-label) for one column's averaged ERP waveform + ±SD band."""
+    if not gathered or gathered.get("empty"):
+        return empty_fig("Build the ERP-image first"), ""
+    trials, row_ms, tto = gathered["trials"], gathered["row_ms"], gathered["tto"]
+    step = max(1, round(float(n) * (1.0 - float(overlap) / 100.0)))
+    mean, sd, col_tto, ncol, nin = _erp.column_waveform(
+        trials, tto, int(n), step, int(col or 0))
+    if mean.size == 0:
+        return empty_fig("No column to show"), ""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([row_ms, row_ms[::-1]]),
+        y=np.concatenate([mean + sd, (mean - sd)[::-1]]), fill="toself",
+        mode="lines", line=dict(width=0), fillcolor="rgba(94,124,226,0.15)",
+        hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=row_ms, y=mean, mode="lines", showlegend=False,
+                             line=dict(color=COLOR_ACCENT, width=2),
+                             hovertemplate="%{x:.0f} ms · %{y:.3g}<extra></extra>"))
+    fig.add_hline(y=0, line=dict(color=COLOR_DIVIDER, width=1))
+    lbl = f"{_fmt_from_onset(col_tto)} · avg of {nin} trials · column {int(col or 0) + 1}/{ncol}"
+    fig.update_layout(
+        height=240, margin=dict(l=56, r=20, t=26, b=40),
+        title=dict(text=f"ERP at {lbl}", font=dict(size=11), x=0.02),
+        xaxis=dict(title="post-stim time (ms)"), yaxis=dict(title="amplitude"),
+        uirevision="pex-erp-wave")
+    return fig, lbl
+
+
+def _erp_ncol_and_onset(gathered, n, overlap):
+    """(n_columns, onset_column_index) for the current sliding-average settings —
+    cheap (just the per-window median lead-times, no trace math)."""
+    tto = gathered.get("tto")
+    nt = int(tto.shape[0]) if tto is not None else 0
+    step = max(1, round(float(n) * (1.0 - float(overlap) / 100.0)))
+    starts = _erp.window_starts(nt, int(n), step)
+    if not starts:
+        return 0, 0
+    ct = np.array([np.nanmedian(tto[s:s + int(n)]) for s in starts])
+    return len(starts), int(np.argmin(np.abs(ct)))
 
 
 def _erp_render(gathered, n, overlap, contrast, key):
@@ -1229,3 +1299,52 @@ def register_callbacks(app, store, config):
         if not gathered or gathered.get("empty"):
             return no_update
         return _erp_figure(gathered, navg, overlap, contrast)
+
+    @app.callback(
+        Output("pex-erp-col", "data"),
+        Input("pex-erp", "clickData"),
+        Input("pex-erp-prev", "n_clicks"),
+        Input("pex-erp-next", "n_clicks"),
+        Input("pex-erp-job", "data"),
+        State("pex-erp-col", "data"),
+        State("pex-erp-n", "value"),
+        State("pex-erp-overlap", "value"),
+        prevent_initial_call=True,
+    )
+    def _erp_pick_col(click, _p, _nx, job, cur, navg, overlap):
+        gathered = _ERP_CACHE.get(job) if job else None
+        if not gathered or gathered.get("empty"):
+            return no_update
+        ncol, onset_col = _erp_ncol_and_onset(gathered, navg or 20, overlap or 50)
+        if ncol == 0:
+            return no_update
+        trig = callback_context.triggered_id
+        if trig == "pex-erp-job":                       # new build -> onset column
+            return onset_col
+        base = int(cur) if cur is not None else onset_col
+        if trig == "pex-erp" and click and click.get("points"):
+            col = int(round(click["points"][0].get("x", base)))
+        elif trig == "pex-erp-prev":
+            col = base - 1
+        elif trig == "pex-erp-next":
+            col = base + 1
+        else:
+            col = base
+        return int(min(max(col, 0), ncol - 1))
+
+    @app.callback(
+        Output("pex-erp-wave", "figure"),
+        Output("pex-erp-navlabel", "children"),
+        Input("pex-erp-col", "data"),
+        Input("pex-erp-n", "value"),
+        Input("pex-erp-overlap", "value"),
+        State("pex-erp-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _erp_wave(col, navg, overlap, job):
+        gathered = _ERP_CACHE.get(job) if job else None
+        if not gathered or gathered.get("empty"):
+            return no_update, no_update
+        fig, lbl = _erp_wave_figure(gathered, navg or 20, overlap or 50,
+                                    col if col is not None else 0)
+        return fig, lbl
