@@ -64,6 +64,27 @@ def test_passive_metric_set_drops_poststim_band_features():
     assert len(_cfg.metrics_for_variant("evoked")) == len(_cfg.CHEAP_METRICS)
 
 
+def test_window_config_pushes_bound_off_artifact():
+    # A post-stim window starting at 0 is pushed out to +guard; a pre-stim
+    # window ending at 0 is pushed to -guard -- the artifact is always excluded.
+    w = pv.window_config(0.0, 50.0, artifact_half_ms=2.0)
+    assert w.window_start_ms == 2.0 and w.window_end_ms == 50.0
+    w2 = pv.window_config(-100.0, 0.0, artifact_half_ms=2.0)
+    assert w2.window_start_ms == -100.0 and w2.window_end_ms == -2.0
+
+
+def test_window_config_rejects_reversed():
+    with pytest.raises(AssertionError):
+        pv.window_config(100.0, 10.0)
+
+
+def test_build_variant_refuses_shared_default_name():
+    # 'evoked' is the shared toolkit-default sidecar; a windowed variant must
+    # never overwrite it (chronic_evoked / evoked_figures read it).
+    with pytest.raises(AssertionError):
+        pv.build_variant_sidecar("x.mat", "BCH040", "evoked", pv.evoked_config())
+
+
 def test_variant_sidecar_roundtrip_and_config_gate(tmp_path):
     mat = str(tmp_path / "sess__stimCopy_BCH040SR___2026_03_02__00_00_00_evoked.mat")
     with open(mat, "wb") as f:

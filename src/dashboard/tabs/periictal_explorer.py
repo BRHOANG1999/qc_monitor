@@ -66,8 +66,8 @@ _RADIO_LABEL = {"color": COLOR_TEXT_PRIMARY, "marginRight": SPACE_4,
 _RADIO_INPUT = {"marginRight": "4px"}
 
 
-def _job_id(animal, protocol, variant, window_h, method, cap) -> str:
-    return f"{animal}|{protocol}|{variant}|{window_h}|{method}|{cap}"
+def _job_id(animal, protocol, variant, window_h, method, cap, wintok="") -> str:
+    return f"{animal}|{protocol}|{variant}|{window_h}|{method}|{cap}|{wintok}"
 
 
 def _tok(session_dir: str) -> str:
@@ -84,7 +84,7 @@ def _set(job_id: str, **kw) -> None:
 
 
 def _kick(store, evoked_dir, job_id, animal, protocol, variant,
-          window_h, method, cap) -> None:
+          window_h, method, cap, sidecar_variant, feature_cfg) -> None:
     """Start the build thread for *job_id* unless one is already running or the
     result is already cached."""
     with _LOCK:
@@ -97,28 +97,30 @@ def _kick(store, evoked_dir, job_id, animal, protocol, variant,
     th = threading.Thread(
         target=_worker, name=f"periictal-{job_id}", daemon=True,
         args=(store, evoked_dir, job_id, animal, protocol, variant,
-              window_h, method, cap))
+              window_h, method, cap, sidecar_variant, feature_cfg))
     th.start()
 
 
 def _worker(store, evoked_dir, job_id, animal, protocol, variant,
-            window_h, method, cap) -> None:
+            window_h, method, cap, sidecar_variant, feature_cfg) -> None:
     """Build the matrix + embedding for one job and cache the result. Never
     raises (records the error for the poll to surface)."""
     try:
-        passive_cfg = None
-        if variant == "passive":
-            passive_cfg = _passive.passive_config()
-            _set(job_id, progress=f"warming passive {protocol or 'all'}…")
-            _passive.warm_passive(
-                animal, evoked_dir, passive_cfg, protocol=protocol or None,
+        # A windowed variant (passive / custom-evoked) recomputes features from
+        # the raw traces first; the shared default 'evoked' sidecar is pre-warm.
+        if sidecar_variant not in (None, "evoked"):
+            _set(job_id, progress="reading traces for the feature window…")
+            _passive.warm_variant(
+                animal, evoked_dir, sidecar_variant, feature_cfg,
+                protocol=protocol or None,
                 progress=lambda d, n, fp: _set(
-                    job_id, progress=f"reading pre-stim traces… ({d}/{n})"))
+                    job_id, progress=f"windowing traces… ({d}/{n})"))
         _set(job_id, progress="joining stimuli to seizures…")
         df = build_matrix_cached(
             store, animal, evoked_dir, _CACHE_DIR or _default_cache_dir(),
             protocol=protocol or None, window_sec=window_h * 3600.0,
-            variant=variant, passive_cfg=passive_cfg)
+            variant=variant, feature_cfg=feature_cfg,
+            sidecar_variant=sidecar_variant)
         if df.empty:
             _finish(job_id, {"empty": True})
             return
@@ -171,7 +173,8 @@ def layout(store):
     a0 = "BCH111" if "BCH111" in animals else (animals[0] if animals else None)
     return html.Div([
         _title_block(),
-        card(section_header("Selection"), _controls(store, animals, a0)),
+        card(section_header("Selection"), _controls(store, animals, a0),
+             _window_panel()),
         card(html.Div(id="pex-preview", style={"marginBottom": SPACE_3}),
              dcc.Loading(
                  custom_spinner=loading_icon("Building…"),
@@ -315,6 +318,70 @@ def _controls(store, animals, a0) -> html.Div:
 
 _GRP = {"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
         "alignItems": "flex-start"}
+_WIN_INP = {**DROPDOWN_STYLE, "width": "90px"}
+
+
+def _window_panel() -> html.Details:
+    """Progressive-disclosure 'Feature window' panel: which slice of each evoked
+    trace the features are computed over. Collapsed by default so it never
+    clutters the common path."""
+    return html.Details([
+        html.Summary("Feature window (advanced)",
+                     style={"cursor": "pointer", "color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600",
+                            "marginBottom": SPACE_2}),
+        html.Div([
+            _ctl("Evoked mode", dcc.RadioItems(
+                id="pex-winmode", value="full", inline=True,
+                labelStyle=_RADIO_LABEL, inputStyle=_RADIO_INPUT,
+                options=[{"label": "full trace (fast)", "value": "full"},
+                         {"label": "custom window", "value": "custom"}]),
+                "Full = the toolkit's extracted trace (fast, but INCLUDES the "
+                "stim artifact at t=0). Custom = recompute features over the ms "
+                "window below, excluding the artifact. (Passive is always a "
+                "window.)"),
+            _ctl("From (ms)", dcc.Input(id="pex-win-from", type="number", value=1,
+                                        step="any", debounce=True, style=_WIN_INP),
+                 "Window start relative to the stimulus (t=0)."),
+            _ctl("To (ms)", dcc.Input(id="pex-win-to", type="number", value=200,
+                                      step="any", debounce=True, style=_WIN_INP),
+                 "Window end relative to the stimulus."),
+            _ctl("Artifact guard (ms)", dcc.Input(
+                id="pex-win-guard", type="number", value=1, min=0, step="any",
+                debounce=True, style=_WIN_INP),
+                "Exclude ±this many ms around t=0 (the stim artifact); the bound "
+                "nearest 0 is pushed out to here."),
+        ], style=_GRP),
+        html.Div("t = 0 is the stimulus. Evoked = a POST-stim window (e.g. 1→200 "
+                 "ms); passive = PRE-stim (−200→−1). A custom window recomputes "
+                 "features from the raw traces — a one-time background warm, then "
+                 "cached.",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                        "marginTop": SPACE_2, "maxWidth": "90ch"}),
+    ], style={"marginTop": SPACE_3})
+
+
+def _resolve_window(variant, winmode, frm, to, guard):
+    """(sidecar_variant, feature_cfg) for the current selection. Evoked 'full'
+    reads the fast shared default sidecar (cfg None); a custom evoked window uses
+    the 'evokedw' variant; passive is always windowed. Raises ValueError on a bad
+    window so the caller can surface it."""
+    if variant != "passive" and winmode == "full":
+        return "evoked", None
+    try:
+        frm, to, guard = float(frm), float(to), float(guard)
+    except (TypeError, ValueError):
+        raise ValueError("window bounds must be numbers")
+    sv = "passive" if variant == "passive" else "evokedw"
+    try:
+        cfg = _passive.window_config(frm, to, artifact_half_ms=guard)
+    except AssertionError as e:
+        raise ValueError(f"invalid window ({e})")
+    return sv, cfg
+
+
+def _win_token(sidecar_variant, cfg) -> str:
+    return f"{sidecar_variant}:{_passive.config_sig(cfg) if cfg is not None else ''}"
 
 
 def _divider() -> html.Div:
@@ -384,10 +451,25 @@ def _continuous_fig(emb, sub, color_by) -> go.Figure:
                   reversescale=spec["reverse"], showscale=True, colorbar=cbar)
     if spec["cmin"] is not None:
         marker["cmin"], marker["cmax"] = spec["cmin"], spec["cmax"]
-    return go.Figure(go.Scattergl(
-        x=emb[:, 0], y=emb[:, 1], mode="markers", marker=marker,
-        customdata=np.arange(emb.shape[0]),
-        hovertemplate=f"{spec['label']}: %{{marker.color:.2f}}<extra></extra>"))
+    kw = dict(x=emb[:, 0], y=emb[:, 1], mode="markers", marker=marker,
+              customdata=np.arange(emb.shape[0]))
+    if color_by == "time_to_onset_sec":
+        # colour is log10(seconds); hover shows a readable duration instead.
+        kw["text"] = [_fmt_dur(s) for s in sub["time_to_onset_sec"].to_numpy()]
+        kw["hovertemplate"] = "time to onset: %{text}<extra></extra>"
+    else:
+        kw["hovertemplate"] = f"{spec['label']}: %{{marker.color:.2f}}<extra></extra>"
+    return go.Figure(go.Scattergl(**kw))
+
+
+def _fmt_dur(s) -> str:
+    """Human-readable duration for hover (the colour axis is log-seconds)."""
+    s = float(s)
+    if s < 90:
+        return f"{s:.0f} s"
+    if s < 5400:
+        return f"{s / 60:.0f} min"
+    return f"{s / 3600:.1f} h"
 
 
 def _categorical_fig(emb, sub, color_by) -> go.Figure:
@@ -438,7 +520,8 @@ def _axis_titles(method, meta):
 #  Guided preview + reading strip
 # --------------------------------------------------------------------- #
 
-def _preview_panel(store, animal, protocol, variant, window_h) -> html.Div:
+def _preview_panel(store, animal, protocol, variant, window_h,
+                   window_label="") -> html.Div:
     if not animal:
         return _callout("Pick an animal to begin.", COLOR_TEXT_SECONDARY)
     szs = [s for s in scored_seizures(store, animal)
@@ -450,16 +533,25 @@ def _preview_panel(store, animal, protocol, variant, window_h) -> html.Div:
             f"{animal} has {n} scored seizure(s) in {proto} — need at least 2 to "
             f"define lead-up windows. Try another protocol or 'All protocols'.",
             COLOR_WARNING, "⚠")
+    win = f" [{window_label}]" if window_label else ""
     return html.Div([
         html.Span("Ready — ", style={"color": COLOR_SUCCESS, "fontWeight": "600",
                                      "fontSize": FONT_SIZE_BODY}),
-        html.Span(f"{animal} · {proto} · {variant} features · {window_h:g} h lead-up",
+        html.Span(f"{animal} · {proto} · {variant} features{win} · "
+                  f"{window_h:g} h lead-up",
                   style={"color": COLOR_TEXT_PRIMARY, "fontSize": FONT_SIZE_BODY}),
         html.Span(f"    Effective n = {n} seizures. Press ▶ Build to embed their "
                   f"lead-up stimuli.",
                   style={"color": COLOR_TEXT_SECONDARY,
                          "fontSize": FONT_SIZE_CAPTION}),
     ])
+
+
+def _window_label(sidecar_variant, cfg) -> str:
+    """Human label for the active feature window."""
+    if cfg is None:
+        return "full trace, incl. artifact"
+    return f"{cfg.window_start_ms:g} to {cfg.window_end_ms:g} ms"
 
 
 def _reading_strip(res) -> html.Div:
@@ -635,6 +727,9 @@ def register_callbacks(app, store, config):
         Output("pex-protocol", "value"),
         Output("pex-colorby", "options"),
         Output("pex-colorby", "value"),
+        Output("pex-winmode", "value"),
+        Output("pex-win-from", "value"),
+        Output("pex-win-to", "value"),
         Input("pex-animal", "value"),
         Input("pex-variant", "value"),
         State("pex-colorby", "value"),
@@ -646,7 +741,17 @@ def register_callbacks(app, store, config):
         cvals = {o["value"] for o in copts}
         cval = cur_color if cur_color in cvals else "time_to_onset_sec"
         trig = callback_context.triggered_id
-        return opts, (pval if trig == "pex-animal" else no_update), copts, cval
+        # Reset the feature window to the variant's default when the variant
+        # flips (passive needs pre-stim bounds, evoked post-stim).
+        if variant == "passive":
+            wm, w0, w1 = "custom", *_cfg.DEFAULT_PASSIVE_WINDOW_MS
+        else:
+            wm, w0, w1 = "full", *_cfg.DEFAULT_EVOKED_WINDOW_MS
+        win_reset = trig == "pex-variant"
+        return (opts, (pval if trig == "pex-animal" else no_update), copts, cval,
+                wm if win_reset else no_update,
+                w0 if win_reset else no_update,
+                w1 if win_reset else no_update)
 
     @app.callback(
         Output("pex-preview", "children"),
@@ -654,11 +759,20 @@ def register_callbacks(app, store, config):
         Input("pex-protocol", "value"),
         Input("pex-variant", "value"),
         Input("pex-window-h", "value"),
+        Input("pex-winmode", "value"),
+        Input("pex-win-from", "value"),
+        Input("pex-win-to", "value"),
+        Input("pex-win-guard", "value"),
     )
-    def _preview(animal, protocol, variant, window_h):
+    def _preview(animal, protocol, variant, window_h, winmode, wf, wt, wg):
+        variant = variant or "evoked"
         try:
-            return _preview_panel(store, animal, protocol or "",
-                                  variant or "evoked", float(window_h or 6.0))
+            sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
+        except ValueError as e:
+            return _callout(f"Feature window: {e}.", COLOR_WARNING, "⚠")
+        try:
+            return _preview_panel(store, animal, protocol or "", variant,
+                                  float(window_h or 6.0), _window_label(sv, cfg))
         except Exception:                                     # noqa: BLE001
             return no_update
 
@@ -676,15 +790,25 @@ def register_callbacks(app, store, config):
         State("pex-window-h", "value"),
         State("pex-method", "value"),
         State("pex-colorby", "value"),
+        State("pex-winmode", "value"),
+        State("pex-win-from", "value"),
+        State("pex-win-to", "value"),
+        State("pex-win-guard", "value"),
         prevent_initial_call=True,
     )
     def _build_or_poll(_n, _iv, animal, protocol, variant, window_h,
-                       method, color_by):
+                       method, color_by, winmode, wf, wt, wg):
         if not animal:
             return no_update, no_update, "Pick an animal.", True, no_update
+        try:
+            sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
+        except ValueError as e:
+            return (empty_fig("Invalid feature window", hint=str(e)),
+                    "", f"⚠ Feature window: {e}", True, no_update)
         window_h = float(window_h or 6.0)
         cap = _cfg.INTERACTIVE_POINT_CAP
-        jid = _job_id(animal, protocol or "", variant, window_h, method, cap)
+        jid = _job_id(animal, protocol or "", variant, window_h, method, cap,
+                      _win_token(sv, cfg))
         with _LOCK:
             cached = _CACHE.get(jid)
             state = dict(_JOBS.get(jid) or {})
@@ -694,7 +818,7 @@ def register_callbacks(app, store, config):
             return (empty_fig("Build failed", hint=state.get("progress", "")),
                     "", state.get("progress", "error"), True, no_update)
         _kick(store, evoked_dir, jid, animal, protocol or "", variant,
-              window_h, method, cap)
+              window_h, method, cap, sv, cfg)
         prog = (_JOBS.get(jid) or {}).get("progress", "starting…")
         return no_update, no_update, f"⏳ {prog}", False, no_update
 

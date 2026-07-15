@@ -88,9 +88,18 @@ def continuous_spec(color_by: str, values) -> dict:
     large seizure set is a PU sequential."""
     v = np.asarray(values, dtype=float)
     if color_by == "time_to_onset_sec":
-        return {"vals": v / 3600.0, "scale": SEQUENTIAL_SCALE, "reverse": True,
-                "label": "hrs to onset", "cmin": None, "cmax": None,
-                "ticks": None}
+        # LOG scale: pre-ictal dynamics of interest span seconds..hours, and a
+        # linear 0-6h ramp crushes all the near-onset detail into one colour.
+        # log10(seconds) spreads 1s / 10s / 1min / 10min / 1h across the map.
+        sec = np.maximum(v, 1.0)                         # floor at 1 s (no log 0)
+        hi = float(sec.max()) if sec.size else 1.0
+        marks = [(1, "1s"), (10, "10s"), (60, "1m"), (600, "10m"),
+                 (3600, "1h"), (21600, "6h"), (86400, "1d"), (604800, "1w")]
+        tv = [np.log10(s) for s, _ in marks if s <= hi * 1.2]
+        tt = [lbl for s, lbl in marks if s <= hi * 1.2]
+        return {"vals": np.log10(sec), "scale": SEQUENTIAL_SCALE, "reverse": True,
+                "label": "time to onset (log)", "cmin": None, "cmax": None,
+                "ticks": (tv, tt) if tv else None}
     if color_by == "hour_of_day":
         return {"vals": v, "scale": cyclic_scale(), "reverse": False,
                 "label": "hour of day", "cmin": 0.0, "cmax": 24.0,

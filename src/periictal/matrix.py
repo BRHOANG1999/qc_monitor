@@ -36,18 +36,19 @@ from src.preictal.isi import (leadtime_bins, lookback_ceilings,
 _MAX_FILES = 2_000_000        # NASA Rule 2: explicit scan bound.
 
 
-def _sidecar_iter(animal: str, evoked_dir: str, variant: str, passive_cfg):
-    """The (mat, sidecar, rows) generator for *variant*: the default evoked
-    sidecars, or the passive pre-stim variant (needs its FeatureConfig to read
-    the right, config-signed sidecars)."""
-    if variant == "passive":
-        cfg = passive_cfg or _passive.passive_config()
-        return _passive.iter_passive_sidecars(animal, evoked_dir, cfg)
-    return iter_animal_sidecars(animal, evoked_dir)
+def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cfg):
+    """The (mat, sidecar, rows) generator for a sidecar variant. The shared
+    default 'evoked' sidecar (full trace, no window) is read directly; any other
+    variant ('passive', 'evokedw', …) is a config-signed windowed sidecar and
+    needs its FeatureConfig to read the right file."""
+    if sidecar_variant in (None, "evoked"):
+        return iter_animal_sidecars(animal, evoked_dir)
+    cfg = feature_cfg or _passive.passive_config()
+    return _passive.iter_variant_sidecars(animal, evoked_dir, sidecar_variant, cfg)
 
 
 def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
-                   variant: str, passive_cfg):
+                   sidecar_variant: str, feature_cfg):
     """One pass over *animal*'s fresh sidecars -> parallel arrays:
     (t_epoch[N], metric_arrays{m: f32[N]}, channel[N] obj, session[N] obj).
     Session/channel are kept per row so the protocol filter + fingerprint can
@@ -56,7 +57,7 @@ def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
     t_parts, ch_parts, se_parts, rec_parts = [], [], [], []
     m_parts: dict = {m: [] for m in metrics}
     for i, (_fp, _sp, rows) in enumerate(
-            _sidecar_iter(animal, evoked_dir, variant, passive_cfg)):
+            _sidecar_iter(animal, evoked_dir, sidecar_variant, feature_cfg)):
         assert i < _MAX_FILES, "sidecar scan runaway"
         if not rows:
             continue
@@ -118,6 +119,8 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
                  min_leadtime_sec: float = _cfg.DEFAULT_MIN_LEADTIME_SEC,
                  metrics: list[str] | None = None,
                  variant: str = "evoked",
+                 feature_cfg=None,
+                 sidecar_variant: str | None = None,
                  passive_cfg=None,
                  attach_fingerprint: bool = True) -> pd.DataFrame:
     """Tidy ``event x metric`` frame for *animal*: one row per lead-up stimulus,
@@ -127,6 +130,11 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
     assert animal and evoked_dir, "animal and evoked_dir required"
     assert window_sec > 0, "window_sec must be > 0"
     metrics = metrics or _cfg.metrics_for_variant(variant)
+    # sidecar_variant selects which sidecar to read (defaults from the metric
+    # variant); feature_cfg is its windowing (passive_cfg kept as a legacy alias).
+    feature_cfg = feature_cfg if feature_cfg is not None else passive_cfg
+    if sidecar_variant is None:
+        sidecar_variant = "passive" if variant == "passive" else "evoked"
     seizures = scored_seizures(store, animal)
     onsets = np.array([s.onset_epoch for s in seizures], dtype=np.float64)
     if onsets.size < 2:
@@ -137,7 +145,7 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
         dtype=np.float64)
 
     t, mcols, chan, sess, rec = _epoch_columns(animal, evoked_dir, metrics,
-                                               variant, passive_cfg)
+                                               sidecar_variant, feature_cfg)
     if t.size == 0:
         return _empty_frame(metrics)
     idx, tto, keep = _assign_next_onset(t, onsets, ceilings)

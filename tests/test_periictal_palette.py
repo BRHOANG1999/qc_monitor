@@ -31,11 +31,24 @@ def test_hour_of_day_uses_cyclic_not_hsv():
     assert spec["ticks"][0] == [0, 6, 12, 18, 24]
 
 
-def test_time_to_onset_is_reversed_sequential_in_hours():
-    spec = pal.continuous_spec("time_to_onset_sec", [0.0, 3600.0, 7200.0])
+def test_time_to_onset_is_log_scaled_and_reversed():
+    import numpy as np
+    spec = pal.continuous_spec("time_to_onset_sec", [1.0, 10.0, 100.0, 3600.0])
     assert spec["reverse"] is True                  # near-onset = salient end
-    assert list(spec["vals"]) == [0.0, 1.0, 2.0]    # seconds -> hours
     assert spec["scale"] == pal.SEQUENTIAL_SCALE
+    # colour value is log10(seconds), not linear hours -> near-onset detail
+    # (seconds..minutes) is spread across the map instead of one sliver.
+    assert np.allclose(spec["vals"], [0.0, 1.0, 2.0, np.log10(3600)])
+    assert "log" in spec["label"]
+    tv, tt = spec["ticks"]                           # readable log ticks
+    assert "1s" in tt and "1h" in tt
+    assert len(tv) == len(tt)
+
+
+def test_time_to_onset_floors_at_one_second():
+    import numpy as np
+    spec = pal.continuous_spec("time_to_onset_sec", [0.0, 0.3])
+    assert np.all(np.isfinite(spec["vals"]))        # no log(0) -> -inf
 
 
 def test_is_categorical_seizure_switches_past_the_cap():

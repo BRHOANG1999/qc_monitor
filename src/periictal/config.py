@@ -34,6 +34,11 @@ DEFAULT_MIN_LEADTIME_SEC = 2.0        # one stim ISI (0.5 Hz)
 # applied to the whole trace BEFORE the window crop (see passive.guard_ms).
 DEFAULT_ARTIFACT_HALF_MS = 1.0
 
+# Default feature windows (ms) offered in the explorer's "Feature window" panel.
+# Evoked = post-stim (excludes the artifact at t=0); passive = pre-stim.
+DEFAULT_EVOKED_WINDOW_MS = (1.0, 200.0)
+DEFAULT_PASSIVE_WINDOW_MS = (-200.0, -1.0)
+
 # Above this many points an interactive embedding is stratified-subsampled
 # (UMAP at ~50k is ~20s; PCA is cheap at any N but the browser Scattergl
 # ceiling is ~100k).

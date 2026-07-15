@@ -72,6 +72,28 @@ def evoked_config(post_ms: float = 200.0,
                          bp_high_hz=bp_high_hz)
 
 
+def window_config(start_ms: float, end_ms: float,
+                  artifact_half_ms: float = _cfg.DEFAULT_ARTIFACT_HALF_MS,
+                  smoothing: bool = False, smooth_ms: float = 5.0,
+                  bandpass: bool = False, bp_low_hz: float = 1.0,
+                  bp_high_hz: float = 100.0) -> FeatureConfig:
+    """FeatureConfig for an explicit ``[start, end]`` ms window. The bound
+    nearest the stim (t=0) is pushed out by the artifact guard, so a post-stim
+    (evoked) window never starts before +g and a pre-stim (passive) window never
+    ends after -g -- the stim artifact is always excluded."""
+    g = guard_ms(artifact_half_ms, smoothing, smooth_ms)
+    s, e = float(start_ms), float(end_ms)
+    if s >= 0:                          # post-stim window
+        s = max(s, g)
+    if e <= 0:                          # pre-stim window
+        e = min(e, -g)
+    _validate_window(s, e)
+    return FeatureConfig(window_start_ms=s, window_end_ms=e,
+                         smoothing=smoothing, smooth_ms=smooth_ms,
+                         bandpass=bandpass, bp_low_hz=bp_low_hz,
+                         bp_high_hz=bp_high_hz)
+
+
 def config_sig(cfg: FeatureConfig) -> str:
     """Stable signature of the windowing/filter fields, so a passive sidecar is
     rebuilt when the window or guard changes."""
@@ -79,51 +101,69 @@ def config_sig(cfg: FeatureConfig) -> str:
     return json.dumps(d, sort_keys=True)
 
 
-def build_passive_sidecar(mat_path: str, animal: str,
+def build_variant_sidecar(mat_path: str, animal: str, variant: str,
                           cfg: FeatureConfig) -> int:
-    """Compute *animal*'s pre-stim features for one .mat and write the passive
-    variant sidecar. Returns rows written (0 if none / unreadable)."""
-    assert mat_path and animal, "mat_path and animal required"
+    """Compute *animal*'s windowed features for one .mat and write the *variant*
+    sidecar (config-signed). Returns rows written (0 if none / unreadable).
+    NOTE: *variant* must NOT be the shared default 'evoked' -- use a distinct key
+    (e.g. 'passive', 'evokedw') so this never overwrites the toolkit-default
+    sidecar that chronic_evoked / evoked_figures read."""
+    assert mat_path and animal and variant, "mat_path, animal, variant required"
+    assert variant != "evoked", "'evoked' is the shared default sidecar"
     rows = eo.compute_feature_rows(mat_path, animal, cfg, expensive=False)
     if not rows:
         return 0
-    eo.write_feature_sidecar(mat_path, animal, rows, variant="passive",
+    eo.write_feature_sidecar(mat_path, animal, rows, variant=variant,
                              config_sig=config_sig(cfg))
     return len(rows)
 
 
-def warm_passive(animal: str, evoked_dir: str, cfg: FeatureConfig,
+def warm_variant(animal: str, evoked_dir: str, variant: str, cfg: FeatureConfig,
                  progress=None, protocol: str | None = None) -> tuple[int, int]:
-    """Build every fresh passive sidecar for *animal* under *evoked_dir* (skips
-    ones already fresh for this config). *protocol* restricts to recordings
-    whose session token contains that substring (the passive feature read
-    re-parses the traces, ~15 s/file, so scoping to one protocol matters).
-    Returns (built, total). *progress* is an optional callback(done, total, path)."""
-    assert animal and evoked_dir, "animal and evoked_dir required"
+    """Build every fresh *variant* sidecar for *animal* (skips ones already fresh
+    for this config). *protocol* restricts to recordings whose session token
+    contains that substring (the windowed read re-parses the traces, ~15 s/file,
+    so scoping to one protocol matters). Returns (built, total)."""
+    assert animal and evoked_dir and variant, "animal, evoked_dir, variant required"
     sig = config_sig(cfg)
     files = [f for f in eo.list_evoked_files(evoked_dir)
              if animal in eo.animals_in_filename(f)
              and (not protocol or protocol in eo.parse_session(f))]
     built = 0
     for i, fp in enumerate(files):
-        assert i < _MAX_FILES, "passive warm runaway"
-        if eo.read_feature_sidecar(fp, animal, "passive", sig) is None:
-            built += build_passive_sidecar(fp, animal, cfg) and 1 or 0
+        assert i < _MAX_FILES, "variant warm runaway"
+        if eo.read_feature_sidecar(fp, animal, variant, sig) is None:
+            built += build_variant_sidecar(fp, animal, variant, cfg) and 1 or 0
         if progress:
             progress(i + 1, len(files), fp)
     return built, len(files)
 
 
-def iter_passive_sidecars(animal: str, evoked_dir: str, cfg: FeatureConfig):
-    """Yield (mat_path, sidecar_path, rows) for each FRESH passive sidecar of
-    *animal* under the given config -- the readiness gate for the passive
+def iter_variant_sidecars(animal: str, evoked_dir: str, variant: str,
+                          cfg: FeatureConfig):
+    """Yield (mat_path, sidecar_path, rows) for each FRESH *variant* sidecar of
+    *animal* under the given config -- the readiness gate for the windowed
     matrix. Mirrors evoked_figures.data.iter_animal_sidecars."""
-    assert animal, "animal required"
+    assert animal and variant, "animal and variant required"
     sig = config_sig(cfg)
     for i, fp in enumerate(eo.list_evoked_files(evoked_dir)):
-        assert i < _MAX_FILES, "passive sidecar scan runaway"
+        assert i < _MAX_FILES, "variant sidecar scan runaway"
         if animal not in eo.animals_in_filename(fp):
             continue
-        rows = eo.read_feature_sidecar(fp, animal, "passive", sig)
+        rows = eo.read_feature_sidecar(fp, animal, variant, sig)
         if rows:
-            yield fp, eo.feature_sidecar_path(fp, animal, "passive"), rows
+            yield fp, eo.feature_sidecar_path(fp, animal, variant), rows
+
+
+# Backwards-compatible passive wrappers (the passive variant is one instance).
+def build_passive_sidecar(mat_path: str, animal: str, cfg: FeatureConfig) -> int:
+    return build_variant_sidecar(mat_path, animal, "passive", cfg)
+
+
+def warm_passive(animal: str, evoked_dir: str, cfg: FeatureConfig,
+                 progress=None, protocol: str | None = None) -> tuple[int, int]:
+    return warm_variant(animal, evoked_dir, "passive", cfg, progress, protocol)
+
+
+def iter_passive_sidecars(animal: str, evoked_dir: str, cfg: FeatureConfig):
+    return iter_variant_sidecars(animal, evoked_dir, "passive", cfg)

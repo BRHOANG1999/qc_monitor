@@ -126,6 +126,25 @@ def test_render_cached_empty_and_ready_paths():
     assert disabled is True and len(fig.data) == 1
 
 
+def test_resolve_window_modes():
+    import pytest
+    assert pex._resolve_window("evoked", "full", 1, 200, 1) == ("evoked", None)
+    sv, cfg = pex._resolve_window("evoked", "custom", 5, 100, 1)
+    assert sv == "evokedw" and cfg.window_start_ms == 5.0 and cfg.window_end_ms == 100.0
+    # passive is always windowed, regardless of the (evoked-only) mode toggle.
+    sv, cfg = pex._resolve_window("passive", "full", -200, -1, 1)
+    assert sv == "passive" and cfg.window_end_ms == -1.0
+    with pytest.raises(ValueError):
+        pex._resolve_window("evoked", "custom", 200, 1, 1)     # reversed
+
+
+def test_win_token_distinguishes_windows():
+    a = pex._win_token(*pex._resolve_window("evoked", "custom", 1, 200, 1))
+    b = pex._win_token(*pex._resolve_window("evoked", "custom", 1, 100, 1))
+    full = pex._win_token(*pex._resolve_window("evoked", "full", 1, 200, 1))
+    assert a != b and a != full        # window is part of the job/cache key
+
+
 def test_selected_indices_defensive():
     assert pex._selected_indices(None) == []
     assert pex._selected_indices({"points": [{"customdata": 3},
