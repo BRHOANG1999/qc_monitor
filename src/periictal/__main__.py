@@ -67,6 +67,10 @@ def main(argv) -> int:
     df = build_matrix(store, args.animal, evoked_dir, protocol=protocol,
                       window_sec=args.window_h * 3600.0, variant=args.variant,
                       passive_cfg=passive_cfg)
+    # The embedding figures are PRE-onset only; the post-onset rows exist only
+    # for the trend-test positive control (tab-side), so drop them here.
+    if "phase" in df.columns:
+        df = df[df["phase"] == "pre"].reset_index(drop=True)
     print(f"  {len(df)} lead-up stimuli, "
           f"{df['seizure_idx'].nunique() if len(df) else 0} seizures, "
           f"in {time.time() - t0:.1f}s", flush=True)

@@ -102,6 +102,29 @@ def _assign_next_onset(t: np.ndarray, onsets: np.ndarray,
     return safe, tto, keep
 
 
+def _assign_prev_onset(t: np.ndarray, onsets: np.ndarray,
+                       ceilings: np.ndarray):
+    """Vectorized nearest-PAST-onset assignment for the post-ictal window (the
+    positive-control substrate — symmetric to ``_assign_next_onset``).
+
+    Returns (idx[N], tto[N], keep[N]) where idx = index of the LAST onset
+    strictly before each t, tto = that onset minus t (NEGATIVE — a post-ictal row
+    reads as time PAST the onset), and keep marks stimuli within that seizure's
+    post-window ceiling. Nearest-previous-onset attribution keeps each post row
+    tied to its immediately preceding seizure, so the ceiling is a plain window
+    length (no reach into the next seizure)."""
+    assert onsets.ndim == 1, "onsets must be 1-D"
+    assert ceilings.shape == onsets.shape, "ceilings/onsets shape mismatch"
+    idx = np.searchsorted(onsets, t, side="left") - 1   # last onset < t
+    has_prev = idx >= 0
+    safe = np.where(has_prev, idx, 0)
+    ceil = ceilings[safe]
+    since = np.where(has_prev, t - onsets[safe], np.nan)   # time since onset, >0
+    tto = -since                                           # negative
+    keep = has_prev & np.isfinite(ceil) & (since > 0.0) & (since <= ceil)
+    return safe, tto, keep
+
+
 def _lead_bins_for(ceilings: np.ndarray, min_leadtime_sec: float) -> dict:
     """Per-seizure dyadic bin edges, indexed by seizure position (skips NaN
     ceilings). Built once so the row-wise bin lookup is a cheap searchsorted."""
@@ -148,21 +171,38 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
                                                sidecar_variant, feature_cfg)
     if t.size == 0:
         return _empty_frame(metrics)
-    idx, tto, keep = _assign_next_onset(t, onsets, ceilings)
+    idx_pre, tto_pre, keep_pre = _assign_next_onset(t, onsets, ceilings)
+    # Symmetric post-onset window (phase="post") — the positive-control substrate.
+    # A stimulus may legitimately be BOTH a pre-row (upcoming seizure) and a
+    # post-row (previous seizure); the two phases are analysed separately.
+    post_ceil = np.full(onsets.size, float(window_sec), dtype=np.float64)
+    idx_post, tto_post, keep_post = _assign_prev_onset(t, onsets, post_ceil)
     if protocol:
-        # Keep a stimulus only when BOTH it and the seizure it precedes are in
-        # the requested protocol -- a clean within-protocol scope (no mixing
-        # stim conditions across the join).
+        # Keep a stimulus only when BOTH it and the seizure it flanks are in the
+        # requested protocol -- a clean within-protocol scope (no mixing stim
+        # conditions across the join).
         epoch_ok = np.array([protocol in s for s in sess], dtype=bool)
-        sz_ok = np.array([protocol in _token(seizures[j].session_dir)
-                          for j in idx], dtype=bool)
-        keep &= epoch_ok & sz_ok
-    if not keep.any():
+        keep_pre &= epoch_ok & np.array(
+            [protocol in _token(seizures[j].session_dir) for j in idx_pre], bool)
+        keep_post &= epoch_ok & np.array(
+            [protocol in _token(seizures[j].session_dir) for j in idx_post], bool)
+    if not (keep_pre.any() or keep_post.any()):
         return _empty_frame(metrics)
 
-    sel = np.flatnonzero(keep)
-    frame = _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics)
-    _add_lead_bins(frame, idx[sel], ceilings, min_leadtime_sec)
+    frames = []
+    sel_pre = np.flatnonzero(keep_pre)
+    if sel_pre.size:
+        fp = _assemble(sel_pre, t, tto_pre, idx_pre, mcols, chan, sess, rec,
+                       seizures, metrics, "pre")
+        _add_lead_bins(fp, idx_pre[sel_pre], ceilings, min_leadtime_sec)
+        frames.append(fp)
+    sel_post = np.flatnonzero(keep_post)
+    if sel_post.size:
+        fq = _assemble(sel_post, t, tto_post, idx_post, mcols, chan, sess, rec,
+                       seizures, metrics, "post")
+        fq["lead_bin"] = np.full(len(fq), -1, dtype=np.int32)   # n/a post-onset
+        frames.append(fq)
+    frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     if attach_fingerprint:
         _attach_fingerprint(frame, store, animal)
     return frame
@@ -175,7 +215,7 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
 # The non-metric columns the frame always carries.
 _META = ["t_epoch", "abs_dt", "channel", "session", "rec", "time_to_onset_sec",
          "seizure_idx", "seizure_onset_epoch", "seizure_racine", "hour_of_day",
-         "lead_bin", "stim_key", "stim_status"]
+         "phase", "lead_bin", "stim_key", "stim_status"]
 
 
 def _token(session_dir: str) -> str:
@@ -188,8 +228,10 @@ def _empty_frame(metrics: list[str]) -> pd.DataFrame:
                          _META + list(metrics)})
 
 
-def _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics):
-    """Build the DataFrame for the kept stimuli (index array *sel*)."""
+def _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics,
+              phase):
+    """Build the DataFrame for the kept stimuli (index array *sel*), tagged with
+    the peri-onset *phase* ('pre' | 'post')."""
     sz_idx = idx[sel]
     data = {
         "t_epoch": t[sel],
@@ -202,6 +244,7 @@ def _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics):
         "seizure_onset_epoch": np.array([seizures[j].onset_epoch for j in sz_idx]),
         "seizure_racine": np.array([_int_or(seizures[j].racine) for j in sz_idx]),
         "hour_of_day": np.array([_hour_of_day(x) for x in t[sel]]),
+        "phase": np.array([phase] * sz_idx.size, dtype=object),
     }
     for m in metrics:
         data[m] = mcols[m][sel]

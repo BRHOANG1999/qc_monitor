@@ -130,14 +130,21 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
         if df.empty:
             _finish(job_id, {"empty": True})
             return
-        _set(job_id, progress=f"embedding {len(df):,} stimuli ({method.upper()})…")
-        res = embed(df, method=method, cap=cap)
-        sub = df.loc[res["rows"]].reset_index(drop=True)
+        # The embedding / scatter / trajectory are PRE-onset only (unchanged);
+        # the full frame (pre + post) is kept for the per-seizure trend test.
+        pre = df[df["phase"] == "pre"].reset_index(drop=True)
+        if pre.empty:
+            _finish(job_id, {"empty": True})
+            return
+        _set(job_id, progress=f"embedding {len(pre):,} stimuli ({method.upper()})…")
+        res = embed(pre, method=method, cap=cap)
+        sub = pre.loc[res["rows"]].reset_index(drop=True)
         ro = confound_readout(res["emb"], sub)
         _finish(job_id, {"empty": False, "emb": res["emb"], "sub": sub,
+                         "full": df.reset_index(drop=True),
                          "readout": ro, "meta": res["meta"],
                          "method": res["method"],
-                         "n_seizures": int(df["seizure_idx"].nunique())})
+                         "n_seizures": int(pre["seizure_idx"].nunique())})
     except Exception as e:                                     # noqa: BLE001
         _set(job_id, status="error", progress=f"error: {e}")
 

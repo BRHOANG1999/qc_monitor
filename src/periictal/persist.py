@@ -27,8 +27,9 @@ from src.utils.evoked_output import (animals_in_filename, feature_sidecar_path,
 _MAX_FILES = 2_000_000
 
 # Bump when the matrix column schema changes, so old cached pickles (which lack
-# the new columns) are invalidated rather than silently loaded. v2 added `rec`.
-_SCHEMA_VERSION = "2"
+# the new columns) are invalidated rather than silently loaded. v2 added `rec`;
+# v3 added `phase` (pre/post) + the symmetric post-onset rows.
+_SCHEMA_VERSION = "3"
 
 
 def _safe(name: str) -> str:
