@@ -39,7 +39,7 @@ from src.dashboard.design import (COLOR_ACCENT, COLOR_DIVIDER, COLOR_SUCCESS,
                                   COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
                                   COLOR_WARNING, FONT_SIZE_BODY,
                                   FONT_SIZE_CAPTION, FONT_SIZE_TITLE, RADIUS_SM,
-                                  SPACE_2, SPACE_3, SPACE_4, SPACE_5)
+                                  SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5)
 from src.periictal import config as _cfg
 from src.periictal import palette as _pal
 from src.periictal import passive as _passive
@@ -181,6 +181,7 @@ def layout(store):
                      config={"displaylogo": False},
                      figure=empty_fig("Press ▶ Build to embed the lead-up stimuli",
                                       hint="Pick an animal and protocol above."))),
+             _explainer(),
              html.Div(id="pex-status", style={"color": COLOR_TEXT_SECONDARY,
                                               "fontSize": FONT_SIZE_CAPTION,
                                               "minHeight": "14px",
@@ -193,6 +194,56 @@ def layout(store):
         dcc.Interval(id="pex-poll", interval=1200, disabled=True),
         dcc.Store(id="pex-job"),
     ], style={"padding": SPACE_4})
+
+
+_EXPLAIN_P = {"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+              "margin": f"{SPACE_2} 0", "maxWidth": "95ch"}
+
+
+def _explainer() -> html.Div:
+    """Persistent 'what am I looking at' panel: what a point is, what sets its
+    position (the features -- NOT the colour), and how to read UMAP honestly."""
+    feats = ", ".join(_cfg.CHEAP_METRICS)
+    always = html.Div([
+        html.Span("How to read this   ",
+                  style={"fontWeight": "600", "color": COLOR_TEXT_PRIMARY}),
+        html.Span("Each point is one evoked response, positioned by its "
+                  "standardized feature vector. Colour is an overlay — it never "
+                  "moves points; recolour to test whether the layout tracks "
+                  "seizure proximity or a confound.",
+                  style={"color": COLOR_TEXT_SECONDARY}),
+    ], style={"fontSize": FONT_SIZE_CAPTION, "marginBottom": SPACE_1})
+    detail = html.Details([
+        html.Summary("What determines the layout, and the features used",
+                     style={"cursor": "pointer", "color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION}),
+        html.P([html.B("Position = feature similarity. "),
+                "Each response's ", html.B("22 evoked (19 passive) features"),
+                " — amplitudes, latencies, slope, line length, AUC, RMS, "
+                "variance, autocorrelation, and spectral + wavelet-gamma powers "
+                "— are z-scored and reduced to 2-D. Responses with similar "
+                "features sit near each other; the blobs are regions of similar "
+                "response morphology, not clusters 'of' time or seizures."],
+               style=_EXPLAIN_P),
+        html.P([html.B("Colour is not an input. "),
+                "Time-to-onset, hour-of-day, seizure and stim fingerprint are "
+                "painted on afterward, so a colour pattern means the feature "
+                "layout happens to line up with that variable — recolour by "
+                "hour-of-day or stim fingerprint to check it isn't a confound."],
+               style=_EXPLAIN_P),
+        html.P([html.B("UMAP caveat. "), "Blob shapes and the distances between "
+                "separated blobs are not meaningful — treat UMAP as a picture. "
+                "PCA axes, by contrast, carry real variance (shown on the axes)."],
+               style=_EXPLAIN_P),
+        html.Div("Features fed in: " + feats + "  (passive drops early_area, "
+                 "late_area, early_late_ratio).",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                        "marginTop": SPACE_2}),
+    ])
+    return html.Div([always, detail],
+                    style={"marginTop": SPACE_2, "background": COLOR_SURFACE_2,
+                           "padding": f"{SPACE_2} {SPACE_3}",
+                           "borderRadius": RADIUS_SM})
 
 
 def _title_block() -> html.Div:
