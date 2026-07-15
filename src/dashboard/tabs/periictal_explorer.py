@@ -261,6 +261,15 @@ def _erp_card(store, a0) -> object:
             id="pex-erp-contrast", type="number", value=99, min=80, max=100,
             step="any", debounce=True, style=_WIN_INP),
             "Colour range = ± this percentile of |amplitude| (clips outliers)."),
+        _ctl("Display", dcc.RadioItems(
+            id="pex-erp-mode", value="amplitude", inline=True,
+            labelStyle=_RADIO_LABEL, inputStyle=_RADIO_INPUT,
+            options=[{"label": "raw", "value": "amplitude"},
+                     {"label": "Δ from mean", "value": "deviation"},
+                     {"label": "row z-score", "value": "zscore"}]),
+            "Raw = the actual amplitude (dominated by the fixed early peak). "
+            "Δ from mean subtracts the grand-average waveform per latency so only "
+            "CHANGES show. Row z-score normalizes each latency — most sensitive."),
         html.Div(button("▶ Build ERP", "pex-erp-build", icon_name="play",
                         **{"title": "Read the raw traces for this seizure's "
                                     "lead-up and stack them. Runs in the "
@@ -981,13 +990,26 @@ def _erp_worker(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)
         _erp_set(key, status="error", progress=f"error: {e}")
 
 
-def _erp_figure(gathered, n, overlap, contrast) -> go.Figure:
+def _erp_transform(z, mode):
+    """Per-latency (row) display transform: raw, deviation-from-mean-waveform, or
+    row z-score -- so a constant response goes flat and only CHANGES show."""
+    if mode == "deviation":
+        return z - np.nanmean(z, axis=1, keepdims=True), "Δ amplitude"
+    if mode == "zscore":
+        m = np.nanmean(z, axis=1, keepdims=True)
+        sd = np.nanstd(z, axis=1, keepdims=True)
+        return (z - m) / np.where(sd > 0, sd, 1.0), "z-score"
+    return z, "amplitude"
+
+
+def _erp_figure(gathered, n, overlap, contrast, mode="amplitude") -> go.Figure:
     if not gathered or gathered.get("empty"):
         return empty_fig("No trials in this lead-up window")
     trials, row_ms, tto = gathered["trials"], gathered["row_ms"], gathered["tto"]
     step = max(1, round(float(n) * (1.0 - float(overlap) / 100.0)))
     z, col_tto = sliding_trial_average(trials, tto, int(n), step)
     z, rm = decimate_rows(z, row_ms, 300)
+    z, cbar_title = _erp_transform(z, mode)
     absz = np.abs(z[np.isfinite(z)])
     zmax = float(np.percentile(absz, float(contrast))) if absz.size else 1.0
     zmax = zmax or 1.0
@@ -997,7 +1019,7 @@ def _erp_figure(gathered, n, overlap, contrast) -> go.Figure:
     fig = go.Figure(go.Heatmap(
         z=z, x=x, y=rm, colorscale="RdBu", reversescale=True, zmid=0,
         zmin=-zmax, zmax=zmax,
-        colorbar=dict(title=dict(text="amplitude", font=dict(size=9)),
+        colorbar=dict(title=dict(text=cbar_title, font=dict(size=9)),
                       thickness=10, len=0.85, x=1.005),
         hovertemplate="%{y:.0f} ms · %{z:.3g}<extra></extra>"))
     if ncol and col_tto.min() <= 0.0 <= col_tto.max():      # mark onset (tto≈0)
@@ -1032,13 +1054,18 @@ def _erp_wave_figure(gathered, n, overlap, col):
         trials, tto, int(n), step, int(col or 0))
     if mean.size == 0:
         return empty_fig("No column to show"), ""
+    grand = np.nanmean(trials, axis=0)                   # grand-average waveform
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=np.concatenate([row_ms, row_ms[::-1]]),
         y=np.concatenate([mean + sd, (mean - sd)[::-1]]), fill="toself",
         mode="lines", line=dict(width=0), fillcolor="rgba(94,124,226,0.15)",
         hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(x=row_ms, y=mean, mode="lines", showlegend=False,
+    fig.add_trace(go.Scatter(x=row_ms, y=grand, mode="lines", name="mean of all",
+                             line=dict(color=COLOR_TEXT_TERTIARY, width=1,
+                                       dash="dash"),
+                             hovertemplate="mean %{y:.3g}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=row_ms, y=mean, mode="lines", name="this column",
                              line=dict(color=COLOR_ACCENT, width=2),
                              hovertemplate="%{x:.0f} ms · %{y:.3g}<extra></extra>"))
     fig.add_hline(y=0, line=dict(color=COLOR_DIVIDER, width=1))
@@ -1047,7 +1074,8 @@ def _erp_wave_figure(gathered, n, overlap, col):
         height=240, margin=dict(l=56, r=20, t=26, b=40),
         title=dict(text=f"ERP at {lbl}", font=dict(size=11), x=0.02),
         xaxis=dict(title="post-stim time (ms)"), yaxis=dict(title="amplitude"),
-        uirevision="pex-erp-wave")
+        legend=dict(orientation="h", y=1.04, yanchor="bottom", x=1, xanchor="right",
+                    font=dict(size=9)), uirevision="pex-erp-wave")
     return fig, lbl
 
 
@@ -1064,7 +1092,7 @@ def _erp_ncol_and_onset(gathered, n, overlap):
     return len(starts), int(np.argmin(np.abs(ct)))
 
 
-def _erp_render(gathered, n, overlap, contrast, key):
+def _erp_render(gathered, n, overlap, contrast, key, mode="amplitude"):
     """(figure, status, poll_disabled, job, warn) for a ready ERP gather."""
     if gathered.get("empty"):
         msg = "No trials in this seizure's lead-up (unreachable traces or none in window)."
@@ -1076,7 +1104,7 @@ def _erp_render(gathered, n, overlap, contrast, key):
                         "another animal's pulses, not true evoked responses.",
                         COLOR_WARNING, "⚠")
     nt = int(gathered["trials"].shape[0])
-    return (_erp_figure(gathered, n, overlap, contrast),
+    return (_erp_figure(gathered, n, overlap, contrast, mode),
             f"✓ built from {nt:,} trials", True, key, warn)
 
 
@@ -1265,10 +1293,11 @@ def register_callbacks(app, store, config):
         State("pex-erp-n", "value"),
         State("pex-erp-overlap", "value"),
         State("pex-erp-contrast", "value"),
+        State("pex-erp-mode", "value"),
         prevent_initial_call=True,
     )
     def _erp_build_or_poll(_n, _iv, animal, protocol, sz, lookback, frm, to,
-                           navg, overlap, contrast):
+                           navg, overlap, contrast, mode):
         if not animal or sz is None:
             return no_update, "Pick a seizure.", True, no_update, no_update
         lookback = float(lookback or 60.0)
@@ -1277,7 +1306,7 @@ def register_callbacks(app, store, config):
             gathered = _ERP_CACHE.get(key)
             state = dict(_ERP_JOBS.get(key) or {})
         if gathered is not None:
-            return _erp_render(gathered, navg, overlap, contrast, key)
+            return _erp_render(gathered, navg, overlap, contrast, key, mode)
         if state.get("status") == "error":
             return (empty_fig("ERP build failed", hint=state.get("progress", "")),
                     state.get("progress", "error"), True, no_update, no_update)
@@ -1291,14 +1320,15 @@ def register_callbacks(app, store, config):
         Input("pex-erp-n", "value"),
         Input("pex-erp-overlap", "value"),
         Input("pex-erp-contrast", "value"),
+        Input("pex-erp-mode", "value"),
         State("pex-erp-job", "data"),
         prevent_initial_call=True,
     )
-    def _erp_rerender(navg, overlap, contrast, key):
+    def _erp_rerender(navg, overlap, contrast, mode, key):
         gathered = _ERP_CACHE.get(key) if key else None
         if not gathered or gathered.get("empty"):
             return no_update
-        return _erp_figure(gathered, navg, overlap, contrast)
+        return _erp_figure(gathered, navg, overlap, contrast, mode)
 
     @app.callback(
         Output("pex-erp-col", "data"),
