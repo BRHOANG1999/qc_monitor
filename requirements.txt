@@ -21,6 +21,10 @@ opencv-python>=4.8
 # Imported by src/dashboard/tabs/{surgeries,maintenance,data_log_xref}.py
 # and src/utils/assignments.py for Google Sheets dataframes.
 pandas>=2.0
+# Imported by src/periictal/ (PCA embedding, StandardScaler) and declared for
+# the peri-ictal evoked explorer's UMAP option.
+scikit-learn>=1.3
+umap-learn>=0.5.4
 # Imported by src/dashboard/tabs/surgeries.py for the published-CSV path.
 requests>=2.31
 # Imported by src/dashboard/tabs/surgeries.py (lazy) for the

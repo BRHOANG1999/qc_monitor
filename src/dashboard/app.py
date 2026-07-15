@@ -28,6 +28,7 @@ from src.dashboard.tabs import criticality as tabs_criticality
 from src.dashboard.tabs import electrode_health as tabs_electrode_health
 from src.dashboard.tabs import evoked as tabs_evoked
 from src.dashboard.tabs import chronic_evoked as tabs_chronic_evoked
+from src.dashboard.tabs import periictal_explorer as tabs_periictal_explorer
 from src.dashboard.tabs import jobs_monitor as tabs_jobs_monitor
 from src.dashboard.tabs import workers_monitor as tabs_workers_monitor
 from src.dashboard.tabs import lfp_browser as tabs_lfp_browser
@@ -112,6 +113,7 @@ NAV_GROUPS = [
         {"id": "waveforms", "label": "Evoked waveforms"},
         {"id": "evoked", "label": "Evoked features"},
         {"id": "chronic_evoked", "label": "Chronic Evoked Analyzer"},
+        {"id": "periictal_explorer", "label": "Peri-ictal Explorer"},
         {"id": "criticality", "label": "Criticality"},
         {"id": "lfp", "label": "LFP browser"},
         {"id": "video", "label": "Video review"},
@@ -1041,6 +1043,9 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "chronic_evoked":
                 return _enable_persistence(
                     tabs_chronic_evoked.layout(store))
+            elif tab == "periictal_explorer":
+                return _enable_persistence(
+                    tabs_periictal_explorer.layout(store))
             elif tab == "jobs_monitor":
                 return _enable_persistence(tabs_jobs_monitor.layout(store))
             elif tab == "workers_monitor":
@@ -1162,6 +1167,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_waveforms.register_callbacks(app, store, config)
     tabs_evoked.register_callbacks(app, store, config)
     tabs_chronic_evoked.register_callbacks(app, store, config)
+    tabs_periictal_explorer.register_callbacks(app, store, config)
     tabs_jobs_monitor.register_callbacks(app, store, config)
     tabs_workers_monitor.register_callbacks(app, store, config)
     tabs_settings.register_callbacks(app, store, config)
@@ -1225,6 +1231,7 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
         tabs_evoked.layout, tabs_chronic_evoked.layout,
+        tabs_periictal_explorer.layout,
         tabs_jobs_monitor.layout,
         tabs_workers_monitor.layout,
         tabs_settings.layout,

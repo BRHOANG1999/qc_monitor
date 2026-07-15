@@ -33,6 +33,7 @@ def main() -> int:
         video, surgeries, maintenance, data_log_xref,
         lfp_browser, overview,
         review_status, event_verification,
+        periictal_explorer,
     )
 
     tabs = [
@@ -56,6 +57,7 @@ def main() -> int:
         ("overview", overview.layout),
         ("review_status", review_status.layout),
         ("event_verification", event_verification.layout),
+        ("periictal_explorer", periictal_explorer.layout),
     ]
 
     failures = []

@@ -160,24 +160,39 @@ def list_animals(evoked_dir: str) -> list[str]:
 _FEATURE_SIDECAR_VERSION = "2"
 
 
-def feature_sidecar_path(mat_path: str, animal: str) -> str:
-    """Path of *animal*'s per-epoch feature sidecar next to a *_evoked.mat."""
+def feature_sidecar_path(mat_path: str, animal: str,
+                         variant: str = "evoked") -> str:
+    """Path of *animal*'s per-epoch feature sidecar next to a *_evoked.mat.
+
+    The default 'evoked' variant keeps the original ``<base>.features.<animal>.json``
+    name (so the ~2000 existing sidecars and every current caller are unchanged);
+    a non-default *variant* (e.g. 'passive') gets its own
+    ``<base>.features.<animal>.<variant>.json`` so it coexists.
+    """
     assert mat_path and animal, "mat_path and animal required"
+    assert variant, "variant required"
     base = mat_path[:-4] if mat_path.lower().endswith(".mat") else mat_path
-    return f"{base}.features.{animal}.json"
+    if variant == "evoked":
+        return f"{base}.features.{animal}.json"
+    return f"{base}.features.{animal}.{variant}.json"
 
 
-def write_feature_sidecar(mat_path: str, animal: str, rows: list) -> str:
-    """Atomically write *animal*'s feature rows beside the source .mat as
-    JSON, stamped with the source mtime so a stale sidecar is detectable."""
+def write_feature_sidecar(mat_path: str, animal: str, rows: list,
+                          variant: str = "evoked",
+                          config_sig: str | None = None) -> str:
+    """Atomically write *animal*'s feature rows beside the source .mat as JSON,
+    stamped with the source mtime (staleness) and, for a windowed *variant*, a
+    *config_sig* so a sidecar computed under a different window/guard is
+    detectable and rebuilt."""
     assert mat_path and animal, "mat_path and animal required"
     assert isinstance(rows, list), "rows must be a list"
-    sp = feature_sidecar_path(mat_path, animal)
+    sp = feature_sidecar_path(mat_path, animal, variant)
     try:
         src_mtime = os.path.getmtime(mat_path)
     except OSError:
         src_mtime = 0.0
     payload = {"version": _FEATURE_SIDECAR_VERSION, "animal": animal,
+               "variant": variant, "config_sig": config_sig,
                "source": os.path.basename(mat_path), "source_mtime": src_mtime,
                "columns": list(ef.ALL_COLUMNS), "rows": rows}
     tmp = sp + ".tmp"
@@ -187,11 +202,13 @@ def write_feature_sidecar(mat_path: str, animal: str, rows: list) -> str:
     return sp
 
 
-def read_feature_sidecar(mat_path: str, animal: str) -> list | None:
-    """*animal*'s feature rows from the sidecar, or None when it's missing,
-    unreadable, a different schema version, or stale (source .mat changed)."""
+def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
+                         config_sig: str | None = None) -> list | None:
+    """*animal*'s feature rows from the *variant* sidecar, or None when it's
+    missing, unreadable, a different schema version, stale (source .mat changed),
+    or -- when *config_sig* is given -- computed under a different config."""
     assert mat_path and animal, "mat_path and animal required"
-    sp = feature_sidecar_path(mat_path, animal)
+    sp = feature_sidecar_path(mat_path, animal, variant)
     if not os.path.exists(sp):
         return None
     try:
@@ -200,6 +217,8 @@ def read_feature_sidecar(mat_path: str, animal: str) -> list | None:
     except (OSError, ValueError):
         return None
     if payload.get("version") != _FEATURE_SIDECAR_VERSION:
+        return None
+    if config_sig is not None and payload.get("config_sig") != config_sig:
         return None
     try:
         if abs(float(payload.get("source_mtime", -1.0))

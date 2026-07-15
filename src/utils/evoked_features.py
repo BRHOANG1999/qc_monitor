@@ -95,13 +95,19 @@ class FeatureConfig:
 
 
 def _bandpass(a: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
-    from scipy.signal import butter, filtfilt
+    # Second-order-sections form, NOT transfer-function (b, a). At fs=20 kHz a
+    # 4th-order band butter in (b, a) form places poles outside the unit circle
+    # for low corners (a documented numerical failure of high-order IIR in
+    # (b, a)); filtfilt then blows the output up to ~1e80. SOS is stable there.
+    from scipy.signal import butter, sosfiltfilt
     nyq = 0.5 * fs
     lo = max(1e-3, min(lo, nyq * 0.99))
     hi = max(lo + 1e-3, min(hi, nyq * 0.99))
-    b, c = butter(4, [lo / nyq, hi / nyq], btype="band")
-    pad = min(a.shape[1] - 1, 3 * max(len(b), len(c)))
-    return filtfilt(b, c, a, axis=1, padlen=pad)
+    sos = butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+    # sosfiltfilt needs padlen < signal length; its default (3*(2*n_sections+1))
+    # is fine for our ~8k-20k-sample traces but clamp for short windows.
+    pad = min(a.shape[1] - 1, 3 * (2 * sos.shape[0] + 1))
+    return sosfiltfilt(sos, a, axis=1, padlen=pad)
 
 
 def _notch(a: np.ndarray, fs: float, f0: float) -> np.ndarray:
