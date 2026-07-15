@@ -53,7 +53,7 @@ def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
     Session/channel are kept per row so the protocol filter + fingerprint can
     attach; a stimulus with no parseable abs_dt is dropped here."""
     assert animal, "animal required"
-    t_parts, ch_parts, se_parts = [], [], []
+    t_parts, ch_parts, se_parts, rec_parts = [], [], [], []
     m_parts: dict = {m: [] for m in metrics}
     for i, (_fp, _sp, rows) in enumerate(
             _sidecar_iter(animal, evoked_dir, variant, passive_cfg)):
@@ -67,16 +67,19 @@ def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
         t_parts.append(secs)
         ch_parts.append(np.array([r.get("channel") or "" for r in rows], dtype=object))
         se_parts.append(np.array([r.get("session") or "" for r in rows], dtype=object))
+        # rec_dt (recording start) is the natural per-recording id for drill-down.
+        rec_parts.append(np.array([r.get("rec_dt") or "" for r in rows], dtype=object))
         for m in metrics:
             m_parts[m].append(
                 np.fromiter((_nan(r.get(m)) for r in rows),
                             dtype=np.float32, count=len(rows)))
     if not t_parts:
         return (np.empty(0), {m: np.empty(0, np.float32) for m in metrics},
-                np.empty(0, object), np.empty(0, object))
+                np.empty(0, object), np.empty(0, object), np.empty(0, object))
     t = np.concatenate(t_parts)
     mcols = {m: np.concatenate(m_parts[m]) for m in metrics}
-    return t, mcols, np.concatenate(ch_parts), np.concatenate(se_parts)
+    return (t, mcols, np.concatenate(ch_parts), np.concatenate(se_parts),
+            np.concatenate(rec_parts))
 
 
 def _assign_next_onset(t: np.ndarray, onsets: np.ndarray,
@@ -133,8 +136,8 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
          for c in lookback_ceilings(seizures, post_ictal_buffer_sec, window_sec)],
         dtype=np.float64)
 
-    t, mcols, chan, sess = _epoch_columns(animal, evoked_dir, metrics,
-                                          variant, passive_cfg)
+    t, mcols, chan, sess, rec = _epoch_columns(animal, evoked_dir, metrics,
+                                               variant, passive_cfg)
     if t.size == 0:
         return _empty_frame(metrics)
     idx, tto, keep = _assign_next_onset(t, onsets, ceilings)
@@ -150,7 +153,7 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
         return _empty_frame(metrics)
 
     sel = np.flatnonzero(keep)
-    frame = _assemble(sel, t, tto, idx, mcols, chan, sess, seizures, metrics)
+    frame = _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics)
     _add_lead_bins(frame, idx[sel], ceilings, min_leadtime_sec)
     if attach_fingerprint:
         _attach_fingerprint(frame, store, animal)
@@ -162,7 +165,7 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
 # --------------------------------------------------------------------- #
 
 # The non-metric columns the frame always carries.
-_META = ["t_epoch", "abs_dt", "channel", "session", "time_to_onset_sec",
+_META = ["t_epoch", "abs_dt", "channel", "session", "rec", "time_to_onset_sec",
          "seizure_idx", "seizure_onset_epoch", "seizure_racine", "hour_of_day",
          "lead_bin", "stim_key", "stim_status"]
 
@@ -177,7 +180,7 @@ def _empty_frame(metrics: list[str]) -> pd.DataFrame:
                          _META + list(metrics)})
 
 
-def _assemble(sel, t, tto, idx, mcols, chan, sess, seizures, metrics):
+def _assemble(sel, t, tto, idx, mcols, chan, sess, rec, seizures, metrics):
     """Build the DataFrame for the kept stimuli (index array *sel*)."""
     sz_idx = idx[sel]
     data = {
@@ -185,6 +188,7 @@ def _assemble(sel, t, tto, idx, mcols, chan, sess, seizures, metrics):
         "abs_dt": [datetime.fromtimestamp(x).isoformat() for x in t[sel]],
         "channel": chan[sel],
         "session": sess[sel],
+        "rec": rec[sel],
         "time_to_onset_sec": tto[sel],
         "seizure_idx": sz_idx.astype(np.int32),
         "seizure_onset_epoch": np.array([seizures[j].onset_epoch for j in sz_idx]),

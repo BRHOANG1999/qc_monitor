@@ -25,6 +25,10 @@ from src.utils.evoked_output import (animals_in_filename, feature_sidecar_path,
 
 _MAX_FILES = 2_000_000
 
+# Bump when the matrix column schema changes, so old cached pickles (which lack
+# the new columns) are invalidated rather than silently loaded. v2 added `rec`.
+_SCHEMA_VERSION = "2"
+
 
 def _safe(name: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(name))
@@ -58,7 +62,7 @@ def _signature(store, animal, evoked_dir, variant, protocol,
                window_sec, extra: str) -> str:
     parts = [inputs_signature(_sidecar_inputs(animal, evoked_dir, variant)),
              _seizure_sig(store, animal),
-             f"{protocol}|{window_sec}|{variant}|{extra}"]
+             f"{protocol}|{window_sec}|{variant}|{extra}|v{_SCHEMA_VERSION}"]
     return hashlib.sha256("::".join(parts).encode()).hexdigest()[:16]
 
 
