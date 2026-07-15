@@ -900,17 +900,36 @@ def _default_cache_dir() -> str:
     return os.path.join(root, "data", "derivatives", "periictal", "cache")
 
 
-def _render_cached(cached, color_by, jid, traj_y):
-    """(figure, reading, status, poll_disabled, job, trajectory) for a ready
-    build."""
-    if cached.get("empty"):
-        msg = ("No lead-up stimuli — fewer than 2 seizures, none in this protocol, "
-               "or no fresh sidecars for this animal.")
-        return empty_fig(msg), "", msg, True, jid, empty_fig(msg)
+_EMPTY_MSG = ("No lead-up stimuli — fewer than 2 seizures, none in this protocol, "
+              "or no fresh sidecars for this animal.")
+
+
+def _embed_fig_reading(cached, color_by):
+    """(scatter figure, reading strip) for a ready embedding build (empty-safe).
+    The single source of truth for the Embedding lens's render."""
+    if not cached or cached.get("empty"):
+        return empty_fig(_EMPTY_MSG), ""
     fig = _figure(cached["emb"], cached["sub"], color_by,
                   cached.get("method", "pca"), cached.get("meta"))
+    return fig, _reading_strip(cached)
+
+
+def _build_status(cached, jid):
+    """(status, poll_disabled, job) once a build is ready in cache — the pulse
+    that wakes the per-lens render callbacks (they key off the job store)."""
+    if cached.get("empty"):
+        return _EMPTY_MSG, True, jid
+    return "✓ built", True, jid
+
+
+def _render_cached(cached, color_by, jid, traj_y):
+    """(figure, reading, status, poll_disabled, job, trajectory) — composes the
+    per-lens renderers; retained as a stable helper for tests."""
+    if cached.get("empty"):
+        return empty_fig(_EMPTY_MSG), "", _EMPTY_MSG, True, jid, empty_fig(_EMPTY_MSG)
+    fig, reading = _embed_fig_reading(cached, color_by)
     traj = _trajectory_fig(cached, traj_y or "peak_to_trough")
-    return fig, _reading_strip(cached), "✓ built", True, jid, traj
+    return fig, reading, "✓ built", True, jid, traj
 
 
 # --------------------------------------------------------------------- #
@@ -1182,12 +1201,9 @@ def register_callbacks(app, store, config):
             return no_update
 
     @app.callback(
-        Output("pex-graph", "figure"),
-        Output("pex-reading", "children"),
         Output("pex-status", "children"),
         Output("pex-poll", "disabled"),
         Output("pex-job", "data"),
-        Output("pex-traj", "figure"),
         Input("pex-build", "n_clicks"),
         Input("pex-poll", "n_intervals"),
         State("pex-animal", "value"),
@@ -1195,24 +1211,23 @@ def register_callbacks(app, store, config):
         State("pex-variant", "value"),
         State("pex-window-h", "value"),
         State("pex-method", "value"),
-        State("pex-colorby", "value"),
         State("pex-winmode", "value"),
         State("pex-win-from", "value"),
         State("pex-win-to", "value"),
         State("pex-win-guard", "value"),
-        State("pex-traj-y", "value"),
         prevent_initial_call=True,
     )
     def _build_or_poll(_n, _iv, animal, protocol, variant, window_h,
-                       method, color_by, winmode, wf, wt, wg, traj_y):
+                       method, winmode, wf, wt, wg):
+        """Compute + cache the matrix/embedding for the current scope; publish the
+        job id ONLY when the cache is ready (that pulse drives the per-lens render
+        callbacks). Writes no figures itself."""
         if not animal:
-            return (no_update, no_update, "Pick an animal.", True, no_update,
-                    no_update)
+            return "Pick an animal.", True, no_update
         try:
             sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
         except ValueError as e:
-            return (empty_fig("Invalid feature window", hint=str(e)),
-                    "", f"⚠ Feature window: {e}", True, no_update, no_update)
+            return f"⚠ Feature window: {e}", True, no_update
         window_h = float(window_h or 6.0)
         cap = _cfg.INTERACTIVE_POINT_CAP
         jid = _job_id(animal, protocol or "", variant, window_h, method, cap,
@@ -1221,14 +1236,28 @@ def register_callbacks(app, store, config):
             cached = _CACHE.get(jid)
             state = dict(_JOBS.get(jid) or {})
         if cached is not None:
-            return _render_cached(cached, color_by, jid, traj_y)
+            return _build_status(cached, jid)
         if state.get("status") == "error":
-            return (empty_fig("Build failed", hint=state.get("progress", "")),
-                    "", state.get("progress", "error"), True, no_update, no_update)
+            return state.get("progress", "error"), True, no_update
         _kick(store, evoked_dir, jid, animal, protocol or "", variant,
               window_h, method, cap, sv, cfg)
         prog = (_JOBS.get(jid) or {}).get("progress", "starting…")
-        return no_update, no_update, f"⏳ {prog}", False, no_update, no_update
+        return f"⏳ {prog}", False, no_update
+
+    @app.callback(
+        Output("pex-graph", "figure"),
+        Output("pex-reading", "children"),
+        Input("pex-job", "data"),
+        State("pex-colorby", "value"),
+        prevent_initial_call=False,
+    )
+    def _embed_render(jid, color_by):
+        """Draw the Embedding lens from cache when the job pulse arrives (or on
+        mount, from the persisted job)."""
+        cached = _CACHE.get(jid) if jid else None
+        if cached is None:
+            return no_update, no_update
+        return _embed_fig_reading(cached, color_by)
 
     @app.callback(
         Output("pex-graph", "figure", allow_duplicate=True),
@@ -1244,14 +1273,17 @@ def register_callbacks(app, store, config):
                        cached.get("method", "pca"), cached.get("meta"))
 
     @app.callback(
-        Output("pex-traj", "figure", allow_duplicate=True),
+        Output("pex-traj", "figure"),
+        Input("pex-job", "data"),
         Input("pex-traj-y", "value"),
-        State("pex-job", "data"),
-        prevent_initial_call=True,
+        prevent_initial_call=False,
     )
-    def _retraj(traj_y, jid):
+    def _trend_render(jid, traj_y):
+        """Draw the Trend lens (trajectory) from cache on the job pulse or a
+        y-selector change. (The forest + verdict + FDR table attach here in the
+        trend-test step.)"""
         cached = _CACHE.get(jid) if jid else None
-        if not cached or cached.get("empty"):
+        if cached is None:
             return no_update
         return _trajectory_fig(cached, traj_y or "peak_to_trough")
 
