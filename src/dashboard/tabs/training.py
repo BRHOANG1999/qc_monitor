@@ -1540,7 +1540,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not current or not current.get("file_id"):
             return [], 1, hide
         from src.utils.video import companion_videos
-        mat_path = _file_path_for_id(store, int(current["file_id"]))
+        # Resolve the live path (DB path can be stale for historical files;
+        # see store.live_file_path) so the companion video is actually found.
+        mat_path = store.live_file_path(int(current["file_id"]))
         cams = companion_videos(mat_path) if mat_path else []
         opts = [{"label": f" Cam {c['cam']}", "value": c["cam"]}
                 for c in cams]
@@ -1884,7 +1886,9 @@ def _video_children_and_sig(store: Store, config: dict, file_id: int,
     readiness changes."""
     from src.utils import avi_transcode as _avi
     from src.utils.video import companion_videos
-    mat_path = _file_path_for_id(store, file_id)
+    # Live path, not the raw DB path -- historical training files can hold a
+    # stale, un-updatable path whose folder has no video (see live_file_path).
+    mat_path = store.live_file_path(file_id)
     cams = companion_videos(mat_path) if mat_path else []
     if not cams:
         return (_vid_placeholder("No companion video for this recording — "

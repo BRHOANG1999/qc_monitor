@@ -5025,6 +5025,39 @@ class Store:
             conn.close()
         return found
 
+    def live_file_path(self, file_id) -> str | None:
+        """The recording's path that ACTUALLY exists on disk for *file_id*.
+
+        Returns the DB ``file_path`` when it's a real file. Otherwise falls
+        back to the cached EEG location (``eeg_file_location``, keyed by
+        filename) -- populated by the lazy training resolver -- so callers
+        reach the live copy even when the DB row holds a stale,
+        un-updatable path (``UNIQUE(file_path)`` blocked the relocation
+        because another row already owns the live path). This is the single
+        resolution point every non-LFP consumer of a recording (video
+        render, camera picker, media-serving route) should use so they don't
+        each re-derive the dead path. Returns the stale path as a last resort
+        (so callers still 404/placeholder cleanly), or None when the row is
+        unknown."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT file_path FROM processed_files WHERE id=?",
+                (int(file_id),)).fetchone()
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
+        finally:
+            conn.close()
+        if not row or not row["file_path"]:
+            return None
+        cur = row["file_path"]
+        if os.path.isfile(cur):
+            return cur
+        cached = self.eeg_location_get(os.path.basename(cur))
+        if cached and os.path.isfile(cached):
+            return cached
+        return cur
+
     def eeg_location_get(self, filename: str) -> str | None:
         """Cached recording location for the EEGLocator. Returns the path
         for a positive hit, "" for a known-missing file still inside the

@@ -30,14 +30,11 @@ _snapshot_lock = threading.Lock()
 
 
 def _lookup_mat_path(store, file_id: int) -> str | None:
-    with store.connection() as conn:
-        row = conn.execute(
-            "SELECT file_path, has_video FROM processed_files WHERE id = ?",
-            (file_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return row["file_path"]
+    # live_file_path falls back to the resolved EEG location when the DB
+    # row's path is stale (historical files whose drive was remapped and
+    # whose relocation was blocked by UNIQUE(file_path)); otherwise the
+    # companion video next to the dead path is never found.
+    return store.live_file_path(file_id)
 
 
 def _latest_mat_with_video(store) -> str | None:
