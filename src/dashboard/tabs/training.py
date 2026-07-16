@@ -237,6 +237,9 @@ def _filtered_trace(store: Store, file_id: int, channel: int,
         add_click_catcher(fig)   # click anywhere in the column sets a landmark
         return fig
     except Exception:
+        logger.exception("Filtered trace load failed "
+                         "(file_id=%s channel=%s mode=%s)",
+                         file_id, channel, mode)
         return _empty_lfp_fig("Trace failed to load.")
 
 
@@ -273,6 +276,11 @@ def _build_figures(store: Store, file_id: int, channel: int,
                                  title=ttl)
         add_click_catcher(lfp)   # click anywhere in the column sets a landmark
     except Exception:
+        # Log the real cause (interrupted SMB read, file mid-rewrite by the
+        # dispatcher, bad channel, ...) so "LFP failed to load." on the UI
+        # isn't a blind spot when reviewers report it.
+        logger.exception("LFP load failed (file_id=%s channel=%s)",
+                         file_id, channel)
         lfp = _empty_lfp_fig("LFP failed to load.")
         dur = 0.0
     return lfp, _filtered_trace(store, file_id, channel, mode), float(dur)

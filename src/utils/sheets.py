@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from datetime import date, datetime
 from io import BytesIO
@@ -45,13 +46,26 @@ import requests
 
 logger = logging.getLogger("qc_monitor.utils.sheets")
 
-# Service-account lookup cache: SA-path -> built Sheets API client.
 # google-api-python-client + google-auth are optional installs, imported
 # lazily inside _sheets_api so that the published-CSV path still works
 # on machines without the SA dep set.
 _SHEETS_API_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# Sheets API clients are held PER THREAD (below). googleapiclient/httplib2
+# transports are NOT thread-safe: a single client shared between the
+# dashboard render threads and the background sync threads interleaves
+# writes on one TLS socket, which corrupts the record stream and surfaces
+# as a flood of ``[SSL: WRONG_VERSION_NUMBER]`` /
+# ``[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC]`` fetch failures and stalled,
+# retrying sheet reads. Giving each thread its own client removes the
+# sharing entirely. These two module globals are retained only so the
+# ``surgeries.py`` re-export shim keeps importing (they are no longer the
+# client store).
 _sa_service_cache: dict = {}
 _sa_service_lock = RLock()
+
+# Per-thread Sheets API client store: {sa_path: client}, one dict per thread.
+_thread_local = threading.local()
 
 # TTL cache: (epoch_sec_fetched, dataframe_or_None) keyed by source.
 # Same cache backs both fetch paths so the warmth survives switching
@@ -115,17 +129,29 @@ def cache_has_entry(key: str) -> bool:
 #  Service-account API path
 # ===================================================================== #
 
+def _thread_svc_cache() -> dict:
+    """This thread's {sa_path: client} store, created on first use."""
+    cache = getattr(_thread_local, "svc_cache", None)
+    if cache is None:
+        cache = {}
+        _thread_local.svc_cache = cache
+    return cache
+
+
 def _sheets_api(service_account_file: str):
     """Lazy-build a Sheets API client keyed by the SA JSON path.
 
-    Cached so we don't re-parse the JSON / re-handshake on every fetch.
-    Raises if google-api-python-client / google-auth aren't installed.
+    The client is cached PER THREAD (see the module-level note): the
+    googleapiclient/httplib2 transport is not thread-safe, so each thread
+    keeps its own client and credentials rather than sharing one. Cached
+    within the thread so we don't re-parse the JSON / re-handshake on every
+    fetch. Raises if google-api-python-client / google-auth aren't installed.
     """
     assert service_account_file, "service_account_file required"
-    with _sa_service_lock:
-        svc = _sa_service_cache.get(service_account_file)
-        if svc is not None:
-            return svc
+    cache = _thread_svc_cache()
+    svc = cache.get(service_account_file)
+    if svc is not None:
+        return svc
 
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
@@ -134,9 +160,16 @@ def _sheets_api(service_account_file: str):
         service_account_file, scopes=_SHEETS_API_SCOPES,
     )
     svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    with _sa_service_lock:
-        _sa_service_cache[service_account_file] = svc
+    cache[service_account_file] = svc
     return svc
+
+
+def _drop_thread_svc(service_account_file: str) -> None:
+    """Discard this thread's cached client so a connection left in a bad
+    state (e.g. after a read timeout) isn't reused on the next fetch."""
+    cache = getattr(_thread_local, "svc_cache", None)
+    if cache is not None:
+        cache.pop(service_account_file, None)
 
 
 def _load_sheet_via_api(sheet_id: str, tab_name: str,
@@ -160,14 +193,25 @@ def _load_sheet_via_api(sheet_id: str, tab_name: str,
         if hit is not None and (now - hit[0]) < ttl_sec:
             return hit[1]
 
-    try:
-        svc = _sheets_api(service_account_file)
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=tab_name,
-        ).execute()
-    except Exception as e:
+    # One retry: a transient timeout can leave this thread's httplib2
+    # connection in a bad state, so we drop the cached client and rebuild
+    # a fresh one for the second attempt rather than reusing the poisoned
+    # socket. Two attempts is the fixed bound (no unbounded retry loop).
+    resp = None
+    last_err: Exception | None = None
+    for attempt in range(2):
+        try:
+            svc = _sheets_api(service_account_file)
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=tab_name,
+            ).execute()
+            break
+        except Exception as e:  # noqa: BLE001 - fall back to stale cache
+            last_err = e
+            _drop_thread_svc(service_account_file)
+    if resp is None:
         logger.warning("Sheets API fetch failed: %s (sheet=%s tab=%s)",
-                       e, sheet_id, tab_name)
+                       last_err, sheet_id, tab_name)
         with _cache_lock:
             stale = _cache.get(cache_key)
         return stale[1] if stale is not None else None
