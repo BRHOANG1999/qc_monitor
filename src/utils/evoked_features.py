@@ -52,6 +52,66 @@ EXPENSIVE_COLUMNS = [
 ]
 ALL_COLUMNS = CHEAP_COLUMNS + EXPENSIVE_COLUMNS
 
+# One-line, code-accurate descriptions of each feature column — the source of
+# truth for the "features used" reference shown in the UI (a validation aid).
+# KEEP IN SYNC with the functions below; band/window numbers are interpolated
+# from the constants above so they cannot silently drift. `y` = the trace over
+# an epoch; `dt = 1000/fs` ms per sample; t=0 is the stimulus.
+COLUMN_DOCS: dict[str, str] = {
+    "line_length": "Σ|Δy| — sum of |sample-to-sample differences| (waveform path "
+                   "length / wiggliness).",
+    "log_auc": "log(Σ|y|·dt + ε) — log area under the rectified trace.",
+    "peak_amplitude": "max(y) — the most positive sample.",
+    "trough_amplitude": "min(y) — the most negative sample.",
+    "peak_to_trough": "max(y) − min(y) — full peak-to-trough amplitude.",
+    "rms_amplitude": "√mean(y²) — root-mean-square amplitude.",
+    "variance": "var(y, ddof=1) — sample variance (÷N−1). A critical-slowing "
+                "early-warning signal.",
+    "peak_latency_ms": "time at argmax(y) — latency of the positive peak (ms "
+                       "after stim).",
+    "trough_latency_ms": "time at argmin(y) — latency of the negative trough.",
+    "max_slope": "max(|Δy|/dt) — steepest instantaneous slope (per ms).",
+    "max_slope_time_ms": "time at argmax(|Δy|) — when the steepest slope occurs.",
+    "early_area": "Σ|y| over 0–50 ms — rectified area in the early post-stim "
+                  "window.",
+    "late_area": "Σ|y| over 50–200 ms — rectified area in the late post-stim "
+                 "window.",
+    "early_late_ratio": "early_area / (late_area + ε) — early-vs-late energy "
+                        "balance.",
+    "autocorrelation": "lag-1 autocorrelation Σ(yₜ·yₜ₊₁)/Σyₜ² on the "
+                       "mean-subtracted trace (Maturana 2020). A critical-slowing "
+                       "early-warning signal (AR(1); ≈ exp(−dt/τ)).",
+    "sum_power_low": f"Σ periodogram power, {_LOW_BAND[0]:g}–{_LOW_BAND[1]:g} Hz.",
+    "freq_moment_low": "power-weighted mean frequency (spectral centroid), "
+                       f"{_LOW_BAND[0]:g}–{_LOW_BAND[1]:g} Hz.",
+    "sum_power_high": "Σ periodogram power, "
+                      f"{_HIGH_SUM_BAND[0]:g}–{_HIGH_SUM_BAND[1]:g} Hz.",
+    "freq_moment_high": "power-weighted mean frequency, "
+                        f"{_MOMENT_HIGH_BAND[0]:g}–{_MOMENT_HIGH_BAND[1]:g} Hz.",
+    "wavelet_power_slow_gamma": "mean Morlet-wavelet power, "
+        f"{_WAVELET_BANDS['wavelet_power_slow_gamma'][0]:g}–"
+        f"{_WAVELET_BANDS['wavelet_power_slow_gamma'][1]:g} Hz.",
+    "wavelet_power_gamma": "mean Morlet-wavelet power, "
+        f"{_WAVELET_BANDS['wavelet_power_gamma'][0]:g}–"
+        f"{_WAVELET_BANDS['wavelet_power_gamma'][1]:g} Hz.",
+    "wavelet_power_high_gamma": "mean Morlet-wavelet power, "
+        f"{_WAVELET_BANDS['wavelet_power_high_gamma'][0]:g}–"
+        f"{_WAVELET_BANDS['wavelet_power_high_gamma'][1]:g} Hz.",
+    # Expensive (per-epoch fits; NOT in the default UMAP set).
+    "recovery_tau": "exp-decay time constant of the post-peak Hilbert envelope: "
+                    "fit A·exp(−t/τ) from the envelope peak (found in 0–50 ms) to "
+                    "the window end (semi-log seed, Nelder-Mead refine). The "
+                    "active-probing critical-slowing metric (τ rises toward onset).",
+    "recovery_slope": "linear slope of y from its |peak| to the window end.",
+    "template_correlation": "Pearson r of each epoch vs the median of the "
+                            "previous 10 epochs (waveform stability).",
+    "pca_recon_error": "reconstruction error of the epoch against a top-3 PCA "
+                       "basis fit on the first epochs (normalised to that baseline).",
+    "ac_width": "first lag where the (FFT) autocorrelation drops below 0.5, "
+                "linearly interpolated — the AC half-width (broadens under slowing).",
+    "exp_fit_a": "amplitude A of an exp fit to the pre-peak rising |y|.",
+}
+
 _MAX_EPOCHS = 1_000_000     # NASA Rule 2: explicit per-epoch loop bound.
 
 

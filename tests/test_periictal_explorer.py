@@ -281,6 +281,37 @@ def test_trend_test_views_render_and_pc_placeholder():
     assert t2 is not None and v2 is not None
 
 
+# ------------------------------------------------------------------ #
+#  Feature reference (validation): every UMAP input is documented
+# ------------------------------------------------------------------ #
+
+def _iter_nodes(node):
+    yield node
+    kids = getattr(node, "children", None)
+    if kids is None:
+        return
+    if not isinstance(kids, (list, tuple)):
+        kids = [kids]
+    for k in kids:
+        if k is not None and not isinstance(k, str):
+            yield from _iter_nodes(k)
+
+
+def test_column_docs_document_every_feature():
+    # drift guard: no feature column may go undocumented (the validation promise).
+    from src.utils import evoked_features as ef
+    assert [c for c in ef.ALL_COLUMNS if c not in ef.COLUMN_DOCS] == []
+    assert all(m in ef.COLUMN_DOCS for m in pex._cfg.CHEAP_METRICS)
+
+
+def test_feature_reference_lists_all_umap_inputs():
+    from dash import html
+    ref = pex._feature_reference()
+    codes = [n.children for n in _iter_nodes(ref) if isinstance(n, html.Code)]
+    for m in pex._cfg.CHEAP_METRICS:
+        assert m in codes, f"{m} missing from the feature reference"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

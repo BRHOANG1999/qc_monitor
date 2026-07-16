@@ -54,6 +54,7 @@ from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
 from src.periictal.selection import summarize_selection
 from src.periictal import trendtest as _tt
 from src.preictal.isi import scored_seizures
+from src.utils import evoked_features as _ef
 from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
 
@@ -402,10 +403,67 @@ _EXPLAIN_P = {"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
               "margin": f"{SPACE_2} 0", "maxWidth": "95ch"}
 
 
+_FREF_TH = {"textAlign": "left", "padding": f"{SPACE_1} {SPACE_3}",
+            "color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+            "borderBottom": f"1px solid {COLOR_DIVIDER}", "position": "sticky",
+            "top": "0", "background": COLOR_SURFACE_2}
+_FREF_TD = {"padding": f"{SPACE_1} {SPACE_3}", "fontSize": FONT_SIZE_CAPTION,
+            "verticalAlign": "top", "borderBottom": f"1px solid {COLOR_DIVIDER}"}
+
+
+def _feature_reference() -> html.Details:
+    """Code-accurate reference of every feature fed to the embedding — the exact
+    computation of each, for validation. Sourced from
+    ``evoked_features.COLUMN_DOCS`` so the formulas can't drift from the code;
+    'evoked only' marks the three post-stim-window features the passive variant
+    drops."""
+    cols = list(_cfg.CHEAP_METRICS)
+    rows = []
+    for col in cols:
+        passive_drop = col in _cfg.PASSIVE_INVALID
+        name = [html.Code(col, style={"color": COLOR_TEXT_PRIMARY,
+                                      "background": "transparent"})]
+        if passive_drop:
+            name.append(html.Span(" · evoked only",
+                                  style={"color": COLOR_WARNING,
+                                         "fontSize": "11px"}))
+        rows.append(html.Tr([
+            html.Td(name, style={**_FREF_TD, "whiteSpace": "nowrap"}),
+            html.Td(_ef.COLUMN_DOCS.get(col, "—"),
+                    style={**_FREF_TD, "color": COLOR_TEXT_SECONDARY,
+                           "maxWidth": "70ch"}),
+        ]))
+    table = html.Div(html.Table([
+        html.Thead(html.Tr([html.Th("Feature", style=_FREF_TH),
+                            html.Th("How it's computed", style=_FREF_TH)])),
+        html.Tbody(rows),
+    ], style={"borderCollapse": "collapse", "width": "100%"}),
+        style={"maxHeight": "340px", "overflowY": "auto", "marginTop": SPACE_2,
+               "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_SM})
+    return html.Details([
+        html.Summary(f"Feature reference — the {len(cols)} inputs to the "
+                     "embedding, and how each is computed",
+                     style={"cursor": "pointer", "color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600"}),
+        html.Div("Each response's feature vector below is standardized (z-scored "
+                 "per column) then reduced to 2-D by PCA/UMAP — these are the "
+                 "ONLY inputs to the layout. 'evoked only' rows are dropped for "
+                 "the passive (pre-stim) variant. Formulas mirror "
+                 "src/utils/evoked_features.py exactly.",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                        "marginTop": SPACE_2, "maxWidth": "90ch"}),
+        table,
+        html.Div("Critical-slowing measures (recovery_tau, ac_width, "
+                 "recovery_slope, …) are computed in evoked_features but are NOT "
+                 "in this default set — they live in EXPENSIVE_COLUMNS.",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": "11px",
+                        "marginTop": SPACE_2, "fontStyle": "italic"}),
+    ], style={"marginTop": SPACE_2})
+
+
 def _explainer() -> html.Div:
     """Persistent 'what am I looking at' panel: what a point is, what sets its
     position (the features -- NOT the colour), and how to read UMAP honestly."""
-    feats = ", ".join(_cfg.CHEAP_METRICS)
     always = html.Div([
         html.Span("How to read this   ",
                   style={"fontWeight": "600", "color": COLOR_TEXT_PRIMARY}),
@@ -437,10 +495,7 @@ def _explainer() -> html.Div:
                 "separated blobs are not meaningful — treat UMAP as a picture. "
                 "PCA axes, by contrast, carry real variance (shown on the axes)."],
                style=_EXPLAIN_P),
-        html.Div("Features fed in: " + feats + "  (passive drops early_area, "
-                 "late_area, early_late_ratio).",
-                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
-                        "marginTop": SPACE_2}),
+        _feature_reference(),
     ])
     return html.Div([always, detail],
                     style={"marginTop": SPACE_2, "background": COLOR_SURFACE_2,
