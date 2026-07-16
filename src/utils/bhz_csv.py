@@ -101,6 +101,21 @@ _NUMERIC_COLS: frozenset[str] = frozenset((
     "AUC_Threshold", "AUC_Window_s",
 ))
 
+# Scoring cells that distinguish a FULLY-scored event from a partial
+# onset-only one. ``write_event_rows`` counts how many of these are
+# populated to decide whether a new same-EventEO row is "more complete"
+# than the one already on disk, so a later full score upgrades a partial
+# onset row in place instead of being blocked by the append dedup.
+_COMPLETENESS_COLS: tuple[str, ...] = (
+    "Score", "Onset", "OnsetComment", "BehaviorOnsetComment",
+    "scorecomment", "EventLAS", "EventBO", "EventPID", "EventBB",
+    "Eventstart", "Eventstop", "Roomlight", "VideoQuality", "Light",
+)
+
+# One lock serialises ALL day-CSV mutations (append + overwrite), since
+# both read-modify-rewrite the same per-(animal, day) files.
+_CSV_WRITE_LOCK = threading.Lock()
+
 
 def _to_sample_index(t_sec: float | None,
                        fs: float) -> int | None:
@@ -190,32 +205,65 @@ def _fmt_cell(col: str, val) -> str:
     return str(val)
 
 
-def _read_existing_eos(csv_path: Path) -> set[tuple[str, str]]:
-    """Return the ``{(filename, EventEO_str)}`` pairs already in
-    *csv_path*, used for idempotent append. Empty set if the
-    file doesn't exist.
+def _read_existing_rows(csv_path: Path) -> list[dict]:
+    """Return every row of *csv_path* as an ordered list of dicts.
+
+    Empty list if the file doesn't exist. Reading full rows (not just the
+    ``(filename, EventEO)`` keys) lets ``write_event_rows`` compare an
+    existing row's completeness against a new one and upgrade a partial
+    onset row in place. On a corrupt/unreadable CSV we log and return [],
+    which degrades to the plain-append behaviour (never blows up the save
+    path).
     """
     assert isinstance(csv_path, Path), "Path required"
     if not csv_path.exists():
-        return set()
-    seen: set[tuple[str, str]] = set()
+        return []
     try:
         with csv_path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             max_iter = 100_000  # NASA Rule 2
+            rows: list[dict] = []
             for i, row in enumerate(reader):
                 assert i < max_iter, "CSV scan runaway"
-                fn = (row.get("filename") or "").strip()
-                eo = (row.get("EventEO") or "").strip()
-                if fn:
-                    seen.add((fn, eo))
+                rows.append(dict(row))
+            return rows
     except Exception as e:
         # Corrupt CSV is the operator's problem; don't blow up
         # the save path -- log and treat as empty.
         logger.warning("Failed to scan existing CSV %s: %s",
                         csv_path, e)
-        return set()
-    return seen
+        return []
+
+
+def _row_completeness(row: dict) -> int:
+    """Count of populated scoring cells in *row* (see ``_COMPLETENESS_COLS``).
+
+    Works for both a freshly-built row (native values from ``_event_to_row``)
+    and an on-disk row (already-formatted strings from ``csv.DictReader``):
+    both are run through ``_fmt_cell``, so an unset cell reads as ``""`` or
+    ``"NaN"`` either way and is not counted."""
+    assert isinstance(row, dict), "row must be dict"
+    n = 0
+    for c in _COMPLETENESS_COLS:
+        if _fmt_cell(c, row.get(c)) not in ("", "NaN"):
+            n += 1
+    return n
+
+
+def _write_all_rows(path: Path, rows: list[dict]) -> None:
+    """Atomically (re)write *path* = header + *rows* via a temp file.
+
+    Existing on-disk rows are already formatted strings, so re-running them
+    through ``_fmt_cell`` is a no-op and preserves them byte-for-byte; only
+    upgraded/new rows carry native values that get formatted here."""
+    assert isinstance(path, Path), "Path required"
+    tmp = path.with_suffix(path.suffix + ".rewrtmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+        writer.writerow(COLUMNS)
+        for row in rows:
+            writer.writerow([_fmt_cell(c, row.get(c)) for c in COLUMNS])
+    tmp.replace(path)
 
 
 def _event_to_row(event: dict, file_meta: dict,
@@ -301,7 +349,7 @@ def write_event_rows(csv_path: str | Path,
                        file_meta: dict,
                        events: list[dict],
                        fs: float) -> int:
-    """Append rows for one ``.mat`` file's review.
+    """Append (or upgrade) rows for one ``.mat`` file's review.
 
     *file_meta* must populate at minimum:
       folder, filename, fs, Cutoff, Channel,
@@ -311,48 +359,77 @@ def write_event_rows(csv_path: str | Path,
     *events* is a list of structured event dicts (the JSON
     schema from the plan); empty list -> one "No events" row.
 
-    Returns the number of rows actually written (after dedup).
-    Creates the file with the header on first write; appends
-    otherwise.
+    Dedup is by ``(filename, EventEO)``. A new event whose EventEO is
+    already on disk is normally a no-op -- EXCEPT when the new row is more
+    complete (more scoring cells populated; see ``_row_completeness``), in
+    which case it REPLACES the on-disk row in place. This lets a later full
+    score upgrade a partial onset-only row (quick-flag / needs_scoring
+    export) instead of being silently blocked by the append dedup. A less-
+    or equally-complete row never overwrites a fuller one.
+
+    Returns the number of rows written OR upgraded. Creates the file with
+    the header on first write; appends otherwise, or rewrites atomically
+    when a row is upgraded.
     """
     assert isinstance(file_meta, dict), "file_meta dict required"
     assert isinstance(events, list), "events list required"
     assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
     path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Upgrade a legacy/older-schema CSV to the current COLUMNS before we
-    # append, so the new row's extra columns don't spill past the header.
-    _ensure_header(path)
-    existing = _read_existing_eos(path)
-    # Always carry the file-level meta into every row.
-    is_new = not path.exists()
-    rows_to_write: list[dict] = []
-    if not events:
-        key = (str(file_meta.get("filename") or ""), "")
-        if key not in existing:
-            rows_to_write.append(_no_events_row(file_meta))
-    else:
-        max_iter = 1024  # NASA Rule 2 cap on events per file
-        for i, ev in enumerate(events):
-            assert i < max_iter, "too many events for one file"
-            row = _event_to_row(ev, file_meta, fs)
-            key = (str(file_meta.get("filename") or ""),
-                    _fmt_cell("EventEO", row["EventEO"]))
-            if key in existing:
-                continue
-            rows_to_write.append(row)
-            existing.add(key)
-    if not rows_to_write:
-        return 0
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL,
-                              lineterminator="\n")
-        if is_new:
-            writer.writerow(COLUMNS)
-        for row in rows_to_write:
-            writer.writerow([_fmt_cell(c, row.get(c))
-                              for c in COLUMNS])
-    return len(rows_to_write)
+    fname = str(file_meta.get("filename") or "")
+    with _CSV_WRITE_LOCK:
+        # Upgrade a legacy/older-schema CSV to the current COLUMNS before we
+        # append, so the new row's extra columns don't spill past the header.
+        _ensure_header(path)
+        existing_rows = _read_existing_rows(path)
+        # (filename, EventEO_str) -> position of the row in existing_rows.
+        index: dict[tuple[str, str], int] = {}
+        for pos, r in enumerate(existing_rows):
+            fn = (r.get("filename") or "").strip()
+            if fn:
+                eo = (r.get("EventEO") or "").strip()
+                index[(fn, eo)] = pos
+
+        to_append: list[dict] = []
+        upgraded = 0
+        if not events:
+            if (fname, "") not in index:
+                to_append.append(_no_events_row(file_meta))
+        else:
+            max_iter = 1024  # NASA Rule 2 cap on events per file
+            for i, ev in enumerate(events):
+                assert i < max_iter, "too many events for one file"
+                row = _event_to_row(ev, file_meta, fs)
+                key = (fname, _fmt_cell("EventEO", row["EventEO"]))
+                pos = index.get(key)
+                if pos is None:
+                    to_append.append(row)
+                elif _row_completeness(row) > _row_completeness(
+                        existing_rows[pos]):
+                    existing_rows[pos] = row     # in-place upgrade
+                    upgraded += 1
+                # else: same-or-less-complete duplicate -> no-op.
+
+        if upgraded == 0:
+            # Fast path: pure append (or nothing changed).
+            if not to_append:
+                return 0
+            is_new = not path.exists()
+            with path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL,
+                                     lineterminator="\n")
+                if is_new:
+                    writer.writerow(COLUMNS)
+                for row in to_append:
+                    writer.writerow([_fmt_cell(c, row.get(c))
+                                      for c in COLUMNS])
+            return len(to_append)
+
+        # An upgrade means we must rewrite the whole file (CSV append can't
+        # edit a row in place). Existing rows are preserved verbatim; the
+        # upgraded ones already sit in existing_rows.
+        _write_all_rows(path, existing_rows + to_append)
+        return upgraded + len(to_append)
 
 
 def build_file_meta(*, folder: str, filename: str,
@@ -431,9 +508,6 @@ class CsvDiff:
     modified_filenames: list[str]
 
 
-_OVERWRITE_LOCK = threading.Lock()
-
-
 def existing_filenames_in_csv(csv_path: str | Path
                                 ) -> dict[str, list[dict]]:
     """Return ``{filename: [row, ...]}`` for every row in
@@ -499,7 +573,7 @@ def overwrite_day_csv(csv_path: str | Path,
     assert isinstance(file_meta_by_filename, dict)
     assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
     path = Path(csv_path)
-    with _OVERWRITE_LOCK:
+    with _CSV_WRITE_LOCK:
         # Snapshot what's on disk.
         existing = existing_filenames_in_csv(path)
         existing_fns = set(existing.keys())
