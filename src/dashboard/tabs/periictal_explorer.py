@@ -145,6 +145,7 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
         _finish(job_id, {"empty": False, "emb": res["emb"], "sub": sub,
                          "full": df.reset_index(drop=True),
                          "metrics": list(_cfg.metrics_for_variant(variant)),
+                         "cols": list(res["cols"]),
                          "readout": ro, "meta": res["meta"],
                          "method": res["method"],
                          "n_seizures": int(pre["seizure_idx"].nunique())})
@@ -217,7 +218,8 @@ def scope_bar(store):
 
 
 def layout_embedding(store):
-    """Embedding lens: the PCA/UMAP scatter (+ confound strip) and lasso details."""
+    """Embedding lens: the PCA/UMAP scatter (+ confound strip), the feature-space
+    loadings, the feature reference, and lasso details."""
     return html.Div([
         scope_bar(store),
         card(_embed_colorby_ctl(),
@@ -232,6 +234,22 @@ def layout_embedding(store):
              _explainer(),
              html.Div(id="pex-reading", style={"marginTop": SPACE_3}),
              style={"marginTop": SPACE_4}),
+        card(section_header("Feature space — what defines the axes"),
+             html.Div("Each axis is a weighted mix of the standardized features. "
+                      "The bars are the PCA loadings: how much each feature pushes "
+                      "PC1 and PC2 — i.e. the directions of the feature vector "
+                      "space the scatter is a projection of. (PCA only; UMAP is "
+                      "non-linear and has no loadings.)",
+                      style={"color": COLOR_TEXT_SECONDARY,
+                             "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch",
+                             "marginBottom": SPACE_2}),
+             dcc.Graph(id="pex-loadings", config={"displaylogo": False},
+                       figure=empty_fig("Build to see which features define the "
+                                        "axes")),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Features fed to the embedding"),
+             _feature_reference(),
+             style={"marginTop": SPACE_4}),
         card(section_header("Selected points — details on demand"),
              html.Div(id="pex-details", children=_details_view(None)),
              style={"marginTop": SPACE_4}),
@@ -245,21 +263,36 @@ def layout_trend(store):
         scope_bar(store),
         card(section_header("Lead-time trajectory"),
              html.Div([
-                 html.Div("Median value per dyadic log-lead-time bin — one point "
-                          "per bin, so every time-scale has equal weight and the "
-                          "count imbalance (near-onset is sparse, far-onset "
-                          "abundant) can't distort it. Faint lines = individual "
-                          "seizures (a trend is credible only if consistent "
-                          "across them); hollow markers = low-n bins.",
+                 html.Div("Median value per EQUAL (linear) lead-time bin, from "
+                          "onset up to the cap — every bin spans the same amount "
+                          "of real time (so at a uniform stim rate the bins hold "
+                          "~equal counts). Faint lines = individual seizures (a "
+                          "trend is credible only if consistent across them); "
+                          "hollow markers = low-n bins.",
                           style={"color": COLOR_TEXT_SECONDARY,
                                  "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
-                 html.Div(_ctl("Trajectory y", dcc.Dropdown(
-                     id="pex-traj-y", clearable=False,
-                     style={**DROPDOWN_STYLE, "minWidth": "240px"}),
-                     "Which value to trace against lead-time: any feature "
-                     "(median + IQR per bin), a PC embedding coordinate, or "
-                     "hour-of-day as a confound check."),
-                          style={"marginTop": SPACE_3}),
+                 html.Div([
+                     _ctl("Trajectory y", dcc.Dropdown(
+                         id="pex-traj-y", clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "240px"}),
+                         "Which value to trace against lead-time: any feature "
+                         "(median + IQR per bin), a PC embedding coordinate, or "
+                         "hour-of-day as a confound check."),
+                     _ctl("Up to (cap)", dcc.Input(
+                         id="pex-traj-cap", type="number", value=2, min=0.001,
+                         step="any", debounce=True,
+                         style={**DROPDOWN_STYLE, "width": "80px"}),
+                         "Bin from onset up to this much lead time; stimuli "
+                         "further out are dropped from the trajectory."),
+                     _ctl("unit", dcc.Dropdown(
+                         id="pex-traj-cap-unit", clearable=False,
+                         options=[{"label": "hours", "value": "h"},
+                                  {"label": "minutes", "value": "m"},
+                                  {"label": "seconds", "value": "s"}],
+                         value="h", style={**DROPDOWN_STYLE, "minWidth": "110px"}),
+                         "Unit for the lead-time cap."),
+                 ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+                           "alignItems": "flex-start", "marginTop": SPACE_3}),
              ]),
              dcc.Graph(id="pex-traj", config={"displaylogo": False},
                        figure=empty_fig("Build to see the lead-time trajectory")),
@@ -281,14 +314,30 @@ def layout_waveform(store):
 
 
 def _embed_colorby_ctl() -> html.Div:
-    """The Colour-by dropdown — lives on the Embedding lens (recolours instantly,
-    no rebuild)."""
-    return html.Div(_ctl("Colour by", dcc.Dropdown(
-        id="pex-colorby", clearable=False,
-        style={**DROPDOWN_STYLE, "minWidth": "220px"}),
-        "Recolour instantly (no rebuild). Try hour-of-day and stim fingerprint "
-        "as confound checks."),
-        style={"marginBottom": SPACE_3})
+    """The Embedding-lens colour controls: what to colour by, plus the
+    time-to-onset colour CAP (value + unit). Colour is linear and equal up to the
+    cap and saturates beyond it — no log. Recolours instantly (no rebuild)."""
+    return html.Div([
+        _ctl("Colour by", dcc.Dropdown(
+            id="pex-colorby", clearable=False,
+            style={**DROPDOWN_STYLE, "minWidth": "220px"}),
+            "Recolour instantly (no rebuild). Try hour-of-day and stim "
+            "fingerprint as confound checks."),
+        _ctl("Time-colour cap", dcc.Input(
+            id="pex-color-cap", type="number", value=2, min=0.001, step="any",
+            debounce=True, style={**DROPDOWN_STYLE, "width": "80px"}),
+            "Colour runs linearly and equally from onset up to this much lead "
+            "time; stimuli further out saturate at the far colour. Only affects "
+            "the time-to-onset colouring."),
+        _ctl("unit", dcc.Dropdown(
+            id="pex-color-cap-unit", clearable=False,
+            options=[{"label": "hours", "value": "h"},
+                     {"label": "minutes", "value": "m"},
+                     {"label": "seconds", "value": "s"}],
+            value="h", style={**DROPDOWN_STYLE, "minWidth": "110px"}),
+            "Unit for the colour cap."),
+    ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+              "alignItems": "flex-start", "marginBottom": SPACE_3})
 
 
 def _trend_test_card() -> object:
@@ -411,12 +460,12 @@ _FREF_TD = {"padding": f"{SPACE_1} {SPACE_3}", "fontSize": FONT_SIZE_CAPTION,
             "verticalAlign": "top", "borderBottom": f"1px solid {COLOR_DIVIDER}"}
 
 
-def _feature_reference() -> html.Details:
+def _feature_reference() -> html.Div:
     """Code-accurate reference of every feature fed to the embedding — the exact
     computation of each, for validation. Sourced from
     ``evoked_features.COLUMN_DOCS`` so the formulas can't drift from the code;
     'evoked only' marks the three post-stim-window features the passive variant
-    drops."""
+    drops. Rendered VISIBLY (its own card), not buried in a disclosure."""
     cols = list(_cfg.CHEAP_METRICS)
     rows = []
     for col in cols:
@@ -438,27 +487,23 @@ def _feature_reference() -> html.Details:
                             html.Th("How it's computed", style=_FREF_TH)])),
         html.Tbody(rows),
     ], style={"borderCollapse": "collapse", "width": "100%"}),
-        style={"maxHeight": "340px", "overflowY": "auto", "marginTop": SPACE_2,
+        style={"maxHeight": "360px", "overflowY": "auto", "marginTop": SPACE_2,
                "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_SM})
-    return html.Details([
-        html.Summary(f"Feature reference — the {len(cols)} inputs to the "
-                     "embedding, and how each is computed",
-                     style={"cursor": "pointer", "color": COLOR_TEXT_SECONDARY,
-                            "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600"}),
-        html.Div("Each response's feature vector below is standardized (z-scored "
+    return html.Div([
+        html.Div(f"The {len(cols)} features below are each standardized (z-scored "
                  "per column) then reduced to 2-D by PCA/UMAP — these are the "
                  "ONLY inputs to the layout. 'evoked only' rows are dropped for "
                  "the passive (pre-stim) variant. Formulas mirror "
                  "src/utils/evoked_features.py exactly.",
-                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
-                        "marginTop": SPACE_2, "maxWidth": "90ch"}),
+                 style={"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+                        "maxWidth": "95ch"}),
         table,
         html.Div("Critical-slowing measures (recovery_tau, ac_width, "
                  "recovery_slope, …) are computed in evoked_features but are NOT "
                  "in this default set — they live in EXPENSIVE_COLUMNS.",
                  style={"color": COLOR_TEXT_TERTIARY, "fontSize": "11px",
                         "marginTop": SPACE_2, "fontStyle": "italic"}),
-    ], style={"marginTop": SPACE_2})
+    ])
 
 
 def _explainer() -> html.Div:
@@ -493,9 +538,10 @@ def _explainer() -> html.Div:
                style=_EXPLAIN_P),
         html.P([html.B("UMAP caveat. "), "Blob shapes and the distances between "
                 "separated blobs are not meaningful — treat UMAP as a picture. "
-                "PCA axes, by contrast, carry real variance (shown on the axes)."],
+                "PCA axes, by contrast, carry real variance (shown on the axes). "
+                "The features fed in — and how the axes weight them — are shown in "
+                "the two panels below."],
                style=_EXPLAIN_P),
-        _feature_reference(),
     ])
     return html.Div([always, detail],
                     style={"marginTop": SPACE_2, "background": COLOR_SURFACE_2,
@@ -700,7 +746,7 @@ def _traj_values(cached, y_key):
     return None, y_key
 
 
-def _trajectory_fig(cached, y_key) -> go.Figure:
+def _trajectory_fig(cached, y_key, cap_sec=None) -> go.Figure:
     if not cached or cached.get("empty"):
         return empty_fig("Build to see the lead-time trajectory")
     values, ylabel = _traj_values(cached, y_key)
@@ -708,14 +754,14 @@ def _trajectory_fig(cached, y_key) -> go.Figure:
         return empty_fig("Pick a trajectory metric")
     sub = cached["sub"]
     tto = sub["time_to_onset_sec"].to_numpy(dtype=float)
-    hi = float(np.nanmax(tto)) if tto.size else 21600.0
-    edges = _traj.default_edges(hi)
-    tr = _traj.lead_time_trajectory(tto, values,
-                                    sub["seizure_idx"].to_numpy(), edges)
-    return _render_trajectory(tr, ylabel, hi)
+    cap = float(cap_sec) if (cap_sec and cap_sec > 0) else _pal.DEFAULT_TIME_CAP_SEC
+    edges = _traj.linear_edges(cap)                      # equal linear bins 0..cap
+    tr = _traj.lead_time_trajectory(tto, values, sub["seizure_idx"].to_numpy(),
+                                    edges, log_centers=False)
+    return _render_trajectory(tr, ylabel, cap)
 
 
-def _render_trajectory(tr, ylabel, hi) -> go.Figure:
+def _render_trajectory(tr, ylabel, cap) -> go.Figure:
     c, med = tr["centers"], tr["median"]
     ok = np.isfinite(med)
     if not ok.any():
@@ -740,11 +786,11 @@ def _render_trajectory(tr, ylabel, hi) -> go.Figure:
         customdata=tr["n"][ok],
         hovertemplate="lead %{x:.3s}s · median %{y:.3g} · n=%{customdata}"
                       "<extra></extra>"))
-    tv, tt = _pal.time_axis_ticks(hi)
+    tv, tt = _pal.linear_time_ticks(cap)                 # equal linear ticks
     fig.update_layout(
         height=300, margin=dict(l=54, r=20, t=22, b=40),
-        xaxis=dict(title="lead time before onset (log)", type="log",
-                   tickvals=tv, ticktext=tt, autorange="reversed"),
+        xaxis=dict(title="lead time before onset", tickvals=tv, ticktext=tt,
+                   range=[cap, 0]),                      # onset (0) at the right
         yaxis=dict(title=ylabel), uirevision="pex-traj")
     return fig
 
@@ -926,18 +972,33 @@ def _trend_test_views(cached, feature):
 #  Figures
 # --------------------------------------------------------------------- #
 
-def _figure(emb, sub, color_by, method, meta) -> go.Figure:
+_UNIT_SEC = {"h": 3600.0, "m": 60.0, "s": 1.0}
+
+
+def _cap_seconds(cap_val, cap_unit) -> float:
+    """The time-to-onset colour cap in seconds from the (value, unit) controls;
+    falls back to the 2 h default on a blank/invalid entry."""
+    try:
+        val = float(cap_val)
+    except (TypeError, ValueError):
+        return _pal.DEFAULT_TIME_CAP_SEC
+    sec = val * _UNIT_SEC.get(cap_unit or "h", 3600.0)
+    return sec if sec > 0 else _pal.DEFAULT_TIME_CAP_SEC
+
+
+def _figure(emb, sub, color_by, method, meta, cap_sec=None) -> go.Figure:
     if emb is None or emb.shape[0] == 0:
         return empty_fig("No lead-up stimuli for this selection")
     n_unique = int(sub[color_by].nunique()) if color_by in sub else 0
     fig = (_categorical_fig(emb, sub, color_by)
            if _pal.is_categorical(color_by, n_unique)
-           else _continuous_fig(emb, sub, color_by))
+           else _continuous_fig(emb, sub, color_by, cap_sec))
     return _finish_fig(fig, method, meta)
 
 
-def _continuous_fig(emb, sub, color_by) -> go.Figure:
-    spec = _pal.continuous_spec(color_by, sub[color_by].to_numpy(dtype=float))
+def _continuous_fig(emb, sub, color_by, cap_sec=None) -> go.Figure:
+    spec = _pal.continuous_spec(color_by, sub[color_by].to_numpy(dtype=float),
+                                cap_sec)
     cbar = dict(title=dict(text=spec["label"], font=dict(size=9)),
                 thickness=10, len=0.7, x=1.005)
     if spec["ticks"]:
@@ -950,7 +1011,8 @@ def _continuous_fig(emb, sub, color_by) -> go.Figure:
     kw = dict(x=emb[:, 0], y=emb[:, 1], mode="markers", marker=marker,
               customdata=np.arange(emb.shape[0]))
     if color_by == "time_to_onset_sec":
-        # colour is log10(seconds); hover shows a readable duration instead.
+        # colour is linear seconds, clamped to the cap; hover shows the TRUE
+        # duration (so points beyond the cap still read their real lead time).
         kw["text"] = [_fmt_dur(s) for s in sub["time_to_onset_sec"].to_numpy()]
         kw["hovertemplate"] = "time to onset: %{text}<extra></extra>"
     else:
@@ -959,7 +1021,8 @@ def _continuous_fig(emb, sub, color_by) -> go.Figure:
 
 
 def _fmt_dur(s) -> str:
-    """Human-readable duration for hover (the colour axis is log-seconds)."""
+    """Human-readable duration for hover (the colour axis is linear seconds
+    clamped to the cap; hover shows the TRUE duration)."""
     s = float(s)
     if s < 90:
         return f"{s:.0f} s"
@@ -1010,6 +1073,60 @@ def _axis_titles(method, meta):
     if method == "umap":
         return "UMAP-1 (relative)", "UMAP-2 (relative)"
     return "dim 1", "dim 2"
+
+
+# --------------------------------------------------------------------- #
+#  Vector-space view: PCA loadings (which features define each axis)
+# --------------------------------------------------------------------- #
+
+def _pc_name(k: int, ev) -> str:
+    """'PC{k} (NN%)' when the explained-variance for that axis is known, else
+    'PC{k}' (guards a short/absent explained_var list — e.g. single-component
+    PCA)."""
+    if ev is not None and len(ev) >= k and np.isfinite(ev[k - 1]):
+        return f"PC{k} ({ev[k - 1]:.0%})"
+    return f"PC{k}"
+
+
+def _loadings_fig(cached) -> go.Figure:
+    """The feature-space view: each feature's loading on PC1/PC2 — i.e. how the
+    standardized feature vectors project onto the two axes you see. PCA only;
+    UMAP has no linear loadings, so it shows an honest note instead."""
+    if not cached or cached.get("empty"):
+        return empty_fig("Build to see which features define the axes")
+    meta = cached.get("meta") or {}
+    comps = meta.get("components")
+    cols = cached.get("cols")
+    if cached.get("method") != "pca" or not comps or not cols:
+        return empty_fig("PCA loadings show which features define each axis — "
+                         "switch Embedding to PCA to see them (UMAP is non-linear, "
+                         "so it has no feature loadings).")
+    comps = np.asarray(comps, dtype=float)
+    if comps.ndim != 2 or comps.shape[0] < 1 or comps.shape[1] != len(cols):
+        return empty_fig("Loadings unavailable for this build")
+    ev = list(meta.get("explained_var") or [])
+    pc1 = comps[0]
+    order = np.argsort(pc1)                       # most −PC1 → most +PC1
+    feats = [cols[i] for i in order]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=feats, x=pc1[order], orientation="h", name=_pc_name(1, ev),
+        marker_color=COLOR_ACCENT,
+        hovertemplate="%{y}<br>PC1 loading %{x:.2f}<extra></extra>"))
+    if comps.shape[0] > 1:                        # PC2 only if it exists
+        fig.add_trace(go.Bar(
+            y=feats, x=comps[1][order], orientation="h", name=_pc_name(2, ev),
+            marker_color="#c98500",
+            hovertemplate="%{y}<br>PC2 loading %{x:.2f}<extra></extra>"))
+    fig.add_vline(x=0, line=dict(width=1, color="rgba(160,160,176,0.5)"))
+    fig.update_layout(
+        barmode="group", bargap=0.25, height=max(320, 20 * len(feats) + 90),
+        margin=dict(l=150, r=20, t=44, b=40),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", font=dict(size=10)),
+        xaxis=dict(title="loading (standardized-feature weight on the axis)",
+                   zeroline=False),
+        yaxis=dict(title="", automargin=True), uirevision="pex-loadings")
+    return fig
 
 
 # --------------------------------------------------------------------- #
@@ -1206,13 +1323,13 @@ _EMPTY_MSG = ("No lead-up stimuli — fewer than 2 seizures, none in this protoc
               "or no fresh sidecars for this animal.")
 
 
-def _embed_fig_reading(cached, color_by):
+def _embed_fig_reading(cached, color_by, cap_sec=None):
     """(scatter figure, reading strip) for a ready embedding build (empty-safe).
     The single source of truth for the Embedding lens's render."""
     if not cached or cached.get("empty"):
         return empty_fig(_EMPTY_MSG), ""
     fig = _figure(cached["emb"], cached["sub"], color_by,
-                  cached.get("method", "pca"), cached.get("meta"))
+                  cached.get("method", "pca"), cached.get("meta"), cap_sec)
     return fig, _reading_strip(cached)
 
 
@@ -1568,30 +1685,40 @@ def register_callbacks(app, store, config):
     @app.callback(
         Output("pex-graph", "figure"),
         Output("pex-reading", "children"),
+        Output("pex-loadings", "figure"),
         Input("pex-job", "data"),
         State("pex-colorby", "value"),
+        State("pex-color-cap", "value"),
+        State("pex-color-cap-unit", "value"),
         prevent_initial_call=False,
     )
-    def _embed_render(jid, color_by):
+    def _embed_render(jid, color_by, cap_val, cap_unit):
         """Draw the Embedding lens from cache when the job pulse arrives (or on
-        mount, from the persisted job)."""
+        mount, from the persisted job): the scatter, the reading strip, and the
+        feature-space loadings."""
         cached = _CACHE.get(jid) if jid else None
         if cached is None:
-            return no_update, no_update
-        return _embed_fig_reading(cached, color_by or "time_to_onset_sec")
+            return no_update, no_update, no_update
+        fig, reading = _embed_fig_reading(
+            cached, color_by or "time_to_onset_sec",
+            _cap_seconds(cap_val, cap_unit))
+        return fig, reading, _loadings_fig(cached)
 
     @app.callback(
         Output("pex-graph", "figure", allow_duplicate=True),
         Input("pex-colorby", "value"),
+        Input("pex-color-cap", "value"),
+        Input("pex-color-cap-unit", "value"),
         State("pex-job", "data"),
         prevent_initial_call=True,
     )
-    def _recolor(color_by, jid):
+    def _recolor(color_by, cap_val, cap_unit, jid):
         cached = _CACHE.get(jid) if jid else None
         if not cached or cached.get("empty"):
             return no_update
         return _figure(cached["emb"], cached["sub"], color_by,
-                       cached.get("method", "pca"), cached.get("meta"))
+                       cached.get("method", "pca"), cached.get("meta"),
+                       _cap_seconds(cap_val, cap_unit))
 
     @app.callback(
         Output("pex-traj", "figure"),
@@ -1600,17 +1727,19 @@ def register_callbacks(app, store, config):
         Output("pex-trend-table", "children"),
         Input("pex-job", "data"),
         Input("pex-traj-y", "value"),
+        Input("pex-traj-cap", "value"),
+        Input("pex-traj-cap-unit", "value"),
         prevent_initial_call=False,
     )
-    def _trend_render(jid, traj_y):
-        """Draw the Trend lens from cache on the job pulse or a y-selector change:
-        the lead-time trajectory (visual) + the per-seizure trend test (forest +
-        verdict + all-features FDR table), computed synchronously."""
+    def _trend_render(jid, traj_y, cap_val, cap_unit):
+        """Draw the Trend lens from cache on the job pulse or a control change:
+        the lead-time trajectory (linear bins up to the cap) + the per-seizure
+        trend test (forest + verdict + all-features FDR table), synchronously."""
         cached = _CACHE.get(jid) if jid else None
         if cached is None:
             return no_update, no_update, no_update, no_update
         feature = traj_y or "peak_to_trough"
-        traj = _trajectory_fig(cached, feature)
+        traj = _trajectory_fig(cached, feature, _cap_seconds(cap_val, cap_unit))
         forest, verdict, table = _trend_test_views(cached, feature)
         return traj, forest, verdict, table
 

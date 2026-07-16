@@ -56,7 +56,10 @@ def _pca(X: np.ndarray, n_components: int):
     Xs = StandardScaler().fit_transform(X)
     pca = PCA(n_components=n_components, random_state=0)
     emb = pca.fit_transform(Xs)
-    return emb, {"explained_var": pca.explained_variance_ratio_.tolist()}
+    # components_ [n_components x n_features] = the loadings (which standardized
+    # feature drives each axis), aligned to the `cols` order the caller returns.
+    return emb, {"explained_var": pca.explained_variance_ratio_.tolist(),
+                 "components": pca.components_.tolist()}
 
 
 def _umap(X: np.ndarray, n_components: int, n_neighbors: int, seed: int):

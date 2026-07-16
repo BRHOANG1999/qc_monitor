@@ -312,6 +312,60 @@ def test_feature_reference_lists_all_umap_inputs():
         assert m in codes, f"{m} missing from the feature reference"
 
 
+# ------------------------------------------------------------------ #
+#  Linear time-to-onset colour cap + PCA loadings (vector-space view)
+# ------------------------------------------------------------------ #
+
+def test_cap_seconds_units_and_fallback():
+    assert pex._cap_seconds(2, "h") == 7200.0
+    assert pex._cap_seconds(90, "m") == 5400.0
+    assert pex._cap_seconds(45, "s") == 45.0
+    assert pex._cap_seconds(None, "h") == pex._pal.DEFAULT_TIME_CAP_SEC  # blank
+    assert pex._cap_seconds(0, "h") == pex._pal.DEFAULT_TIME_CAP_SEC     # non-positive
+
+
+def test_continuous_colour_is_linear_capped_not_log():
+    sub = _sub()
+    emb = np.zeros((len(sub), 2))
+    fig = pex._figure(emb, sub, "time_to_onset_sec", "pca",
+                      {"explained_var": [0.3, 0.2]}, cap_sec=3600.0)
+    mk = fig.data[0].marker
+    assert mk.cmin == 0.0 and mk.cmax == 3600.0        # linear range, capped at 1 h
+    assert float(np.max(mk.color)) <= 3600.0           # clamped, no value past cap
+
+
+def test_loadings_fig_pca_bars_and_umap_note():
+    cols = ["line_length", "rms_amplitude", "variance"]
+    cached = {"empty": False, "method": "pca", "cols": cols,
+              "meta": {"explained_var": [0.4, 0.2],
+                       "components": [[0.7, 0.1, -0.5], [0.2, 0.6, 0.3]]}}
+    fig = pex._loadings_fig(cached)
+    assert len(fig.data) == 2                          # PC1 + PC2 bar traces
+    assert set(fig.data[0].y) == set(cols)             # one bar per feature
+    # UMAP (no linear loadings) -> an honest note, not bars
+    umap_fig = pex._loadings_fig({"empty": False, "method": "umap",
+                                  "cols": cols, "meta": {}})
+    assert not any(getattr(t, "y", None) is not None and len(t.y) for t in umap_fig.data)
+
+
+def test_loadings_fig_single_pc_does_not_crash():
+    # degenerate build: one surviving feature -> 1 component, explained_var len 1.
+    cached = {"empty": False, "method": "pca", "cols": ["peak_to_trough"],
+              "meta": {"explained_var": [0.99], "components": [[1.0]]}}
+    fig = pex._loadings_fig(cached)                    # must NOT raise IndexError
+    assert len(fig.data) == 1                          # only PC1 (no PC2 exists)
+    assert pex._pc_name(1, [0.99]) == "PC1 (99%)"
+    assert pex._pc_name(2, [0.99]) == "PC2"            # missing ev -> no percent
+
+
+def test_loadings_fig_rejects_mismatched_components():
+    # components width must match cols length, else bail gracefully.
+    cached = {"empty": False, "method": "pca", "cols": ["a", "b"],
+              "meta": {"explained_var": [0.5, 0.3], "components": [[1.0]]}}
+    fig = pex._loadings_fig(cached)
+    assert not any(getattr(t, "y", None) for t in fig.data)   # note, not bars
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

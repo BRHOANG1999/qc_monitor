@@ -47,14 +47,33 @@ def _time_marks(hi_sec: float):
     return [(s, lbl) for s, lbl in _TIME_MARKS if s <= hi * 1.2]
 
 
-def log_time_ticks(hi_sec: float):
-    """(log10-second tickvals, labels) for a COLOUR axis whose values are already
-    log10(seconds) -- e.g. the time-to-onset colourbar."""
-    keep = _time_marks(hi_sec)
-    if not keep:
+DEFAULT_TIME_CAP_SEC = 7200.0        # 2 h -- the time-to-onset colour cap default.
+
+
+def dur_label(sec: float) -> str:
+    """Compact duration label for a cap value: 7200->'2h', 120->'2m', 30->'30s'."""
+    s = float(sec)
+    if s >= 3600:
+        q = s / 3600.0
+        return (f"{q:.0f}h" if abs(q - round(q)) < 1e-9 else f"{q:g}h")
+    if s >= 60:
+        q = s / 60.0
+        return (f"{q:.0f}m" if abs(q - round(q)) < 1e-9 else f"{q:g}m")
+    return f"{s:g}s"
+
+
+def linear_time_ticks(cap_sec: float, n: int = 5):
+    """(second tickvals, labels) for a LINEAR time-to-onset colour axis running
+    0..cap. Equal-spaced ticks labelled in the natural unit of the cap (h/m/s).
+    The values are raw seconds (matching the clamped colour data)."""
+    cap = float(cap_sec)
+    if cap <= 0:
         return [], []
-    tv, tt = zip(*[(np.log10(s), lbl) for s, lbl in keep])
-    return list(tv), list(tt)
+    unit, u = ((3600.0, "h") if cap >= 3600 else
+               (60.0, "m") if cap >= 60 else (1.0, "s"))
+    vals = np.linspace(0.0, cap, int(max(2, n)))
+    labels = [f"{v / unit:g}{u}" for v in vals]
+    return list(vals), labels
 
 
 def time_axis_ticks(hi_sec: float):
@@ -112,22 +131,23 @@ def hue_for(display_category: str, index: int) -> str:
     return CATEGORICAL_HUES[index % len(CATEGORICAL_HUES)]
 
 
-def continuous_spec(color_by: str, values) -> dict:
+def continuous_spec(color_by: str, values, cap_sec: float | None = None) -> dict:
     """Declarative continuous colour spec: {vals, scale, reverse, label, cmin,
     cmax, ticks}. hour_of_day is CYCLIC (0..24, wrap-safe); time_to_onset is a
     reversed PU sequential (near-onset = the salient bright end); a metric or a
     large seizure set is a PU sequential."""
     v = np.asarray(values, dtype=float)
     if color_by == "time_to_onset_sec":
-        # LOG scale: pre-ictal dynamics of interest span seconds..hours, and a
-        # linear 0-6h ramp crushes all the near-onset detail into one colour.
-        # log10(seconds) spreads 1s / 10s / 1min / 10min / 1h across the map.
-        sec = np.maximum(v, 1.0)                         # floor at 1 s (no log 0)
-        hi = float(sec.max()) if sec.size else 1.0
-        tv, tt = log_time_ticks(hi)
-        return {"vals": np.log10(sec), "scale": SEQUENTIAL_SCALE, "reverse": True,
-                "label": "time to onset (log)", "cmin": None, "cmax": None,
-                "ticks": (tv, tt) if tv else None}
+        # LINEAR scale, equal spacing, CLAMPED to a configurable cap (default
+        # 2 h): every equal step of real time is an equal step of colour, and
+        # points beyond the cap saturate at the far end. (No log -- a log ramp
+        # implied a density it didn't have.)
+        cap = float(cap_sec) if (cap_sec and cap_sec > 0) else DEFAULT_TIME_CAP_SEC
+        clipped = np.clip(v, 0.0, cap)
+        tv, tt = linear_time_ticks(cap)
+        return {"vals": clipped, "scale": SEQUENTIAL_SCALE, "reverse": True,
+                "label": f"time to onset (≤{dur_label(cap)})",
+                "cmin": 0.0, "cmax": cap, "ticks": (tv, tt) if tv else None}
     if color_by == "hour_of_day":
         return {"vals": v, "scale": cyclic_scale(), "reverse": False,
                 "label": "hour of day", "cmin": 0.0, "cmax": 24.0,

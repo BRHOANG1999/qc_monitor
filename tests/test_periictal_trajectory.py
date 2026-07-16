@@ -77,6 +77,30 @@ def test_default_edges_are_dyadic_ascending():
     assert np.all(np.diff(e) > 0)                          # strictly ascending
 
 
+def test_linear_edges_are_equal_width_from_zero():
+    from src.periictal.trajectory import linear_edges
+    e = linear_edges(7200.0, 12)
+    assert e[0] == 0.0 and e[-1] == 7200.0 and len(e) == 13
+    widths = np.diff(e)
+    assert np.allclose(widths, widths[0])                  # equal-width bins
+    assert np.allclose(widths[0], 600.0)                   # 7200/12 = 10 min each
+
+
+def test_arithmetic_centers_when_not_log():
+    # linear ladder from 0 -> geometric centre of the first bin would be 0
+    # (sqrt(0*x)); arithmetic centres avoid that and sit mid-bin.
+    from src.periictal.trajectory import linear_edges
+    e = linear_edges(1200.0, 4)                            # 0,300,600,900,1200
+    tto = np.array([150., 450., 750., 1050.])
+    tr = lead_time_trajectory(tto, np.array([1., 2, 3, 4]),
+                              np.array([0, 0, 1, 1]), e, log_centers=False)
+    assert np.allclose(tr["centers"], [150., 450., 750., 1050.])   # mid-bin
+    # geometric (default) would put the first centre at 0 — the linear bug we fix
+    tr_log = lead_time_trajectory(tto, np.array([1., 2, 3, 4]),
+                                  np.array([0, 0, 1, 1]), e)
+    assert tr_log["centers"][0] == 0.0
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -31,24 +31,33 @@ def test_hour_of_day_uses_cyclic_not_hsv():
     assert spec["ticks"][0] == [0, 6, 12, 18, 24]
 
 
-def test_time_to_onset_is_log_scaled_and_reversed():
+def test_time_to_onset_is_linear_and_capped():
     import numpy as np
-    spec = pal.continuous_spec("time_to_onset_sec", [1.0, 10.0, 100.0, 3600.0])
+    # LINEAR colour, equal spacing, clamped to the cap (no log).
+    spec = pal.continuous_spec("time_to_onset_sec",
+                               [0.0, 1800.0, 3600.0, 20000.0], cap_sec=7200.0)
     assert spec["reverse"] is True                  # near-onset = salient end
     assert spec["scale"] == pal.SEQUENTIAL_SCALE
-    # colour value is log10(seconds), not linear hours -> near-onset detail
-    # (seconds..minutes) is spread across the map instead of one sliver.
-    assert np.allclose(spec["vals"], [0.0, 1.0, 2.0, np.log10(3600)])
-    assert "log" in spec["label"]
-    tv, tt = spec["ticks"]                           # readable log ticks
-    assert "1s" in tt and "1h" in tt
+    assert spec["cmin"] == 0.0 and spec["cmax"] == 7200.0
+    # raw seconds, clamped to the cap (the 20000 s point saturates at 7200).
+    assert np.allclose(spec["vals"], [0.0, 1800.0, 3600.0, 7200.0])
+    assert "log" not in spec["label"] and "2h" in spec["label"]
+    tv, tt = spec["ticks"]                           # equal linear ticks in hours
+    assert tt == ["0h", "0.5h", "1h", "1.5h", "2h"]
     assert len(tv) == len(tt)
 
 
-def test_time_to_onset_floors_at_one_second():
-    import numpy as np
-    spec = pal.continuous_spec("time_to_onset_sec", [0.0, 0.3])
-    assert np.all(np.isfinite(spec["vals"]))        # no log(0) -> -inf
+def test_time_to_onset_cap_defaults_to_two_hours():
+    spec = pal.continuous_spec("time_to_onset_sec", [0.0, 100.0])   # no cap given
+    assert spec["cmax"] == pal.DEFAULT_TIME_CAP_SEC == 7200.0
+
+
+def test_linear_time_ticks_unit_follows_cap():
+    # minutes cap -> minute-labelled ticks; seconds cap -> second-labelled.
+    _tv, tt_m = pal.linear_time_ticks(600.0)         # 10 min
+    assert tt_m[-1] == "10m" and tt_m[0] == "0m"
+    _tv, tt_s = pal.linear_time_ticks(40.0)          # 40 s
+    assert tt_s[-1] == "40s"
 
 
 def test_is_categorical_seizure_switches_past_the_cap():

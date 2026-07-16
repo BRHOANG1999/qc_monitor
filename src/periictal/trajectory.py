@@ -33,15 +33,27 @@ def default_edges(window_sec: float, min_leadtime_sec: float = 2.0) -> np.ndarra
     return np.asarray(ladder, dtype=float)
 
 
+def linear_edges(cap_sec: float, n_bins: int = 12) -> np.ndarray:
+    """Equal-width (LINEAR) bin edges from 0 up to *cap_sec* — every bin spans the
+    same amount of real time, so at a uniform stim rate the bins hold ~equal
+    counts (the count imbalance the log ladder fought is gone). Use with
+    ``log_centers=False``."""
+    cap = float(cap_sec)
+    n = int(max(1, min(n_bins, _MAX_BINS - 1)))
+    assert cap > 0, "cap_sec must be > 0"
+    return np.linspace(0.0, cap, n + 1)
+
+
 def lead_time_trajectory(tto_sec, values, seizure_idx, edges,
-                         min_n: int = 5) -> dict:
+                         min_n: int = 5, log_centers: bool = True) -> dict:
     """Median (+ p25/p75) of *values* per lead-time bin, plus per-seizure medians.
 
-    *edges* are ascending seconds-before-onset. Returns
-    ``{centers, median, p25, p75, n, low_n, per_seizure}`` where centers are the
-    bins' geometric means, low_n marks bins with < *min_n* finite values
-    (near-onset bins are naturally sparse -- flagged, not silently trusted), and
-    per_seizure maps seizure id -> its own per-bin median (NaN where empty)."""
+    *edges* are ascending seconds-before-onset. *log_centers* picks geometric
+    (log ladder) vs arithmetic (linear ladder) bin centres. Returns
+    ``{centers, median, p25, p75, n, low_n, per_seizure}`` where low_n marks bins
+    with < *min_n* finite values (near-onset bins can be sparse -- flagged, not
+    silently trusted), and per_seizure maps seizure id -> its own per-bin median
+    (NaN where empty)."""
     tto = np.asarray(tto_sec, dtype=float)
     v = np.asarray(values, dtype=float)
     sz = np.asarray(seizure_idx)
@@ -50,7 +62,8 @@ def lead_time_trajectory(tto_sec, values, seizure_idx, edges,
     assert tto.shape == v.shape == sz.shape, "tto/values/seizure_idx mismatch"
     nb = int(edges.size - 1)
     assert nb < _MAX_BINS, "too many bins"
-    centers = np.sqrt(edges[:-1] * edges[1:])            # geometric-mean centres
+    centers = (np.sqrt(edges[:-1] * edges[1:]) if log_centers
+               else 0.5 * (edges[:-1] + edges[1:]))     # geo (log) / arith (linear)
     idx = np.digitize(tto, edges) - 1                    # bin index per point
     med = np.full(nb, np.nan)
     p25 = np.full(nb, np.nan)
