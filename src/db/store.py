@@ -3998,6 +3998,41 @@ class Store:
             return animal
         return None
 
+    def channel_index_for_animal(self, file_id, animal_id) -> int | None:
+        """Channel index of *animal_id*'s electrode in *file_id*, or None.
+
+        Reverse of ``animal_for_file_channel``: given the animal, find the
+        0-based ``channel_names`` slot whose electrode belongs to it (first
+        match wins). Used to resolve which channel an animal's stored onsets
+        were scored on when there's no live channel picker -- e.g. the batch
+        export of needs_scoring drafts."""
+        if file_id is None or not animal_id:
+            return None
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT sc.channel_names FROM processed_files pf
+                   JOIN session_config sc ON sc.session_dir = pf.session_dir
+                   WHERE pf.id = ?""", (int(file_id),)).fetchone()
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
+        finally:
+            conn.close()
+        if not row or not row["channel_names"]:
+            return None
+        try:
+            names = json.loads(row["channel_names"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        for i, name in enumerate(names):
+            if isinstance(name, str) and is_animal_channel(name):
+                a, _ = split_animal_electrode(name)
+                if a == animal_id:
+                    return i
+        return None
+
     def session_animals(self, session_dir: str) -> list[str]:
         """Distinct animal ids present as EEG channels in a session, in channel
         order. Powers the multi-animal channel->animal legend and validates a

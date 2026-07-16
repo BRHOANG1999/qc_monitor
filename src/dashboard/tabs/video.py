@@ -501,6 +501,7 @@ def _build_csv_file_meta(store, file_id: int, channel: int,
                          cutoff: float | None = None,
                          auc_threshold: float | None = None,
                          auc_window: float | None = None,
+                         fs: float | None = None,
                          ) -> tuple[dict, float, str, "date"]:
     """Assemble the file-level meta dict + (fs, animal_id,
     chunk_date) for a BHZ CSV row.
@@ -518,8 +519,16 @@ def _build_csv_file_meta(store, file_id: int, channel: int,
     if not file_path:
         raise ValueError(f"file_id {file_id} has no file_path")
     session_dir = _session_dir_for_file(store, file_id)
-    chunk = get_chunk(file_path)
-    fs = float(chunk.fs)
+    # *fs* may be supplied by the caller (from the DB) so a bulk export
+    # doesn't pay a full-file SMB read per file just to learn the sample
+    # rate. The interactive path leaves it None -> get_chunk (a cache hit
+    # for the file the reviewer is viewing).
+    if fs is None:
+        chunk = get_chunk(file_path)
+        fs = float(chunk.fs)
+    else:
+        fs = float(fs)
+    assert fs > 0, "fs must be > 0"
     with store.connection() as conn:
         row = conn.execute(
             "SELECT chunk_datetime FROM processed_files "
@@ -572,17 +581,18 @@ def _build_csv_file_meta(store, file_id: int, channel: int,
 def _export_partial_csv(store, config: dict, file_id: int,
                           channel, events: list,
                           cutoff=None, auc_threshold=None,
-                          auc_window=None) -> tuple[int, str]:
+                          auc_window=None, fs=None) -> tuple[int, str]:
     """Append the dropped onsets to the official BHZ day CSV right now.
 
     ``bhz_csv.write_event_rows`` tolerates partial events (unset landmarks
     render as ``NaN``), so an EEG-onset-only event writes its ``EventEO``
     and leaves the rest blank -- usable immediately. *cutoff* (raw envelope)
     and *auc_threshold* / *auc_window* (AUC screen) are the live detector
-    settings, recorded on every row. Returns ``(n_rows, csv_name)``; raises
-    ``ValueError`` on misconfig / missing data so the caller can surface a
-    clean message. A later full score is replaced when the PI finalizes the
-    day CSV in overwrite mode.
+    settings, recorded on every row. *fs* lets a bulk caller pass the
+    DB-known sample rate so we skip a full-file read. Returns
+    ``(n_rows, csv_name)``; raises ``ValueError`` on misconfig / missing
+    data so the caller can surface a clean message. A later full score
+    upgrades the partial row in place (write_event_rows dedup).
     """
     assert events, "events required for partial export"
     bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
@@ -592,7 +602,7 @@ def _export_partial_csv(store, config: dict, file_id: int,
         raise ValueError("Pick a channel before exporting.")
     cut = _as_float(cutoff, _BHZ_CUTOFF)
     meta, fs, animal, chunk_date = _build_csv_file_meta(
-        store, int(file_id), int(channel),
+        store, int(file_id), int(channel), fs=fs,
         cutoff=cut if cut and cut > 0 else _BHZ_CUTOFF,
         auc_threshold=_as_float(auc_threshold, None),
         auc_window=_as_float(auc_window, None))
@@ -602,6 +612,83 @@ def _export_partial_csv(store, config: dict, file_id: int,
         chunk_date, animal)
     n = _bhz_csv.write_event_rows(csv_path, meta, events, fs)
     return n, csv_path.name
+
+
+def _needs_scoring_fs(store, file_id: int) -> float | None:
+    """DB sample rate for *file_id* (processed_files.sampling_rate), so the
+    batch export skips a full-file read. None when unknown."""
+    try:
+        with store.connection() as conn:
+            row = conn.execute(
+                "SELECT sampling_rate FROM processed_files WHERE id = ?",
+                (int(file_id),)).fetchone()
+    except Exception:  # noqa: BLE001 -- treat as unknown, caller loads chunk
+        return None
+    if not row or row["sampling_rate"] in (None, "", 0):
+        return None
+    try:
+        fs = float(row["sampling_rate"])
+    except (TypeError, ValueError):
+        return None
+    return fs if fs > 0 else None
+
+
+def _export_all_needs_scoring(store, config: dict) -> dict:
+    """Write every ``needs_scoring`` ("Needs more onsets") file's onsets to
+    its day CSV -- the PI batch flush.
+
+    These files never reach the PI approval gate (they're incomplete), so
+    this is how their scored onsets get out. Idempotent by ``EventEO`` and
+    re-runnable: a later full score upgrades the partial row in place
+    (``bhz_csv`` upgrade dedup). Uses the DB sample rate to avoid a
+    full-file read per file. Returns a summary dict
+    ``{animals, files, rows, skipped, errors}``.
+    """
+    summary = {"animals": 0, "files": 0, "rows": 0,
+               "skipped": 0, "errors": 0}
+    bhz_cfg = (config or {}).get("bhz_csv", {}) or {}
+    if not bhz_cfg.get("enabled"):
+        raise ValueError("BHZ CSV export is disabled in config.")
+    try:
+        animals = store.animals_with_needs_scoring() or []
+    except Exception as e:  # noqa: BLE001 -- no work rather than a crash
+        logger.warning("animals_with_needs_scoring failed: %s", e)
+        animals = []
+    summary["animals"] = len(animals)
+    max_animals = 4096
+    for ai, animal in enumerate(animals):
+        assert ai < max_animals, "too many animals"
+        files = store.files_needing_scoring_for_animal(animal) or []
+        max_files = 100_000
+        for fi, f in enumerate(files):
+            assert fi < max_files, "too many needs_scoring files"
+            file_id = int(f["file_id"])
+            try:
+                events = json.loads(f.get("markers_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                events = []
+            events = [e for e in events if _event_is_meaningful(e)]
+            if not events:
+                summary["skipped"] += 1
+                continue
+            channel = store.channel_index_for_animal(file_id, animal)
+            if channel is None:
+                summary["errors"] += 1
+                logger.warning("needs_scoring export: no channel for %s "
+                               "in file %s", animal, file_id)
+                continue
+            try:
+                n, _name = _export_partial_csv(
+                    store, config, file_id, channel, events,
+                    fs=_needs_scoring_fs(store, file_id))
+                summary["files"] += 1
+                summary["rows"] += int(n)
+            except Exception as e:  # noqa: BLE001 -- one bad file mustn't
+                # abort the whole sweep; count it and move on.
+                summary["errors"] += 1
+                logger.warning("needs_scoring export failed "
+                               "(file_id=%s): %s", file_id, e)
+    return summary
 
 
 def _resolve_next_in_queue(store: Store,
@@ -5728,11 +5815,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-channel-dropdown", "value"),
         State("video-ma-pools-view", "data"),
         State("video-ma-pool-cursor", "data"),
+        # Live detector settings, recorded on each auto-exported onset row
+        # so a needs_scoring CSV row self-documents how it was detected.
+        State("video-ma-cutoff-input", "value"),
+        State("video-ma-auc-threshold-input", "value"),
+        State("video-auc-window-input", "value"),
         prevent_initial_call=True,
     )
     def _save_review(n_clicks, file_id, decision, markers, note,
                       animal_value, events, channel,
-                      pools_view, pool_cursor):
+                      pools_view, pool_cursor,
+                      cutoff, auc_threshold, auc_window):
         nop = (no_update,) * 10
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
@@ -5805,13 +5898,33 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             store.release_claim(int(file_id), animal_id=animal)
         except Exception as e:
             logger.warning("release_claim failed: %s", e)
+        # Auto-export needs_scoring onsets to the day CSV NOW. These files
+        # never reach the PI approval gate (they're incomplete), so their
+        # onsets would otherwise be stranded. The write is idempotent by
+        # EventEO and a later full score upgrades the partial row in place
+        # (bhz_csv upgrade dedup), so re-saving is safe. Best-effort: a CSV
+        # failure must never fail the review save.
+        csv_exported = 0
+        csv_name = ""
+        if target_status == "needs_scoring":
+            try:
+                csv_exported, csv_name = _export_partial_csv(
+                    store, config, int(file_id), channel, events,
+                    cutoff=cutoff, auc_threshold=auc_threshold,
+                    auc_window=auc_window)
+            except Exception as e:  # noqa: BLE001 -- surface, never crash save
+                logger.warning("needs_scoring auto CSV export failed "
+                               "(file_id=%s): %s", file_id, e)
         from datetime import datetime as _dt
         n_ev = sum(1 for e in events if _event_is_meaningful(e))
         hhmm = _dt.now().strftime('%H:%M')
         if target_status == "needs_scoring":
+            csv_note = (f"  ·  {csv_exported} onset"
+                        f"{'' if csv_exported == 1 else 's'} written to "
+                        f"{csv_name}." if csv_exported else "")
             badge = (f"✓ Saved to \"Needs more onsets\" at {hhmm}  ·  "
                       f"{n_ev} event{'' if n_ev == 1 else 's'} scored; add "
-                      "the remaining onsets later.")
+                      f"the remaining onsets later.{csv_note}")
         elif markers_payload is None:
             badge = (f"✓ Submitted (no events) for PI review at {hhmm}.")
         else:

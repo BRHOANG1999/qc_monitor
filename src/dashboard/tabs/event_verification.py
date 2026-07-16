@@ -244,9 +244,24 @@ def _flagged_scored_section() -> html.Details:
                         n_clicks=0, style=_btn_style(accent=True),
                         title="Approve the selected scored files and write "
                               "their onsets to the per-animal BHZ day CSV."),
+            html.Button("Flush all Needs-more-onsets → CSV",
+                        id="evtv-fs-flush-btn", n_clicks=0,
+                        style=_btn_style(secondary=True),
+                        title="Write the onsets of EVERY file in ⚠️ Needs "
+                              "more onsets to its per-animal day CSV now. "
+                              "Those files can't be PI-approved (they're "
+                              "incomplete), so this is how their onsets reach "
+                              "the CSV. Idempotent + re-runnable; a later full "
+                              "score upgrades the partial row in place."),
             html.Div(id="evtv-fs-status",
                      style={"color": "#a0a0b0", "fontSize": "11px",
                             "marginLeft": "12px"}),
+            dcc.Loading(
+                type="circle", color="#5e7ce2", delay_show=120,
+                children=html.Div(
+                    id="evtv-fs-flush-status",
+                    style={"color": "#a0a0b0", "fontSize": "11px",
+                           "marginLeft": "8px"})),
         ], style={"display": "flex", "gap": "8px", "alignItems": "center",
                   "marginBottom": "10px", "flexWrap": "wrap"}),
         # Bulk re-attribution: fix multi-animal mis-filing. Tick rows filed
@@ -1196,6 +1211,37 @@ def register_callbacks(app, store, config: dict) -> None:
         rows = _flagged_scored_rows(store)
         sig = "|".join(f"{x['id']}={x['scored']}" for x in rows)
         return rows, [], msg, fin, sig
+
+    @app.callback(
+        Output("evtv-fs-flush-status", "children"),
+        Input("evtv-fs-flush-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _fs_flush_needs_scoring(_n):
+        """PI batch flush: write EVERY needs_scoring file's onsets to CSV.
+
+        These files can't be PI-approved (incomplete), so their onsets are
+        otherwise stranded. Idempotent + re-runnable (EventEO dedup; a full
+        score later upgrades the partial row in place)."""
+        email = (current_user_email() or "").lower()
+        if not _is_pi(config or {}, email) \
+                or not _has_real_click(callback_context.triggered):
+            return no_update
+        # Lazy import: video.py imports heavily; importing it at module load
+        # would risk a cycle. Import here, only when the button fires.
+        from src.dashboard.tabs.video import _export_all_needs_scoring
+        try:
+            s = _export_all_needs_scoring(store, config)
+        except Exception as e:  # noqa: BLE001 -- surface, never crash the tab
+            logger.warning("needs_scoring flush failed: %s", e)
+            return f"Flush failed: {e}"
+        parts = [f"✓ Flushed {s['files']} file(s) / {s['rows']} onset "
+                 f"row(s) to CSV across {s['animals']} animal(s)."]
+        if s["skipped"]:
+            parts.append(f" {s['skipped']} had no scored onset (skipped).")
+        if s["errors"]:
+            parts.append(f" {s['errors']} error(s) — see log.")
+        return "".join(parts)
 
     @app.callback(
         Output("evtv-flagged-table", "data", allow_duplicate=True),
