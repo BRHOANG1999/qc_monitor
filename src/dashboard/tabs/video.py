@@ -1045,6 +1045,7 @@ def _render_hilbert_trace(store, file_id: int,
                             cutoff: float = _BHZ_CUTOFF,
                             min_peak_dist_sec: float = _BHZ_MIN_PEAK_DIST_SEC,
                             show_raw: bool = False,
+                            file_path: str | None = None,
                             ) -> tuple:
     """Return (figure, status_text) for the BHZ Hilbert detector.
 
@@ -1065,7 +1066,7 @@ def _render_hilbert_trace(store, file_id: int,
     lab's BHZ_DETECTOR defaults (0.05 and 150 s).
     """
     assert isinstance(file_id, int), "file_id must be int"
-    file_path = _file_path_for_id(store, file_id)
+    file_path = file_path or _file_path_for_id(store, file_id)
     if not file_path:
         return (_empty_lfp_fig("File not found in DB."), "")
     if channel is None:
@@ -1710,14 +1711,15 @@ def _render_auc_trace(store, file_id: int, channel: int | None,
                        window_sec: float,
                        blank_pre_ms: float = -5.0,
                        blank_post_ms: float = 15.0,
-                       show_raw: bool = False) -> tuple:
+                       show_raw: bool = False,
+                       file_path: str | None = None) -> tuple:
     """Sliding-window AUC (moving integral) of the Hilbert envelope.
 
     Sustained seizure events show as plateaus; transient noise spikes
     stay near zero -- the visual the PI uses to rescue low-amplitude
     events the peak detector misses."""
     assert isinstance(file_id, int), "file_id must be int"
-    file_path = _file_path_for_id(store, file_id)
+    file_path = file_path or _file_path_for_id(store, file_id)
     if not file_path:
         return (_empty_lfp_fig("File not found in DB."), "")
     if channel is None:

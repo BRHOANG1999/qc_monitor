@@ -225,15 +225,17 @@ def _channel_animal(store: Store, session_dir: str | None, channel: int,
 
 
 def _filtered_trace(store: Store, file_id: int, channel: int,
-                     mode: str):
+                     mode: str, file_path: str | None = None):
     """The student's chosen 2nd-panel trace: raw Hilbert envelope (default)
-    or its sliding-window AUC. Falls back to a placeholder on error."""
+    or its sliding-window AUC. Falls back to a placeholder on error.
+    *file_path* passes an already-resolved live path (see _build_figures)."""
     try:
         if mode == "auc":
             fig, _s = _render_auc_trace(store, file_id, channel,
-                                        _AUC_WINDOW_SEC)
+                                        _AUC_WINDOW_SEC, file_path=file_path)
         else:
-            fig, _s = _render_hilbert_trace(store, file_id, channel)
+            fig, _s = _render_hilbert_trace(store, file_id, channel,
+                                            file_path=file_path)
         add_click_catcher(fig)   # click anywhere in the column sets a landmark
         return fig
     except Exception:
@@ -244,12 +246,16 @@ def _filtered_trace(store: Store, file_id: int, channel: int,
 
 
 def _build_figures(store: Store, file_id: int, channel: int,
-                    mode: str = "hilbert"):
+                    mode: str = "hilbert", file_path: str | None = None):
     """(lfp_fig, filtered_fig, lfp_dur_s) for a recording -- stim-blanked
     like the Video Review default. *mode* picks the 2nd panel (hilbert |
     auc). *lfp_dur_s* is the recording length in seconds (0.0 if unknown);
-    the cursor-sync clientside callback maps video time onto it."""
-    file_path = _file_path_for_id(store, file_id)
+    the cursor-sync clientside callback maps video time onto it.
+
+    *file_path* lets the caller pass an already-resolved live path (the DB
+    row's path can be stale and un-updatable when another row owns the live
+    path via UNIQUE(file_path)); falls back to the DB path when omitted."""
+    file_path = file_path or _file_path_for_id(store, file_id)
     if not file_path:
         ph = _empty_lfp_fig("Recording file not found.")
         return ph, ph, 0.0
@@ -283,7 +289,10 @@ def _build_figures(store: Store, file_id: int, channel: int,
                          file_id, channel)
         lfp = _empty_lfp_fig("LFP failed to load.")
         dur = 0.0
-    return lfp, _filtered_trace(store, file_id, channel, mode), float(dur)
+    return (lfp,
+            _filtered_trace(store, file_id, channel, mode,
+                            file_path=file_path),
+            float(dur))
 
 
 def _ensure_round(store: Store, email: str, stage: int, n: int,
@@ -321,18 +330,25 @@ def _history_text(store: Store, email: str, stage: int, rnd=None) -> str:
     return "  ·  ".join(bits)
 
 
-def _resolve_for_load(store: Store, config: dict, file_id: int) -> None:
+def _resolve_for_load(store: Store, config: dict,
+                       file_id: int) -> str | None:
     """Lazily confirm/relocate a Training recording right before it loads.
     For a real DB file (path on disk) this is a quick stat; for a cataloged
     historical example with a stale path it runs the recursive multi-drive
-    EEG search once (cached). Failures are non-fatal -- the figure builders
-    fall back to a 'file not found' placeholder."""
+    EEG search once (cached).
+
+    Returns the live path on disk (None if unresolved). The DB row's path is
+    NOT always updatable -- when another processed_files row already owns the
+    located path (UNIQUE(file_path)), resolve_training_file leaves the stale
+    path in the row but still returns the live one -- so callers must USE this
+    return value rather than re-reading the DB path. Failures are non-fatal."""
     try:
         loc = _past.make_locator(store, config or {})
-        store.resolve_training_file(int(file_id), loc)
+        return store.resolve_training_file(int(file_id), loc)
     except Exception as e:  # noqa: BLE001 -- resolution must not break load
         logger.warning("training: lazy resolve failed for #%s: %s",
                        file_id, e)
+        return None
 
 
 def _validated_events_for(store: Store, file_id: int):
@@ -371,24 +387,23 @@ def _next_valid_file(store: Store, stage: int, rnd: dict, idx: int):
     return int(files[idx]), rnd
 
 
-def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
-                config: dict | None = None):
-    """('loaded', payload) for the next round example, ('complete', rnd) when
-    the round is finished, or None when no candidate files exist."""
-    min_dur = _cfg(config or {})["min_file_duration_sec"]
-    rnd = _ensure_round(store, email, stage, n, min_dur)
-    if rnd is None:
-        return None
-    idx = _round_idx(store, email, stage, rnd)
-    if idx >= rnd["examples"]:
-        return "complete", rnd
-    file_id, rnd = _next_valid_file(store, stage, rnd, idx)
-    if file_id is None:
-        # Every remaining example went stale -- end on what was scored.
-        return "complete", rnd
-    # Locate the EEG on disk now, only for this one file (lazy, cached).
-    _resolve_for_load(store, config or {}, file_id)
-    mat_path = _file_path_for_id(store, file_id)
+def _skip_notice(skipped: list[str]) -> str | html.Div:
+    """Student-facing banner naming how many examples we skipped because
+    their EEG couldn't be located on any drive. Empty string when none."""
+    if not skipped:
+        return ""
+    k = len(skipped)
+    return _note(
+        f"⚠️ Skipped {k} recording{'' if k == 1 else 's'} whose EEG couldn't "
+        "be found on any connected drive (logged for the admin). Showing the "
+        "next example.", COLOR_WARNING)
+
+
+def _example_payload(store: Store, config: dict | None, email: str,
+                      stage: int, rnd: dict, idx: int, file_id: int,
+                      mat_path: str, mode: str, skipped: list[str]):
+    """Assemble the ('loaded') payload for one located example. *mat_path*
+    is the confirmed live path (see _resolve_for_load / _build_figures)."""
     fname = os.path.basename(mat_path) if mat_path else f"file #{file_id}"
     session_dir = _session_dir_for_file(store, file_id)
     # Show the channel of the animal whose validated answer carries the
@@ -406,7 +421,8 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
         channel = _first_animal_channel(store, session_dir, mat_path)
         validated = store.validated_events_for_file(file_id)
     chan_name, animal = _channel_animal(store, session_dir, channel, mat_path)
-    lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode)
+    lfp, hil, lfp_dur = _build_figures(store, file_id, channel, mode,
+                                        file_path=mat_path)
     # Stamp the measured length so the min-duration gate becomes real for
     # historical files once opened (no-op when already known).
     if lfp_dur:
@@ -420,8 +436,55 @@ def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
     now = (f"Example {idx + 1} of {rnd['examples']}  ·  {who}  ·  {fname}")
     # The video is rendered by _render_video (camera picker + .avi transcode);
     # show a transient placeholder until that fires.
-    return "loaded", (cur, _vid_placeholder("Loading video…"), lfp, hil, now,
-                      _history_text(store, email, stage, rnd))
+    return (cur, _vid_placeholder("Loading video…"), lfp, hil, now,
+            _history_text(store, email, stage, rnd), _skip_notice(skipped))
+
+
+def _load_next(store: Store, email: str, stage: int, mode: str, n: int,
+                config: dict | None = None):
+    """('loaded', payload) for the next round example, ('complete', rnd) when
+    the round is finished, or None when no candidate files exist.
+
+    An example whose EEG can't be located on any drive after the multi-drive
+    search is a dead catalog entry (its file was archived off every reachable
+    drive). Rather than wedge the round on it, we prune it and advance to the
+    next example, surfacing the count to the student (payload notice) and
+    logging each miss for the admin. The loop is bounded by the round size."""
+    min_dur = _cfg(config or {})["min_file_duration_sec"]
+    rnd = _ensure_round(store, email, stage, n, min_dur)
+    if rnd is None:
+        return None
+    idx = _round_idx(store, email, stage, rnd)
+    if idx >= rnd["examples"]:
+        return "complete", rnd
+    skipped: list[str] = []
+    max_tries = int(rnd["examples"]) + 1        # NASA Rule 2: bounded loop
+    for _try in range(max_tries):
+        file_id, rnd = _next_valid_file(store, stage, rnd, idx)
+        if file_id is None:
+            # Nothing scoreable left (stale and/or all-skipped) -- end the
+            # round on what was actually scored, carrying the skip notice.
+            return "complete_skipped", (rnd, _skip_notice(skipped))
+        # Locate the EEG on disk NOW (recursive multi-drive search, cached).
+        # Use the RESOLVED path, not the DB path: the row can hold a stale,
+        # un-updatable path (another row owns the live one via UNIQUE).
+        resolved = _resolve_for_load(store, config or {}, file_id)
+        mat_path = resolved or _file_path_for_id(store, file_id)
+        if not mat_path or not os.path.isfile(mat_path):
+            fname = (os.path.basename(mat_path) if mat_path
+                     else f"file #{file_id}")
+            logger.warning("training: EEG not found on any drive; skipping "
+                           "example (file_id=%s path=%s)", file_id, mat_path)
+            skipped.append(fname)
+            remaining = [f for f in rnd["files"] if int(f) != int(file_id)]
+            store.prune_training_round(rnd["round_id"], remaining)
+            rnd = {**rnd, "files": remaining, "examples": len(remaining)}
+            continue                            # next file shifts into idx
+        return "loaded", _example_payload(
+            store, config, email, stage, rnd, idx, file_id, mat_path,
+            mode, skipped)
+    # Exhausted the bound with nothing loadable.
+    return "complete_skipped", (rnd, _skip_notice(skipped))
 
 
 def _build_prompt(store: Store, email: str, stage: int,
@@ -837,14 +900,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "No validated recordings to train on yet — check back once "
                 "the PI has approved some."), ph, ph, [], "", "", "", hide, "")
         kind, payload = res
-        if kind == "complete":
-            prompt = _build_prompt(store, email, stage, payload)
-            return (no_update, no_update, no_update, no_update, no_update, "",
-                    "Round complete — choose below.", prompt,
+        if kind in ("complete", "complete_skipped"):
+            rnd, notice = ((payload[0], payload[1])
+                           if kind == "complete_skipped" else (payload, ""))
+            prompt = _build_prompt(store, email, stage, rnd)
+            return (no_update, no_update, no_update, no_update, no_update,
+                    notice, "Round complete — choose below.", prompt,
                     {"display": "block"},
-                    _history_text(store, email, stage, payload))
-        cur, vid, lfp, hil, now, hist = payload
-        return cur, vid, lfp, hil, [], "", now, "", hide, hist
+                    _history_text(store, email, stage, rnd))
+        cur, vid, lfp, hil, now, hist, notice = payload
+        # `notice` (if any) warns the student we skipped unreachable examples.
+        return cur, vid, lfp, hil, [], notice, now, "", hide, hist
 
     # ---- 2nd-panel filter: Hilbert envelope vs AUC ---- #
     @app.callback(

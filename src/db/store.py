@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+import logging
 import sqlite3
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from .schema import SCHEMA_SQL
+
+logger = logging.getLogger("qc_monitor.db.store")
 
 
 def _current_fidelity_pct(r_reversal, r_offset):
@@ -5009,7 +5012,15 @@ class Store:
                 (found, os.path.dirname(found), int(file_id)))
             conn.commit()
         except sqlite3.IntegrityError:
-            pass              # another row already owns that path; fine
+            # Another processed_files row already owns *found* (the same
+            # recording catalogued twice, e.g. a live-scan row + this
+            # training-example row) -- UNIQUE(file_path) blocks the update.
+            # The DB row keeps its stale path, so callers MUST use the
+            # returned path, not re-read file_path. Log so this is
+            # diagnosable rather than a silent stale-path load failure.
+            logger.info("resolve_training_file: %s already owned by another "
+                        "row; file_id=%s keeps its stored path but resolves "
+                        "to the live one", found, file_id)
         finally:
             conn.close()
         return found
