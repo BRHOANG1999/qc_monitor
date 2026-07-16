@@ -358,6 +358,22 @@ def test_loadings_fig_single_pc_does_not_crash():
     assert pex._pc_name(2, [0.99]) == "PC2"            # missing ev -> no percent
 
 
+def test_single_value_categorical_annotates_not_blank():
+    # A colour-by with ONE distinct value (e.g. channel/stim on BCH111 chronicStim)
+    # must SAY so + force the legend, not silently paint one colour (reads as
+    # "colour-by does nothing").
+    n = 30
+    sub = pd.DataFrame({"channel": ["BCH111SR"] * n,
+                        "seizure_idx": np.arange(n) % 4})
+    emb = np.random.default_rng(0).random((n, 2))
+    one = pex._categorical_fig(emb, sub, "channel")
+    assert len(one.data) == 1 and one.data[0].showlegend is True
+    assert one.layout.annotations and "Only one" in one.layout.annotations[0].text
+    # a genuinely multi-valued category is unaffected (no annotation)
+    multi = pex._categorical_fig(emb, sub, "seizure_idx")
+    assert len(multi.data) == 4 and not multi.layout.annotations
+
+
 def test_loadings_fig_rejects_mismatched_components():
     # components width must match cols length, else bail gracefully.
     cached = {"empty": False, "method": "pca", "cols": ["a", "b"],

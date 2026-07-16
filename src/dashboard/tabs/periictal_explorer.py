@@ -1040,13 +1040,27 @@ def _categorical_fig(emb, sub, color_by) -> go.Figure:
     for k, name in enumerate(order):
         m = shown == name
         fig.add_trace(go.Scattergl(
-            x=emb[m, 0], y=emb[m, 1], mode="markers", name=name,
+            x=emb[m, 0], y=emb[m, 1], mode="markers", name=name, showlegend=True,
             marker=dict(size=4, opacity=0.65, color=_pal.hue_for(name, k)),
             customdata=row_idx[m],
             hovertemplate=f"{_pretty(color_by)}: {name}<extra></extra>"))
-    fig.update_layout(legend=dict(title=_pretty(color_by), orientation="h",
+    # Force the legend even for a single category (Plotly hides a 1-trace legend
+    # by default) so a single-valued colour-by reads as "one value here", not as
+    # a broken control.
+    fig.update_layout(showlegend=True,
+                      legend=dict(title=_pretty(color_by), orientation="h",
                                   y=1.02, yanchor="bottom", font=dict(size=10),
                                   itemsizing="constant"))
+    if len(order) <= 1:
+        only = order[0] if order else "—"
+        fig.add_annotation(
+            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+            text=(f"Only one {_pretty(color_by)} here: <b>{only}</b><br>"
+                  f"nothing to distinguish — this colour-by can't separate points "
+                  f"for this selection."),
+            font=dict(size=12, color=COLOR_WARNING),
+            bgcolor="rgba(20,20,28,0.72)", bordercolor=COLOR_WARNING,
+            borderwidth=1, borderpad=8, align="center")
     return fig
 
 
