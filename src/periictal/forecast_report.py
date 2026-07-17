@@ -61,13 +61,16 @@ def _write_stats_csv(path: str, scan: list, res: dict, n_seizures: int) -> None:
 
 def run(store, animal: str, evoked_dir: str, out_dir: str, *,
         protocol: str | None = "chronicStim", window_h: float = 6.0,
-        n_phases: int = 6, top: int = 4, n_perm: int = 500) -> dict:
+        n_phases: int = 6, top: int = 4, n_perm: int = 500,
+        warm_missing: bool = True) -> dict:
     """Build + label + render the report for *animal*. Returns a summary dict
-    (also printed by the CLI). Warms missing sidecars so a fresh checkout / a
-    feature-version bump self-heals."""
+    (also printed by the CLI). *warm_missing* recomputes stale/missing sidecars
+    so a fresh checkout / a feature-version bump self-heals; pass False to read
+    only the already-warm sidecars (fast, when the near-seizure files are
+    known to be current)."""
     os.makedirs(out_dir, exist_ok=True)
     df = build_matrix(store, animal, evoked_dir, protocol=protocol or None,
-                      window_sec=window_h * 3600.0, warm_missing=True)
+                      window_sec=window_h * 3600.0, warm_missing=warm_missing)
     if df.empty:
         return {"animal": animal, "ok": False, "reason": "empty matrix"}
     lab = _fc.label_classes(df)
@@ -113,6 +116,9 @@ def _parse(argv):
     p.add_argument("--top", type=int, default=4,
                    help="render PDF/CDF for the top-N features by AUC")
     p.add_argument("--perm", type=int, default=500)
+    p.add_argument("--no-warm", action="store_true",
+                   help="read only already-warm sidecars (don't recompute "
+                        "stale/missing ones)")
     p.add_argument("--out", default=_OUT_ROOT)
     return p.parse_args(argv)
 
@@ -128,7 +134,8 @@ def main(argv) -> int:
     t0 = time.time()
     summary = run(store, args.animal, evoked_dir, out_dir,
                   protocol=args.protocol or None, window_h=args.window_h,
-                  n_phases=args.phases, top=args.top, n_perm=args.perm)
+                  n_phases=args.phases, top=args.top, n_perm=args.perm,
+                  warm_missing=not args.no_warm)
     print(f"  done in {time.time() - t0:.0f}s: {summary}", flush=True)
     return 0 if summary.get("ok") else 1
 
