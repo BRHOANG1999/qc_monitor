@@ -157,7 +157,11 @@ def list_animals(evoked_dir: str) -> list[str]:
 # WITHOUT re-reading the heavy traces or warming the sqlite cache -- and it
 # doubles as the on-disk export. Bump the version if the row schema changes.
 # v2: added wavelet_power_{slow_gamma,gamma,high_gamma} columns.
-_FEATURE_SIDECAR_VERSION = "2"
+# v3: added Chang et al. 2026 columns -- spectral sum_power_mid /
+#     freq_moment_vhigh, curvature, skewness, the transition-point + exp/lin
+#     fit morphology set (tp_*, expfit_*, linfit_*), and (expensive) the
+#     per-band autocorr_{low,mid,high}. Stale v2 sidecars recompute on access.
+_FEATURE_SIDECAR_VERSION = "3"
 
 
 def feature_sidecar_path(mat_path: str, animal: str,

@@ -25,7 +25,35 @@ import numpy as np
 _LOW_BAND = (1.0, 64.0)
 _HIGH_SUM_BAND = (256.0, 1024.0)
 _MOMENT_HIGH_BAND = (64.0, 256.0)
+# The three canonical Chang et al. 2026 bands (Table 1 #14-19). The repo
+# historically computed SumPower for the low/high bands and the spectral
+# first-moment for the low/mid bands only (4 of the paper's 6); these two
+# constants fill in SumPower[mid] and first-moment[vhigh] so all three bands
+# carry BOTH statistics.
+_MID_BAND = (64.0, 256.0)            # SumPower[64-256]  (paper #16)
+_VHIGH_BAND = (256.0, 1024.0)        # first-moment[256-1024] (paper #19)
 _EPS = 1e-10
+
+# --- Chang et al. 2026 evoked-morphology features (Table 1 #1-13) ---------
+# The 0.5 s evoked response is split at a "transition point" (|dV/dt|~=0,
+# between the fast recovery and the slow drift) into a fast component fit
+# with an exponential a*exp(b*t) and a slow component fit with a line
+# m*t+c (paper Figure 1F). Our evoked epochs are extracted at +/-200 ms in
+# most files (some +/-500 ms), so the analysis window is capped at the
+# cross-file-safe 200 ms rather than the paper's 500 ms; raise _CHANG_POST_MS
+# if the cohort is uniformly +/-500 ms. All choices under the transition
+# detector are reconstructions (the paper's exact algorithm is in Supporting
+# Information we don't have) and are documented at each step.
+_CHANG_GUARD_MS = 1.0                # skip the stim artifact right after t=0
+_CHANG_POST_MS = 200.0               # analysis window end (paper used 500)
+_CHANG_SMOOTH_MS = 1.0               # derivative/trace smoothing for detection
+_CHANG_MIN_SEG = 5                   # min samples per segment to fit
+# Per-band lag-1 autocorrelation bands (Table 2 passive #11-13).
+_AC_BANDS = {
+    "autocorr_low": (1.0, 64.0),
+    "autocorr_mid": (64.0, 256.0),
+    "autocorr_high": (256.0, 1024.0),
+}
 
 # Per-epoch Morlet-wavelet band power. Gamma-and-up only: the evoked
 # window is short (<=~200 ms), so lower bands aren't resolvable by a
@@ -45,10 +73,20 @@ CHEAP_COLUMNS = [
     "freq_moment_low", "sum_power_high", "freq_moment_high",
     "wavelet_power_slow_gamma", "wavelet_power_gamma",
     "wavelet_power_high_gamma",
+    # Chang et al. 2026 additions (Table 1 / Table 2), vectorized + cheap.
+    "sum_power_mid", "freq_moment_vhigh", "curvature", "skewness",
+    "tp_latency_ms", "tp_amplitude",
+    "expfit_decay", "expfit_initial", "expfit_rms", "expfit_curvature",
+    "expfit_skew", "expfit_area",
+    "linfit_slope", "linfit_intercept", "linfit_rms", "linfit_curvature",
+    "linfit_skew",
 ]
 EXPENSIVE_COLUMNS = [
     "recovery_tau", "recovery_slope", "template_correlation",
     "pca_recon_error", "ac_width", "exp_fit_a",
+    # Per-band lag-1 autocorrelation (Table 2 passive #11-13): 3 filtfilt
+    # passes, so opt-in with the other per-epoch/expensive features.
+    "autocorr_low", "autocorr_mid", "autocorr_high",
 ]
 ALL_COLUMNS = CHEAP_COLUMNS + EXPENSIVE_COLUMNS
 
@@ -97,6 +135,37 @@ COLUMN_DOCS: dict[str, str] = {
     "wavelet_power_high_gamma": "mean Morlet-wavelet power, "
         f"{_WAVELET_BANDS['wavelet_power_high_gamma'][0]:g}–"
         f"{_WAVELET_BANDS['wavelet_power_high_gamma'][1]:g} Hz.",
+    # Chang et al. 2026 (Table 1 / Table 2). Fast/slow split at the transition
+    # point (smoothed |dy/dt| min after the fast peak) over the post-stim
+    # window [1, 200] ms; exp fit on |y−slow_baseline|, linear fit on the slow
+    # segment. All reconstructed from the paper's definitions (SI unavailable).
+    "sum_power_mid": f"Σ periodogram power, {_MID_BAND[0]:g}–{_MID_BAND[1]:g} Hz "
+                     "(paper SumPower[64-256]).",
+    "freq_moment_vhigh": "power-weighted mean frequency, "
+                         f"{_VHIGH_BAND[0]:g}–{_VHIGH_BAND[1]:g} Hz "
+                         "(paper 1st-moment[256-1024]).",
+    "curvature": "Σ|dy/dt| over the trace ÷ its peak-to-trough span — scale-free "
+                 "wiggliness (paper curvature).",
+    "skewness": "Fisher skewness of the trace's sample distribution.",
+    "tp_latency_ms": "transition-point latency: time of the smoothed-|dy/dt| "
+                     "minimum after the fast peak (fast→slow inflection).",
+    "tp_amplitude": "trace amplitude at the transition point.",
+    "expfit_decay": "b of a·exp(b·t′) fit to |y−slow_baseline| on the fast "
+                    "segment (t′ = ms since the fast peak); b<0 = recovery rate.",
+    "expfit_initial": "a of the fast-segment exponential fit — amplitude at the "
+                      "peak (paper 'explni'; rises in importance in late phases).",
+    "expfit_rms": "RMS of the exponential-fit residuals (goodness).",
+    "expfit_curvature": "Σ|dy/dt| over the fast segment ÷ its span.",
+    "expfit_skew": "skewness of |dy/dt| over the fast segment.",
+    "expfit_area": "mean of the fitted exponential over the fast segment "
+                   "(∫f·dt ÷ segment duration).",
+    "linfit_slope": "slope m of the line m·t+c fit to the slow segment "
+                    "[transition, window end].",
+    "linfit_intercept": "intercept c of the slow-segment linear fit.",
+    "linfit_rms": "RMS of the slow-segment linear-fit residuals ÷ segment span "
+                  "(normalised deviation goodness).",
+    "linfit_curvature": "Σ|dy/dt| over the slow segment ÷ its span.",
+    "linfit_skew": "skewness of |dy/dt| over the slow segment.",
     # Expensive (per-epoch fits; NOT in the default UMAP set).
     "recovery_tau": "exp-decay time constant of the post-peak Hilbert envelope: "
                     "fit A·exp(−t/τ) from the envelope peak (found in 0–50 ms) to "
@@ -110,6 +179,12 @@ COLUMN_DOCS: dict[str, str] = {
     "ac_width": "first lag where the (FFT) autocorrelation drops below 0.5, "
                 "linearly interpolated — the AC half-width (broadens under slowing).",
     "exp_fit_a": "amplitude A of an exp fit to the pre-peak rising |y|.",
+    "autocorr_low": f"lag-1 autocorrelation of the {_AC_BANDS['autocorr_low'][0]:g}"
+                    f"–{_AC_BANDS['autocorr_low'][1]:g} Hz band-passed trace.",
+    "autocorr_mid": f"lag-1 autocorrelation of the {_AC_BANDS['autocorr_mid'][0]:g}"
+                    f"–{_AC_BANDS['autocorr_mid'][1]:g} Hz band-passed trace.",
+    "autocorr_high": f"lag-1 autocorrelation of the {_AC_BANDS['autocorr_high'][0]:g}"
+                     f"–{_AC_BANDS['autocorr_high'][1]:g} Hz band-passed trace.",
 }
 
 _MAX_EPOCHS = 1_000_000     # NASA Rule 2: explicit per-epoch loop bound.
@@ -334,9 +409,11 @@ def spectral(traces, fs: float) -> dict:
     f, pxx = periodogram(a, fs=fs, nfft=nfft, axis=1)
     return {
         "sum_power_low": _band_sum(f, pxx, _LOW_BAND),
+        "sum_power_mid": _band_sum(f, pxx, _MID_BAND),
         "sum_power_high": _band_sum(f, pxx, _HIGH_SUM_BAND),
         "freq_moment_low": _freq_moment(f, pxx, _LOW_BAND),
         "freq_moment_high": _freq_moment(f, pxx, _MOMENT_HIGH_BAND),
+        "freq_moment_vhigh": _freq_moment(f, pxx, _VHIGH_BAND),
     }
 
 
@@ -377,9 +454,12 @@ def compute_cheap(traces, time_ms, fs: float) -> dict:
         "late_area": late_area(a, time_ms),
         "early_late_ratio": early_late_ratio(a, time_ms),
         "autocorrelation": autocorrelation(a),
+        "curvature": curvature(a, dt),
+        "skewness": skewness(a),
     }
     out.update(spectral(a, fs))
     out.update(wavelet(a, fs))
+    out.update(compute_chang(a, time_ms, fs))
     return out
 
 
@@ -557,7 +637,7 @@ def _one_exp_a(y, t) -> float:
 def compute_expensive(traces, time_ms, fs: float) -> dict:
     """All expensive (per-epoch fit) features as a column->array dict."""
     a = _check(traces)
-    return {
+    out = {
         "recovery_tau": recovery_tau(a, time_ms),
         "recovery_slope": recovery_slope(a, time_ms),
         "template_correlation": template_correlation(a),
@@ -565,6 +645,256 @@ def compute_expensive(traces, time_ms, fs: float) -> dict:
         "ac_width": ac_width(a),
         "exp_fit_a": exp_fit_a(a, time_ms),
     }
+    out.update(autocorr_bands(a, fs))
+    return out
+
+
+# --------------------------------------------------------------------- #
+#  Chang et al. 2026 morphology + spectral features (Table 1 / Table 2)
+#
+#  These reconstruct the paper's evoked-response feature portfolio. The
+#  fast/slow split and the two fits are computed for ALL epochs at once with
+#  per-epoch boolean masks and closed-form (log-)linear least squares -- no
+#  per-epoch Python loop, no iterative optimiser -- so they stay cheap enough
+#  to live in the always-computed set. Every reconstructed choice (window,
+#  smoothing, transition rule, baseline, normalisation) is a documented knob.
+# --------------------------------------------------------------------- #
+
+def curvature(traces, dt: float) -> np.ndarray:
+    """Σ|dy/dt| over the trace, normalised by the peak-to-trough span so it is
+    a scale-free "wiggliness" (Table 2 #2 / the per-segment curvature base)."""
+    a = _check(traces)
+    assert dt > 0, "dt must be positive"
+    path = np.sum(np.abs(np.diff(a, axis=1)), axis=1) / dt
+    span = np.max(a, axis=1) - np.min(a, axis=1)
+    return path / (span + _EPS)
+
+
+def skewness(traces) -> np.ndarray:
+    """Fisher skewness of each trace's sample distribution (Table 2 #3)."""
+    a = _check(traces)
+    y = a - a.mean(axis=1, keepdims=True)
+    m2 = np.mean(y * y, axis=1)
+    m3 = np.mean(y * y * y, axis=1)
+    sd = np.sqrt(m2)
+    return np.where(sd > _EPS, m3 / (sd ** 3), 0.0)
+
+
+def _masked_count(mask) -> np.ndarray:
+    return mask.sum(axis=1).astype(np.float64)
+
+
+def _masked_linfit(x_row, y, mask):
+    """Per-epoch OLS ``y ~ slope*x + intercept`` over *mask*.
+
+    *x_row* is the shared 1-D abscissa (samples,), *y* and *mask* are
+    ``[epochs x samples]``. Returns ``(slope, intercept, n)`` with NaN slope/
+    intercept where an epoch has < 2 masked points or a degenerate spread.
+    Pure closed-form normal equations -- vectorised over all epochs.
+    """
+    m = mask.astype(np.float64)
+    n = m.sum(axis=1)
+    X = np.broadcast_to(np.asarray(x_row, dtype=np.float64), y.shape)
+    sx = np.sum(m * X, axis=1)
+    sy = np.sum(m * y, axis=1)
+    sxx = np.sum(m * X * X, axis=1)
+    sxy = np.sum(m * X * y, axis=1)
+    denom = n * sxx - sx * sx
+    ok = (n >= 2) & (np.abs(denom) > _EPS)
+    slope = np.where(ok, (n * sxy - sx * sy) / np.where(ok, denom, 1.0), np.nan)
+    intercept = np.where(ok, (sy - slope * sx) / np.where(n > 0, n, 1.0), np.nan)
+    return slope, intercept, n
+
+
+def _masked_rms(x_row, y, mask, slope, intercept):
+    """RMS of residuals of a per-epoch linear model over *mask*."""
+    m = mask.astype(np.float64)
+    n = m.sum(axis=1)
+    X = np.broadcast_to(np.asarray(x_row, dtype=np.float64), y.shape)
+    pred = slope[:, None] * X + intercept[:, None]
+    resid = (y - pred) * m
+    sse = np.sum(resid * resid, axis=1)
+    return np.where(n > 0, np.sqrt(sse / np.where(n > 0, n, 1.0)), np.nan)
+
+
+def _masked_skew(v, mask):
+    """Fisher skewness of *v* over *mask*, per epoch (NaN when < 3 points)."""
+    m = mask.astype(np.float64)
+    n = m.sum(axis=1)
+    mean = np.sum(m * v, axis=1) / np.where(n > 0, n, 1.0)
+    d = (v - mean[:, None]) * m
+    m2 = np.sum(d * d, axis=1) / np.where(n > 0, n, 1.0)
+    m3 = np.sum(d * d * d, axis=1) / np.where(n > 0, n, 1.0)
+    sd = np.sqrt(m2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sk = m3 / (sd ** 3)
+    return np.where((n >= 3) & (sd > _EPS), sk, np.nan)
+
+
+def _transition_indices(a, t, fs):
+    """Locate, per epoch, the fast-component peak and the fast->slow
+    transition point (smoothed |dy/dt| minimum after the peak).
+
+    Returns ``(peak_idx, trans_idx, post_mask, valid)`` where *post_mask* is
+    the ``[guard, post]`` analysis window and *valid* flags epochs with enough
+    room for both segments. All within the post-stim window only."""
+    n_ep, n_s = a.shape
+    post = (t >= _CHANG_GUARD_MS) & (t <= _CHANG_POST_MS)
+    idx = np.arange(n_s)
+    if post.sum() < 2 * _CHANG_MIN_SEG + 1:
+        z = np.zeros(n_ep, dtype=int)
+        return z, z, post, np.zeros(n_ep, dtype=bool)
+    lo = int(np.argmax(post))                 # first in-window sample
+    hi = int(n_s - np.argmax(post[::-1]))     # one past last in-window sample
+    # Fast-component peak = max |y| inside the window.
+    absa = np.abs(a)
+    absa_win = np.where(post[None, :], absa, -np.inf)
+    peak_idx = np.argmax(absa_win, axis=1)
+    # Smoothed |dy/dt| for a stable transition minimum.
+    w = max(1, int(round(_CHANG_SMOOTH_MS * 1e-3 * fs)))
+    dabs = np.abs(np.diff(_movmean2d(a, w), axis=1))       # [ep, n_s-1]
+    dabs = np.concatenate([dabs, dabs[:, -1:]], axis=1)     # pad to n_s
+    # Search the transition strictly after the peak, within the window,
+    # leaving room for a fittable slow segment at the end.
+    trans_hi = hi - _CHANG_MIN_SEG
+    after_peak = idx[None, :] >= (peak_idx[:, None] + _CHANG_MIN_SEG)
+    in_search = post[None, :] & after_peak & (idx[None, :] < trans_hi)
+    cand = np.where(in_search, dabs, np.inf)
+    trans_idx = np.argmin(cand, axis=1)
+    valid = (in_search.any(axis=1)
+             & (peak_idx >= lo + _CHANG_MIN_SEG - _CHANG_MIN_SEG)
+             & (trans_idx - peak_idx >= _CHANG_MIN_SEG)
+             & (hi - trans_idx >= _CHANG_MIN_SEG))
+    return peak_idx, trans_idx, post, valid
+
+
+def compute_chang(traces, time_ms, fs: float) -> dict:
+    """Table 1 #1-13: transition point + exponential (fast) + linear (slow)
+    component features, vectorised over all epochs. Invalid epochs (window
+    too short / no clean transition) get NaN across the group."""
+    a = _check(traces)
+    t = np.asarray(time_ms, dtype=np.float64)
+    assert t.shape[0] == a.shape[1], "time_ms length must match samples"
+    dt = 1000.0 / fs
+    n_ep, n_s = a.shape
+    idx = np.arange(n_s)
+    peak_idx, trans_idx, post, valid = _transition_indices(a, t, fs)
+
+    # Segment masks (within the post-stim window).
+    hi = int(n_s - np.argmax(post[::-1])) if post.any() else n_s
+    fast = (idx[None, :] >= peak_idx[:, None]) & (idx[None, :] <= trans_idx[:, None])
+    slow = (idx[None, :] >= trans_idx[:, None]) & (idx[None, :] < hi) & post[None, :]
+    fast = fast & valid[:, None]
+    slow = slow & valid[:, None]
+
+    # Slow-component baseline = level at/after the transition (median of slow
+    # segment) -- the fast component decays toward this.
+    slow_f = slow.astype(np.float64)
+    slow_n = np.sum(slow_f, axis=1)
+    base = np.sum(slow_f * a, axis=1) / np.where(slow_n > 0, slow_n, 1.0)
+
+    # --- Fast component: exponential a*exp(b*t') on |y - baseline| --------- #
+    trel = t[None, :] - t[peak_idx][:, None]        # ms since the peak
+    dev = np.abs(a - base[:, None])
+    pos = dev > _EPS
+    exp_mask = fast & pos
+    with np.errstate(invalid="ignore", divide="ignore"):
+        logdev = np.log(np.where(exp_mask, dev, 1.0))
+    # trel varies per epoch (measured from each epoch's peak), so fit with the
+    # 2-D-abscissa masked least squares.
+    b, ln_a = _linfit2d(trel, logdev, exp_mask)
+    expfit_decay = b
+    expfit_initial = np.exp(np.clip(ln_a, -50.0, 50.0))
+    # Goodness: RMS of residuals in linear (dev) space. Clip the exponent so a
+    # pathological (positive-b) fit can't overflow -> inf.
+    pred_dev = np.exp(np.clip(ln_a[:, None] + b[:, None] * trel, -50.0, 50.0))
+    r = (dev - pred_dev) * exp_mask
+    fe_n = np.sum(exp_mask, axis=1)
+    expfit_rms = np.where(fe_n > 0, np.sqrt(np.sum(r * r, axis=1)
+                                            / np.where(fe_n > 0, fe_n, 1.0)), np.nan)
+    # Curvature over the fast segment (Σ|dy| / span), + skewness of |dy|.
+    dabs_full = np.abs(np.diff(a, axis=1))
+    dabs_full = np.concatenate([dabs_full, dabs_full[:, -1:]], axis=1) / dt
+    fspan = _masked_span(a, fast)
+    expfit_curvature = (np.sum(dabs_full * fast, axis=1)
+                        / (fspan + _EPS))
+    expfit_skew = _masked_skew(dabs_full, fast)
+    # Area under the fit, normalised by segment duration.
+    fdur = np.sum(fast, axis=1) * dt
+    expfit_area = (np.sum(pred_dev * exp_mask, axis=1) * dt
+                   / (fdur + _EPS))
+
+    # --- Slow component: line m*t + c on y over [transition, end] ---------- #
+    linfit_slope, linfit_intercept, ln_n = _masked_linfit(t, a, slow)
+    linfit_rms = _masked_rms(t, a, slow, linfit_slope, linfit_intercept)
+    sspan = _masked_span(a, slow)
+    linfit_rms = linfit_rms / (sspan + _EPS)        # normalised deviation
+    linfit_curvature = np.sum(dabs_full * slow, axis=1) / (sspan + _EPS)
+    linfit_skew = _masked_skew(dabs_full, slow)
+
+    nan = np.full(n_ep, np.nan)
+    out = {
+        "tp_latency_ms": np.where(valid, t[trans_idx], np.nan),
+        "tp_amplitude": np.where(valid, a[np.arange(n_ep), trans_idx], np.nan),
+        "expfit_decay": np.where(valid, expfit_decay, np.nan),
+        "expfit_initial": np.where(valid, expfit_initial, np.nan),
+        "expfit_rms": np.where(valid, expfit_rms, np.nan),
+        "expfit_curvature": np.where(valid, expfit_curvature, np.nan),
+        "expfit_skew": np.where(valid, expfit_skew, np.nan),
+        "expfit_area": np.where(valid, expfit_area, np.nan),
+        "linfit_slope": np.where(valid, linfit_slope, np.nan),
+        "linfit_intercept": np.where(valid, linfit_intercept, np.nan),
+        "linfit_rms": np.where(valid, linfit_rms, np.nan),
+        "linfit_curvature": np.where(valid, linfit_curvature, np.nan),
+        "linfit_skew": np.where(valid, linfit_skew, np.nan),
+    }
+    return out
+
+
+def _linfit2d(x2d, y, mask):
+    """Per-epoch OLS with a per-epoch (2-D) abscissa *x2d*. Returns
+    ``(slope, intercept)``; NaN where < 2 masked points."""
+    m = mask.astype(np.float64)
+    n = m.sum(axis=1)
+    sx = np.sum(m * x2d, axis=1)
+    sy = np.sum(m * y, axis=1)
+    sxx = np.sum(m * x2d * x2d, axis=1)
+    sxy = np.sum(m * x2d * y, axis=1)
+    denom = n * sxx - sx * sx
+    ok = (n >= 2) & (np.abs(denom) > _EPS)
+    slope = np.where(ok, (n * sxy - sx * sy) / np.where(ok, denom, 1.0), np.nan)
+    intercept = np.where(ok, (sy - slope * sx) / np.where(n > 0, n, 1.0), np.nan)
+    return slope, intercept
+
+
+def _masked_span(a, mask):
+    """Per-epoch (max - min) of *a* over *mask* (0 where empty)."""
+    big = np.where(mask, a, -np.inf)
+    small = np.where(mask, a, np.inf)
+    mx = np.max(big, axis=1)
+    mn = np.min(small, axis=1)
+    span = mx - mn
+    return np.where(np.isfinite(span), span, 0.0)
+
+
+def autocorr_bands(traces, fs: float) -> dict:
+    """Lag-1 autocorrelation of the band-limited trace, per band
+    (Table 2 #11-13). Band-passes each epoch then applies the Maturana lag-1
+    form. Kept in the expensive set -- 3 filtfilt passes are the cost."""
+    a = _check(traces)
+    out = {}
+    for key, band in _AC_BANDS.items():
+        lo, hi = band
+        try:
+            filt = _bandpass(a, fs, lo, min(hi, 0.49 * fs))
+        except Exception:            # noqa: BLE001 -- degrade to NaN, never crash warm
+            out[key] = np.full(a.shape[0], np.nan)
+            continue
+        y = filt - filt.mean(axis=1, keepdims=True)
+        num = np.sum(y[:, :-1] * y[:, 1:], axis=1)
+        den = np.sum(y * y, axis=1) + _EPS
+        out[key] = num / den
+    return out
 
 
 def compute_all(traces, time_ms, fs: float, expensive: bool = False,
