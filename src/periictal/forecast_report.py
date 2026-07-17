@@ -99,6 +99,15 @@ def run(store, animal: str, evoked_dir: str, out_dir: str, *,
         res, os.path.join(out_dir, f"{stem}_forecaster.png"),
         title=f"{animal} — prospective logistic forecaster "
               f"(mean AUC {res.get('mean_auc'):.3f}, {n_sz} seizures)")
+    # The combined multivariable model output as a distribution (paper Fig 3A):
+    # prospective scores, so preictal vs interictal here is on NOVEL data.
+    lab_m = lab.assign(lr_model=_fc.prospective_scores(lab, n_phases=n_phases))
+    pcm = _fc.pdf_cdf(lab_m, "lr_model")
+    render.pdf_cdf_panel(
+        pcm, os.path.join(out_dir, f"{stem}_pdfcdf_model_score.png"),
+        feature="multivariable model score",
+        title=f"{animal} — logistic model output, preictal vs interictal "
+              f"(prospective; AUC {pcm.get('auc_norm', float('nan')):.3f})")
     _write_stats_csv(os.path.join(out_dir, f"{stem}_stats.csv"), scan, res, n_sz)
     return {"animal": animal, "ok": True, "n_pre": n_pre, "n_inter": n_int,
             "n_seizures": n_sz, "top_feature": scan[0]["feature"],

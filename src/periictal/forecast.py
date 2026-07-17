@@ -396,6 +396,43 @@ def select_best_features(df, metrics, *, k: int = 5, n_phases: int = 4) -> list:
     return ranked[:k]
 
 
+def prospective_scores(df, features=None, *,
+                       n_phases: int = _cfg.DEFAULT_N_PHASES) -> np.ndarray:
+    """Per-row PROSPECTIVE predicted preictal-probability of the multivariable
+    logistic forecaster -- the paper's combined model output (Fig 3A), usable
+    as a metric.
+
+    For each labeled row in phase P>=1 the score is the probability from the
+    model TRAINED on phase P-1 (novel data), so it is not overfit. NaN for
+    phase 0 (never a test fold) and rows with missing features. Returned
+    aligned to *df* rows (positional). *df* must already carry a ``class``
+    column (call ``label_classes`` first)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    assert "class" in df.columns, "call label_classes(df) first"
+    feats = [f for f in (features or _cfg.PAPER_BEST5) if f in df.columns]
+    out = np.full(len(df), np.nan)
+    if not feats:
+        return out
+    dfp, k = assign_epi_phase(df, n_phases)
+    ep = dfp["epi_phase"].to_numpy()
+    cls = dfp["class"].to_numpy()
+    labeled = np.isin(cls, [CLASS_PREICTAL, CLASS_INTERICTAL])
+    X = dfp[feats].to_numpy(dtype=float)
+    finite = np.all(np.isfinite(X), axis=1)
+    for p in range(k - 1):
+        tr = labeled & finite & (ep == p)
+        te = labeled & finite & (ep == p + 1)
+        ytr = (cls[tr] == CLASS_PREICTAL).astype(int)
+        if tr.sum() < 5 or te.sum() == 0 or np.unique(ytr).size < 2:
+            continue
+        sc = StandardScaler().fit(X[tr])
+        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+        clf.fit(sc.transform(X[tr]), ytr)
+        out[te] = clf.predict_proba(sc.transform(X[te]))[:, 1]
+    return out
+
+
 def logistic_forecast(df, features=None, *, n_phases: int = _cfg.DEFAULT_N_PHASES,
                       select_best: bool = False, metrics=None) -> dict:
     """Prospective multivariable-logistic-regression forecaster (paper Fig 3).

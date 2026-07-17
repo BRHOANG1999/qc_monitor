@@ -325,9 +325,16 @@ _PRE_COLOR = "#ff5a5f"        # preictal = red (paper convention)
 _INT_COLOR = "#5a9bd4"        # interictal = blue-grey
 
 
+_LR_MODEL_KEY = "__lr_model__"
+
+
 def _pc_feature_options(variant: str):
-    return [{"label": f"metric: {m}", "value": m}
-            for m in _cfg.metrics_for_variant(variant)]
+    # The multivariable logistic model's OWN output is the paper's headline
+    # metric (Fig 3A) -- offered first, above the raw features.
+    return ([{"label": "★ multivariable model score (paper Fig 3A)",
+              "value": _LR_MODEL_KEY}]
+            + [{"label": f"metric: {m}", "value": m}
+               for m in _cfg.metrics_for_variant(variant)])
 
 
 def layout_pdfcdf(store):
@@ -2032,9 +2039,8 @@ def register_callbacks(app, store, config):
     def _pc_feature_opts(_animal, variant, cur):
         opts = _pc_feature_options(variant or "evoked")
         vals = {o["value"] for o in opts}
-        default = "expfit_initial" if any(o["value"] == "expfit_initial"
-                                          for o in opts) else opts[0]["value"]
-        return opts, (cur if cur in vals else default)
+        # Default to the multivariable model score -- the paper's headline.
+        return opts, (cur if cur in vals else _LR_MODEL_KEY)
 
     @app.callback(
         Output("pex-pc-pdf", "figure"),
@@ -2042,14 +2048,24 @@ def register_callbacks(app, store, config):
         Output("pex-pc-verdict", "children"),
         Input("pex-job", "data"),
         Input("pex-pc-feature", "value"),
+        Input("pex-pc-nphases", "value"),
         prevent_initial_call=False,
     )
-    def _pc_render(jid, feature):
+    def _pc_render(jid, feature, nphases):
         cached = _CACHE.get(jid) if jid else None
         if cached is None or cached.get("empty"):
             return no_update, no_update, no_update
-        feature = feature or "expfit_initial"
+        feature = feature or _LR_MODEL_KEY
         lab = _fc.label_classes(cached["full"])
+        if feature == _LR_MODEL_KEY:
+            # The combined multivariable model output as a metric (Fig 3A):
+            # prospective train-P/test-P+1 scores, so it is not overfit.
+            try:
+                k = max(2, min(20, int(nphases or _cfg.DEFAULT_N_PHASES)))
+            except (TypeError, ValueError):
+                k = _cfg.DEFAULT_N_PHASES
+            lab = lab.assign(lr_model=_fc.prospective_scores(lab, n_phases=k))
+            feature = "lr_model"
         pc = _fc.pdf_cdf(lab, feature)
         pp = _fc.permutation_p(lab, feature, n_perm=500)
         ps = _fc.paired_seizure_test(lab, feature)

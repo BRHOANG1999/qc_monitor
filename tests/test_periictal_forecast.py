@@ -145,6 +145,26 @@ def test_logistic_forecast_null_is_chance():
     assert abs(res["mean_auc"] - 0.5) < 0.12
 
 
+def test_prospective_model_score_beats_single_features():
+    lab = F.label_classes(_phase_growing_matrix())
+    scores = F.prospective_scores(lab, n_phases=5)
+    lab2 = lab.assign(lr_model=scores)
+    # Phase 0 is never a test fold -> those rows are unscored (NaN).
+    assert np.isnan(scores).any() and np.isfinite(scores).any()
+    model_auc = F.feature_auc(lab2, "lr_model")["auc_norm"]
+    best_single = max(F.feature_auc(lab2, f)["auc_norm"]
+                      for f in ("sum_power_low", "sum_power_high",
+                                "expfit_initial"))
+    assert model_auc > best_single          # combined > any one feature
+    assert model_auc > 0.8
+
+
+def test_prospective_scores_no_features_is_all_nan():
+    lab = F.label_classes(_matrix(sep=1.0))
+    out = F.prospective_scores(lab, features=["does_not_exist"], n_phases=3)
+    assert np.all(np.isnan(out)) and out.shape[0] == len(lab)
+
+
 def test_select_best_features_finds_informative():
     lab = F.label_classes(_phase_growing_matrix())
     best = F.select_best_features(
