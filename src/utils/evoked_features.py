@@ -758,7 +758,6 @@ def _transition_indices(a, t, fs):
     if post.sum() < 2 * _CHANG_MIN_SEG + 1:
         z = np.zeros(n_ep, dtype=int)
         return z, z, post, np.zeros(n_ep, dtype=bool)
-    lo = int(np.argmax(post))                 # first in-window sample
     hi = int(n_s - np.argmax(post[::-1]))     # one past last in-window sample
     # Fast-component peak = max |y| inside the window.
     absa = np.abs(a)
@@ -775,8 +774,9 @@ def _transition_indices(a, t, fs):
     in_search = post[None, :] & after_peak & (idx[None, :] < trans_hi)
     cand = np.where(in_search, dabs, np.inf)
     trans_idx = np.argmin(cand, axis=1)
+    # Valid = a transition was found with room for a fittable segment on each
+    # side (peak_idx is always in-window by construction).
     valid = (in_search.any(axis=1)
-             & (peak_idx >= lo + _CHANG_MIN_SEG - _CHANG_MIN_SEG)
              & (trans_idx - peak_idx >= _CHANG_MIN_SEG)
              & (hi - trans_idx >= _CHANG_MIN_SEG))
     return peak_idx, trans_idx, post, valid
