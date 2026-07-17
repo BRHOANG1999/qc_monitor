@@ -206,6 +206,10 @@ def test_three_sub_tab_layouts_build_with_scope_and_lens_ids(tmp_path):
                                  "pex-details"},
             "layout_trend": {"pex-traj", "pex-traj-y", "pex-trend-forest",
                              "pex-trend-verdict", "pex-trend-table"},
+            "layout_pdfcdf": {"pex-pc-feature", "pex-pc-pdf", "pex-pc-cdf",
+                              "pex-pc-verdict", "pex-pc-scan", "pex-pc-nphases",
+                              "pex-pc-roc", "pex-pc-phaseauc", "pex-pc-coef",
+                              "pex-pc-fverdict"},
             "layout_waveform": {"pex-erp", "pex-erp-wave", "pex-erp-seizure",
                                 "pex-erp-job", "pex-erp-col"}}
     for name, want in lens.items():
@@ -228,7 +232,8 @@ def test_nav_group_promoted_to_top_level():
     grp = next((g for g in _app.NAV_GROUPS if g["id"] == "periictal"), None)
     assert grp is not None
     assert [s["id"] for s in grp["subs"]] == [
-        "periictal_embedding", "periictal_trend", "periictal_waveform"]
+        "periictal_embedding", "periictal_trend", "periictal_pdfcdf",
+        "periictal_waveform"]
     # the old single sub-tab is gone from every group
     assert all(s["id"] != "periictal_explorer"
                for g in _app.NAV_GROUPS for s in g["subs"])
@@ -279,6 +284,47 @@ def test_trend_test_views_render_and_pc_placeholder():
     # a PC coordinate isn't a matrix column -> forest is a placeholder, table stays
     f2, v2, t2 = pex._trend_test_views(cached, "__pc1__")
     assert t2 is not None and v2 is not None
+
+
+def _cached_pc(n_sz=10, per=50, sep=1.0, seed=1):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for sid in range(n_sz):
+        onset = 1.7e9 + sid * 7200
+        for lo, hi, mu in ((60, 1800, sep), (3600, 5400, -sep)):
+            for _ in range(per):
+                rows.append({
+                    "seizure_idx": sid, "phase": "pre",
+                    "time_to_onset_sec": float(rng.uniform(lo, hi)),
+                    "seizure_onset_epoch": onset, "hour_of_day": 0.0,
+                    "expfit_initial": float(rng.normal(mu, 1)),
+                    "sum_power_low": float(rng.normal(mu, 1)),
+                    "sum_power_high": float(rng.normal(mu, 1)),
+                    "freq_moment_high": float(rng.normal(0, 1)),
+                    "freq_moment_low": float(rng.normal(0, 1))})
+    return {"empty": False, "full": pd.DataFrame(rows), "n_seizures": n_sz,
+            "metrics": ["expfit_initial", "sum_power_low", "sum_power_high",
+                        "freq_moment_high", "freq_moment_low"]}
+
+
+def test_pdfcdf_lens_render_helpers():
+    from src.periictal import forecast as F
+    cached = _cached_pc()
+    lab = F.label_classes(cached["full"])
+    pc = F.pdf_cdf(lab, "expfit_initial")
+    assert pc["auc_norm"] > 0.7
+    assert len(pex._pdf_fig(pc, "expfit_initial").data) >= 1
+    assert len(pex._cdf_fig(pc, "expfit_initial").data) == 2
+    v = pex._pc_verdict(pc, F.permutation_p(lab, "expfit_initial", n_perm=200),
+                        F.paired_seizure_test(lab, "expfit_initial"))
+    assert v is not None
+    assert pex._pc_scan_table(F.scan_features(lab, cached["metrics"], n_perm=100)) \
+        is not None
+    res = F.logistic_forecast(lab, n_phases=4)
+    assert len(pex._roc_fig(res).data) >= 1
+    assert len(pex._phaseauc_fig(res).data) >= 1
+    assert pex._coef_fig(res) is not None
+    assert pex._forecast_verdict(res, cached["n_seizures"]) is not None
 
 
 # ------------------------------------------------------------------ #

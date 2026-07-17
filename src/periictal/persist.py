@@ -28,8 +28,9 @@ _MAX_FILES = 2_000_000
 
 # Bump when the matrix column schema changes, so old cached pickles (which lack
 # the new columns) are invalidated rather than silently loaded. v2 added `rec`;
-# v3 added `phase` (pre/post) + the symmetric post-onset rows.
-_SCHEMA_VERSION = "3"
+# v3 added `phase` (pre/post) + the symmetric post-onset rows; v4 added the Chang
+# et al. 2026 feature columns (via the widened CHEAP_METRICS).
+_SCHEMA_VERSION = "4"
 
 
 def _safe(name: str) -> str:

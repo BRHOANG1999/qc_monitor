@@ -42,6 +42,7 @@ from src.dashboard.design import (COLOR_ACCENT, COLOR_DIVIDER, COLOR_SUCCESS,
                                   FONT_SIZE_CAPTION, FONT_SIZE_TITLE, RADIUS_SM,
                                   SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5)
 from src.periictal import config as _cfg
+from src.periictal import forecast as _fc
 from src.periictal import palette as _pal
 from src.periictal import passive as _passive
 from src.periictal import stim_map as _sm
@@ -128,7 +129,11 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
             store, animal, evoked_dir, _CACHE_DIR or _default_cache_dir(),
             protocol=protocol or None, window_sec=window_h * 3600.0,
             variant=variant, feature_cfg=feature_cfg,
-            sidecar_variant=sidecar_variant)
+            sidecar_variant=sidecar_variant,
+            # Self-heal a feature-schema/version bump: recompute stale/missing
+            # 'evoked' sidecars incrementally instead of returning an empty
+            # matrix (the Chang columns need the new sidecar version).
+            warm_missing=(sidecar_variant in (None, "evoked")))
         if df.empty:
             _finish(job_id, {"empty": True})
             return
@@ -311,6 +316,250 @@ def layout_waveform(store):
         dcc.Store(id="pex-erp-job"),
         dcc.Store(id="pex-erp-col"),
     ], style={"padding": SPACE_4})
+
+
+# --------------------------------------------------------------------- #
+#  Preictal-vs-interictal lens (Chang et al. 2026 PDF/CDF + forecaster)
+# --------------------------------------------------------------------- #
+_PRE_COLOR = "#ff5a5f"        # preictal = red (paper convention)
+_INT_COLOR = "#5a9bd4"        # interictal = blue-grey
+
+
+def _pc_feature_options(variant: str):
+    return [{"label": f"metric: {m}", "value": m}
+            for m in _cfg.metrics_for_variant(variant)]
+
+
+def layout_pdfcdf(store):
+    """Preictal-vs-interictal lens: per-feature PDF + CDF split by preictal
+    (0-30 min before a seizure) vs interictal (60-90 min), the discrimination
+    AUC + significance, and the paper's prospective logistic-regression
+    forecaster. Recreates Chang et al. 2026's metric + modeling strategy."""
+    return html.Div([
+        scope_bar(store),
+        card(section_header("Preictal vs interictal — distribution of a feature"),
+             html.Div([
+                 html.Div("Every lead-up stimulus is labelled PREICTAL (0-30 min "
+                          "before a seizure onset) or INTERICTAL (60-90 min "
+                          "before); the 30-60 min band is a redacted buffer. The "
+                          "PDF (kernel density) and CDF (empirical) below show how "
+                          "the chosen feature is distributed in each state, with "
+                          "the rank AUC and its 500-permutation p (per-stimulus, "
+                          "optimistic) alongside the honest per-seizure paired "
+                          "test. After Chang et al. 2026.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 _ctl("Feature", dcc.Dropdown(
+                     id="pex-pc-feature", clearable=False,
+                     style={**DROPDOWN_STYLE, "minWidth": "260px"}),
+                     "Which evoked feature to compare between the preictal and "
+                     "interictal states."),
+             ], style={"display": "flex", "flexDirection": "column",
+                       "gap": SPACE_3, "marginTop": SPACE_2}),
+             html.Div(id="pex-pc-verdict", style={"margin": f"{SPACE_3} 0"}),
+             html.Div([
+                 dcc.Graph(id="pex-pc-pdf", config={"displaylogo": False},
+                           figure=empty_fig("Build to see the PDF"),
+                           style={"flex": "1 1 380px"}),
+                 dcc.Graph(id="pex-pc-cdf", config={"displaylogo": False},
+                           figure=empty_fig("Build to see the CDF"),
+                           style={"flex": "1 1 380px"}),
+             ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Per-feature discrimination (ranked)"),
+             html.Div("Rank AUC (normalised to ≥.5), 500-permutation p and "
+                      "Benjamini–Hochberg q for every feature — the paper's "
+                      "single-feature screen (Fig 2). The seizure is the honest "
+                      "unit of replication, so the paired p is shown too.",
+                      style={"color": COLOR_TEXT_TERTIARY,
+                             "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch",
+                             "marginBottom": SPACE_2}),
+             html.Div(id="pex-pc-scan"),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Multivariable forecaster (train phase P → test P+1)"),
+             html.Div([
+                 html.Div("The paper's prospective preictal detector: split the "
+                          "recording into equal-seizure-count epilepsy phases, "
+                          "train a logistic regression (paper's best-5 features) "
+                          "on each phase and test on the NEXT (novel data). The "
+                          "ROC, per-phase AUC and normalised coefficients follow "
+                          "Fig 3 / Fig 5C.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 _ctl("Phases", dcc.Input(
+                     id="pex-pc-nphases", type="number", value=6, min=2, max=20,
+                     step=1, debounce=True,
+                     style={**DROPDOWN_STYLE, "width": "90px"}),
+                     "Number of equal-seizure-count epilepsy phases (clamped to "
+                     "the seizure count). The paper used 10; fewer is steadier "
+                     "when an animal has few seizures."),
+             ], style={"display": "flex", "flexDirection": "column",
+                       "gap": SPACE_3, "marginTop": SPACE_2}),
+             html.Div(id="pex-pc-fverdict", style={"margin": f"{SPACE_3} 0"}),
+             html.Div([
+                 dcc.Graph(id="pex-pc-roc", config={"displaylogo": False},
+                           figure=empty_fig("Build to see the ROC curves"),
+                           style={"flex": "1 1 320px"}),
+                 dcc.Graph(id="pex-pc-phaseauc", config={"displaylogo": False},
+                           figure=empty_fig("Build to see AUC vs phase"),
+                           style={"flex": "1 1 320px"}),
+                 dcc.Graph(id="pex-pc-coef", config={"displaylogo": False},
+                           figure=empty_fig("Build to see coefficients"),
+                           style={"flex": "1 1 320px"}),
+             ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+    ], style={"padding": SPACE_4})
+
+
+def _pc_layout(title: str, xtitle: str) -> dict:
+    return dict(template="plotly_dark", title=title,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(size=12, color=COLOR_TEXT_SECONDARY),
+                margin=dict(l=55, r=15, t=45, b=45), xaxis_title=xtitle,
+                legend=dict(orientation="h", y=1.12, x=0))
+
+
+def _pdf_fig(pc: dict, feature: str) -> go.Figure:
+    fig = go.Figure()
+    if pc["grid"].size and pc["pre_kde"] is not None:
+        fig.add_trace(go.Scatter(x=pc["grid"], y=pc["pre_kde"], mode="lines",
+                                 name=f"preictal (n={pc['n_pre']})", fill="tozeroy",
+                                 line=dict(color=_PRE_COLOR, width=2),
+                                 fillcolor="rgba(255,90,95,0.18)"))
+    if pc["grid"].size and pc["inter_kde"] is not None:
+        fig.add_trace(go.Scatter(x=pc["grid"], y=pc["inter_kde"], mode="lines",
+                                 name=f"interictal (n={pc['n_inter']})", fill="tozeroy",
+                                 line=dict(color=_INT_COLOR, width=2),
+                                 fillcolor="rgba(90,155,212,0.15)"))
+    if len(fig.data) == 0:      # KDE undefined -> fall back to histograms
+        fig.add_trace(go.Bar(x=pc["centers"], y=pc["pre_hist"], name="preictal",
+                             marker_color=_PRE_COLOR, opacity=0.5))
+        fig.add_trace(go.Bar(x=pc["centers"], y=pc["inter_hist"], name="interictal",
+                             marker_color=_INT_COLOR, opacity=0.5))
+        fig.update_layout(barmode="overlay")
+    fig.update_layout(**_pc_layout(f"PDF · {feature}", feature),
+                      yaxis_title="density")
+    return fig
+
+
+def _cdf_fig(pc: dict, feature: str) -> go.Figure:
+    fig = go.Figure()
+    if pc["pre_cdf_x"].size:
+        fig.add_trace(go.Scatter(x=pc["pre_cdf_x"], y=pc["pre_cdf_y"],
+                                 mode="lines", name="preictal",
+                                 line=dict(color=_PRE_COLOR, width=2, shape="hv")))
+    if pc["inter_cdf_x"].size:
+        fig.add_trace(go.Scatter(x=pc["inter_cdf_x"], y=pc["inter_cdf_y"],
+                                 mode="lines", name="interictal",
+                                 line=dict(color=_INT_COLOR, width=2, shape="hv")))
+    fig.update_layout(**_pc_layout(f"CDF · {feature}", feature),
+                      yaxis_title="cumulative fraction", yaxis_range=[0, 1])
+    return fig
+
+
+def _pc_verdict(pc: dict, pp: dict, ps: dict) -> object:
+    """Plain-language AUC + significance callout for the selected feature."""
+    if not np.isfinite(pc.get("auc_norm", np.nan)):
+        return _callout("No preictal/interictal samples for this feature yet — "
+                        "build, or pick another feature.", COLOR_WARNING, "⚠")
+    strong = pc["auc_norm"] >= 0.7 and pp.get("p", 1) < 0.05 and ps.get("p", 1) < 0.05
+    colour = COLOR_SUCCESS if strong else COLOR_WARNING if pc["auc_norm"] >= 0.6 \
+        else COLOR_TEXT_SECONDARY
+    txt = (f"AUC {pc['auc_norm']:.3f} (preictal {pc['direction']}) · "
+           f"permutation p {_fmt_p(pp.get('p'))} (per-stimulus) · "
+           f"paired-seizure p {_fmt_p(ps.get('p'))} over {ps.get('n_seizures', 0)} "
+           f"seizures · n = {pc['n_pre']} preictal / {pc['n_inter']} interictal "
+           "stimuli.")
+    return _callout(txt, colour, "✓" if strong else "•")
+
+
+def _pc_scan_table(rows: list) -> object:
+    """Compact ranked table of per-feature preictal/interictal AUC + p + q
+    (top 25) for the preictal-vs-interictal lens."""
+    if not rows:
+        return html.Div("No features scored.",
+                        style={"color": COLOR_TEXT_TERTIARY,
+                               "fontSize": FONT_SIZE_CAPTION})
+    head = [html.Th(h, style={"textAlign": "left", "padding": "4px 10px",
+                              "color": COLOR_TEXT_TERTIARY,
+                              "fontSize": FONT_SIZE_CAPTION})
+            for h in ("feature", "AUC", "dir", "perm p", "q", "n pre/int")]
+    body = []
+    for r in rows[:25]:
+        cells = [r["feature"], f"{r['auc_norm']:.3f}", r["direction"],
+                 _fmt_p(r["p"]), _fmt_p(r["q"]),
+                 f"{r['n_pre']}/{r['n_inter']}"]
+        body.append(html.Tr([html.Td(c, style={"padding": "3px 10px",
+                                                "fontSize": FONT_SIZE_CAPTION,
+                                                "color": COLOR_TEXT_PRIMARY})
+                             for c in cells]))
+    return html.Table([html.Thead(html.Tr(head)), html.Tbody(body)],
+                      style={"borderCollapse": "collapse", "width": "100%"})
+
+
+def _roc_fig(res: dict) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                             line=dict(color=COLOR_DIVIDER, dash="dash", width=1),
+                             showlegend=False, hoverinfo="skip"))
+    phases = [p for p in res.get("phases", []) if p.get("fpr") is not None]
+    for i, p in enumerate(phases):
+        shade = 0.35 + 0.6 * (i / max(1, len(phases) - 1))
+        fig.add_trace(go.Scatter(
+            x=p["fpr"], y=p["tpr"], mode="lines",
+            name=f"P{p['train_phase']}→{p['test_phase']} ({p['auc']:.2f})",
+            line=dict(color=f"rgba(255,90,95,{shade:.2f})", width=2)))
+    fig.update_layout(**_pc_layout("ROC per phase (test on P+1)",
+                                   "false-positive rate"),
+                      yaxis_title="true-positive rate",
+                      xaxis_range=[0, 1], yaxis_range=[0, 1])
+    return fig
+
+
+def _phaseauc_fig(res: dict) -> go.Figure:
+    phases = res.get("phases", [])
+    xs = [p["test_phase"] for p in phases]
+    ys = [p["auc"] for p in phases]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[min(xs) if xs else 0, max(xs) if xs else 1],
+                             y=[0.5, 0.5], mode="lines", showlegend=False,
+                             line=dict(color=COLOR_DIVIDER, dash="dash", width=1),
+                             hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="test AUC",
+                             line=dict(color=_PRE_COLOR, width=2),
+                             marker=dict(size=8)))
+    fig.update_layout(**_pc_layout("AUC vs epilepsy phase", "test phase"),
+                      yaxis_title="test AUC", yaxis_range=[0.3, 1.0])
+    return fig
+
+
+def _coef_fig(res: dict) -> go.Figure:
+    coef = res.get("coefficients", {}) or {}
+    items = sorted(coef.items(), key=lambda kv: kv[1])
+    fig = go.Figure()
+    if items:
+        fig.add_trace(go.Bar(x=[v for _, v in items], y=[k for k, _ in items],
+                             orientation="h", marker_color=COLOR_ACCENT))
+    fig.update_layout(**_pc_layout("Normalised |coefficient|", "importance (Σ=1)"),
+                      yaxis_title="")
+    return fig
+
+
+def _forecast_verdict(res: dict, n_seizures: int) -> object:
+    mean_auc = res.get("mean_auc", float("nan"))
+    if not np.isfinite(mean_auc):
+        return _callout("Not enough phases/seizures with both classes to fit the "
+                        "forecaster — lower the phase count or pick an animal with "
+                        "more seizures.", COLOR_WARNING, "⚠")
+    slope = res.get("phase_auc_slope", float("nan"))
+    colour = COLOR_SUCCESS if mean_auc >= 0.75 else COLOR_WARNING \
+        if mean_auc >= 0.6 else COLOR_TEXT_SECONDARY
+    trend = (f"; AUC {'rises' if slope > 0 else 'falls'} over phases "
+             f"(slope {slope:+.3f})") if np.isfinite(slope) else ""
+    txt = (f"Mean prospective test AUC {mean_auc:.3f} across {res.get('n_phases')} "
+           f"phases ({n_seizures} seizures){trend}. Features: "
+           f"{', '.join(res.get('features', []))}.")
+    return _callout(txt, colour, "✓" if mean_auc >= 0.75 else "•")
 
 
 def _embed_colorby_ctl() -> html.Div:
@@ -1756,6 +2005,77 @@ def register_callbacks(app, store, config):
         traj = _trajectory_fig(cached, feature, _cap_seconds(cap_val, cap_unit))
         forest, verdict, table = _trend_test_views(cached, feature)
         return traj, forest, verdict, table
+
+    # --- Preictal-vs-interictal lens callbacks --- #
+    @app.callback(
+        Output("pex-pc-feature", "options"),
+        Output("pex-pc-feature", "value"),
+        Input("pex-animal", "value"),
+        Input("pex-variant", "value"),
+        State("pex-pc-feature", "value"),
+        prevent_initial_call=False,
+    )
+    def _pc_feature_opts(_animal, variant, cur):
+        opts = _pc_feature_options(variant or "evoked")
+        vals = {o["value"] for o in opts}
+        default = "expfit_initial" if any(o["value"] == "expfit_initial"
+                                          for o in opts) else opts[0]["value"]
+        return opts, (cur if cur in vals else default)
+
+    @app.callback(
+        Output("pex-pc-pdf", "figure"),
+        Output("pex-pc-cdf", "figure"),
+        Output("pex-pc-verdict", "children"),
+        Input("pex-job", "data"),
+        Input("pex-pc-feature", "value"),
+        prevent_initial_call=False,
+    )
+    def _pc_render(jid, feature):
+        cached = _CACHE.get(jid) if jid else None
+        if cached is None or cached.get("empty"):
+            return no_update, no_update, no_update
+        feature = feature or "expfit_initial"
+        lab = _fc.label_classes(cached["full"])
+        pc = _fc.pdf_cdf(lab, feature)
+        pp = _fc.permutation_p(lab, feature, n_perm=500)
+        ps = _fc.paired_seizure_test(lab, feature)
+        return _pdf_fig(pc, feature), _cdf_fig(pc, feature), _pc_verdict(pc, pp, ps)
+
+    @app.callback(
+        Output("pex-pc-scan", "children"),
+        Input("pex-job", "data"),
+        prevent_initial_call=False,
+    )
+    def _pc_scan(jid):
+        cached = _CACHE.get(jid) if jid else None
+        if cached is None or cached.get("empty"):
+            return no_update
+        lab = _fc.label_classes(cached["full"])
+        metrics = [m for m in cached.get("metrics", []) if m in lab.columns]
+        return _pc_scan_table(_fc.scan_features(lab, metrics, n_perm=500))
+
+    @app.callback(
+        Output("pex-pc-roc", "figure"),
+        Output("pex-pc-phaseauc", "figure"),
+        Output("pex-pc-coef", "figure"),
+        Output("pex-pc-fverdict", "children"),
+        Input("pex-job", "data"),
+        Input("pex-pc-nphases", "value"),
+        prevent_initial_call=False,
+    )
+    def _pc_forecast(jid, nphases):
+        cached = _CACHE.get(jid) if jid else None
+        if cached is None or cached.get("empty"):
+            return no_update, no_update, no_update, no_update
+        lab = _fc.label_classes(cached["full"])
+        try:
+            k = int(nphases or _cfg.DEFAULT_N_PHASES)
+        except (TypeError, ValueError):
+            k = _cfg.DEFAULT_N_PHASES
+        res = _fc.logistic_forecast(lab, n_phases=max(2, min(20, k)))
+        n_sz = int(cached.get("n_seizures", 0))
+        return (_roc_fig(res), _phaseauc_fig(res), _coef_fig(res),
+                _forecast_verdict(res, n_sz))
 
     @app.callback(
         Output("pex-details", "children"),

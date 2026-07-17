@@ -289,10 +289,11 @@ def pdf_cdf(df, feature: str, *, bins: int = 40, clip_pct: float = 0.5) -> dict:
         lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1e-9
     edges = np.linspace(lo, hi, int(bins) + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    pre_hist = (np.histogram(pre, bins=edges, density=True)[0]
-                if pre.size else np.zeros(bins))
-    inter_hist = (np.histogram(inter, bins=edges, density=True)[0]
-                  if inter.size else np.zeros(bins))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pre_hist = (np.histogram(pre, bins=edges, density=True)[0]
+                    if pre.size else np.zeros(bins))
+        inter_hist = (np.histogram(inter, bins=edges, density=True)[0]
+                      if inter.size else np.zeros(bins))
     grid = np.linspace(lo, hi, 256)
     return {**out, "edges": edges, "centers": centers,
             "pre_hist": pre_hist, "inter_hist": inter_hist,
