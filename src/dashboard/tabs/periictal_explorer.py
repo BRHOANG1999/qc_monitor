@@ -360,10 +360,12 @@ def layout_pdfcdf(store):
              html.Div([
                  dcc.Graph(id="pex-pc-pdf", config={"displaylogo": False},
                            figure=empty_fig("Build to see the PDF"),
-                           style={"flex": "1 1 380px"}),
+                           style={"flex": "1 1 380px", "minWidth": "0",
+                                  "height": "375px"}),
                  dcc.Graph(id="pex-pc-cdf", config={"displaylogo": False},
                            figure=empty_fig("Build to see the CDF"),
-                           style={"flex": "1 1 380px"}),
+                           style={"flex": "1 1 380px", "minWidth": "0",
+                                  "height": "375px"}),
              ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
              style={"marginTop": SPACE_4}),
         card(section_header("Per-feature discrimination (ranked)"),
@@ -399,20 +401,27 @@ def layout_pdfcdf(store):
              html.Div([
                  dcc.Graph(id="pex-pc-roc", config={"displaylogo": False},
                            figure=empty_fig("Build to see the ROC curves"),
-                           style={"flex": "1 1 320px"}),
+                           style={"flex": "1 1 320px", "minWidth": "0",
+                                  "height": "355px"}),
                  dcc.Graph(id="pex-pc-phaseauc", config={"displaylogo": False},
                            figure=empty_fig("Build to see AUC vs phase"),
-                           style={"flex": "1 1 320px"}),
+                           style={"flex": "1 1 320px", "minWidth": "0",
+                                  "height": "355px"}),
                  dcc.Graph(id="pex-pc-coef", config={"displaylogo": False},
                            figure=empty_fig("Build to see coefficients"),
-                           style={"flex": "1 1 320px"}),
+                           style={"flex": "1 1 320px", "minWidth": "0",
+                                  "height": "355px"}),
              ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
              style={"marginTop": SPACE_4}),
     ], style={"padding": SPACE_4})
 
 
-def _pc_layout(title: str, xtitle: str) -> dict:
-    return dict(template="plotly_dark", title=title,
+def _pc_layout(title: str, xtitle: str, height: int = 360) -> dict:
+    # A FIXED height + autosize off is essential: these graphs live in flex
+    # rows, and an autosizing Plotly graph in a flexbox ratchets its container
+    # taller on every resize (the "graph grows forever" bug).
+    return dict(template="plotly_dark", title=title, height=height,
+                autosize=False,
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(size=12, color=COLOR_TEXT_SECONDARY),
                 margin=dict(l=55, r=15, t=45, b=45), xaxis_title=xtitle,
@@ -437,7 +446,7 @@ def _pdf_fig(pc: dict, feature: str) -> go.Figure:
         fig.add_trace(go.Bar(x=pc["centers"], y=pc["inter_hist"], name="interictal",
                              marker_color=_INT_COLOR, opacity=0.5))
         fig.update_layout(barmode="overlay")
-    fig.update_layout(**_pc_layout(f"PDF · {feature}", feature),
+    fig.update_layout(**_pc_layout(f"PDF · {feature}", feature, height=370),
                       yaxis_title="density")
     return fig
 
@@ -452,7 +461,7 @@ def _cdf_fig(pc: dict, feature: str) -> go.Figure:
         fig.add_trace(go.Scatter(x=pc["inter_cdf_x"], y=pc["inter_cdf_y"],
                                  mode="lines", name="interictal",
                                  line=dict(color=_INT_COLOR, width=2, shape="hv")))
-    fig.update_layout(**_pc_layout(f"CDF · {feature}", feature),
+    fig.update_layout(**_pc_layout(f"CDF · {feature}", feature, height=370),
                       yaxis_title="cumulative fraction", yaxis_range=[0, 1])
     return fig
 
@@ -499,9 +508,12 @@ def _pc_scan_table(rows: list) -> object:
 
 def _roc_fig(res: dict) -> go.Figure:
     fig = go.Figure()
+    # The chance diagonal = a classifier with ROC-AUC 0.5 (labelled so it reads
+    # as the reference, not another phase).
     fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
-                             line=dict(color=COLOR_DIVIDER, dash="dash", width=1),
-                             showlegend=False, hoverinfo="skip"))
+                             name="chance (AUC 0.5)",
+                             line=dict(color=COLOR_TEXT_TERTIARY, dash="dash",
+                                       width=1.5), hoverinfo="skip"))
     phases = [p for p in res.get("phases", []) if p.get("fpr") is not None]
     for i, p in enumerate(phases):
         shade = 0.35 + 0.6 * (i / max(1, len(phases) - 1))
@@ -510,7 +522,7 @@ def _roc_fig(res: dict) -> go.Figure:
             name=f"P{p['train_phase']}→{p['test_phase']} ({p['auc']:.2f})",
             line=dict(color=f"rgba(255,90,95,{shade:.2f})", width=2)))
     fig.update_layout(**_pc_layout("ROC per phase (test on P+1)",
-                                   "false-positive rate"),
+                                   "false-positive rate", height=350),
                       yaxis_title="true-positive rate",
                       xaxis_range=[0, 1], yaxis_range=[0, 1])
     return fig
@@ -528,7 +540,8 @@ def _phaseauc_fig(res: dict) -> go.Figure:
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="test AUC",
                              line=dict(color=_PRE_COLOR, width=2),
                              marker=dict(size=8)))
-    fig.update_layout(**_pc_layout("AUC vs epilepsy phase", "test phase"),
+    fig.update_layout(**_pc_layout("AUC vs epilepsy phase", "test phase",
+                                   height=350),
                       yaxis_title="test AUC", yaxis_range=[0.3, 1.0])
     return fig
 
@@ -540,7 +553,8 @@ def _coef_fig(res: dict) -> go.Figure:
     if items:
         fig.add_trace(go.Bar(x=[v for _, v in items], y=[k for k, _ in items],
                              orientation="h", marker_color=COLOR_ACCENT))
-    fig.update_layout(**_pc_layout("Normalised |coefficient|", "importance (Σ=1)"),
+    fig.update_layout(**_pc_layout("Normalised |coefficient|", "importance (Σ=1)",
+                                   height=350),
                       yaxis_title="")
     return fig
 

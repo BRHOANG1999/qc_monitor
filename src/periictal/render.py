@@ -119,7 +119,8 @@ def forecast_panel(res: dict, path: str, *, title: str) -> None:
     fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(14.0, 4.4), dpi=120)
     phases = res.get("phases", [])
     roc_ph = [p for p in phases if p.get("fpr") is not None]
-    a1.plot([0, 1], [0, 1], color="#bbbbbb", ls="--", lw=1)
+    a1.plot([0, 1], [0, 1], color="#bbbbbb", ls="--", lw=1.2,
+            label="chance (AUC 0.5)")
     for i, p in enumerate(roc_ph):
         shade = 0.3 + 0.6 * (i / max(1, len(roc_ph) - 1))
         a1.plot(p["fpr"], p["tpr"], color=_PRE_C, alpha=shade, lw=1.8,
