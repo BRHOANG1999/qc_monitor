@@ -434,8 +434,17 @@ def _freq_moment(f, pxx, band) -> np.ndarray:
     return (p @ fb) / denom
 
 
-def compute_cheap(traces, time_ms, fs: float) -> dict:
-    """All cheap features as a column->``[epochs]`` dict (one pass)."""
+WAVELET_COLUMNS = list(_WAVELET_BANDS.keys())
+
+
+def compute_cheap(traces, time_ms, fs: float,
+                  include_wavelet: bool = True) -> dict:
+    """All cheap features as a column->``[epochs]`` dict (one pass).
+
+    *include_wavelet* False skips the Morlet gamma-band power (the dominant warm
+    cost), leaving those columns for the caller to splice from an existing
+    sidecar -- used by the incremental sidecar upgrade so a schema/version bump
+    doesn't recompute the unchanged wavelet columns."""
     a = _check(traces)
     dt = 1000.0 / fs
     out = {
@@ -458,7 +467,12 @@ def compute_cheap(traces, time_ms, fs: float) -> dict:
         "skewness": skewness(a),
     }
     out.update(spectral(a, fs))
-    out.update(wavelet(a, fs))
+    if include_wavelet:
+        out.update(wavelet(a, fs))
+    else:
+        nan = np.full(a.shape[0], np.nan)
+        for col in WAVELET_COLUMNS:
+            out[col] = nan.copy()
     out.update(compute_chang(a, time_ms, fs))
     return out
 
@@ -898,16 +912,18 @@ def autocorr_bands(traces, fs: float) -> dict:
 
 
 def compute_all(traces, time_ms, fs: float, expensive: bool = False,
-                cfg: "FeatureConfig | None" = None) -> dict:
+                cfg: "FeatureConfig | None" = None,
+                include_wavelet: bool = True) -> dict:
     """Cheap features always; expensive ones only when *expensive*.
 
     When *cfg* is given (and not pass-through) the traces are pre-processed
     (Configure: filter/notch/smooth/baseline/window-crop) before the feature
     math; the default cfg=None reproduces today's behavior exactly. Columns
     not computed are present as all-NaN arrays so the schema stays uniform.
+    *include_wavelet* False leaves the wavelet columns NaN (incremental upgrade).
     """
     a, t = preprocess(traces, time_ms, fs, cfg or FeatureConfig())
-    out = compute_cheap(a, t, fs)
+    out = compute_cheap(a, t, fs, include_wavelet=include_wavelet)
     if expensive:
         out.update(compute_expensive(a, t, fs))
     else:

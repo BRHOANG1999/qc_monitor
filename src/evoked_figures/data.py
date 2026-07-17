@@ -27,7 +27,8 @@ import numpy as np
 
 from src.utils import evoked_features as ef
 from src.utils.evoked_output import (animals_in_filename, feature_sidecar_path,
-                                     list_evoked_files, read_feature_sidecar)
+                                     list_evoked_files, read_feature_sidecar,
+                                     read_or_compute_sidecar)
 
 _META_COLS = ["channel", "electrode", "rec_dt", "session", "stim_time_sec",
               "abs_dt", "peak", "trough"]
@@ -53,16 +54,23 @@ def parse_iso(s):
         return None
 
 
-def iter_animal_sidecars(animal: str, evoked_dir: str):
-    """Yield (mat_path, sidecar_path, rows) for each FRESH sidecar of *animal*,
-    oldest recording first. Stale/missing sidecars are skipped (readiness gate).
-    One file's rows at a time -- the caller never holds them all."""
+def iter_animal_sidecars(animal: str, evoked_dir: str, *,
+                         compute_missing: bool = False):
+    """Yield (mat_path, sidecar_path, rows) for each sidecar of *animal*,
+    oldest recording first.
+
+    By default stale/missing sidecars are SKIPPED (readiness gate -- the
+    figure-export path wants only what's ready). With *compute_missing* they
+    are recomputed + written on the fly (``read_or_compute_sidecar``), so a
+    feature-schema/version bump self-heals for callers that opt in (build_matrix
+    via ``warm_missing``). One file's rows at a time."""
     assert animal, "animal required"
     for i, fp in enumerate(list_evoked_files(evoked_dir)):
         assert i < 1_000_000, "evoked file scan runaway"
         if animal not in animals_in_filename(fp):
             continue
-        rows = read_feature_sidecar(fp, animal)
+        rows = (read_or_compute_sidecar(fp, animal) if compute_missing
+                else read_feature_sidecar(fp, animal))
         if not rows:
             continue
         yield fp, feature_sidecar_path(fp, animal), rows

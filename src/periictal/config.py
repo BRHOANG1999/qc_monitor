@@ -43,3 +43,23 @@ DEFAULT_PASSIVE_WINDOW_MS = (-200.0, -1.0)
 # (UMAP at ~50k is ~20s; PCA is cheap at any N but the browser Scattergl
 # ceiling is ~100k).
 INTERACTIVE_POINT_CAP = 50_000
+
+# --- Chang et al. 2026 preictal / interictal class windows ----------------
+# Seconds before the NEXT seizure onset (time_to_onset_sec is signed positive
+# for pre-onset rows). Preictal = the 30 min before a seizure; interictal =
+# 60-90 min before (the user's bounded window; the paper used ">60 min"). The
+# 30-60 min band is the redacted buffer. A seizure's preictal rows are dropped
+# when its inter-seizure interval is shorter than MIN_PREICTAL_SEC (clustered
+# seizures have no clean 30-min preictal period). The interictal side is
+# implicitly ISI-guarded by src.preictal.isi.lookback_ceilings.
+PREICTAL_MAX_SEC = 1800.0
+INTERICTAL_LO_SEC = 3600.0
+INTERICTAL_HI_SEC = 5400.0
+MIN_PREICTAL_SEC = 1800.0
+DEFAULT_N_PHASES = 10            # epileptogenesis phases for the forecaster
+
+# The paper's five best perturbed features (Fig 3 / Table 1), in our column
+# names: SumPower[1-64], SumPower[256-1024], exp-fit initial factor a,
+# 1st-moment[64-256], 1st-moment[1-64].
+PAPER_BEST5 = ["sum_power_low", "sum_power_high", "expfit_initial",
+               "freq_moment_high", "freq_moment_low"]

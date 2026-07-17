@@ -36,19 +36,21 @@ from src.preictal.isi import (leadtime_bins, lookback_ceilings,
 _MAX_FILES = 2_000_000        # NASA Rule 2: explicit scan bound.
 
 
-def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cfg):
+def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cfg,
+                  warm_missing: bool = False):
     """The (mat, sidecar, rows) generator for a sidecar variant. The shared
     default 'evoked' sidecar (full trace, no window) is read directly; any other
     variant ('passive', 'evokedw', …) is a config-signed windowed sidecar and
-    needs its FeatureConfig to read the right file."""
+    needs its FeatureConfig to read the right file. *warm_missing* recomputes a
+    stale/missing default sidecar on the fly (self-heals a version bump)."""
     if sidecar_variant in (None, "evoked"):
-        return iter_animal_sidecars(animal, evoked_dir)
+        return iter_animal_sidecars(animal, evoked_dir, compute_missing=warm_missing)
     cfg = feature_cfg or _passive.passive_config()
     return _passive.iter_variant_sidecars(animal, evoked_dir, sidecar_variant, cfg)
 
 
 def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
-                   sidecar_variant: str, feature_cfg):
+                   sidecar_variant: str, feature_cfg, warm_missing: bool = False):
     """One pass over *animal*'s fresh sidecars -> parallel arrays:
     (t_epoch[N], metric_arrays{m: f32[N]}, channel[N] obj, session[N] obj).
     Session/channel are kept per row so the protocol filter + fingerprint can
@@ -57,7 +59,8 @@ def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
     t_parts, ch_parts, se_parts, rec_parts = [], [], [], []
     m_parts: dict = {m: [] for m in metrics}
     for i, (_fp, _sp, rows) in enumerate(
-            _sidecar_iter(animal, evoked_dir, sidecar_variant, feature_cfg)):
+            _sidecar_iter(animal, evoked_dir, sidecar_variant, feature_cfg,
+                          warm_missing)):
         assert i < _MAX_FILES, "sidecar scan runaway"
         if not rows:
             continue
@@ -145,7 +148,8 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
                  feature_cfg=None,
                  sidecar_variant: str | None = None,
                  passive_cfg=None,
-                 attach_fingerprint: bool = True) -> pd.DataFrame:
+                 attach_fingerprint: bool = True,
+                 warm_missing: bool = False) -> pd.DataFrame:
     """Tidy ``event x metric`` frame for *animal*: one row per lead-up stimulus,
     with continuous ``time_to_onset_sec``, the seizure it precedes, its lead-time
     bin, hour-of-day, protocol token and stim fingerprint. Empty frame when the
@@ -168,7 +172,8 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
         dtype=np.float64)
 
     t, mcols, chan, sess, rec = _epoch_columns(animal, evoked_dir, metrics,
-                                               sidecar_variant, feature_cfg)
+                                               sidecar_variant, feature_cfg,
+                                               warm_missing)
     if t.size == 0:
         return _empty_frame(metrics)
     idx_pre, tto_pre, keep_pre = _assign_next_onset(t, onsets, ceilings)

@@ -234,6 +234,67 @@ def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
     return rows if isinstance(rows, list) else None
 
 
+def _read_raw_sidecar_rows(mat_path: str, animal: str) -> list | None:
+    """Rows from the default sidecar IGNORING the schema version, but only when
+    it matches the source .mat mtime (so the reused columns are still valid).
+    None otherwise. Used by the incremental upgrade to salvage the expensive
+    unchanged columns (wavelet) from an older-version sidecar."""
+    sp = feature_sidecar_path(mat_path, animal, "evoked")
+    if not os.path.exists(sp):
+        return None
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if abs(float(payload.get("source_mtime", -1.0))
+               - os.path.getmtime(mat_path)) > 1e-6:
+            return None
+    except (OSError, ValueError):
+        return None
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else None
+
+
+def read_or_compute_sidecar(mat_path: str, animal: str, *,
+                            expensive: bool = False) -> list | None:
+    """Read the default ('evoked') sidecar; on a miss -- missing, stale, or an
+    OLDER schema version -- (re)compute it, write v-current, and return the rows.
+    None only when the source can't be read / yields nothing.
+
+    Fast path: when a SAME-mtime older-version sidecar exists (a schema/version
+    bump, not a changed source), reuse its unchanged wavelet columns and compute
+    only the rest (``include_wavelet=False``) -- ~10x cheaper than a full
+    recompute, since the Morlet CWT dominates the warm. Falls back to a full
+    compute when no reusable sidecar is present. Lets a version bump self-heal
+    on next access (``build_matrix(..., warm_missing=True)``)."""
+    rows = read_feature_sidecar(mat_path, animal)
+    if rows is not None:
+        return rows
+    old = _read_raw_sidecar_rows(mat_path, animal)
+    reuse_wavelet = bool(old) and all(
+        w in old[0] for w in ef.WAVELET_COLUMNS)
+    try:
+        rows = compute_feature_rows(mat_path, animal, None, expensive,
+                                    include_wavelet=not reuse_wavelet)
+    except Exception:            # noqa: BLE001 -- a bad file must not abort the scan
+        return None
+    if not rows:
+        return None
+    if reuse_wavelet:
+        # Splice the unchanged wavelet columns from the old sidecar, matched by
+        # (channel, stim_time_sec) so ordering differences can't misalign them.
+        wsrc = {(r.get("channel"), r.get("stim_time_sec")): r for r in old}
+        for r in rows:
+            src = wsrc.get((r.get("channel"), r.get("stim_time_sec")))
+            if src is not None:
+                for w in ef.WAVELET_COLUMNS:
+                    r[w] = src.get(w)
+    try:
+        write_feature_sidecar(mat_path, animal, rows)
+    except Exception:            # noqa: BLE001 -- warm best-effort; still return rows
+        pass
+    return rows
+
+
 def read_file_evoked(path: str,
                      only_animals: list | None = None) -> dict[str, dict]:
     """Per-channel data for one ``*_evoked.mat`` (h5py read).
@@ -305,12 +366,14 @@ def _abs_dt(rec_iso: str, seconds) -> str:
 
 
 def compute_feature_rows(path: str, animal: str, cfg=None,
-                         expensive: bool = False) -> list:
+                         expensive: bool = False,
+                         include_wavelet: bool = True) -> list:
     """Per-epoch feature rows for one ``*_evoked.mat`` / *animal* -- the
     canonical sidecar payload. Pure: reads the animal's traces, computes the
     full feature set (optionally with *cfg* window/filter/smoothing/baseline),
     and returns oldest-first rows. Shared by the dashboard preview/load path
-    and the offline sidecar-build tool.
+    and the offline sidecar-build tool. *include_wavelet* False leaves the
+    Morlet columns NaN (for the incremental sidecar upgrade).
     """
     assert path and animal, "path and animal required"
     chans = read_file_evoked(path, only_animals=[animal])
@@ -325,7 +388,8 @@ def compute_feature_rows(path: str, animal: str, cfg=None,
         if traces is None or tms is None or len(traces) < 1 or tms.size < 2:
             continue
         fs = 1000.0 / float(np.mean(np.diff(tms)))
-        feats = ef.compute_all(traces, tms, fs, expensive, cfg)
+        feats = ef.compute_all(traces, tms, fs, expensive, cfg,
+                               include_wavelet=include_wavelet)
         times = rec.get("times") or []
         pk, tr = rec.get("stim_peak") or [], rec.get("stim_trough") or []
         for j in range(traces.shape[0]):
