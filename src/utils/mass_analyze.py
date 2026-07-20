@@ -87,27 +87,36 @@ def _run_file_pool(files: list, work_fn, cancel_fn, on_result,
     ``on_result(file, result)`` is invoked in THIS (draining) thread as
     each file completes, so tallies + the job-row progress write stay
     single-threaded and race-free. ``cancel_fn() -> bool`` is checked
-    between completions; on cancel, pending futures are dropped and the
-    function returns True (running ones finish in the background -- they
-    only warm the cache). ``work_fn`` must catch its own per-file errors
-    and return a sentinel rather than raising.
+    between completions; on cancel, QUEUED futures are dropped and we wait
+    for the few already-running ones. ``work_fn`` must catch its own
+    per-file errors and return a sentinel rather than raising.
+
+    We deliberately JOIN the pool before returning. Letting the running
+    workers "finish in the background" leaked both threads and memory: each
+    in-flight worker holds a whole multi-GB recording, and because the sweep
+    restarts every couple of minutes, abandoned pools stacked up (observed:
+    216 live threads and ~5 GB/min of RSS growth). Waiting costs at most
+    *workers* files' worth of screening and keeps the peak bounded.
     """
     n = len(files)
     if n == 0:
         return False
-    ex = ThreadPoolExecutor(max_workers=max(1, int(workers)))
-    futs = {ex.submit(work_fn, f): f for f in files}
     cancelled = False
-    try:
-        max_iter = n + 1
-        for i, fut in enumerate(as_completed(futs)):
-            assert i < max_iter, "pool drain runaway"
-            if cancel_fn():
-                cancelled = True
-                break
-            on_result(futs[fut], fut.result())
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
+    with ThreadPoolExecutor(max_workers=max(1, int(workers)),
+                            thread_name_prefix="ma-scan") as ex:
+        futs = {ex.submit(work_fn, f): f for f in files}
+        try:
+            max_iter = n + 1
+            for i, fut in enumerate(as_completed(futs)):
+                assert i < max_iter, "pool drain runaway"
+                if cancel_fn():
+                    cancelled = True
+                    break
+                on_result(futs[fut], fut.result())
+        finally:
+            # Drop what hasn't started; the `with` then joins the runners.
+            for f in futs:
+                f.cancel()
     return cancelled
 
 

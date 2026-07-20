@@ -11,7 +11,7 @@ with the dashboard.
 from __future__ import annotations
 
 from collections import OrderedDict
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 
 from src.utils.mat_loader import ChunkData, load_mat
 
@@ -24,6 +24,16 @@ _MAX_ENTRIES = 3
 _MAX_BYTES = 4_000_000_000
 _od: "OrderedDict[str, ChunkData]" = OrderedDict()
 _lock = RLock()
+
+# load_mat runs OUTSIDE _lock (so a slow SMB read doesn't block cache hits),
+# which means every concurrent caller can hold its own multi-GB recording at
+# the same time -- the cache budget bounds what is RETAINED, not what is
+# IN FLIGHT. With the mass_analyze scan pool (4 workers) plus dashboard
+# threads that is tens of GB of transient peak. This semaphore bounds the
+# number of simultaneous loads; waiters re-check the cache on wake, so a
+# queued thread usually gets a hit instead of a second read of the same file.
+_MAX_CONCURRENT_LOADS = 2
+_load_sem = BoundedSemaphore(_MAX_CONCURRENT_LOADS)
 
 
 def _nbytes(chunk: ChunkData) -> int:
@@ -57,7 +67,17 @@ def get_chunk(file_path: str) -> ChunkData:
             _od[file_path] = hit
             return hit
 
-    chunk = load_mat(file_path)
+    # Bound how many multi-GB reads are in flight at once (see _load_sem).
+    with _load_sem:
+        # Re-check under the lock: while we waited for a slot another thread
+        # may have loaded this very file, so we return its copy instead of
+        # reading (and holding) a second one.
+        with _lock:
+            hit = _od.pop(file_path, None)
+            if hit is not None:
+                _od[file_path] = hit
+                return hit
+        chunk = load_mat(file_path)
     assert chunk.signal.ndim == 2, "signal must be 2-D"
 
     with _lock:

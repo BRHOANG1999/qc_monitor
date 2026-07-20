@@ -103,3 +103,67 @@ def test_chunk_cache_info_reports_bytes(monkeypatch):
 
 def test_nbytes_tolerates_missing_signal():
     assert CC._nbytes(SimpleNamespace()) == 0
+
+
+# ------------------------------------------------- in-flight peak memory --- #
+
+def test_concurrent_loads_are_bounded(monkeypatch):
+    """load_mat runs outside the lock, so without a semaphore every scan
+    thread holds its own multi-GB recording at once."""
+    import threading
+    import time
+    live = {"now": 0, "peak": 0}
+    lk = threading.Lock()
+
+    def fake_load(path):
+        with lk:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        time.sleep(0.15)
+        with lk:
+            live["now"] -= 1
+        return SimpleNamespace(signal=np.zeros((10, 1)), fs=1.0)
+
+    monkeypatch.setattr(CC, "load_mat", fake_load)
+    monkeypatch.setattr(CC, "_od", OrderedDict())
+    threads = [threading.Thread(target=CC.get_chunk, args=(f"f{i}",))
+               for i in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert live["peak"] <= CC._MAX_CONCURRENT_LOADS
+
+
+def test_scan_pool_does_not_leak_threads():
+    """Repeated sweeps must not stack abandoned pools (the 216-thread bug)."""
+    import threading
+    import time
+    from src.utils import mass_analyze as MA
+
+    def work(f):
+        time.sleep(0.05)
+        return f
+
+    before = threading.active_count()
+    for _ in range(3):
+        MA._run_file_pool(list(range(8)), work, lambda: False,
+                          lambda f, r: None, workers=4)
+    time.sleep(0.3)
+    assert threading.active_count() <= before + 1
+
+
+def test_scan_pool_joins_even_when_cancelled():
+    import threading
+    import time
+    from src.utils import mass_analyze as MA
+
+    def work(f):
+        time.sleep(0.05)
+        return f
+
+    before = threading.active_count()
+    assert MA._run_file_pool(list(range(20)), work, lambda: True,
+                             lambda f, r: None, workers=4) is True
+    time.sleep(0.3)
+    assert threading.active_count() <= before + 1
