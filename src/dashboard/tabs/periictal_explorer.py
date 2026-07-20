@@ -87,9 +87,23 @@ def _tok(session_dir: str) -> str:
 #  Background build
 # --------------------------------------------------------------------- #
 
+# Job-status dicts are keyed by a selection signature, so their key space is
+# unbounded (every distinct animal/protocol/variant/window/method combination
+# leaves a permanent entry). Entries are small, but "small x forever" is still
+# a leak -- prune oldest-first. Dicts preserve insertion order (3.7+).
+_JOBS_MAX = 200
+
+
+def _prune_jobs(jobs: dict, max_n: int = _JOBS_MAX) -> None:
+    """Drop oldest job-status entries beyond *max_n*. Caller holds _LOCK."""
+    while len(jobs) > max_n:
+        jobs.pop(next(iter(jobs)), None)
+
+
 def _set(job_id: str, **kw) -> None:
     with _LOCK:
         _JOBS.setdefault(job_id, {}).update(kw)
+        _prune_jobs(_JOBS)
 
 
 def _kick(store, evoked_dir, job_id, animal, protocol, variant,
@@ -103,6 +117,7 @@ def _kick(store, evoked_dir, job_id, animal, protocol, variant,
         if st and st.get("status") == "running":
             return
         _JOBS[job_id] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_JOBS)
     th = threading.Thread(
         target=_worker, name=f"periictal-{job_id}", daemon=True,
         args=(store, evoked_dir, job_id, animal, protocol, variant,
@@ -1669,6 +1684,7 @@ def _erp_key(animal, protocol, sz, lookback, frm, to) -> str:
 def _erp_set(key, **kw):
     with _LOCK:
         _ERP_JOBS.setdefault(key, {}).update(kw)
+        _prune_jobs(_ERP_JOBS)
 
 
 def _erp_finish(key, result):
@@ -1677,6 +1693,7 @@ def _erp_finish(key, result):
         while len(_ERP_CACHE) > _ERP_CACHE_MAX:
             _ERP_CACHE.popitem(last=False)
         _ERP_JOBS[key] = {"status": "done", "progress": "done"}
+        _prune_jobs(_ERP_JOBS)
 
 
 def _erp_kick(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to):
@@ -1687,6 +1704,7 @@ def _erp_kick(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to):
         if st and st.get("status") == "running":
             return
         _ERP_JOBS[key] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_ERP_JOBS)
     threading.Thread(
         target=_erp_worker, name=f"erp-{key}", daemon=True,
         args=(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)

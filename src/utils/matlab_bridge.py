@@ -203,6 +203,34 @@ def run_matlab_batch(script: str, timeout: int = 600,
                 pass
 
 
+_TEMP_PREFIXES = ("qc_pipeline_", "qc_config_", "qc_matlab_")
+
+
+def sweep_stale_temp_files(max_age_h: float = 24.0) -> int:
+    """Delete our leftover temp files older than *max_age_h*.
+
+    The ``finally`` cleanup in ``run_pipeline`` can't run if the process is
+    hard-killed mid-run, so pairs accumulate in the temp dir indefinitely.
+    Returns the number removed; never raises."""
+    import glob
+    import time as _time
+    removed = 0
+    cutoff = _time.time() - max_age_h * 3600.0
+    tmpdir = tempfile.gettempdir()
+    for prefix in _TEMP_PREFIXES:
+        for path in glob.glob(os.path.join(tmpdir, prefix + "*")):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+                    removed += 1
+            except OSError:
+                pass
+    if removed:
+        logger.info("swept %d stale MATLAB temp file(s) from %s",
+                    removed, tmpdir)
+    return removed
+
+
 def run_pipeline(input_file: str, matlab_exe: str = MATLAB_EXE_DEFAULT,
                  timeout: int = 600, config: Optional[dict] = None) -> dict:
     """Run the full analysis pipeline on a single .mat file.
@@ -232,6 +260,11 @@ def run_pipeline(input_file: str, matlab_exe: str = MATLAB_EXE_DEFAULT,
         - matlab_stdout, matlab_stderr
         Or an error dict with exit_status="error" and error_message.
     """
+    # Reclaim temp files orphaned by earlier hard-kills (the finally below
+    # can't run if the process is killed mid-pipeline). Only touches files
+    # older than a day, so nothing in flight is at risk.
+    sweep_stale_temp_files()
+
     # Create temp output path for JSON results
     fd, output_json = tempfile.mkstemp(suffix=".json", prefix="qc_pipeline_")
     os.close(fd)

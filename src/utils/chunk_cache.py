@@ -17,8 +17,32 @@ from src.utils.mat_loader import ChunkData, load_mat
 
 
 _MAX_ENTRIES = 3
+# Entry count alone does NOT bound memory: one recording's signal matrix runs
+# 0.3-4.7 GB (measured across the production processed_files rows), so three
+# "bounded" entries reached ~14 GB. Cap the resident BYTES too -- evict oldest
+# until the total fits, always keeping the most recent (the caller needs it).
+_MAX_BYTES = 4_000_000_000
 _od: "OrderedDict[str, ChunkData]" = OrderedDict()
 _lock = RLock()
+
+
+def _nbytes(chunk: ChunkData) -> int:
+    """Resident size of a cached chunk (the signal matrix dominates)."""
+    sig = getattr(chunk, "signal", None)
+    try:
+        return int(sig.nbytes) if sig is not None else 0
+    except AttributeError:
+        return 0
+
+
+def _evict_locked() -> None:
+    """Enforce BOTH the entry cap and the byte budget. Caller holds _lock."""
+    while len(_od) > _MAX_ENTRIES:
+        _od.popitem(last=False)
+    total = sum(_nbytes(c) for c in _od.values())
+    while total > _MAX_BYTES and len(_od) > 1:
+        _k, victim = _od.popitem(last=False)
+        total -= _nbytes(victim)
 
 
 def get_chunk(file_path: str) -> ChunkData:
@@ -38,8 +62,7 @@ def get_chunk(file_path: str) -> ChunkData:
 
     with _lock:
         _od[file_path] = chunk
-        while len(_od) > _MAX_ENTRIES:
-            _od.popitem(last=False)
+        _evict_locked()
     return chunk
 
 
@@ -51,6 +74,9 @@ def evict(file_path: str) -> None:
 
 
 def cache_info() -> dict:
-    """Debug helper: paths currently cached, in LRU order (oldest first)."""
+    """Debug helper: paths currently cached, in LRU order (oldest first),
+    plus the resident bytes vs the budget (the thing that actually matters)."""
     with _lock:
-        return {"entries": list(_od.keys()), "max_entries": _MAX_ENTRIES}
+        return {"entries": list(_od.keys()), "max_entries": _MAX_ENTRIES,
+                "bytes": sum(_nbytes(c) for c in _od.values()),
+                "max_bytes": _MAX_BYTES}

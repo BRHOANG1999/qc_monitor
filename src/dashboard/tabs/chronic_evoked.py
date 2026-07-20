@@ -73,6 +73,34 @@ _ROWS_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
 _ROWS_CACHE_MAX = 6
 _warm_gen: dict = {}     # animal -> generation int (bumped per completed warm)
 
+# --- Row-cache memory budget -------------------------------------------- #
+# The entry caps above bound how MANY results are memoized, not how BIG they
+# are -- and one result can be an animal's entire history. Measured: a sidecar
+# row is a ~56-key dict costing ~3.3 KB of RSS (far more than its ~1.2 KB on
+# disk), and BCH040 is ~1450 sidecars x ~1743 rows ~= 2.5M rows ~= 8.5 GB for
+# ONE entry. Six such "bounded" entries is ~50 GB, which is how the service
+# reached ~59 GB RSS. So cache by BYTES: refuse to memoize a single oversized
+# result at all, and evict oldest until the total fits.
+_ROW_BYTES_EST = 3300                     # measured RSS per row dict
+_ROWS_BUDGET_BYTES = 1_500_000_000        # ~1.5 GB per row cache
+_MAX_CACHED_ROWS = _ROWS_BUDGET_BYTES // _ROW_BYTES_EST     # ~454k rows
+
+
+def _cache_worth_keeping(rows) -> bool:
+    """False for a result too big to memoize (it would blow the budget on its
+    own). Such a selection is recomputed on demand instead -- slower, bounded."""
+    return bool(rows) and len(rows) <= _MAX_CACHED_ROWS
+
+
+def _evict_to_budget(cache, max_entries: int) -> None:
+    """Evict oldest-first until BOTH the entry cap and the row budget hold.
+    Never evicts the most recent entry (the caller is about to use it)."""
+    while len(cache) > max_entries:
+        cache.pop(next(iter(cache)))
+    total = sum(len(v) for v in cache.values())
+    while total > _MAX_CACHED_ROWS and len(cache) > 1:
+        total -= len(cache.pop(next(iter(cache))))
+
 # Per-recording mean-waveform memo for the overlay (the 2nd heavy trace
 # read), keyed (animal, file-basenames). Bounded.
 _MEANS_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
@@ -154,6 +182,11 @@ def _window_summary(cfg_dict) -> str:
 _warm_threads: dict = {}
 _warm_progress: dict = {}        # animal -> {"done": int, "total": int}
 _warm_lock = threading.Lock()
+# A warm holds its whole result set in RAM while it builds (a non-passthrough
+# recompute is millions of row dicts, GBs). The per-animal guard below only
+# stopped DUPLICATE warms of the SAME animal, so every animal could warm at
+# once -- 7 concurrent multi-GB builds. Cap the global concurrency.
+_MAX_CONCURRENT_WARMS = 2
 
 
 def _kick_warm(animal: str, sessions: list | None = None,
@@ -161,13 +194,23 @@ def _kick_warm(animal: str, sessions: list | None = None,
                recordings: list | None = None) -> bool:
     """Start a background sidecar-build for *animal* (optionally just
     *sessions* and/or an explicit *recordings* subset) unless one is
-    already running."""
+    already running, or too many warms are already in flight."""
     if not animal:
         return False
     with _warm_lock:
         t = _warm_threads.get(animal)
         if t is not None and t.is_alive():
             return False
+        live = sum(1 for th in _warm_threads.values()
+                   if th is not None and th.is_alive())
+        if live >= _MAX_CONCURRENT_WARMS:
+            logger.info("chronic warm for %s deferred: %d already running "
+                        "(cap %d)", animal, live, _MAX_CONCURRENT_WARMS)
+            return False
+        # Drop finished threads so this dict can't grow unboundedly.
+        for done in [a for a, th in _warm_threads.items()
+                     if th is not None and not th.is_alive()]:
+            _warm_threads.pop(done, None)
         _warm_progress[animal] = {"done": 0, "total": 0}
         th = threading.Thread(target=_warm_worker,
                               args=(animal, sessions, cfg_dict, force,
@@ -213,10 +256,19 @@ def _warm_worker(animal: str, sessions: list | None = None,
                 recompute.extend(rows)
         if not passthrough:
             recompute.sort(key=lambda r: r.get("abs_dt") or "")
+            # NOTE: unlike _ROWS_CACHE this is not a pure memo -- the renderer
+            # reads the recomputed rows back out of here, so we must always
+            # insert. We bound it by evicting the OLDER entries to the row
+            # budget instead (the newest, which the render needs, is kept).
             _RECOMPUTE_CACHE[_recompute_key(animal, sessions, cfg_dict,
                                              recordings)] = recompute
-            while len(_RECOMPUTE_CACHE) > _RECOMPUTE_MAX:
-                _RECOMPUTE_CACHE.pop(next(iter(_RECOMPUTE_CACHE)))
+            _evict_to_budget(_RECOMPUTE_CACHE, _RECOMPUTE_MAX)
+            if len(recompute) > _MAX_CACHED_ROWS:
+                logger.warning("chronic recompute for %s is %d rows (~%.1f GB) "
+                               "-- exceeds the %d-row cache budget on its own",
+                               animal, len(recompute),
+                               len(recompute) * _ROW_BYTES_EST / 1e9,
+                               _MAX_CACHED_ROWS)
         # New sidecars written -> bump the warm generation so the
         # assembled-rows memo re-reads them on the next query.
         _warm_gen[animal] = _warm_gen.get(animal, 0) + 1
@@ -1118,10 +1170,11 @@ def _query_for_selection(sel: dict, need_means: bool = True):
                 if sc:
                     rows.extend(sc)
             rows.sort(key=lambda r: r.get("abs_dt") or "")
-            if rows:          # don't memo an empty pre-warm result
+            # Don't memo an empty pre-warm result, and don't memo a result so
+            # large it blows the budget on its own (see _cache_worth_keeping).
+            if _cache_worth_keeping(rows):
                 _ROWS_CACHE[ck] = rows
-                while len(_ROWS_CACHE) > _ROWS_CACHE_MAX:
-                    _ROWS_CACHE.popitem(last=False)
+                _evict_to_budget(_ROWS_CACHE, _ROWS_CACHE_MAX)
     else:
         rows = _RECOMPUTE_CACHE.get(
             _recompute_key(animal, sessions, sel.get("config"),
