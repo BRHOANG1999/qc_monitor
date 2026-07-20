@@ -153,6 +153,50 @@ def test_scan_pool_does_not_leak_threads():
     assert threading.active_count() <= before + 1
 
 
+def test_background_sweep_does_not_starve_interactive_loads(monkeypatch):
+    """A saturating sweep must not make the dashboard queue behind multi-GB
+    reads (the 'Video tab takes forever' regression)."""
+    import threading
+    import time
+    monkeypatch.setattr(CC, "load_mat",
+                        lambda p: (time.sleep(0.3),
+                                   SimpleNamespace(signal=np.zeros((10, 1)),
+                                                   fs=1.0))[1])
+    monkeypatch.setattr(CC, "_od", OrderedDict())
+    stop = {"v": False}
+
+    def sweeper(i):
+        n = 0
+        while not stop["v"] and n < 50:
+            CC.get_chunk(f"scan{i}_{n}", transient=True)
+            n += 1
+
+    threads = [threading.Thread(target=sweeper, args=(i,), daemon=True)
+               for i in range(6)]
+    for t in threads:
+        t.start()
+    time.sleep(0.45)                       # let the sweep saturate its budget
+    t0 = time.time()
+    CC.get_chunk("INTERACTIVE")
+    waited = time.time() - t0
+    stop["v"] = True
+    for t in threads:
+        t.join(timeout=5)
+    # Should be ~one load, not a queue behind every sweep read.
+    assert waited < 1.5, f"interactive load starved by the sweep: {waited:.2f}s"
+
+
+def test_sweep_does_not_evict_the_interactive_recording(monkeypatch):
+    monkeypatch.setattr(CC, "_od", OrderedDict())
+    monkeypatch.setattr(CC, "_MAX_BYTES", 600_000_000)
+    monkeypatch.setattr(CC, "load_mat", lambda p: _chunk(250))
+    CC.get_chunk("UI_FILE")                       # what the operator is viewing
+    for i in range(5):                            # sweep streams past it
+        CC.get_chunk(f"sweep{i}", transient=True)
+    assert "UI_FILE" in CC.cache_info()["entries"], (
+        "a one-shot background sweep evicted the recording the UI is showing")
+
+
 def test_scan_pool_joins_even_when_cancelled():
     import threading
     import time

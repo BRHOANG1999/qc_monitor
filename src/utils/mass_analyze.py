@@ -258,7 +258,9 @@ def _compute_peak_count_uncached(store, file_id: int,
             file_id=file_id, channel=channel,
             cutoff=float(cutoff), n_peaks=0,
             peak_times=[])
-    chunk = get_chunk(file_row["file_path"])
+    # transient=True: a background sweep read. Uses the scan load budget
+    # and is evicted before any recording the dashboard is showing.
+    chunk = get_chunk(file_row["file_path"], transient=True)
     fs = float(chunk.fs)
     if chunk.signal.ndim != 2 or chunk.signal.shape[1] <= channel:
         logger.debug(
@@ -491,7 +493,9 @@ def _compute_auc_count_uncached(store, file_id: int, channel: int,
     file_row = store.file_row(file_id)
     if not file_row or not file_row.get("file_path"):
         return empty
-    chunk = get_chunk(file_row["file_path"])
+    # transient=True: a background sweep read. Uses the scan load budget
+    # and is evicted before any recording the dashboard is showing.
+    chunk = get_chunk(file_row["file_path"], transient=True)
     fs = float(chunk.fs)
     if chunk.signal.ndim != 2 or chunk.signal.shape[1] <= channel:
         logger.debug(

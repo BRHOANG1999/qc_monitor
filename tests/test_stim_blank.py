@@ -105,7 +105,9 @@ def test_scan_compute_blanks_stim(tmp_path, monkeypatch):
     store = Store(db)
     _seed_file(store)
 
-    monkeypatch.setattr(ma, "get_chunk", lambda path: chunk)
+    # **kw so the stub tolerates get_chunk's transient= flag (background
+    # sweep reads use a separate load budget / eviction priority).
+    monkeypatch.setattr(ma, "get_chunk", lambda path, **kw: chunk)
     monkeypatch.setattr(ma.stim_blank, "stim_copy_channels",
                          lambda store, sd: set())
 
