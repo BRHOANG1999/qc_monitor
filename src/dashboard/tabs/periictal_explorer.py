@@ -153,13 +153,17 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
         # background warmer (utils.sidecar_warm) fills in genuinely missing
         # ones, so the tab stays responsive and catches up on its own.
         if df.empty:
-            _finish(job_id, {"empty": True})
+            _finish(job_id, {"empty": True,
+                             "reason": _empty_reason(store, evoked_dir,
+                                                     animal, protocol)})
             return
         # The embedding / scatter / trajectory are PRE-onset only (unchanged);
         # the full frame (pre + post) is kept for the per-seizure trend test.
         pre = df[df["phase"] == "pre"].reset_index(drop=True)
         if pre.empty:
-            _finish(job_id, {"empty": True})
+            _finish(job_id, {"empty": True,
+                             "reason": _empty_reason(store, evoked_dir,
+                                                     animal, protocol)})
             return
         _set(job_id, progress=f"embedding {len(pre):,} stimuli ({method.upper()})…")
         res = embed(pre, method=method, cap=cap)
@@ -1625,11 +1629,54 @@ _EMPTY_MSG = ("No lead-up stimuli — fewer than 2 seizures, none in this protoc
               "or no fresh sidecars for this animal.")
 
 
+def _empty_reason(store, evoked_dir, animal, protocol) -> str:
+    """Say WHICH of the three causes made the build empty.
+
+    The generic message above lumps them together, which sends people hunting
+    for a bug when the real answer is usually "features for this protocol
+    haven't been computed yet" -- a backlog the warmer clears on its own.
+    Only runs on an empty result, so the directory scan is not a hot path."""
+    try:
+        szs = scored_seizures(store, animal)
+    except Exception:                                   # noqa: BLE001
+        return _EMPTY_MSG
+    n_all = len(szs)
+    if n_all < 2:
+        return (f"{animal} has {n_all} scored seizure(s) — at least 2 are "
+                "needed to build lead-up windows.")
+    if protocol:
+        n_p = sum(1 for s in szs if protocol in str(s.session_dir or ""))
+        if n_p < 2:
+            return (f"{animal} has {n_all} scored seizures but only {n_p} in "
+                    f"'{protocol}'. Try another protocol / stim group.")
+    have = tot = 0
+    try:
+        from src.utils.evoked_output import (animals_in_filename,
+                                             feature_sidecar_path,
+                                             list_evoked_files)
+        for fp in list_evoked_files(evoked_dir):
+            if animal not in animals_in_filename(fp):
+                continue
+            if protocol and protocol not in os.path.basename(fp):
+                continue
+            tot += 1
+            if os.path.exists(feature_sidecar_path(fp, animal)):
+                have += 1
+    except Exception:                                   # noqa: BLE001
+        return _EMPTY_MSG
+    if tot and have < tot:
+        scope = f"{animal}" + (f" / {protocol}" if protocol else "")
+        return (f"Features aren't computed yet for {scope}: {have} of {tot} "
+                "recordings have a feature sidecar. The background warmer is "
+                "catching up — rebuild in a few minutes.")
+    return _EMPTY_MSG
+
+
 def _embed_fig_reading(cached, color_by, cap_sec=None):
     """(scatter figure, reading strip) for a ready embedding build (empty-safe).
     The single source of truth for the Embedding lens's render."""
     if not cached or cached.get("empty"):
-        return empty_fig(_EMPTY_MSG), ""
+        return empty_fig((cached or {}).get("reason") or _EMPTY_MSG), ""
     fig = _figure(cached["emb"], cached["sub"], color_by,
                   cached.get("method", "pca"), cached.get("meta"), cap_sec)
     return fig, _reading_strip(cached)
@@ -1639,7 +1686,7 @@ def _build_status(cached, jid):
     """(status, poll_disabled, job) once a build is ready in cache — the pulse
     that wakes the per-lens render callbacks (they key off the job store)."""
     if cached.get("empty"):
-        return _EMPTY_MSG, True, jid
+        return cached.get("reason") or _EMPTY_MSG, True, jid
     return "✓ built", True, jid
 
 
@@ -1647,7 +1694,8 @@ def _render_cached(cached, color_by, jid, traj_y):
     """(figure, reading, status, poll_disabled, job, trajectory) — composes the
     per-lens renderers; retained as a stable helper for tests."""
     if cached.get("empty"):
-        return empty_fig(_EMPTY_MSG), "", _EMPTY_MSG, True, jid, empty_fig(_EMPTY_MSG)
+        msg = cached.get("reason") or _EMPTY_MSG
+        return empty_fig(msg), "", msg, True, jid, empty_fig(msg)
     fig, reading = _embed_fig_reading(cached, color_by)
     traj = _trajectory_fig(cached, traj_y or "peak_to_trough")
     return fig, reading, "✓ built", True, jid, traj
