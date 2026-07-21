@@ -22,7 +22,15 @@ def _prepare(df: pd.DataFrame, metrics: list[str]):
     the column median. Returns (X[N,d], used_cols)."""
     cols = [m for m in metrics if m in df.columns and df[m].notna().any()]
     assert cols, "no usable metric columns (all-NaN)"
-    X = df[cols].to_numpy(dtype=np.float64)
+    # copy=True is REQUIRED, not defensive. Under pandas >= 3.0 Copy-on-Write
+    # (always on, not disableable) to_numpy() returns a READ-ONLY view, so the
+    # median fill below died with "assignment destination is read-only". It only
+    # surfaced once a metric column actually carried NaN -- the `if bad.any()`
+    # guard hid it until the newly warmed sidecars added NaN-bearing columns.
+    # Copying also stops the fill from writing median-imputed values back into
+    # the shared cached matrix that the other lenses read.
+    X = df[cols].to_numpy(dtype=np.float64, copy=True)
+    assert X.flags.writeable, "metric matrix must be writeable"
     med = np.nanmedian(X, axis=0)
     bad = np.isnan(X)
     if bad.any():

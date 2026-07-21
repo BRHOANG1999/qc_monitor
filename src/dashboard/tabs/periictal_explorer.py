@@ -22,6 +22,7 @@ embedding and is instant.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from collections import OrderedDict
@@ -58,6 +59,8 @@ from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
 from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
+
+logger = logging.getLogger(__name__)
 
 # Where the signature-keyed matrix cache lives.
 _CACHE_DIR = None       # set in register_callbacks from the repo derivatives root
@@ -177,6 +180,14 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
                          "method": res["method"],
                          "n_seizures": int(pre["seizure_idx"].nunique())})
     except Exception as e:                                     # noqa: BLE001
+        # Log the TRACEBACK, not just str(e). The UI can only show one line, and
+        # a bare message ("assignment destination is read-only") names neither
+        # the file nor the frame -- which made a real build failure impossible
+        # to diagnose without re-deriving the whole call path by hand.
+        logger.exception("peri-ictal build failed (job=%s animal=%s protocol=%s "
+                         "variant=%s sidecar=%s window_h=%s method=%s): %s",
+                         job_id, animal, protocol, variant, sidecar_variant,
+                         window_h, method, e)
         _set(job_id, status="error", progress=f"error: {e}")
 
 
@@ -1785,6 +1796,7 @@ def _erp_worker(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)
         res["record_only"] = rec_only
         _erp_finish(key, res)
     except Exception as e:                                    # noqa: BLE001
+        logger.exception("peri-ictal ERP build failed (key=%s): %s", key, e)
         _erp_set(key, status="error", progress=f"error: {e}")
 
 
