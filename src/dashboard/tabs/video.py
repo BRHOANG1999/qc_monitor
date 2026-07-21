@@ -393,6 +393,33 @@ _POOL_LIST_HEADER = {
                       "rest."),
 }
 
+# review_state statuses whose markers_json still holds live, un-finalised
+# scoring work that the editor must re-hydrate when the recording is opened.
+#
+#   needs_scoring -- the reviewer quick-flag pool (autosaved draft).
+#   abandoned     -- a draft returned to the Flag pool by
+#                    src/maintenance/revert_stranded_drafts.py. That script
+#                    PRESERVES markers_json by contract (see its docstring),
+#                    so the onsets are still on disk; gating the restore on
+#                    'needs_scoring' alone made them invisible and looked
+#                    exactly like the reviewer's work had been erased.
+_DRAFT_BEARING_STATUSES = ("needs_scoring", "abandoned")
+
+
+def restorable_drafts(latest) -> list:
+    """Saved scoring events to re-hydrate from a ``review_state`` row, or ``[]``.
+
+    Only draft-bearing statuses qualify, so finalised work is never resurrected
+    into the editor as if it were unsaved.
+    """
+    if not latest or latest.get("status") not in _DRAFT_BEARING_STATUSES:
+        return []
+    try:
+        drafts = json.loads(latest.get("markers_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return drafts if isinstance(drafts, list) else []
+
 
 def _fetch_queue_by_mode(store, mode, animal_ids, email, floor, limit):
     """Return the carousel rows for the chosen navigation *mode*, normalized so
@@ -4649,23 +4676,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                             int(cf), email, ca, list(cur_events or []))
                     except Exception as e:      # never break navigation
                         logger.warning("rescope draft flush failed: %s", e)
-        # Restore: in-session stash first, else the saved needs_scoring draft.
+        # Restore: in-session stash first, else the saved draft (needs_scoring
+        # or a revert_stranded_drafts 'abandoned' row -- both keep markers).
         if new_key in by_animal:
             new_events = by_animal[new_key]
         else:
-            new_events = []
             try:
                 latest = store.get_review_state(int(file_id),
                                                  animal_id=animal)
             except Exception:
                 latest = None
-            if latest and latest.get("status") == "needs_scoring":
-                try:
-                    drafts = json.loads(latest.get("markers_json") or "[]")
-                except (json.JSONDecodeError, TypeError):
-                    drafts = []
-                if isinstance(drafts, list):
-                    new_events = drafts
+            new_events = restorable_drafts(latest)
         return new_events, by_animal, new_key
 
     # ---- Autosave: durable draft persistence (score-loss safety net) --- #
@@ -5515,6 +5536,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ([], "has_events", latest.get("note") or "",
                     "Resuming quick-flagged events -- finish "
                     "scoring each, then Mark recording done.")
+        # A draft returned to the Flag pool by revert_stranded_drafts keeps its
+        # onsets. Say so, or the restored markers look like they came from
+        # nowhere (and their absence looked like data loss).
+        recovered = restorable_drafts(latest)
+        if recovered:
+            return ([], "has_events", latest.get("note") or "",
+                    f"Restored {len(recovered)} previously saved onset(s) from "
+                    "an earlier draft -- add Racine to each, then Mark "
+                    "recording done.")
         existing = store.get_review_state_by_user(int(file_id),
                                                      email, animal_id=animal)
         if existing and existing["status"] in (
