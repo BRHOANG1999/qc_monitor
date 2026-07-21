@@ -160,8 +160,19 @@ def list_animals(evoked_dir: str) -> list[str]:
 # v3: added Chang et al. 2026 columns -- spectral sum_power_mid /
 #     freq_moment_vhigh, curvature, skewness, the transition-point + exp/lin
 #     fit morphology set (tp_*, expfit_*, linfit_*), and (expensive) the
-#     per-band autocorr_{low,mid,high}. Stale v2 sidecars recompute on access.
+#     per-band autocorr_{low,mid,high}.
 _FEATURE_SIDECAR_VERSION = "3"
+
+# Versions whose rows are still USABLE. Every schema bump so far only ADDED
+# columns, and readers pull columns by name (a missing key reads as NaN), so an
+# older sidecar is perfectly good data -- just without the newer features.
+#
+# Treating an older version as "missing" instead created a cliff: one bump made
+# every sidecar in the corpus stale at once, so the peri-ictal build either
+# returned an empty matrix or (with warm_missing) tried to recompute hundreds of
+# multi-GB recordings inline and appeared to hang forever. Accept old rows for
+# READING and let the background warmer upgrade them at its own pace.
+_COMPATIBLE_SIDECAR_VERSIONS = {"2", "3"}
 
 
 def feature_sidecar_path(mat_path: str, animal: str,
@@ -220,7 +231,7 @@ def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
             payload = json.load(f)
     except (OSError, ValueError):
         return None
-    if payload.get("version") != _FEATURE_SIDECAR_VERSION:
+    if payload.get("version") not in _COMPATIBLE_SIDECAR_VERSIONS:
         return None
     if config_sig is not None and payload.get("config_sig") != config_sig:
         return None
@@ -232,6 +243,25 @@ def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
         return None
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else None
+
+
+def sidecar_is_current(mat_path: str, animal: str) -> bool:
+    """True when *animal*'s sidecar exists, matches the source mtime AND is on
+    the CURRENT schema version. ``read_feature_sidecar`` deliberately accepts
+    older-but-compatible versions; this is the stricter test the background
+    warmer uses to decide what still needs upgrading."""
+    sp = feature_sidecar_path(mat_path, animal, "evoked")
+    if not os.path.exists(sp):
+        return False
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("version") != _FEATURE_SIDECAR_VERSION:
+            return False
+        return abs(float(payload.get("source_mtime", -1.0))
+                   - os.path.getmtime(mat_path)) <= 1e-6
+    except (OSError, ValueError):
+        return False
 
 
 def _read_raw_sidecar_rows(mat_path: str, animal: str) -> list | None:

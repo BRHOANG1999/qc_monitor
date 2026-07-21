@@ -144,11 +144,14 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
             store, animal, evoked_dir, _CACHE_DIR or _default_cache_dir(),
             protocol=protocol or None, window_sec=window_h * 3600.0,
             variant=variant, feature_cfg=feature_cfg,
-            sidecar_variant=sidecar_variant,
-            # Self-heal a feature-schema/version bump: recompute stale/missing
-            # 'evoked' sidecars incrementally instead of returning an empty
-            # matrix (the Chang columns need the new sidecar version).
-            warm_missing=(sidecar_variant in (None, "evoked")))
+            sidecar_variant=sidecar_variant)
+        # NOTE: deliberately NOT warm_missing. Computing a missing sidecar
+        # means reading a multi-GB recording, and an animal can be hundreds of
+        # recordings behind -- doing that inline made this build appear to hang
+        # forever on "joining stimuli to seizures". Older-schema sidecars are
+        # now READ as-is (newer feature columns simply come back NaN), and the
+        # background warmer (utils.sidecar_warm) fills in genuinely missing
+        # ones, so the tab stays responsive and catches up on its own.
         if df.empty:
             _finish(job_id, {"empty": True})
             return

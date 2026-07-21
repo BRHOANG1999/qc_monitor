@@ -398,6 +398,19 @@ chronic_evoked:
   # vectorized features only. To enable: set true AND rebuild the sidecars with
   # `python tools/warm_evoked_cache.py --expensive`.
   compute_expensive: false
+  # Background sidecar builder. Sidecars used to be created only when someone
+  # opened this tab, so new recordings accumulated without features forever
+  # (the coverage monitor's "evoked recordings unanalyzed" gap). This fills
+  # them a few at a time. Deliberately slow: each one reads a whole multi-GB
+  # recording off the share, so a flat-out catch-up would starve the UI.
+  sidecar_warm:
+    enabled: true
+    interval_sec: 300     # sleep between batches
+    batch: 4              # sidecars per batch (newest recordings first)
+    # Older-schema sidecars are still READ fine (new columns come back NaN),
+    # so re-computing them is optional. Turn on to backfill the newer feature
+    # columns across the archive.
+    upgrade_outdated: false
   # "Configure" defaults (the analyzer's processing panel; mirrors the MATLAB
   # ChronicTabController config dialog / ChronicTabState defaults). These seed
   # the in-tab controls; features are recomputed from the raw epoch traces

@@ -188,6 +188,16 @@ def main():
     except Exception:
         logger.exception("needs_scoring flush worker start failed")
 
+    # Build evoked feature sidecars in the background, a few at a time. They
+    # used to appear only when someone opened the Chronic Evoked tab, so the
+    # backlog grew forever (the coverage monitor reports it) and any view
+    # needing features had to compute them inline -- which looks like a hang.
+    try:
+        from src.utils import sidecar_warm as _sidecar_warm
+        _sidecar_warm.start_worker(store, config)
+    except Exception:
+        logger.exception("sidecar warm worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
