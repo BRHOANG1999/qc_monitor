@@ -452,6 +452,14 @@ bhz_csv:
   base_dir: "G:\\BHZ\\BHZ_CSV_Exports"
   filename_template: "{date}_{animal}.csv"
   append: true
+  # Periodically export "Needs more onsets" (needs_scoring) events to the day
+  # CSVs. Those files never reach the PI approval gate, and onsets saved by the
+  # 4-second autosave bypass the Submit path that exports inline -- without
+  # this they'd stay in the DB only. Idempotent (dedup by EventEO), so it is a
+  # no-op once everything is written, and it retries a CSV that was momentarily
+  # locked (e.g. open in Excel).
+  auto_flush_enabled: true
+  auto_flush_interval_sec: 600
 
 # Google-Sheet sync into "BHZ Analysis Log". Each animal gets TWO tabs:
 #   "<MouseID> Daily"  -- one row PER DAY (the rollup summary)

@@ -177,6 +177,17 @@ def main():
     except Exception:
         logger.exception("preictal worker start failed")
 
+    # Flush "Needs more onsets" events into the BHZ day CSVs on a timer.
+    # Those files never reach the PI approval gate (they're incomplete), and
+    # onsets that arrive via the 4-second AUTOSAVE bypass the Submit path that
+    # exports inline -- so without this they stay in the DB only. Idempotent
+    # (dedup by EventEO) and self-healing for a momentarily locked CSV.
+    try:
+        from src.utils import needs_scoring_flush as _ns_flush
+        _ns_flush.start_worker(store, config)
+    except Exception:
+        logger.exception("needs_scoring flush worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
