@@ -5,7 +5,12 @@ pyjwt[crypto]>=2.8
 cryptography>=41
 psutil>=5.9
 pyyaml>=6.0
-numpy>=1.24
+# UPPER BOUND IS LOAD-BEARING: umap-learn -> numba pins numpy, and no numba
+# release (through 0.66.0) accepts numpy >= 2.5. Installing numpy 2.5 breaks
+# `import umap` with "Numba needs NumPy 2.4 or less", which surfaced as a
+# peri-ictal build failure naming numba rather than the real cause. Raise this
+# only together with numba/umap-learn, and re-check with `pip check`.
+numpy>=1.24,<2.5
 scipy>=1.11
 # Imported by src/evoked_figures/render.py (Agg backend) for the headless
 # scatter + percentile-band PNGs of evoked metrics over time.
