@@ -1507,9 +1507,14 @@ def _reading_strip(res) -> html.Div:
         msg, colour, glyph = "", COLOR_TEXT_SECONDARY, ""
     prov = (f"n = {n} seizures · showing {pts:,} of {tot:,} stimuli"
             if tot and pts < tot else f"n = {n} seizures · {pts:,} stimuli")
+    # Say so when UMAP was asked for and PCA was drawn instead -- an unlabelled
+    # substitution would be read as the UMAP figure that was requested.
+    fb = (f"Showing PCA, not UMAP: {meta.get('fallback_reason')}."
+          if meta.get("fallback_from") == "umap" else "")
     return html.Div([
         html.Div(prov, style={"color": COLOR_TEXT_TERTIARY,
                               "fontSize": FONT_SIZE_CAPTION, "marginBottom": SPACE_2}),
+        _callout(fb, COLOR_WARNING, "⚠") if fb else html.Div(),
         html.Div([html.Span("Reading this plot   ",
                             style={"fontWeight": "600", "color": COLOR_TEXT_PRIMARY,
                                    "fontSize": FONT_SIZE_CAPTION}), *chips],

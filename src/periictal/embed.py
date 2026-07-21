@@ -70,6 +70,24 @@ def _pca(X: np.ndarray, n_components: int):
                  "components": pca.components_.tolist()}
 
 
+def _umap_unavailable() -> str | None:
+    """``None`` when UMAP is importable, else a short human reason.
+
+    UMAP is OPTIONAL here (PCA is the default and the honest projection), so an
+    environment that cannot import it must degrade to PCA rather than fail the
+    whole build. umap-learn pulls in numba, which pins a maximum NumPy -- a
+    routine `pip install -U numpy` therefore breaks the import with a message
+    that names numba, not umap, and reads like a code bug.
+    """
+    try:
+        import umap                               # noqa: F401
+    except ImportError as e:
+        return str(e) or "umap-learn is not installed"
+    except Exception as e:                        # noqa: BLE001
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def _umap(X: np.ndarray, n_components: int, n_neighbors: int, seed: int):
     import umap                                   # lazy: heavy import
     from sklearn.preprocessing import StandardScaler
@@ -99,11 +117,20 @@ def embed(df: pd.DataFrame, metrics: list[str] | None = None, *,
     rows = _stratified_subsample(df, cap, seed)
     sub = df.loc[rows]
     X, cols = _prepare(sub, metrics)
-    if method == "umap" and X.shape[0] >= 5:
+    fallback = None
+    if method == "umap":
+        if X.shape[0] < 5:
+            fallback = f"only {X.shape[0]} points — UMAP needs at least 5"
+        else:
+            fallback = _umap_unavailable()
+    if method == "umap" and fallback is None:
         emb, meta = _umap(X, n_components, n_neighbors, seed)
     else:
         emb, meta = _pca(X, min(n_components, X.shape[1]))
         method = "pca"
+        if fallback:
+            meta["fallback_from"] = "umap"
+            meta["fallback_reason"] = fallback
     meta["n_points"] = int(X.shape[0])
     meta["n_total"] = int(len(df))
     return {"emb": emb, "rows": rows, "cols": cols, "method": method, "meta": meta}
