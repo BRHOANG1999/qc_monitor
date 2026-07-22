@@ -47,7 +47,35 @@ _EPS = 1e-10
 _CHANG_GUARD_MS = 1.0                # skip the stim artifact right after t=0
 _CHANG_POST_MS = 200.0               # analysis window end (paper used 500)
 _CHANG_SMOOTH_MS = 1.0               # derivative/trace smoothing for detection
-_CHANG_MIN_SEG = 5                   # min samples per segment to fit
+# Peak search is bounded to an EARLY window. Searching the whole 200 ms let a
+# slow late hump win the argmax: on real BCH111 data 50% of epochs "peaked"
+# after 50 ms and 34% after 100 ms, so the "fast" component was routinely not
+# the fast component at all.
+_CHANG_PEAK_MAX_MS = 30.0
+# Minimum fitted-segment DURATION. This was 5 *samples*, i.e. 0.25 ms at 20 kHz
+# -- it validated pure noise (164/164 epochs passed, 72.6% of fast segments
+# spanned <5% of the window). A duration is sample-rate independent.
+_CHANG_MIN_SEG_MS = 1.0
+# Transition = the EARLIEST split from which the remainder is linear TO WITHIN
+# THE TRACE'S OWN NOISE. The previous rule (global minimum of |dy/dt| after the
+# peak) was biased to the settled tail by construction -- the flattest part of
+# an evoked response is its end -- so on the trial-averaged trace it landed at
+# 196.55 ms of a 200 ms window and inverted the fast/slow roles.
+#
+# The split is chosen as a PIECEWISE-LINEAR breakpoint: minimise the summed
+# residual of a line fit either side. Criteria scored on the slow side alone
+# (its MSE, or its distance from a noise floor) are not comparable across
+# candidates, because a shorter segment always fits a line better -- that
+# reintroduces the tail bias this replaced. Here the total sample count is
+# fixed, so moving the split only reallocates points between two models and
+# length cancels. The exponential is then fit on the fast segment as before;
+# the model used to FIND the boundary need not be the model fitted to it.
+# ABSOLUTE, and tiny: this exists only to resolve an exactly-flat cost basin
+# (a noiseless trace where many splits are equally perfect) toward the earliest
+# split. A relative tolerance instead admits splits that are merely "nearly as
+# good", which lets the exponential's tail leak into the slow segment.
+_CHANG_TIE_TOL = 1e-9
+_CHANG_MAX_SPLITS = 400              # candidate splits scanned (bounds memory)
 # Per-band lag-1 autocorrelation bands (Table 2 passive #11-13).
 _AC_BANDS = {
     "autocorr_low": (1.0, 64.0),
@@ -136,9 +164,10 @@ COLUMN_DOCS: dict[str, str] = {
         f"{_WAVELET_BANDS['wavelet_power_high_gamma'][0]:g}–"
         f"{_WAVELET_BANDS['wavelet_power_high_gamma'][1]:g} Hz.",
     # Chang et al. 2026 (Table 1 / Table 2). Fast/slow split at the transition
-    # point (smoothed |dy/dt| min after the fast peak) over the post-stim
-    # window [1, 200] ms; exp fit on |y−slow_baseline|, linear fit on the slow
-    # segment. All reconstructed from the paper's definitions (SI unavailable).
+    # point (earliest split from which the remainder is linear to within
+    # _CHANG_LIN_TOL) over the post-stim window [1, 200] ms; exp fit on
+    # |y−slow_baseline|, linear fit on the slow segment. All reconstructed from
+    # the paper's definitions (SI unavailable).
     "sum_power_mid": f"Σ periodogram power, {_MID_BAND[0]:g}–{_MID_BAND[1]:g} Hz "
                      "(paper SumPower[64-256]).",
     "freq_moment_vhigh": "power-weighted mean frequency, "
@@ -147,15 +176,21 @@ COLUMN_DOCS: dict[str, str] = {
     "curvature": "Σ|dy/dt| over the trace ÷ its peak-to-trough span — scale-free "
                  "wiggliness (paper curvature).",
     "skewness": "Fisher skewness of the trace's sample distribution.",
-    "tp_latency_ms": "transition-point latency: time of the smoothed-|dy/dt| "
-                     "minimum after the fast peak (fast→slow inflection).",
+    "tp_latency_ms": "transition-point latency: earliest split after the fast "
+                     "peak from which the rest of the window is linear to "
+                     "within 5% of the best achievable line fit.",
     "tp_amplitude": "trace amplitude at the transition point.",
     "expfit_decay": "b of a·exp(b·t′) fit to |y−slow_baseline| on the fast "
-                    "segment (t′ = ms since the fast peak); b<0 = recovery rate.",
+                    "segment (t′ = ms since the fast peak); b<0 = recovery "
+                    "rate. NaN when the fit returns b≥0 (a growing "
+                    "exponential is a failed fit, not a recovery rate).",
     "expfit_initial": "a of the fast-segment exponential fit — amplitude at the "
                       "peak (paper 'explni'; rises in importance in late phases).",
-    "expfit_rms": "RMS of the exponential-fit residuals (goodness).",
-    "expfit_curvature": "Σ|dy/dt| over the fast segment ÷ its span.",
+    "expfit_rms": "RMS of the exponential-fit residuals ÷ the fast segment's "
+                  "amplitude span (normalised, matching linfit_rms).",
+    "expfit_curvature": "mean |dy/dt| over the fast segment ÷ its amplitude "
+                        "span — length-independent (the Σ form tracked how "
+                        "many samples the segment happened to contain).",
     "expfit_skew": "skewness of |dy/dt| over the fast segment.",
     "expfit_area": "mean of the fitted exponential over the fast segment "
                    "(∫f·dt ÷ segment duration).",
@@ -164,7 +199,8 @@ COLUMN_DOCS: dict[str, str] = {
     "linfit_intercept": "intercept c of the slow-segment linear fit.",
     "linfit_rms": "RMS of the slow-segment linear-fit residuals ÷ segment span "
                   "(normalised deviation goodness).",
-    "linfit_curvature": "Σ|dy/dt| over the slow segment ÷ its span.",
+    "linfit_curvature": "mean |dy/dt| over the slow segment ÷ its amplitude "
+                        "span — length-independent (see expfit_curvature).",
     "linfit_skew": "skewness of |dy/dt| over the slow segment.",
     # Expensive (per-epoch fits; NOT in the default UMAP set).
     "recovery_tau": "exp-decay time constant of the post-peak Hilbert envelope: "
@@ -745,40 +781,155 @@ def _masked_skew(v, mask):
     return np.where((n >= 3) & (sd > _EPS), sk, np.nan)
 
 
-def _transition_indices(a, t, fs):
-    """Locate, per epoch, the fast-component peak and the fast->slow
-    transition point (smoothed |dy/dt| minimum after the peak).
+def _min_seg_samples(fs: float) -> int:
+    """Minimum samples per fitted segment, derived from a DURATION so the
+    threshold does not silently change with sample rate."""
+    assert fs > 0, "fs must be positive"
+    return max(3, int(round(_CHANG_MIN_SEG_MS * 1e-3 * fs)))
 
-    Returns ``(peak_idx, trans_idx, post_mask, valid)`` where *post_mask* is
-    the ``[guard, post]`` analysis window and *valid* flags epochs with enough
-    room for both segments. All within the post-stim window only."""
+
+def _peak_indices(a, sm, t, post, w: int):
+    """Fast-component peak: max |y| inside the EARLY window only.
+
+    Located on the SMOOTHED trace (so a single noise sample cannot win) then
+    refined to the true extremum on the raw trace within +/-*w*. The refinement
+    matters: a moving average blunts and delays an abrupt onset by about half a
+    window, which biases `a` -- the fitted amplitude AT the peak -- low.
+    """
+    win = post & (t <= _CHANG_PEAK_MAX_MS)
+    if not win.any():                       # window shorter than the bound
+        win = post
+    coarse = np.argmax(np.where(win[None, :], np.abs(sm), -np.inf), axis=1)
+    idx = np.arange(a.shape[1])
+    near = (np.abs(idx[None, :] - coarse[:, None]) <= w) & win[None, :]
+    return np.argmax(np.where(near, np.abs(a), -np.inf), axis=1)
+
+
+def _split_positions(n_s: int, hi: int) -> np.ndarray:
+    """Candidate transition sample indices, decimated to bound memory: the
+    suffix-sum scan is O(n) per epoch but holds [epochs x n_splits] arrays."""
+    step = max(1, hi // _CHANG_MAX_SPLITS)
+    return np.arange(0, hi, step, dtype=int)
+
+
+def _sse_from_sums(n, sx, sy, sxx, sxy, syy):
+    """Residual sum of squares of an OLS line, from its moment sums."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(n > 0, n, np.nan)
+        cxx = sxx - sx * sx / nz
+        cxy = sxy - sx * sy / nz
+        cyy = syy - sy * sy / nz
+        sse = cyy - np.where(np.abs(cxx) > _EPS, cxy * cxy / cxx, 0.0)
+        sse = np.where(n >= 3, np.maximum(sse, 0.0), np.inf)
+    return np.where(np.isfinite(sse), sse, np.inf)
+
+
+def _unexplained(sums):
+    """Fraction of variance a line leaves unexplained, from moment sums.
+
+    Dimensionless and length-fair, which is what lets the two sides of a split
+    be added together and compared across candidates. A segment with no spread
+    is perfectly explained (0), not undefined.
+    """
+    n, sx, sy, sxx, sxy, syy = sums
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(n > 0, n, np.nan)
+        cxx = sxx - sx * sx / nz
+        cxy = sxy - sx * sy / nz
+        cyy = syy - sy * sy / nz
+        sse = cyy - np.where(np.abs(cxx) > _EPS, cxy * cxy / cxx, 0.0)
+        frac = np.where(cyy > _EPS, np.maximum(sse, 0.0) / cyy, 0.0)
+    return np.where((n >= 3) & np.isfinite(frac), frac, np.inf)
+
+
+def _scan_sums(x, y, m, hi, kpos, start, rows):
+    """Weighted moment sums of (*x*, *y*) over ``[start, k)`` and ``[k, hi)``
+    for every candidate k, from one cumulative pass per moment."""
+    n_ep = m.shape[0]
+    left, right = [], []
+    for q in (m, m * x, m * y, m * x * x, m * x * y, m * y * y):
+        c = np.cumsum(q, axis=1)
+        c = np.concatenate([np.zeros((n_ep, 1)), c], axis=1)   # exclusive
+        at_k, at_s, at_hi = c[:, kpos], c[rows, start][:, None], c[:, hi][:, None]
+        left.append(at_k - at_s)
+        right.append(at_hi - at_k)
+    return left, right
+
+
+def _split_cost(t, a, hi, kpos, peak_idx, post):
+    """Cost of splitting at each candidate k: unexplained variance of the
+    EXPONENTIAL fit left of k (log space, where the model is linear) plus that
+    of the LINE fit right of k.
+
+    Scoring each side by the model actually fitted there -- rather than a line
+    on both -- keeps the left side from absorbing the exponential's curvature
+    and dragging the boundary early. Both terms are variance fractions, so
+    neither side is rewarded merely for being short.
+    """
+    n_ep, n_s = a.shape
+    idx = np.arange(n_s)
+    rows = np.arange(n_ep)
+    inwin = np.broadcast_to((idx < hi) & post, a.shape).astype(np.float64)
+    # Provisional slow component from the tail, used only to LOCATE the split
+    # (the real baseline needs the slow segment, which is what we are finding).
+    # It must be a LINE, not a constant: the exponential decays toward the slow
+    # component, so with a sloped slow component |y - const| is not exponential
+    # at all and the boundary collapses to the start of the window.
+    lo_i = int(np.argmax(post))
+    tail = inwin * (idx[None, :] >= hi - max(3, (hi - lo_i) // 4))
+    tm, tc, _ = _masked_linfit(t, a, tail > 0)
+    tm = np.where(np.isfinite(tm), tm, 0.0)
+    tc = np.where(np.isfinite(tc), tc, 0.0)
+
+    tt = np.broadcast_to(t[None, :], a.shape)
+    lin_l, lin_r = _scan_sums(tt, a, inwin, hi, kpos, peak_idx, rows)
+    dev = np.abs(a - (tm[:, None] * tt + tc[:, None]))
+    em = inwin * (dev > _EPS)
+    trel = tt - t[peak_idx][:, None]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        logdev = np.log(np.where(em > 0, dev, 1.0))
+    exp_l, _ = _scan_sums(trel, logdev, em, hi, kpos, peak_idx, rows)
+    return _unexplained(exp_l) + _unexplained(lin_r)
+
+
+def _transition_indices(a, t, fs):
+    """Locate, per epoch, the fast-component peak and the fast->slow transition.
+
+    The transition is the EARLIEST split from which the remainder is linear to
+    within ``_CHANG_LIN_TOL`` of the best line fit achievable over any split --
+    i.e. "where does the trace stop decaying and start drifting". This replaces
+    a global |dy/dt| minimum, which was biased to the settled tail by
+    construction and got *worse* as the signal got cleaner.
+
+    Returns ``(peak_idx, trans_idx, post_mask, valid)``.
+    """
     n_ep, n_s = a.shape
     post = (t >= _CHANG_GUARD_MS) & (t <= _CHANG_POST_MS)
-    idx = np.arange(n_s)
-    if post.sum() < 2 * _CHANG_MIN_SEG + 1:
-        z = np.zeros(n_ep, dtype=int)
+    min_seg = _min_seg_samples(fs)
+    z = np.zeros(n_ep, dtype=int)
+    if post.sum() < 2 * min_seg + 1:
         return z, z, post, np.zeros(n_ep, dtype=bool)
     hi = int(n_s - np.argmax(post[::-1]))     # one past last in-window sample
-    # Fast-component peak = max |y| inside the window.
-    absa = np.abs(a)
-    absa_win = np.where(post[None, :], absa, -np.inf)
-    peak_idx = np.argmax(absa_win, axis=1)
-    # Smoothed |dy/dt| for a stable transition minimum.
     w = max(1, int(round(_CHANG_SMOOTH_MS * 1e-3 * fs)))
-    dabs = np.abs(np.diff(_movmean2d(a, w), axis=1))       # [ep, n_s-1]
-    dabs = np.concatenate([dabs, dabs[:, -1:]], axis=1)     # pad to n_s
-    # Search the transition strictly after the peak, within the window,
-    # leaving room for a fittable slow segment at the end.
-    trans_hi = hi - _CHANG_MIN_SEG
-    after_peak = idx[None, :] >= (peak_idx[:, None] + _CHANG_MIN_SEG)
-    in_search = post[None, :] & after_peak & (idx[None, :] < trans_hi)
-    cand = np.where(in_search, dabs, np.inf)
-    trans_idx = np.argmin(cand, axis=1)
-    # Valid = a transition was found with room for a fittable segment on each
-    # side (peak_idx is always in-window by construction).
-    valid = (in_search.any(axis=1)
-             & (trans_idx - peak_idx >= _CHANG_MIN_SEG)
-             & (hi - trans_idx >= _CHANG_MIN_SEG))
+    peak_idx = _peak_indices(a, _movmean2d(a, w), t, post, w)
+
+    kpos = _split_positions(n_s, hi)
+    cost = _split_cost(t, a, hi, kpos, peak_idx, post)
+    ok = ((kpos[None, :] >= peak_idx[:, None] + min_seg)
+          & (kpos[None, :] <= hi - min_seg)
+          & post[kpos][None, :])
+    cand = np.where(ok, cost, np.inf)
+    best = np.min(cand, axis=1)
+    found = ok.any(axis=1) & np.isfinite(best)
+    # Prefer the EARLIEST split among near-ties: the fast component ends as
+    # soon as the remainder is explained, and later splits then only add
+    # already-explained samples to the fast side. Without this a flat cost
+    # basin is resolved by floating-point noise.
+    thr = best + _CHANG_TIE_TOL
+    near = ok & (cand <= thr[:, None])
+    trans_idx = np.where(found, kpos[np.argmax(near, axis=1)], 0)
+    valid = (found & (trans_idx - peak_idx >= min_seg)
+             & (hi - trans_idx >= min_seg))
     return peak_idx, trans_idx, post, valid
 
 
@@ -801,11 +952,18 @@ def compute_chang(traces, time_ms, fs: float) -> dict:
     fast = fast & valid[:, None]
     slow = slow & valid[:, None]
 
-    # Slow-component baseline = level at/after the transition (median of slow
-    # segment) -- the fast component decays toward this.
+    # Slow-component baseline = level at/after the transition -- the fast
+    # component decays toward this. This is a MEDIAN: the comment always said
+    # median but the code took a mean, which a late drift or a single artifact
+    # sample pulls off the settled level.
     slow_f = slow.astype(np.float64)
     slow_n = np.sum(slow_f, axis=1)
-    base = np.sum(slow_f * a, axis=1) / np.where(slow_n > 0, slow_n, 1.0)
+    base = np.zeros(n_ep, dtype=np.float64)
+    has_slow = slow_n > 0
+    if has_slow.any():                      # nanmedian warns on all-NaN rows
+        base[has_slow] = np.nanmedian(
+            np.where(slow[has_slow], a[has_slow], np.nan), axis=1)
+    base = np.where(np.isfinite(base), base, 0.0)
 
     # --- Fast component: exponential a*exp(b*t') on |y - baseline| --------- #
     trel = t[None, :] - t[peak_idx][:, None]        # ms since the peak
@@ -824,13 +982,19 @@ def compute_chang(traces, time_ms, fs: float) -> dict:
     pred_dev = np.exp(np.clip(ln_a[:, None] + b[:, None] * trel, -50.0, 50.0))
     r = (dev - pred_dev) * exp_mask
     fe_n = np.sum(exp_mask, axis=1)
+    fspan = _masked_span(a, fast)
     expfit_rms = np.where(fe_n > 0, np.sqrt(np.sum(r * r, axis=1)
                                             / np.where(fe_n > 0, fe_n, 1.0)), np.nan)
-    # Curvature over the fast segment (Σ|dy| / span), + skewness of |dy|.
+    expfit_rms = expfit_rms / (fspan + _EPS)     # normalised, as linfit_rms is
+    # Curvature = MEAN |dy/dt| over the segment, normalised by its amplitude
+    # span. The Σ form divided only by span, so it grew with sample count:
+    # rho(curvature, segment length) was +0.78 (fast) / +0.82 (slow) on real
+    # data -- it was mostly reporting how long the detector made the segment.
     dabs_full = np.abs(np.diff(a, axis=1))
     dabs_full = np.concatenate([dabs_full, dabs_full[:, -1:]], axis=1) / dt
-    fspan = _masked_span(a, fast)
+    fast_n = np.sum(fast, axis=1)
     expfit_curvature = (np.sum(dabs_full * fast, axis=1)
+                        / np.where(fast_n > 0, fast_n, 1.0)
                         / (fspan + _EPS))
     expfit_skew = _masked_skew(dabs_full, fast)
     # Area under the fit, normalised by segment duration.
@@ -843,19 +1007,27 @@ def compute_chang(traces, time_ms, fs: float) -> dict:
     linfit_rms = _masked_rms(t, a, slow, linfit_slope, linfit_intercept)
     sspan = _masked_span(a, slow)
     linfit_rms = linfit_rms / (sspan + _EPS)        # normalised deviation
-    linfit_curvature = np.sum(dabs_full * slow, axis=1) / (sspan + _EPS)
+    slow_cnt = np.sum(slow, axis=1)
+    linfit_curvature = (np.sum(dabs_full * slow, axis=1)
+                        / np.where(slow_cnt > 0, slow_cnt, 1.0)
+                        / (sspan + _EPS))
     linfit_skew = _masked_skew(dabs_full, slow)
 
-    nan = np.full(n_ep, np.nan)
+    # A positive b is a GROWING exponential -- the fit failed, and the column
+    # is documented as a recovery rate ("b < 0"). 8.5% of real epochs landed
+    # here and the values flowed into the feature matrix unflagged. Drop the
+    # exponential group for those epochs; the transition and the linear group
+    # are still meaningful, so they keep `valid`.
+    exp_ok = valid & np.isfinite(expfit_decay) & (expfit_decay < 0.0)
     out = {
         "tp_latency_ms": np.where(valid, t[trans_idx], np.nan),
         "tp_amplitude": np.where(valid, a[np.arange(n_ep), trans_idx], np.nan),
-        "expfit_decay": np.where(valid, expfit_decay, np.nan),
-        "expfit_initial": np.where(valid, expfit_initial, np.nan),
-        "expfit_rms": np.where(valid, expfit_rms, np.nan),
-        "expfit_curvature": np.where(valid, expfit_curvature, np.nan),
-        "expfit_skew": np.where(valid, expfit_skew, np.nan),
-        "expfit_area": np.where(valid, expfit_area, np.nan),
+        "expfit_decay": np.where(exp_ok, expfit_decay, np.nan),
+        "expfit_initial": np.where(exp_ok, expfit_initial, np.nan),
+        "expfit_rms": np.where(exp_ok, expfit_rms, np.nan),
+        "expfit_curvature": np.where(exp_ok, expfit_curvature, np.nan),
+        "expfit_skew": np.where(exp_ok, expfit_skew, np.nan),
+        "expfit_area": np.where(exp_ok, expfit_area, np.nan),
         "linfit_slope": np.where(valid, linfit_slope, np.nan),
         "linfit_intercept": np.where(valid, linfit_intercept, np.nan),
         "linfit_rms": np.where(valid, linfit_rms, np.nan),

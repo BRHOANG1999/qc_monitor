@@ -161,7 +161,27 @@ def list_animals(evoked_dir: str) -> list[str]:
 #     freq_moment_vhigh, curvature, skewness, the transition-point + exp/lin
 #     fit morphology set (tp_*, expfit_*, linfit_*), and (expensive) the
 #     per-band autocorr_{low,mid,high}.
-_FEATURE_SIDECAR_VERSION = "3"
+# v4: REDEFINED the transition-point / fit morphology set. The transition is now
+#     a changepoint (earliest split from which the remainder is linear) instead
+#     of a global |dy/dt| minimum, which was biased to the settled tail; the
+#     peak search is bounded to an early window; curvature is length-normalised;
+#     expfit_rms is span-normalised; the slow baseline is a real median; and a
+#     positive decay constant is rejected. See evoked_features._transition_indices.
+_FEATURE_SIDECAR_VERSION = "4"
+
+# Columns whose MEANING changed at v4. Unlike every previous bump (which only
+# ADDED columns), pre-v4 values for these are not merely older -- they came from
+# a detector we no longer trust, so reading them as-is would silently mix two
+# definitions in one feature matrix. They are nulled on read instead of
+# rejecting the whole sidecar, which would recreate the corpus-wide staleness
+# cliff. The background warmer refills them at its own pace.
+_REDEFINED_AT_V4 = (
+    "tp_latency_ms", "tp_amplitude",
+    "expfit_decay", "expfit_initial", "expfit_rms", "expfit_curvature",
+    "expfit_skew", "expfit_area",
+    "linfit_slope", "linfit_intercept", "linfit_rms", "linfit_curvature",
+    "linfit_skew",
+)
 
 # Versions whose rows are still USABLE. Every schema bump so far only ADDED
 # columns, and readers pull columns by name (a missing key reads as NaN), so an
@@ -172,7 +192,7 @@ _FEATURE_SIDECAR_VERSION = "3"
 # returned an empty matrix or (with warm_missing) tried to recompute hundreds of
 # multi-GB recordings inline and appeared to hang forever. Accept old rows for
 # READING and let the background warmer upgrade them at its own pace.
-_COMPATIBLE_SIDECAR_VERSIONS = {"2", "3"}
+_COMPATIBLE_SIDECAR_VERSIONS = {"2", "3", "4"}
 
 
 def feature_sidecar_path(mat_path: str, animal: str,
@@ -242,7 +262,27 @@ def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
     except OSError:
         return None
     rows = payload.get("rows")
-    return rows if isinstance(rows, list) else None
+    if not isinstance(rows, list):
+        return None
+    return _null_redefined(rows, str(payload.get("version")))
+
+
+def _null_redefined(rows: list, version: str) -> list:
+    """NaN out columns whose definition changed after *version*, so a stale
+    sidecar contributes its still-valid features and nothing else."""
+    if version == _FEATURE_SIDECAR_VERSION:
+        return rows
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+        r = dict(r)
+        for col in _REDEFINED_AT_V4:
+            if col in r:
+                r[col] = None
+        out.append(r)
+    return out
 
 
 def sidecar_is_current(mat_path: str, animal: str) -> bool:
