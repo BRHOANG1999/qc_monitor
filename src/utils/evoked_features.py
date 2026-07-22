@@ -75,6 +75,12 @@ _CHANG_MIN_SEG_MS = 1.0
 # split. A relative tolerance instead admits splits that are merely "nearly as
 # good", which lets the exponential's tail leak into the slow segment.
 _CHANG_TIE_TOL = 1e-9
+
+# Trials averaged per output row (centred sliding window). Features are
+# computed on this average, not on the raw single epoch: a single 20 kHz epoch
+# is noise-dominated, and the transition detector was measuring that noise. One
+# row per stimulus is preserved, so downstream timing/joins are unaffected.
+TRIAL_AVG_N = 5
 _CHANG_MAX_SPLITS = 400              # candidate splits scanned (bounds memory)
 # Per-band lag-1 autocorrelation bands (Table 2 passive #11-13).
 _AC_BANDS = {
@@ -779,6 +785,27 @@ def _masked_skew(v, mask):
     with np.errstate(invalid="ignore", divide="ignore"):
         sk = m3 / (sd ** 3)
     return np.where((n >= 3) & (sd > _EPS), sk, np.nan)
+
+
+def trial_moving_average(traces, n: int = None):
+    """Centred moving average ACROSS trials: row j becomes the mean of the *n*
+    trials centred on j, with the window shrinking at the ends.
+
+    Single evoked epochs are noise-dominated at 20 kHz -- the fast/slow split
+    and every fit downstream of it were being driven by sample noise rather
+    than morphology. Averaging n trials cuts that noise by ~sqrt(n) while
+    keeping exactly ONE row per stimulus, so each row still carries its own
+    stimulus time and the join to seizure onsets is unchanged. (A decimating
+    window, as in periictal.erpimage.sliding_trial_average, would not.)
+
+    Rows are ordered oldest-first, so the window is a local time neighbourhood.
+    """
+    a = _check(traces)
+    n = TRIAL_AVG_N if n is None else int(n)
+    if n <= 1 or a.shape[0] < 2:
+        return a
+    # _movmean2d averages along axis 1; transpose to average along trials.
+    return _movmean2d(a.T, min(n, a.shape[0])).T
 
 
 def _min_seg_samples(fs: float) -> int:

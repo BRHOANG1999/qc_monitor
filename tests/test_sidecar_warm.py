@@ -30,13 +30,30 @@ def _write_sidecar(mat: Path, animal: str, version: str, rows=None):
 
 # ----------------------------------------------------- version tolerance --- #
 
-def test_older_schema_sidecar_is_still_readable(tmp_path):
-    """A bump that only ADDS columns must not invalidate existing sidecars."""
+def test_listed_compatible_version_is_readable(tmp_path, monkeypatch):
+    """The anti-cliff mechanism: a version listed as compatible must READ.
+
+    An ADDITIVE bump belongs in that set -- readers pull columns by name, so an
+    older sidecar is good data minus the new columns. Asserted through the set
+    rather than a hardcoded "2", because which versions are additive changes.
+    """
+    monkeypatch.setattr(EO, "_COMPATIBLE_SIDECAR_VERSIONS",
+                        set(EO._COMPATIBLE_SIDECAR_VERSIONS) | {"3"})
     mat = tmp_path / "rec_evoked.mat"
     mat.write_bytes(b"x")
-    _write_sidecar(mat, "BCH111", "2")
-    rows = EO.read_feature_sidecar(str(mat), "BCH111")
-    assert rows, "an older-but-compatible sidecar must still read"
+    _write_sidecar(mat, "BCH111", "3")
+    assert EO.read_feature_sidecar(str(mat), "BCH111")
+
+
+def test_non_additive_bump_rejects_older_sidecars(tmp_path):
+    """v4 computes every feature on a 5-trial sliding average, so pre-v4 rows
+    measure a different quantity. Mixing them would put two noise regimes in one
+    matrix, split by WHEN each file was warmed -- so they must not read."""
+    mat = tmp_path / "rec_evoked.mat"
+    mat.write_bytes(b"x")
+    for stale in ("2", "3"):
+        _write_sidecar(mat, "BCH111", stale)
+        assert EO.read_feature_sidecar(str(mat), "BCH111") is None, stale
 
 
 def test_unknown_schema_version_is_rejected(tmp_path):
@@ -46,15 +63,28 @@ def test_unknown_schema_version_is_rejected(tmp_path):
     assert EO.read_feature_sidecar(str(mat), "BCH111") is None
 
 
-def test_sidecar_is_current_is_stricter_than_readable(tmp_path):
-    """Readable (v2) but NOT current -- that's what the warmer upgrades."""
+def test_sidecar_is_current_is_stricter_than_readable(tmp_path, monkeypatch):
+    """Readable but NOT current -- that is what the warmer upgrades."""
+    monkeypatch.setattr(EO, "_COMPATIBLE_SIDECAR_VERSIONS",
+                        set(EO._COMPATIBLE_SIDECAR_VERSIONS) | {"3"})
     mat = tmp_path / "rec_evoked.mat"
     mat.write_bytes(b"x")
-    _write_sidecar(mat, "BCH111", "2")
+    _write_sidecar(mat, "BCH111", "3")
     assert EO.read_feature_sidecar(str(mat), "BCH111")
     assert EO.sidecar_is_current(str(mat), "BCH111") is False
     _write_sidecar(mat, "BCH111", EO._FEATURE_SIDECAR_VERSION)
     assert EO.sidecar_is_current(str(mat), "BCH111") is True
+
+
+def test_wavelet_salvage_refuses_a_stale_version(tmp_path):
+    """The incremental upgrade must not splice v2/v3 wavelet columns (computed
+    per single epoch) into an otherwise trial-averaged v4 row."""
+    mat = tmp_path / "rec_evoked.mat"
+    mat.write_bytes(b"x")
+    _write_sidecar(mat, "BCH111", "3")
+    assert EO._read_raw_sidecar_rows(str(mat), "BCH111") is None
+    _write_sidecar(mat, "BCH111", EO._FEATURE_SIDECAR_VERSION)
+    assert EO._read_raw_sidecar_rows(str(mat), "BCH111")
 
 
 def test_sidecar_is_current_false_when_source_changed(tmp_path):

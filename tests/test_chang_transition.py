@@ -196,3 +196,47 @@ def test_short_window_returns_nan_without_raising():
     t = np.linspace(-1.0, 1.2, 40)
     out = ef.compute_chang(np.zeros((2, 40)), t, FS)
     assert np.isnan(out["tp_latency_ms"]).all()
+
+
+# ------------------------------------------- sliding trial average (v4) --- #
+
+def test_trial_average_preserves_one_row_per_stimulus():
+    """Row count must be unchanged: each row still carries its own stimulus
+    time, and the peri-ictal join to seizure onsets depends on that 1:1 map."""
+    x = np.random.default_rng(0).normal(size=(17, 400))
+    assert ef.trial_moving_average(x, 5).shape == x.shape
+
+
+def test_trial_average_is_centred_and_shrinks_at_the_edges():
+    x = np.arange(7, dtype=float)[:, None] * np.ones((1, 3))
+    got = ef.trial_moving_average(x, 5)[:, 0]
+    assert got[3] == pytest.approx(3.0)          # centred: mean(1..5)
+    assert got[0] == pytest.approx(1.0)          # shrunk: mean(0,1,2)
+    assert got[-1] == pytest.approx(5.0)         # shrunk: mean(4,5,6)
+
+
+def test_trial_average_reduces_noise():
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=(200, 50))
+    raw = float(np.std(x))
+    avg = float(np.std(ef.trial_moving_average(x, 5)))
+    assert avg < raw / 1.8, (raw, avg)           # ~sqrt(5) ≈ 2.24
+
+
+def test_trial_average_is_a_no_op_when_disabled():
+    x = np.random.default_rng(2).normal(size=(6, 20))
+    assert np.allclose(ef.trial_moving_average(x, 1), x)
+
+
+def test_trial_average_handles_fewer_trials_than_the_window():
+    x = np.random.default_rng(3).normal(size=(2, 20))
+    out = ef.trial_moving_average(x, 5)
+    assert out.shape == x.shape
+    assert np.allclose(out[0], x.mean(axis=0))   # window clamps to what exists
+
+
+def test_trial_average_does_not_mutate_the_input():
+    x = np.random.default_rng(4).normal(size=(9, 30))
+    before = x.copy()
+    ef.trial_moving_average(x, 5)
+    assert np.array_equal(x, before)

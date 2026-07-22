@@ -161,38 +161,40 @@ def list_animals(evoked_dir: str) -> list[str]:
 #     freq_moment_vhigh, curvature, skewness, the transition-point + exp/lin
 #     fit morphology set (tp_*, expfit_*, linfit_*), and (expensive) the
 #     per-band autocorr_{low,mid,high}.
-# v4: REDEFINED the transition-point / fit morphology set. The transition is now
-#     a changepoint (earliest split from which the remainder is linear) instead
-#     of a global |dy/dt| minimum, which was biased to the settled tail; the
-#     peak search is bounded to an early window; curvature is length-normalised;
-#     expfit_rms is span-normalised; the slow baseline is a real median; and a
-#     positive decay constant is rejected. See evoked_features._transition_indices.
+# v4: (a) every feature is now computed on a centred 5-TRIAL SLIDING AVERAGE
+#     rather than a single epoch -- a single 20 kHz epoch is noise-dominated;
+#     (b) the transition point is a changepoint instead of a global |dy/dt|
+#     minimum (which was biased to the settled tail), the peak search is bounded
+#     to an early window, curvature is length-normalised, expfit_rms is
+#     span-normalised, the slow baseline is a real median, and a positive decay
+#     constant is rejected. See evoked_features.trial_moving_average and
+#     _transition_indices.
 _FEATURE_SIDECAR_VERSION = "4"
 
-# Columns whose MEANING changed at v4. Unlike every previous bump (which only
-# ADDED columns), pre-v4 values for these are not merely older -- they came from
-# a detector we no longer trust, so reading them as-is would silently mix two
-# definitions in one feature matrix. They are nulled on read instead of
-# rejecting the whole sidecar, which would recreate the corpus-wide staleness
-# cliff. The background warmer refills them at its own pace.
-_REDEFINED_AT_V4 = (
-    "tp_latency_ms", "tp_amplitude",
-    "expfit_decay", "expfit_initial", "expfit_rms", "expfit_curvature",
-    "expfit_skew", "expfit_area",
-    "linfit_slope", "linfit_intercept", "linfit_rms", "linfit_curvature",
-    "linfit_skew",
-)
-
-# Versions whose rows are still USABLE. Every schema bump so far only ADDED
-# columns, and readers pull columns by name (a missing key reads as NaN), so an
-# older sidecar is perfectly good data -- just without the newer features.
+# Versions whose rows are still USABLE.
 #
-# Treating an older version as "missing" instead created a cliff: one bump made
-# every sidecar in the corpus stale at once, so the peri-ictal build either
-# returned an empty matrix or (with warm_missing) tried to recompute hundreds of
-# multi-GB recordings inline and appeared to hang forever. Accept old rows for
-# READING and let the background warmer upgrade them at its own pace.
-_COMPATIBLE_SIDECAR_VERSIONS = {"2", "3", "4"}
+# An ADDITIVE bump belongs in this set: readers pull columns by name (a missing
+# key reads as NaN), so an older sidecar is perfectly good data, just without
+# the newer features. Treating additive bumps as "missing" created a cliff once
+# already -- every sidecar in the corpus went stale at once and the peri-ictal
+# build either returned an empty matrix or (with warm_missing) tried to
+# recompute hundreds of multi-GB recordings inline and appeared to hang.
+#
+# v4 is NOT additive: every feature is now computed on a 5-trial sliding
+# average, so pre-v4 values are single-epoch measurements of a different
+# quantity. Mixing them would put two noise regimes in one matrix, and which
+# rows came from which would track WHEN a file happened to be warmed -- exactly
+# the kind of artefact these features exist to detect. So v2/v3 are rejected and
+# the corpus needs a re-warm. The background warmer does that unattended, and
+# the build reports an empty result with a reason rather than hanging.
+_COMPATIBLE_SIDECAR_VERSIONS = {"4"}
+
+# Versions whose WAVELET columns still mean what they mean now, i.e. from which
+# the incremental upgrade may salvage them instead of recomputing the Morlet CWT
+# (which dominates a warm). Separate from the set above because a bump can
+# invalidate cheap columns while leaving the expensive ones intact -- v4 does
+# not, since trial-averaging changes the wavelet columns too.
+_WAVELET_STABLE_VERSIONS = {"4"}
 
 
 def feature_sidecar_path(mat_path: str, animal: str,
@@ -229,7 +231,9 @@ def write_feature_sidecar(mat_path: str, animal: str, rows: list,
     payload = {"version": _FEATURE_SIDECAR_VERSION, "animal": animal,
                "variant": variant, "config_sig": config_sig,
                "source": os.path.basename(mat_path), "source_mtime": src_mtime,
-               "columns": list(ef.ALL_COLUMNS), "rows": rows}
+               "trial_avg": ef.TRIAL_AVG_N,      # self-describing: how many
+               "columns": list(ef.ALL_COLUMNS),  # trials each row averages
+               "rows": rows}
     tmp = sp + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f)
@@ -262,27 +266,7 @@ def read_feature_sidecar(mat_path: str, animal: str, variant: str = "evoked",
     except OSError:
         return None
     rows = payload.get("rows")
-    if not isinstance(rows, list):
-        return None
-    return _null_redefined(rows, str(payload.get("version")))
-
-
-def _null_redefined(rows: list, version: str) -> list:
-    """NaN out columns whose definition changed after *version*, so a stale
-    sidecar contributes its still-valid features and nothing else."""
-    if version == _FEATURE_SIDECAR_VERSION:
-        return rows
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
-            out.append(r)
-            continue
-        r = dict(r)
-        for col in _REDEFINED_AT_V4:
-            if col in r:
-                r[col] = None
-        out.append(r)
-    return out
+    return rows if isinstance(rows, list) else None
 
 
 def sidecar_is_current(mat_path: str, animal: str) -> bool:
@@ -306,15 +290,23 @@ def sidecar_is_current(mat_path: str, animal: str) -> bool:
 
 def _read_raw_sidecar_rows(mat_path: str, animal: str) -> list | None:
     """Rows from the default sidecar IGNORING the schema version, but only when
-    it matches the source .mat mtime (so the reused columns are still valid).
-    None otherwise. Used by the incremental upgrade to salvage the expensive
-    unchanged columns (wavelet) from an older-version sidecar."""
+    it matches the source .mat mtime AND its wavelet columns still mean the same
+    thing. None otherwise. Used by the incremental upgrade to salvage the
+    expensive unchanged columns (wavelet) from an older-version sidecar.
+
+    The version check is load-bearing: v4 computes EVERY feature on a 5-trial
+    sliding average, wavelet included, so salvaging a v2/v3 wavelet column would
+    splice single-epoch power into an otherwise trial-averaged row. That costs
+    the ~10x upgrade shortcut across this boundary -- correctly.
+    """
     sp = feature_sidecar_path(mat_path, animal, "evoked")
     if not os.path.exists(sp):
         return None
     try:
         with open(sp, "r", encoding="utf-8") as f:
             payload = json.load(f)
+        if str(payload.get("version")) not in _WAVELET_STABLE_VERSIONS:
+            return None
         if abs(float(payload.get("source_mtime", -1.0))
                - os.path.getmtime(mat_path)) > 1e-6:
             return None
@@ -437,13 +429,18 @@ def _abs_dt(rec_iso: str, seconds) -> str:
 
 def compute_feature_rows(path: str, animal: str, cfg=None,
                          expensive: bool = False,
-                         include_wavelet: bool = True) -> list:
+                         include_wavelet: bool = True,
+                         trial_avg: int | None = None) -> list:
     """Per-epoch feature rows for one ``*_evoked.mat`` / *animal* -- the
     canonical sidecar payload. Pure: reads the animal's traces, computes the
     full feature set (optionally with *cfg* window/filter/smoothing/baseline),
     and returns oldest-first rows. Shared by the dashboard preview/load path
     and the offline sidecar-build tool. *include_wavelet* False leaves the
     Morlet columns NaN (for the incremental sidecar upgrade).
+
+    Features are computed on a centred *trial_avg*-trial sliding average rather
+    than on the raw single epoch (default ``evoked_features.TRIAL_AVG_N``); pass
+    1 to disable. Still one row per stimulus.
     """
     assert path and animal, "path and animal required"
     chans = read_file_evoked(path, only_animals=[animal])
@@ -458,7 +455,10 @@ def compute_feature_rows(path: str, animal: str, cfg=None,
         if traces is None or tms is None or len(traces) < 1 or tms.size < 2:
             continue
         fs = 1000.0 / float(np.mean(np.diff(tms)))
-        feats = ef.compute_all(traces, tms, fs, expensive, cfg,
+        # Denoise ACROSS trials before any feature is computed. Rows stay 1:1
+        # with stimuli, so `times` / stim_time_sec below still line up.
+        avg = ef.trial_moving_average(traces, trial_avg)
+        feats = ef.compute_all(avg, tms, fs, expensive, cfg,
                                include_wavelet=include_wavelet)
         times = rec.get("times") or []
         pk, tr = rec.get("stim_peak") or [], rec.get("stim_trough") or []
