@@ -767,6 +767,18 @@ CREATE TABLE IF NOT EXISTS notification_log (
     UNIQUE(digest, sent_date)
 );
 
+-- Per-animal opt-in to email alerts when a seizure event is auto-filter
+-- flagged (the "🚩 flagged" checkbox on each Overview seizure-status card).
+-- Global, not per-user: the checkbox is a shared toggle on a shared card, and
+-- the email goes to the configured alerting recipients. The actual send is
+-- edge-triggered + deduped per flagged file via notification_log, so a standing
+-- flag pool does not re-email; a NEW flagged file for a subscribed animal does.
+CREATE TABLE IF NOT EXISTS flag_email_subscription (
+    animal_id  TEXT PRIMARY KEY,
+    enabled    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
 -- ----------------------------------------------------------------------
 -- Pre-ictal CWT sweep engine (thesis subsystem). Discovers the time-scale
 -- at which the pre-ictal trajectory is cleanest. Heavy compute runs in a

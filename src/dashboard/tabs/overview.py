@@ -34,7 +34,7 @@ import time
 from datetime import date, datetime, timedelta
 
 import plotly.graph_objects as go
-from dash import (Input, Output, Patch, State, callback_context,
+from dash import (MATCH, Input, Output, Patch, State, callback_context,
                    dash_table, dcc, html, no_update)
 from plotly.subplots import make_subplots
 
@@ -2631,7 +2631,8 @@ def _build_behavioral_seizure_status_card(store, config=None):
             labelStyle={"color": "#cfd0d6", "marginRight": "14px",
                          "cursor": "pointer"},
             inputStyle={"marginRight": "4px"}),
-        html.Div(_bsz_cards(rows), id="overview-bsz-body"),
+        html.Div(_bsz_cards(rows, store.flag_email_subscribed_animals()),
+                  id="overview-bsz-body"),
     ], style={"borderTop": f"1px solid {COLOR_DIVIDER}",
                "padding": "4px 4px 6px"})
     return html.Details([summary, body], open=False,
@@ -2641,8 +2642,34 @@ def _build_behavioral_seizure_status_card(store, config=None):
                                  "marginBottom": "6px"})
 
 
-def _bsz_cards(rows):
-    """Per-animal stat cards (the default 'Cards' view)."""
+def _flag_email_checkbox(animal_id: str, subscribed: bool):
+    """The per-animal 'email me when a seizure event is flagged' opt-in shown on
+    each seizure-status card. Global toggle -> Store.set_flag_email_subscription;
+    the background loop (AlertRuleEngine.check_flagged_events) does the sending."""
+    return html.Div([
+        dcc.Checklist(
+            id={"type": "bsz-flag-email", "animal": animal_id},
+            options=[{"label": " 📧 email me on a new flagged event",
+                       "value": "on"}],
+            value=["on"] if subscribed else [],
+            style={"fontSize": "10px"},
+            labelStyle={"color": "#cfd0d6", "cursor": "pointer",
+                         "display": "inline-flex", "alignItems": "center"},
+            inputStyle={"marginRight": "5px", "cursor": "pointer"}),
+        html.Span(id={"type": "bsz-flag-email-status", "animal": animal_id},
+                   style={"fontSize": "10px", "color": "#30d158",
+                           "marginLeft": "4px"}),
+    ], style={"marginTop": "6px", "paddingTop": "6px",
+               "borderTop": f"1px solid {COLOR_DIVIDER}"})
+
+
+def _bsz_cards(rows, subscribed: set | None = None):
+    """Per-animal stat cards (the default 'Cards' view).
+
+    *subscribed* is the set of animals opted in to flagged-event emails (from
+    ``Store.flag_email_subscribed_animals``); each card carries a checkbox
+    reflecting and toggling that opt-in."""
+    subscribed = subscribed or set()
     cells = []
     for r in rows:
         delta = (r["created_window"]
@@ -2741,6 +2768,8 @@ def _bsz_cards(rows):
                 f"last activity: {last}",
                 style={"color": "#888",
                         "fontSize": "10px"}),
+            _flag_email_checkbox(r["animal_id"],
+                                 r["animal_id"] in subscribed),
         ], style={"padding": "10px 12px",
                    "background": COLOR_SURFACE_1,
                    "border": f"1px solid {COLOR_DIVIDER}",
@@ -4117,7 +4146,30 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             days=7, exclude=_excluded_animals(config))
         if not rows:
             return no_update
-        return _bsz_charts(rows) if view == "charts" else _bsz_cards(rows)
+        if view == "charts":
+            return _bsz_charts(rows)
+        return _bsz_cards(rows, store.flag_email_subscribed_animals())
+
+    # Per-animal flagged-event email opt-in (the checkbox on each seizure-status
+    # card). MATCH so each card's checkbox is independent. On enable we seed the
+    # dedup baseline with the CURRENT flag pool, so turning it on does not email
+    # the whole standing backlog -- only files flagged afterwards.
+    @app.callback(
+        Output({"type": "bsz-flag-email-status", "animal": MATCH}, "children"),
+        Input({"type": "bsz-flag-email", "animal": MATCH}, "value"),
+        State({"type": "bsz-flag-email", "animal": MATCH}, "id"),
+        prevent_initial_call=True,
+    )
+    def _toggle_flag_email(value, cid):
+        animal = (cid or {}).get("animal")
+        if not animal:
+            return no_update
+        enabled = bool(value) and "on" in value
+        store.set_flag_email_subscription(animal, enabled)
+        if enabled:
+            store.seed_flag_email_baseline(animal)
+            return "✓ on — emails the alert list on new flags"
+        return ""
 
     # Fine-grained refresh: replace just the volatile Overview cards +
     # queue children instead of re-rendering the whole tab. Eliminates

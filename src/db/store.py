@@ -5578,6 +5578,101 @@ class Store:
         finally:
             conn.close()
 
+    def flagged_pool_file_ids_per_animal(self) -> dict[str, set]:
+        """``{animal_id: {file_id, ...}}`` for the SAME flag pool
+        ``flagged_pool_counts_per_animal`` counts -- the specific auto-filter
+        flagged files still awaiting review. Used by the flag-email alert to
+        fire once per NEW flagged file (deduped on the file id), so a standing
+        flag pool doesn't re-email."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT rel.animal_id AS a, rel.file_id AS fid
+                   FROM review_event_log rel
+                   JOIN processed_files pf ON pf.id = rel.file_id
+                   WHERE rel.action = 'auto_filter_flag'
+                     AND pf.has_video = 1
+                     AND rel.animal_id IS NOT NULL
+                     AND NOT EXISTS (
+                       SELECT 1 FROM review_state rs
+                       WHERE rs.file_id = rel.file_id
+                         AND rs.animal_id = rel.animal_id
+                         AND rs.status IN ('no_events', 'has_events',
+                                           'pending_pi_review', 'pi_approved',
+                                           'needs_scoring'))""").fetchall()
+            out: dict[str, set] = {}
+            for r in rows:
+                out.setdefault(r["a"], set()).add(int(r["fid"]))
+            return out
+        finally:
+            conn.close()
+
+    def set_flag_email_subscription(self, animal_id: str,
+                                    enabled: bool) -> None:
+        """Turn the per-animal flagged-event email alert on/off (the Overview
+        card checkbox). Global toggle -- see the table comment in schema.py."""
+        assert animal_id, "animal_id required"
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO flag_email_subscription
+                       (animal_id, enabled, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(animal_id) DO UPDATE SET
+                       enabled = excluded.enabled,
+                       updated_at = excluded.updated_at""",
+                (animal_id, 1 if enabled else 0, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def flag_email_subscribed_animals(self) -> set:
+        """The set of animal ids currently opted in to flagged-event emails."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT animal_id FROM flag_email_subscription "
+                "WHERE enabled = 1").fetchall()
+            return {r["animal_id"] for r in rows}
+        finally:
+            conn.close()
+
+    def is_flag_email_subscribed(self, animal_id: str) -> bool:
+        """Whether *animal_id*'s flagged-event email alert is on (card render)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM flag_email_subscription "
+                "WHERE animal_id = ? AND enabled = 1 LIMIT 1",
+                (animal_id,)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    # A constant (not a date) so the per-file claim in notification_log is
+    # once-EVER rather than once-per-day: a flagged file must email exactly once.
+    FLAG_EMAIL_SENT_KEY = "flag_email"
+
+    @staticmethod
+    def flag_email_digest(animal_id: str, file_id: int) -> str:
+        """notification_log digest identifying one (animal, flagged file) email."""
+        return f"flag_email:{animal_id}:{int(file_id)}"
+
+    def seed_flag_email_baseline(self, animal_id: str) -> int:
+        """Claim every CURRENTLY-flagged file for *animal_id* so enabling the
+        alert does not email the whole standing backlog -- only files flagged
+        AFTER opt-in trigger an email. Returns how many were seeded."""
+        assert animal_id, "animal_id required"
+        fids = self.flagged_pool_file_ids_per_animal().get(animal_id, set())
+        n = 0
+        for fid in fids:
+            if self.record_notification_sent(
+                    self.flag_email_digest(animal_id, fid),
+                    self.FLAG_EMAIL_SENT_KEY):
+                n += 1
+        return n
+
     def behavioral_seizure_status_per_animal(self,
                                                   days: int = 7,
                                                   exclude: list[str] | None = None

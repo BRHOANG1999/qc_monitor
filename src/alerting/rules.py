@@ -260,3 +260,58 @@ class AlertRuleEngine:
         else:
             logger.error("Alert recorded but email NOT sent [%s/%s]: %s",
                          severity, alert_type, message)
+
+    def check_flagged_events(self):
+        """Email the configured recipients when a NEW seizure event is
+        auto-filter flagged for an animal opted in via the Overview card
+        checkbox.
+
+        Edge-triggered and deduped per flagged file (``notification_log``), so a
+        standing flag pool never re-emails -- only a file flagged AFTER opt-in
+        does (existing flags are seeded at opt-in by
+        ``Store.seed_flag_email_baseline``). Does NOT go through ``_fire_alert``:
+        that rate-limits per alert TYPE, which would swallow a second animal's
+        flag within the window; here every distinct file must get through once.
+        Never raises -- alerting must not crash the poll loop.
+        """
+        try:
+            subs = self.store.flag_email_subscribed_animals()
+            if not subs:
+                return
+            per_animal = self.store.flagged_pool_file_ids_per_animal()
+        except Exception as e:  # noqa: BLE001 -- alerting must not crash the loop
+            logger.error("flag-email check failed to read state: %s", e)
+            return
+        for animal in sorted(subs):
+            for fid in sorted(per_animal.get(animal, set())):
+                self._fire_flagged_event(animal, fid)
+
+    def _fire_flagged_event(self, animal: str, file_id: int):
+        """Send (once) the flagged-event email for one (animal, file)."""
+        digest = self.store.flag_email_digest(animal, file_id)
+        sent_key = self.store.FLAG_EMAIL_SENT_KEY
+        # Atomic claim: the first caller to see this (animal, file) wins, so the
+        # email goes out exactly once across daemon restarts / multiple daemons.
+        if not self.store.record_notification_sent(digest, sent_key):
+            return
+        subject = f"{animal}: new flagged seizure event"
+        body = (f"A seizure event was auto-filter flagged for {animal} "
+                f"(recording file id {file_id}) and is awaiting review in the "
+                f"Video Review 'Flag' queue.\n\n"
+                f"You are receiving this because {animal}'s flagged-event email "
+                f"alert is enabled on the Overview behavioral-seizure card. "
+                f"Turn it off there to stop these.")
+        try:
+            ok = self.emailer.send(subject, body, "warning")
+        except Exception as e:  # noqa: BLE001 -- alerting must not crash the loop
+            ok = False
+            logger.error("flag-email raised [%s/file %s]: %s", animal, file_id, e)
+        if ok:
+            self.store.insert_alert("flagged_event", "warning", body)
+            logger.warning("flag-email sent: %s file %s", animal, file_id)
+        else:
+            # Release the claim so a later tick retries rather than permanently
+            # suppressing this file on a transient SMTP failure.
+            self.store.release_notification_sent(digest, sent_key)
+            logger.error("flag-email NOT sent, claim released: %s file %s",
+                         animal, file_id)

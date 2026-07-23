@@ -289,6 +289,9 @@ def main():
                 alert_engine.check_unrecognized_recordings(
                     watcher.last_scan_stats)
                 alert_engine.check_matlab_failures()
+                # Per-animal opt-in: email when a new seizure event is flagged
+                # (Overview seizure-status card checkbox). Deduped per file.
+                alert_engine.check_flagged_events()
 
                 if accessible:
                     consecutive_network_failures = 0
