@@ -2177,14 +2177,15 @@ def _overview_tab(store: Store, config: dict | None = None):
     # Stim-artifact overlay: lazily loaded on button click (loading many
     # traces is heavy), in its own section so a refresh tick doesn't wipe it.
     artifact_overlay = _collapsible(
-        "Stim-artifact overlay (active channels)",
+        "Stim-artifact overlay",
         html.Div([
-            html.Div("Overlays the recorded stim artifacts of recent "
-                     "recordings per active channel (oldest→newest) so you "
-                     "can see how the pulse response + ohmic step shift "
-                     "alongside the Rₐ trend.",
+            html.Div("Overlays the recorded stim artifacts (oldest→newest) so "
+                     "you can see how the pulse response + ohmic step shift "
+                     "alongside the Rₐ trend. Pick any animal + stim "
+                     "location(s) and a recording date range, then Load.",
                      style={"color": "#a0a0b0", "fontSize": "11px",
                              "marginBottom": "6px"}),
+            _artifact_overlay_controls(store, config),
             html.Button("Load / refresh overlay",
                         id="overview-artifact-btn", n_clicks=0,
                         style={"fontSize": "12px", "cursor": "pointer",
@@ -3782,16 +3783,99 @@ def _add_access_r_trace(fig, rr, cc, x, dates, yvals, stat, icfg):
                            "<extra></extra>")), rr, cc)
 
 
-def _impedance_artifact_overlay(store, active_keys, limit: int = 24):
-    """Overlay the recorded stim-artifact traces (per active channel) of the
-    last *limit* recordings, coloured oldest→newest, zoomed to the transition
+_ARTIFACT_LABEL = {"color": "#888", "fontSize": "11px", "display": "block",
+                   "marginBottom": "2px"}
+
+
+def _artifact_default_selection(store, config):
+    """(animals, default_animal, default_locs, (start, end)) to seed the
+    stim-artifact overlay controls -- newest active animal, its channels, and
+    its dominant-charge date span (last 30 days of it)."""
+    amap = _impedance_animals_and_electrodes(store, config)
+    animals = sorted(amap.keys())
+    if not animals:
+        return [], None, [], (None, None)
+    try:
+        active = {a for a, _c in store.active_impedance_channel_keys()}
+    except Exception:  # noqa: BLE001
+        active = set()
+    default_animal = next((a for a in animals if a in active), animals[0])
+    locs = list(amap.get(default_animal, []))
+    return animals, default_animal, locs, _artifact_range_for(store, default_animal, locs)
+
+
+def _artifact_range_for(store, animal, locs):
+    """(start_date, end_date) YYYY-MM-DD for *animal*'s *locs*: the last 30 days
+    of the union of their dominant-charge history, or (None, None)."""
+    los, his = [], []
+    for loc in locs or []:
+        try:
+            b = store.channel_trace_date_bounds(animal, loc)
+        except Exception:  # noqa: BLE001
+            b = None
+        if b:
+            los.append(b[0])
+            his.append(b[1])
+    if not his:
+        return (None, None)
+    end = min(max(his)[:10].replace("_", "-"), date.today().isoformat())
+    lo = min(los)[:10].replace("_", "-")
+    try:
+        start = max(lo, (date.fromisoformat(end) - timedelta(days=30)).isoformat())
+    except ValueError:
+        start = lo
+    return (start, end)
+
+
+def _artifact_overlay_controls(store, config):
+    """Animal + stim-location(s) + date-range pickers for the stim-artifact
+    overlay. Lets the reviewer pick any animal/electrode (incl. retired) and an
+    explicit recording window instead of the active-channels / most-recent
+    default. Mirrors the electrode-compare card's animal->electrode cascade."""
+    animals, animal0, locs0, (start0, end0) = _artifact_default_selection(
+        store, config)
+    return html.Div([
+        html.Div([
+            html.Span("Animal", style=_ARTIFACT_LABEL),
+            dcc.Dropdown(
+                id="overview-artifact-animal",
+                options=[{"label": a, "value": a} for a in animals],
+                value=animal0, clearable=False,
+                style=DROPDOWN_STYLE, className="dark-dropdown"),
+        ], style={"minWidth": "140px"}),
+        html.Div([
+            html.Span("Stim location(s)", style=_ARTIFACT_LABEL),
+            dcc.Dropdown(
+                id="overview-artifact-locs",
+                options=[{"label": c, "value": c} for c in locs0],
+                value=locs0, multi=True,
+                placeholder="Pick stim channel(s) to overlay",
+                style=DROPDOWN_STYLE, className="dark-dropdown"),
+        ], style={"flex": "1", "minWidth": "220px"}),
+        html.Div([
+            html.Span("Recording date range", style=_ARTIFACT_LABEL),
+            dcc.DatePickerRange(
+                id="overview-artifact-daterange",
+                start_date=start0, end_date=end0,
+                display_format="YYYY-MM-DD",
+                className="dark-daterange"),
+        ], style={"minWidth": "240px"}),
+    ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end",
+              "gap": "12px", "marginBottom": "8px"})
+
+
+def _impedance_artifact_overlay(store, keys, *, start=None, end=None,
+                                limit: int = 24, max_traces: int = 200):
+    """Overlay the recorded stim-artifact traces (per (animal, channel) in
+    *keys*) coloured oldest→newest, zoomed to the transition
     window — so a shift in the pulse response / ohmic step is visible next to
     the Rₐ trend. Lazily built (heavy: loads many traces)."""
     from plotly.colors import sample_colorscale
-    keys = sorted(active_keys)
+    keys = sorted(keys)
     if not keys:
-        return html.Div("No active channels.",
+        return html.Div("Pick an animal and at least one stim location.",
                         style={"color": "#888", "fontSize": "11px"})
+    ranged = bool(start and end)
     cols = min(len(keys), 2)
     n_rows = (len(keys) + cols - 1) // cols
     fig = make_subplots(rows=n_rows, cols=cols,
@@ -3799,9 +3883,16 @@ def _impedance_artifact_overlay(store, active_keys, limit: int = 24):
                         vertical_spacing=0.18, horizontal_spacing=0.09)
     lo, hi = -0.3, 1.0
     n_total = 0
+    capped = False
     for i, (animal, ch) in enumerate(keys):
         rr, cc = i // cols + 1, i % cols + 1
-        traces = store.recent_channel_traces(animal, ch, limit)
+        if ranged:
+            traces = store.channel_traces_in_range(
+                animal, ch, start, end, max_traces=max_traces)
+            if len(traces) >= max_traces:
+                capped = True
+        else:
+            traces = store.recent_channel_traces(animal, ch, limit)
         oldest_first = list(reversed(traces))       # oldest → newest
         m = len(oldest_first)
         n_total += m
@@ -3830,9 +3921,17 @@ def _impedance_artifact_overlay(store, active_keys, limit: int = 24):
     fig.update_yaxes(title_text="raw", title_font=dict(size=9),
                      tickfont=dict(size=8), gridcolor="#2a2a3a",
                      automargin=True)
+    span = f" · {start} → {end}" if ranged else ""
+    cap_note = (f" · capped at {max_traces}/channel — narrow the range"
+                if capped else "")
+    if n_total == 0:
+        return html.Div(
+            "No recordings for this selection." + (
+                " Try a wider date range." if ranged else ""),
+            style={"color": "#888", "fontSize": "11px", "padding": "6px 2px"})
     return html.Div([
         html.Div(f"{n_total} traces · oldest (blue) → newest (red) · "
-                 "dominant test-pulse charge only",
+                 f"dominant test-pulse charge only{span}{cap_note}",
                  style={"color": "#888", "fontSize": "10px",
                          "padding": "0 2px 4px"}),
         dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
@@ -4206,16 +4305,45 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("overview-artifact-body", "children"),
         Input("overview-artifact-btn", "n_clicks"),
+        State("overview-artifact-animal", "value"),
+        State("overview-artifact-locs", "value"),
+        State("overview-artifact-daterange", "start_date"),
+        State("overview-artifact-daterange", "end_date"),
         prevent_initial_call=True,
     )
-    def load_artifact_overlay(_n):
+    def load_artifact_overlay(_n, animal, locs, start, end):
         try:
-            active = store.active_impedance_channel_keys()
-            return _impedance_artifact_overlay(store, active)
+            # No animal chosen (e.g. empty colony) -> fall back to the active
+            # channels over the recent-N default, preserving prior behaviour.
+            if not animal:
+                keys = sorted(store.active_impedance_channel_keys())
+                return _impedance_artifact_overlay(store, keys)
+            keys = [(animal, loc) for loc in (locs or [])]
+            return _impedance_artifact_overlay(store, keys, start=start, end=end)
         except Exception as e:  # noqa: BLE001
             logger.warning("artifact overlay failed: %s", e)
             return html.Div("Overlay failed to load.",
                             style={"color": "#888", "fontSize": "11px"})
+
+    # Animal -> stim-location options + a date range matching that animal's
+    # history. Mirrors ecmp_electrode_options; no prevent_initial_call so the
+    # controls are always consistent with the current animal.
+    @app.callback(
+        Output("overview-artifact-locs", "options"),
+        Output("overview-artifact-locs", "value"),
+        Output("overview-artifact-daterange", "start_date"),
+        Output("overview-artifact-daterange", "end_date"),
+        Input("overview-artifact-animal", "value"),
+    )
+    def artifact_location_options(animal):
+        try:
+            locs = _impedance_animals_and_electrodes(
+                store, config).get(animal, [])
+        except Exception as e:  # noqa: BLE001 -- never blank the control silently
+            logger.warning("artifact location options failed: %s", e)
+            locs = []
+        start, end = _artifact_range_for(store, animal, locs)
+        return ([{"label": c, "value": c} for c in locs], locs, start, end)
 
     # Electrode-history comparison: picking an animal repopulates its electrode
     # list (default = up to 4 of them); the overlay figure redraws on any of

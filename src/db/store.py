@@ -2086,6 +2086,90 @@ class Store:
                  int(limit))).fetchall()
         finally:
             conn.close()
+        return self._decode_channel_trace_rows(rows)
+
+    def channel_traces_in_range(self, animal_id: str, channel_name: str,
+                                start_date: str, end_date: str, *,
+                                max_traces: int = 200) -> list[dict]:
+        """Recorded stim-artifact traces for one channel within an inclusive
+        date range, newest first -- the date-selectable twin of
+        ``recent_channel_traces``.
+
+        Same restriction to the channel's DOMINANT stim charge + valid access
+        resistance, same ``{chunk_datetime, time_ms, mean_trace}`` shape.
+        *start_date* / *end_date* are ``YYYY-MM-DD``; *end_date* is inclusive
+        through end-of-day. Capped at *max_traces* (a wide range can pull
+        hundreds of heavy traces); the caller reports the cap. Empty when the
+        channel has no dominant-charge history or nothing falls in range."""
+        assert animal_id and channel_name, "animal_id and channel_name required"
+        assert start_date and end_date, "start_date and end_date required"
+        # Inclusive-through-end-of-day: chunk_datetime is 'YYYY_MM_DD__HH_MM_SS',
+        # which sorts lexically, so a '~' upper bound covers the whole end day.
+        lo = f"{start_date.replace('-', '_')}__00_00_00"
+        hi = f"{end_date.replace('-', '_')}__~"
+        conn = self._connect()
+        try:
+            crow = conn.execute(
+                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
+                   WHERE animal_id = ? AND channel_name = ?
+                     AND access_r_kohm IS NOT NULL
+                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
+                   LIMIT 1""", (animal_id, channel_name)).fetchone()
+            if not crow:
+                return []
+            rows = conn.execute(
+                """SELECT pf.chunk_datetime, ew.time_axis_ms, ew.mean_trace
+                   FROM evoked_waveforms ew
+                   JOIN processed_files pf ON pf.id = ew.file_id
+                   JOIN channel_impedance ci
+                     ON ci.file_id = ew.file_id AND ci.channel = ew.channel
+                   WHERE ci.animal_id = ? AND ci.channel_name = ?
+                     AND ci.access_r_kohm IS NOT NULL
+                     AND ci.charge_nc IS ?
+                     AND pf.chunk_datetime >= ? AND pf.chunk_datetime <= ?
+                   ORDER BY pf.chunk_datetime DESC LIMIT ?""",
+                (animal_id, channel_name, crow["charge_nc"], lo, hi,
+                 int(max_traces))).fetchall()
+        finally:
+            conn.close()
+        return self._decode_channel_trace_rows(rows)
+
+    def channel_trace_date_bounds(self, animal_id: str,
+                                  channel_name: str) -> tuple | None:
+        """``(min_chunk_datetime, max_chunk_datetime)`` for the channel's
+        dominant-charge trace history, or ``None`` when it has none -- used to
+        seed the overlay's date-range picker bounds/defaults."""
+        assert animal_id and channel_name, "animal_id and channel_name required"
+        conn = self._connect()
+        try:
+            crow = conn.execute(
+                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
+                   WHERE animal_id = ? AND channel_name = ?
+                     AND access_r_kohm IS NOT NULL
+                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
+                   LIMIT 1""", (animal_id, channel_name)).fetchone()
+            if not crow:
+                return None
+            row = conn.execute(
+                """SELECT MIN(pf.chunk_datetime) lo, MAX(pf.chunk_datetime) hi
+                   FROM evoked_waveforms ew
+                   JOIN processed_files pf ON pf.id = ew.file_id
+                   JOIN channel_impedance ci
+                     ON ci.file_id = ew.file_id AND ci.channel = ew.channel
+                   WHERE ci.animal_id = ? AND ci.channel_name = ?
+                     AND ci.access_r_kohm IS NOT NULL
+                     AND ci.charge_nc IS ?""",
+                (animal_id, channel_name, crow["charge_nc"])).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["lo"] or not row["hi"]:
+            return None
+        return (row["lo"], row["hi"])
+
+    @staticmethod
+    def _decode_channel_trace_rows(rows) -> list[dict]:
+        """Rows -> ``{chunk_datetime, time_ms, mean_trace}`` dicts, dropping any
+        with unparseable JSON. Shared by the recent / in-range trace readers."""
         out = []
         for r in rows:
             try:

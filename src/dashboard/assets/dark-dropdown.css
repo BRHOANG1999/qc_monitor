@@ -116,3 +116,67 @@
 .dash-dropdown-action-button:hover {
     color: white !important;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Dark theme for dcc.DatePickerRange (react-dates). First and only use in */
+/* the app: the Overview stim-artifact overlay recording-date range. The   */
+/* calendar popup renders in a body-level portal, so its rules are global  */
+/* (not scoped to .dark-daterange) -- safe while this is the sole picker.   */
+.DateRangePickerInput,
+.DateInput {
+    background-color: #1e1e2f !important;
+    border-color: #555 !important;
+}
+.DateInput_input {
+    background-color: #1e1e2f !important;
+    color: #f0f0f5 !important;
+    font-size: 12px !important;
+    border-bottom: 2px solid transparent !important;
+}
+.DateInput_input__focused {
+    border-bottom-color: #5e7ce2 !important;
+}
+.DateRangePickerInput_arrow svg { fill: #888 !important; }
+.DateRangePicker_picker,
+.CalendarMonthGrid,
+.CalendarMonth,
+.DayPicker,
+.DayPicker_transitionContainer {
+    background-color: #1e1e2f !important;
+    color: #f0f0f5 !important;
+}
+.CalendarMonth_caption { color: #f0f0f5 !important; }
+.DayPicker_weekHeader { color: #a0a0b0 !important; }
+.CalendarDay__default {
+    background: #1e1e2f !important;
+    border-color: #2a2a3a !important;
+    color: #cfd0d6 !important;
+}
+.CalendarDay__default:hover {
+    background: #333 !important;
+    border-color: #555 !important;
+    color: #fff !important;
+}
+.CalendarDay__selected,
+.CalendarDay__selected:hover {
+    background: #5e7ce2 !important;
+    border-color: #5e7ce2 !important;
+    color: #fff !important;
+}
+.CalendarDay__selected_span,
+.CalendarDay__hovered_span {
+    background: #37416b !important;
+    border-color: #2a2a3a !important;
+    color: #fff !important;
+}
+.CalendarDay__blocked_out_of_range,
+.CalendarDay__blocked_out_of_range:hover {
+    background: #16161f !important;
+    color: #555 !important;
+    border-color: #2a2a3a !important;
+}
+.DayPickerNavigation_button__default {
+    background-color: #1e1e2f !important;
+    border-color: #555 !important;
+}
+.DayPickerNavigation_svg__horizontal { fill: #cfd0d6 !important; }
