@@ -118,72 +118,29 @@
 }
 
 /* ---------------------------------------------------------------------- */
-/* Dark theme for dcc.DatePickerRange (react-dates). First and only use in */
-/* the app: the Overview stim-artifact overlay recording-date range. The   */
-/* calendar popup renders in a body-level portal, so its rules are global  */
-/* (not scoped to .dark-daterange) -- safe while this is the sole picker.   */
-.DateRangePicker,
-.DateRangePickerInput,
-.DateRangePickerInput__withBorder,
-.DateInput {
-    background-color: #1e1e2f !important;
-    border-color: #555 !important;
+/* Dark theme for dcc.DatePickerRange (Dash 4.x custom `dash-datepicker`    */
+/* component -- NOT legacy react-dates). Every visual property in this      */
+/* component resolves through --Dash-* design tokens whose defaults are the */
+/* LIGHT theme (that's why the input + calendar rendered white). Overriding */
+/* the tokens themes it completely -- input, caret, and the body-portal     */
+/* calendar popup. The popup is a separate DOM subtree, so the tokens are   */
+/* set on its own container classes too (custom properties inherit down).   */
+/* First use in the app: the Overview stim-artifact overlay date ranges.    */
+.dash-datepicker,
+.dash-datepicker-portal,
+.dash-datepicker-content,
+.dash-datepicker-calendar-wrapper {
+    --Dash-Fill-Inverse-Strong: #1e1e2f;   /* surfaces (input, calendar bg) */
+    --Dash-Text-Strong: #f0f0f5;           /* text + caret/nav icons        */
+    --Dash-Text-Disabled: #8a8a99;         /* placeholder / disabled days   */
+    --Dash-Stroke-Strong: #555;            /* borders                        */
+    --Dash-Fill-Interactive-Strong: #5e7ce2;  /* selected day / accent       */
+    --Dash-Fill-Interactive-Weak: #37416b;    /* hover / in-range highlight   */
+    --Dash-Shading-Strong: rgba(0, 0, 0, 0.6);   /* portal backdrop + shadow */
+    --Dash-Shading-Weak: rgba(0, 0, 0, 0.4);
 }
-.DateRangePickerInput__withBorder { border-radius: 5px !important; }
-.DateInput_input,
-.DateInput_input__disabled {
-    background-color: #1e1e2f !important;
-    color: #f0f0f5 !important;
-    font-size: 12px !important;
-    font-weight: 400 !important;
-    font-style: normal !important;
-    border-bottom: 2px solid transparent !important;
-}
-.DateInput_input::placeholder { color: #8a8a99 !important; }
-.DateInput_input__focused {
-    border-bottom-color: #5e7ce2 !important;
-}
-.DateRangePickerInput_arrow svg { fill: #888 !important; }
-.DateRangePicker_picker,
-.CalendarMonthGrid,
-.CalendarMonth,
-.DayPicker,
-.DayPicker_transitionContainer {
-    background-color: #1e1e2f !important;
+/* Inverse-Strong doubles as "text on the accent fill" for a selected day;
+   in dark that would be dark-on-blue, so force light text there. */
+.dash-datepicker-calendar-date-selected:not(.dash-datepicker-calendar-date-outside) {
     color: #f0f0f5 !important;
 }
-.CalendarMonth_caption { color: #f0f0f5 !important; }
-.DayPicker_weekHeader { color: #a0a0b0 !important; }
-.CalendarDay__default {
-    background: #1e1e2f !important;
-    border-color: #2a2a3a !important;
-    color: #cfd0d6 !important;
-}
-.CalendarDay__default:hover {
-    background: #333 !important;
-    border-color: #555 !important;
-    color: #fff !important;
-}
-.CalendarDay__selected,
-.CalendarDay__selected:hover {
-    background: #5e7ce2 !important;
-    border-color: #5e7ce2 !important;
-    color: #fff !important;
-}
-.CalendarDay__selected_span,
-.CalendarDay__hovered_span {
-    background: #37416b !important;
-    border-color: #2a2a3a !important;
-    color: #fff !important;
-}
-.CalendarDay__blocked_out_of_range,
-.CalendarDay__blocked_out_of_range:hover {
-    background: #16161f !important;
-    color: #555 !important;
-    border-color: #2a2a3a !important;
-}
-.DayPickerNavigation_button__default {
-    background-color: #1e1e2f !important;
-    border-color: #555 !important;
-}
-.DayPickerNavigation_svg__horizontal { fill: #cfd0d6 !important; }
