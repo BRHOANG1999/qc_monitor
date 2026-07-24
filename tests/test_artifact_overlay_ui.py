@@ -1,9 +1,10 @@
-"""Overview stim-artifact overlay: selection helpers + figure builder.
+"""Overview stim-artifact overlay: selection helpers + per-figure builder.
 
-The overlay lets a reviewer pick any animal + stim location(s) + a recording
-date range instead of the active-channels / most-recent-N default. These cover
-the non-Dash logic behind that: default selection, the date-range seed, and the
-generalised builder (ranged vs recent-N fallback + empty state).
+The overlay lets a reviewer pick any animal + stim location(s), and gives EACH
+location its own recording date range (they're usually from different periods).
+These cover the non-Dash logic behind that: default selection, the per-location
+date-range seed, the single-figure builder (ranged vs recent-N fallback + empty
+state), and the multi-location body.
 
 Run: pytest tests/test_artifact_overlay_ui.py -q
 """
@@ -68,15 +69,29 @@ def _text(component) -> str:
     return _text(ch) if ch is not None else ""
 
 
+def _find_ids(component, out=None):
+    """Collect every component `id` (dict or str) in a Dash tree."""
+    out = [] if out is None else out
+    cid = getattr(component, "id", None)
+    if cid is not None:
+        out.append(cid)
+    ch = getattr(component, "children", None)
+    if isinstance(ch, (list, tuple)):
+        for c in ch:
+            _find_ids(c, out)
+    elif ch is not None:
+        _find_ids(ch, out)
+    return out
+
+
 # ----------------------------------------------------- default selection --- #
 
-def test_default_selection_lists_all_animals_and_seeds_range(tmp_path):
+def test_default_selection_lists_all_animals_and_locations(tmp_path):
     s = _store(tmp_path)
-    animals, animal0, locs0, (start, end) = ov._artifact_default_selection(s, {})
+    animals, animal0, locs0 = ov._artifact_default_selection(s, {})
     assert set(animals) == {"BCH061", "BCH062"}
     assert animal0 in animals
     assert locs0 == ov._impedance_animals_and_electrodes(s, {}).get(animal0)
-    assert start and end and start <= end
 
 
 def test_range_for_is_last_30_days_of_history(tmp_path):
@@ -93,35 +108,69 @@ def test_range_none_for_unknown_channel(tmp_path):
     assert ov._artifact_range_for(s, "BCH062", ["nope"]) == (None, None)
 
 
-# ------------------------------------------------------------- builder --- #
+# --------------------------------------------------- single-figure builder --- #
 
-def test_builder_ranged_includes_only_in_range(tmp_path):
+def test_single_fig_ranged_includes_only_in_range(tmp_path):
     s = _store(tmp_path)
-    out = ov._impedance_artifact_overlay(
-        s, [("BCH062", "BCH062SR")], start="2026-06-10", end="2026-06-30")
-    txt = _text(out)
-    assert "1 traces" in txt                 # only file 2 (06-15) in range
-    assert "2026-06-10" in txt and "2026-06-30" in txt
+    fig, sub = ov._single_location_fig(
+        s, "BCH062", "BCH062SR", "2026-06-10", "2026-06-30")
+    assert len(fig.data) == 1                 # only file 2 (06-15) in range
+    assert "1 traces" in sub
+    assert "2026-06-10" in sub and "2026-06-30" in sub
 
 
-def test_builder_empty_keys_message(tmp_path):
+def test_single_fig_no_recordings_in_range(tmp_path):
     s = _store(tmp_path)
-    out = ov._impedance_artifact_overlay(s, [], start="2026-06-01",
-                                         end="2026-06-30")
-    assert "Pick an animal" in _text(out)
+    fig, sub = ov._single_location_fig(
+        s, "BCH062", "BCH062SR", "2026-01-01", "2026-01-31")
+    assert len(fig.data) == 0
+    assert "No recordings in this range" in sub
 
 
-def test_builder_no_recordings_in_range_message(tmp_path):
-    s = _store(tmp_path)
-    out = ov._impedance_artifact_overlay(
-        s, [("BCH062", "BCH062SR")], start="2026-01-01", end="2026-01-31")
-    assert "No recordings for this selection" in _text(out)
-
-
-def test_builder_recent_fallback_without_range(tmp_path):
+def test_single_fig_recent_fallback_without_range(tmp_path):
     """No start/end -> recent-N path (preserves the old default behaviour)."""
     s = _store(tmp_path)
-    out = ov._impedance_artifact_overlay(s, [("BCH062", "BCH062SR")])
-    txt = _text(out)
-    assert "2 traces" in txt                 # both SR recordings, no date span
-    assert "→" not in txt.split("dominant")[-1]     # no range suffix
+    fig, sub = ov._single_location_fig(s, "BCH062", "BCH062SR", None, None)
+    assert len(fig.data) == 2                 # both SR recordings
+    assert "recent 24" in sub and "2026-" not in sub    # no date span
+
+
+# ------------------------------------------------------- per-figure body --- #
+
+def test_body_one_dated_block_per_location(tmp_path):
+    s = _store(tmp_path)
+    body = ov._artifact_overlay_body(s, "BCH062", ["BCH062SR", "BCH062SLM"])
+    blocks = body.children
+    assert len(blocks) == 2
+    ids = _find_ids(body)
+    # every location gets its OWN date-range picker + figure, keyed by loc.
+    ranges = [i for i in ids if isinstance(i, dict)
+              and i.get("type") == "artifact-loc-range"]
+    figs = [i for i in ids if isinstance(i, dict)
+            and i.get("type") == "artifact-loc-fig"]
+    assert {r["loc"] for r in ranges} == {"BCH062SR", "BCH062SLM"}
+    assert len(figs) == 2
+    assert all(r["animal"] == "BCH062" for r in ranges)
+
+
+def test_body_empty_locations_message(tmp_path):
+    s = _store(tmp_path)
+    assert "Pick at least one stim location" in _text(
+        ov._artifact_overlay_body(s, "BCH062", []))
+
+
+def test_body_no_animal_falls_back_to_active_channels(tmp_path):
+    """No animal chosen -> the active (newest-session) channels, each as its
+    own dated block (preserves the load-and-see default)."""
+    s = _store(tmp_path)
+    active = {c for _a, c in s.active_impedance_channel_keys()}
+    assert active                                # newest session has a channel
+    out = ov._artifact_overlay_body(s, None, [])
+    ranges = [i for i in _find_ids(out) if isinstance(i, dict)
+              and i.get("type") == "artifact-loc-range"]
+    assert {r["loc"] for r in ranges} == active
+
+
+def test_body_empty_store_prompts_for_selection(tmp_path):
+    s = Store(str(tmp_path / "data" / "empty.db"))   # nothing seeded
+    assert "Pick an animal" in _text(ov._artifact_overlay_body(s, None, []))

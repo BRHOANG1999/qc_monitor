@@ -3788,25 +3788,25 @@ _ARTIFACT_LABEL = {"color": "#888", "fontSize": "11px", "display": "block",
 
 
 def _artifact_default_selection(store, config):
-    """(animals, default_animal, default_locs, (start, end)) to seed the
-    stim-artifact overlay controls -- newest active animal, its channels, and
-    its dominant-charge date span (last 30 days of it)."""
+    """(animals, default_animal, default_locs) to seed the stim-artifact overlay
+    controls -- newest active animal + its channels. Each figure gets its OWN
+    date range (seeded per location), so no global range is returned here."""
     amap = _impedance_animals_and_electrodes(store, config)
     animals = sorted(amap.keys())
     if not animals:
-        return [], None, [], (None, None)
+        return [], None, []
     try:
         active = {a for a, _c in store.active_impedance_channel_keys()}
     except Exception:  # noqa: BLE001
         active = set()
     default_animal = next((a for a in animals if a in active), animals[0])
-    locs = list(amap.get(default_animal, []))
-    return animals, default_animal, locs, _artifact_range_for(store, default_animal, locs)
+    return animals, default_animal, list(amap.get(default_animal, []))
 
 
 def _artifact_range_for(store, animal, locs):
     """(start_date, end_date) YYYY-MM-DD for *animal*'s *locs*: the last 30 days
-    of the union of their dominant-charge history, or (None, None)."""
+    of the union of their dominant-charge history, or (None, None). Used to seed
+    each figure's own picker from that location's own time span."""
     los, his = [], []
     for loc in locs or []:
         try:
@@ -3828,12 +3828,11 @@ def _artifact_range_for(store, animal, locs):
 
 
 def _artifact_overlay_controls(store, config):
-    """Animal + stim-location(s) + date-range pickers for the stim-artifact
-    overlay. Lets the reviewer pick any animal/electrode (incl. retired) and an
-    explicit recording window instead of the active-channels / most-recent
-    default. Mirrors the electrode-compare card's animal->electrode cascade."""
-    animals, animal0, locs0, (start0, end0) = _artifact_default_selection(
-        store, config)
+    """Animal + stim-location(s) picker for the stim-artifact overlay. The date
+    range is PER FIGURE (each location's own picker), because different
+    locations are usually recorded over different periods. Mirrors the
+    electrode-compare card's animal->electrode cascade."""
+    animals, animal0, locs0 = _artifact_default_selection(store, config)
     return html.Div([
         html.Div([
             html.Span("Animal", style=_ARTIFACT_LABEL),
@@ -3852,91 +3851,105 @@ def _artifact_overlay_controls(store, config):
                 placeholder="Pick stim channel(s) to overlay",
                 style=DROPDOWN_STYLE, className="dark-dropdown"),
         ], style={"flex": "1", "minWidth": "220px"}),
-        html.Div([
-            html.Span("Recording date range", style=_ARTIFACT_LABEL),
-            dcc.DatePickerRange(
-                id="overview-artifact-daterange",
-                start_date=start0, end_date=end0,
-                display_format="YYYY-MM-DD",
-                className="dark-daterange"),
-        ], style={"minWidth": "240px"}),
     ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end",
               "gap": "12px", "marginBottom": "8px"})
 
 
-def _impedance_artifact_overlay(store, keys, *, start=None, end=None,
-                                limit: int = 24, max_traces: int = 200):
-    """Overlay the recorded stim-artifact traces (per (animal, channel) in
-    *keys*) coloured oldest→newest, zoomed to the transition
-    window — so a shift in the pulse response / ohmic step is visible next to
-    the Rₐ trend. Lazily built (heavy: loads many traces)."""
+def _single_location_fig(store, animal, loc, start, end, *, max_traces=200):
+    """(figure, subtitle) for ONE stim location's artifact overlay over its own
+    date range -- traces oldest→newest, zoomed to the transition window. Ranged
+    when both dates are set, else the recent-N fallback."""
     from plotly.colors import sample_colorscale
-    keys = sorted(keys)
-    if not keys:
-        return html.Div("Pick an animal and at least one stim location.",
-                        style={"color": "#888", "fontSize": "11px"})
     ranged = bool(start and end)
-    cols = min(len(keys), 2)
-    n_rows = (len(keys) + cols - 1) // cols
-    fig = make_subplots(rows=n_rows, cols=cols,
-                        subplot_titles=[f"{a} {c}" for a, c in keys],
-                        vertical_spacing=0.18, horizontal_spacing=0.09)
+    if ranged:
+        traces = store.channel_traces_in_range(
+            animal, loc, start, end, max_traces=max_traces)
+        capped = len(traces) >= max_traces
+    else:
+        traces = store.recent_channel_traces(animal, loc, 24)
+        capped = False
+    oldest_first = list(reversed(traces))           # oldest → newest
+    m = len(oldest_first)
     lo, hi = -0.3, 1.0
-    n_total = 0
-    capped = False
-    for i, (animal, ch) in enumerate(keys):
-        rr, cc = i // cols + 1, i % cols + 1
-        if ranged:
-            traces = store.channel_traces_in_range(
-                animal, ch, start, end, max_traces=max_traces)
-            if len(traces) >= max_traces:
-                capped = True
-        else:
-            traces = store.recent_channel_traces(animal, ch, limit)
-        oldest_first = list(reversed(traces))       # oldest → newest
-        m = len(oldest_first)
-        n_total += m
-        for j, tr in enumerate(oldest_first):
-            t, y = tr["time_ms"], tr["mean_trace"]
-            xs = [t[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
-            ys = [y[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
-            frac = j / max(1, m - 1)
-            color = sample_colorscale("Turbo", frac)[0]
-            fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode="lines", showlegend=False,
-                line=dict(color=color, width=1), opacity=0.65,
-                customdata=[tr["chunk_datetime"]] * len(xs),
-                hovertemplate="%{y:.3f}<br>%{customdata}<extra></extra>"),
-                rr, cc)
-    for ann in fig.layout.annotations[:len(keys)]:
-        ann.font.size = 11
-        ann.font.color = "#f0f0f5"
+    fig = go.Figure()
+    for j, tr in enumerate(oldest_first):
+        t, y = tr["time_ms"], tr["mean_trace"]
+        xs = [t[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
+        ys = [y[k] for k in range(min(len(t), len(y))) if lo <= t[k] <= hi]
+        color = sample_colorscale("Turbo", j / max(1, m - 1))[0]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", showlegend=False,
+            line=dict(color=color, width=1), opacity=0.65,
+            customdata=[tr["chunk_datetime"]] * len(xs),
+            hovertemplate="%{y:.3f}<br>%{customdata}<extra></extra>"))
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        height=120 + 190 * n_rows, margin=dict(l=52, r=16, t=42, b=34),
+        height=270, margin=dict(l=52, r=16, t=8, b=34),
         showlegend=False, font=dict(color="#cfd0d6"))
     fig.update_xaxes(title_text="ms from stimulus", title_font=dict(size=9),
-                     tickfont=dict(size=8), gridcolor="#2a2a3a",
-                     automargin=True)
+                     tickfont=dict(size=8), gridcolor="#2a2a3a", automargin=True)
     fig.update_yaxes(title_text="raw", title_font=dict(size=9),
-                     tickfont=dict(size=8), gridcolor="#2a2a3a",
-                     automargin=True)
-    span = f" · {start} → {end}" if ranged else ""
-    cap_note = (f" · capped at {max_traces}/channel — narrow the range"
-                if capped else "")
-    if n_total == 0:
-        return html.Div(
-            "No recordings for this selection." + (
-                " Try a wider date range." if ranged else ""),
-            style={"color": "#888", "fontSize": "11px", "padding": "6px 2px"})
+                     tickfont=dict(size=8), gridcolor="#2a2a3a", automargin=True)
+    span = f" · {start} → {end}" if ranged else " · recent 24"
+    cap = f" · capped at {max_traces} — narrow the range" if capped else ""
+    if m == 0:
+        sub = ("No recordings in this range." if ranged
+               else "No recordings for this channel.")
+    else:
+        sub = f"{m} traces · oldest (blue) → newest (red){span}{cap}"
+    return fig, sub
+
+
+def _artifact_location_block(store, animal, loc, start=None, end=None):
+    """One figure card: header + its OWN date-range picker + the overlay. The
+    picker seeds to this location's own history and redraws only this figure."""
+    if start is None and end is None:
+        start, end = _artifact_range_for(store, animal, [loc])
+    fig, sub = _single_location_fig(store, animal, loc, start, end)
+    key = {"animal": animal, "loc": loc}
     return html.Div([
-        html.Div(f"{n_total} traces · oldest (blue) → newest (red) · "
-                 f"dominant test-pulse charge only{span}{cap_note}",
+        html.Div([
+            html.Span(f"{animal} {loc}",
+                      style={"color": "#f0f0f5", "fontWeight": "600",
+                             "fontSize": "12px"}),
+            dcc.DatePickerRange(
+                id={"type": "artifact-loc-range", **key},
+                start_date=start, end_date=end,
+                display_format="YYYY-MM-DD", className="dark-daterange"),
+        ], style={"display": "flex", "justifyContent": "space-between",
+                  "alignItems": "center", "flexWrap": "wrap", "gap": "8px",
+                  "marginBottom": "4px"}),
+        html.Div(sub, id={"type": "artifact-loc-sub", **key},
                  style={"color": "#888", "fontSize": "10px",
-                         "padding": "0 2px 4px"}),
-        dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
-                  style={"padding": "4px 2px"}),
-    ])
+                        "marginBottom": "2px"}),
+        dcc.Graph(figure=fig, id={"type": "artifact-loc-fig", **key},
+                  config=_IMPEDANCE_GRAPH_CONFIG),
+    ], style={"padding": "10px 12px", "background": COLOR_SURFACE_1,
+              "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_SM})
+
+
+def _artifact_overlay_body(store, animal, locs):
+    """The overlay: one independently-dated figure per selected stim location.
+    Falls back to the active channels (recent-N) when no animal is chosen."""
+    if not animal:
+        try:
+            keys = sorted(store.active_impedance_channel_keys())
+        except Exception:  # noqa: BLE001
+            keys = []
+        blocks = [_artifact_location_block(store, a, c) for a, c in keys]
+    elif not locs:
+        return html.Div("Pick at least one stim location.",
+                        style={"color": "#888", "fontSize": "11px",
+                               "padding": "6px 2px"})
+    else:
+        blocks = [_artifact_location_block(store, animal, loc) for loc in locs]
+    if not blocks:
+        return html.Div("Pick an animal and at least one stim location.",
+                        style={"color": "#888", "fontSize": "11px",
+                               "padding": "6px 2px"})
+    return html.Div(blocks, style={
+        "display": "grid", "gap": "10px",
+        "gridTemplateColumns": "repeat(auto-fit, minmax(360px, 1fr))"})
 
 
 def _impedance_example_block(store, channels: list[dict], icfg: dict):
@@ -4307,32 +4320,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("overview-artifact-btn", "n_clicks"),
         State("overview-artifact-animal", "value"),
         State("overview-artifact-locs", "value"),
-        State("overview-artifact-daterange", "start_date"),
-        State("overview-artifact-daterange", "end_date"),
         prevent_initial_call=True,
     )
-    def load_artifact_overlay(_n, animal, locs, start, end):
+    def load_artifact_overlay(_n, animal, locs):
         try:
-            # No animal chosen (e.g. empty colony) -> fall back to the active
-            # channels over the recent-N default, preserving prior behaviour.
-            if not animal:
-                keys = sorted(store.active_impedance_channel_keys())
-                return _impedance_artifact_overlay(store, keys)
-            keys = [(animal, loc) for loc in (locs or [])]
-            return _impedance_artifact_overlay(store, keys, start=start, end=end)
+            return _artifact_overlay_body(store, animal, locs)
         except Exception as e:  # noqa: BLE001
             logger.warning("artifact overlay failed: %s", e)
             return html.Div("Overlay failed to load.",
                             style={"color": "#888", "fontSize": "11px"})
 
-    # Animal -> stim-location options + a date range matching that animal's
-    # history. Mirrors ecmp_electrode_options; no prevent_initial_call so the
-    # controls are always consistent with the current animal.
+    # Animal -> stim-location options. Mirrors ecmp_electrode_options; no
+    # prevent_initial_call so the list always matches the current animal. Each
+    # figure seeds its own date range at render, so nothing date-related here.
     @app.callback(
         Output("overview-artifact-locs", "options"),
         Output("overview-artifact-locs", "value"),
-        Output("overview-artifact-daterange", "start_date"),
-        Output("overview-artifact-daterange", "end_date"),
         Input("overview-artifact-animal", "value"),
     )
     def artifact_location_options(animal):
@@ -4342,8 +4345,32 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:  # noqa: BLE001 -- never blank the control silently
             logger.warning("artifact location options failed: %s", e)
             locs = []
-        start, end = _artifact_range_for(store, animal, locs)
-        return ([{"label": c, "value": c} for c in locs], locs, start, end)
+        return [{"label": c, "value": c} for c in locs], locs
+
+    # Per-figure date range: changing one location's picker redraws ONLY that
+    # figure (+ its subtitle). animal + loc are carried in the pattern id, so no
+    # cross-figure state is needed.
+    @app.callback(
+        Output({"type": "artifact-loc-fig", "animal": MATCH, "loc": MATCH},
+               "figure"),
+        Output({"type": "artifact-loc-sub", "animal": MATCH, "loc": MATCH},
+               "children"),
+        Input({"type": "artifact-loc-range", "animal": MATCH, "loc": MATCH},
+              "start_date"),
+        Input({"type": "artifact-loc-range", "animal": MATCH, "loc": MATCH},
+              "end_date"),
+        State({"type": "artifact-loc-range", "animal": MATCH, "loc": MATCH},
+              "id"),
+        prevent_initial_call=True,
+    )
+    def redraw_artifact_location(start, end, cid):
+        try:
+            fig, sub = _single_location_fig(
+                store, cid["animal"], cid["loc"], start, end)
+            return fig, sub
+        except Exception as e:  # noqa: BLE001
+            logger.warning("artifact per-figure redraw failed: %s", e)
+            return no_update, "Redraw failed."
 
     # Electrode-history comparison: picking an animal repopulates its electrode
     # list (default = up to 4 of them); the overlay figure redraws on any of

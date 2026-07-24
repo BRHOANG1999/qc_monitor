@@ -122,17 +122,24 @@
 /* the app: the Overview stim-artifact overlay recording-date range. The   */
 /* calendar popup renders in a body-level portal, so its rules are global  */
 /* (not scoped to .dark-daterange) -- safe while this is the sole picker.   */
+.DateRangePicker,
 .DateRangePickerInput,
+.DateRangePickerInput__withBorder,
 .DateInput {
     background-color: #1e1e2f !important;
     border-color: #555 !important;
 }
-.DateInput_input {
+.DateRangePickerInput__withBorder { border-radius: 5px !important; }
+.DateInput_input,
+.DateInput_input__disabled {
     background-color: #1e1e2f !important;
     color: #f0f0f5 !important;
     font-size: 12px !important;
+    font-weight: 400 !important;
+    font-style: normal !important;
     border-bottom: 2px solid transparent !important;
 }
+.DateInput_input::placeholder { color: #8a8a99 !important; }
 .DateInput_input__focused {
     border-bottom-color: #5e7ce2 !important;
 }
