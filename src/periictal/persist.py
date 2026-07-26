@@ -37,21 +37,43 @@ def _safe(name: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(name))
 
 
+def _dir_mtimes(evoked_dir: str) -> dict:
+    """``{basename: st_mtime}`` for every entry in *evoked_dir*, from ONE
+    directory enumeration.
+
+    A ``getmtime()`` per sidecar is a separate round-trip on a network share
+    (~10 ms each -> ~5.5 s for BCH111's 568 sidecars, paid on EVERY build,
+    cache hit included). ``os.scandir`` returns each entry's mtime as part of
+    the single directory read (~20 ms total), so the whole stat walk collapses
+    to one call. Sidecars live beside the ``.mat`` in *evoked_dir*."""
+    out: dict = {}
+    try:
+        with os.scandir(evoked_dir) as it:
+            for e in it:
+                try:
+                    out[e.name] = e.stat().st_mtime
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 def _sidecar_inputs(animal: str, evoked_dir: str, sidecar_variant: str) -> list:
     """(sidecar_path, mtime) for *animal*'s *sidecar_variant* sidecars -- a cheap
     stat walk (no JSON read) so the signature is fast to compute. A window/config
     change rewarms the sidecar (new mtime), which flows into this signature and
     invalidates the cached matrix."""
+    mtimes = _dir_mtimes(evoked_dir)
     out: list = []
     for i, fp in enumerate(list_evoked_files(evoked_dir)):
         assert i < _MAX_FILES, "sidecar stat walk runaway"
         if animal not in animals_in_filename(fp):
             continue
         sp = feature_sidecar_path(fp, animal, sidecar_variant)
-        try:
-            out.append((sp, os.path.getmtime(sp)))
-        except OSError:
-            pass
+        mt = mtimes.get(os.path.basename(sp))
+        if mt is not None:
+            out.append((sp, mt))
     return out
 
 

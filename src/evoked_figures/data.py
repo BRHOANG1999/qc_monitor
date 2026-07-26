@@ -21,7 +21,15 @@ import gzip
 import io
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
+# Sidecar reads are network-bound JSON: each read is a round-trip on the share,
+# so reading an animal's hundreds/thousands of sidecars serially dominates a
+# cold matrix build (BCH111: ~90 s serial). The reads are independent + hold no
+# shared state, so a small thread pool overlaps the latency (~4x; the share
+# saturates around 8 concurrent reads).
+_SIDECAR_READ_WORKERS = 8
 
 import numpy as np
 
@@ -65,15 +73,25 @@ def iter_animal_sidecars(animal: str, evoked_dir: str, *,
     feature-schema/version bump self-heals for callers that opt in (build_matrix
     via ``warm_missing``). One file's rows at a time."""
     assert animal, "animal required"
-    for i, fp in enumerate(list_evoked_files(evoked_dir)):
-        assert i < 1_000_000, "evoked file scan runaway"
-        if animal not in animals_in_filename(fp):
-            continue
-        rows = (read_or_compute_sidecar(fp, animal) if compute_missing
-                else read_feature_sidecar(fp, animal))
-        if not rows:
-            continue
-        yield fp, feature_sidecar_path(fp, animal), rows
+    files = [fp for fp in list_evoked_files(evoked_dir)
+             if animal in animals_in_filename(fp)]
+    assert len(files) < 1_000_000, "evoked file scan runaway"
+    if compute_missing:
+        # Recompute path is CPU-heavy (reads the raw .mat) and rare -- keep it
+        # serial so it doesn't contend for the read pool or blow up memory.
+        for fp in files:
+            rows = read_or_compute_sidecar(fp, animal)
+            if rows:
+                yield fp, feature_sidecar_path(fp, animal), rows
+        return
+    # Read-only path: overlap the network round-trips. executor.map preserves
+    # input order, so downstream (which sorts by time anyway) is unaffected.
+    with ThreadPoolExecutor(max_workers=_SIDECAR_READ_WORKERS) as ex:
+        for fp, rows in zip(files,
+                            ex.map(lambda p: read_feature_sidecar(p, animal),
+                                   files)):
+            if rows:
+                yield fp, feature_sidecar_path(fp, animal), rows
 
 
 def animal_series(animal: str, evoked_dir: str, metrics: list[str]):
