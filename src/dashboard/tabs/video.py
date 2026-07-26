@@ -262,6 +262,45 @@ def _animal_for_session(store: Store, session_dir: str,
     return animals[0] if animals else "?"
 
 
+def _pick_file_default(option_values, session_dir, bridge, requested,
+                       current_value):
+    """The file-dropdown default when a session (re)loads, by priority:
+
+      1. a fresh LFP-Browser bridge hand-off,
+      2. an explicit queue/needs/save ``requested-file`` (``_req_file``),
+      3. the preserved ``current_value`` if still valid,
+      4. the session's oldest file.
+
+    Pure so it can be tested directly; ``_update_files`` just wires the I/O.
+    Both the bridge and the request are honoured only for the session they name
+    and only when their file is actually in *option_values*, so a stale one for
+    another session can't hijack the load. Crucially this does NOT rely on the
+    racy ``State`` read of the just-set file value -- the reason a cross-session
+    queue click used to fall through to the oldest chunk."""
+    def _match(src):
+        return (isinstance(src, dict)
+                and src.get("session_dir") == session_dir
+                and src.get("file_id") in option_values)
+    if _match(bridge):
+        return bridge.get("file_id")
+    if _match(requested):
+        return requested.get("file_id")
+    if current_value in option_values:
+        return current_value
+    return option_values[0] if option_values else None
+
+
+def _req_file(session_dir, file_id) -> dict:
+    """Payload for the ``video-requested-file`` store: the explicit (session,
+    file) a navigation action asked to load. ``_update_files`` honours it over
+    the racy State read of the just-set file value, so a cross-session load
+    lands on the requested recording, not the session's oldest chunk. Every
+    callback that sets (session, file) together must also set this, so the store
+    always reflects the LAST intended load (no stale request overriding a later
+    one)."""
+    return {"session_dir": session_dir, "file_id": int(file_id)}
+
+
 def _now_viewing_info(store: Store, file_id: int,
                         prefer_animal: str | None = None) -> dict | None:
     """Orientation for the loaded recording: animal, date/time, its
@@ -3703,6 +3742,11 @@ def layout(store: Store, bridge: dict | None = None):
         dcc.Interval(id="video-prefetch-tick", interval=2000,
                        n_intervals=0),
         dcc.Store(id="video-prefetch-state", data=None),
+        # An explicit "load THIS (session, file)" request from a queue/needs
+        # click. _update_files honours it over the fragile State read of the
+        # just-set file value, so a CROSS-SESSION click loads the clicked
+        # recording instead of falling through to the session's oldest chunk.
+        dcc.Store(id="video-requested-file", data=None),
         # Focused camera (1-based). Defaults to the master
         # (cam 1); each new file load resets to 1. The PiP
         # CSS hides every wrapper with data-focused="false"
@@ -4144,6 +4188,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-file-dropdown", "value",
                 allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("video-queue-load-btn", "n_clicks"),
         State("video-queue-animal", "value"),
         State("video-queue-position", "data"),
@@ -4152,16 +4197,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _on_queue_load(n, animal_value, position, mode):
         if not n or not animal_value:
-            return no_update, no_update
+            return no_update, no_update, no_update
         animal_ids = _animal_ids_from_picker(animal_value)
         if not animal_ids:
-            return no_update, no_update
+            return no_update, no_update, no_update
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
         rows = _fetch_queue_by_mode(store, mode or "queue", animal_ids, email,
                                     floor, queue_limit)
         if not rows:
-            return no_update, no_update
+            return no_update, no_update, no_update
         clamped = max(0, min(int(position or 0), len(rows) - 1))
         row = rows[clamped]
         # Log a claim event so the PI audit log knows the
@@ -4170,7 +4215,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         store.insert_review_event(int(row["id"]),
                                     email or "anon", "claim",
                                     {"source": "queue_card_load"})
-        return row["session_dir"], int(row["id"])
+        return (row["session_dir"], int(row["id"]),
+                {"session_dir": row["session_dir"], "file_id": int(row["id"])})
 
     # Switching the pool mode (Queue <-> Flag <-> Needs more onsets) LOADS a
     # recording from that pool, so the video/LFP reflect the new pool right
@@ -4182,24 +4228,26 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("video-session-dropdown", "value", allow_duplicate=True),
         Output("video-file-dropdown", "value", allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("video-queue-mode", "value"),
         State("video-queue-animal", "value"),
         prevent_initial_call=True,
     )
     def _autoload_on_mode_change(mode, animal_value):
         if not animal_value:
-            return no_update, no_update
+            return no_update, no_update, no_update
         animal_ids = _animal_ids_from_picker(animal_value)
         if not animal_ids:
-            return no_update, no_update
+            return no_update, no_update, no_update
         email = current_user_email() or ""
         floor = store.review_backlog_floor()
         rows = _fetch_queue_by_mode(store, mode or "queue", animal_ids, email,
                                     floor, queue_limit)
         if not rows:
-            return no_update, no_update
+            return no_update, no_update, no_update
         row = rows[0]                 # head of the newly-selected pool
-        return row["session_dir"], int(row["id"])
+        return (row["session_dir"], int(row["id"]),
+                {"session_dir": row["session_dir"], "file_id": int(row["id"])})
 
     # Pool LIST card: the header (title + sub) AND the file rows are rendered
     # by ONE callback from the SAME mode, so the header can NEVER desync from
@@ -4426,6 +4474,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-file-dropdown", "value",
                 allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input({"type": "video-queue-item", "file_id": ALL},
                 "n_clicks"),
         Input({"type": "video-needs-item", "file_id": ALL},
@@ -4453,13 +4502,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # first and mask the real click.
         if not any((t.get("value") or 0)
                    for t in (callback_context.triggered or [])):
-            return no_update, no_update
+            return no_update, no_update, no_update
         trig = callback_context.triggered_id
         if not isinstance(trig, dict):
-            return no_update, no_update
+            return no_update, no_update, no_update
         file_id = trig.get("file_id")
         if file_id is None:
-            return no_update, no_update
+            return no_update, no_update, no_update
         # Get the session_dir + file_path of the chosen file.
         with store.connection() as conn:
             row = conn.execute(
@@ -4468,7 +4517,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 (int(file_id),),
             ).fetchone()
         if not row:
-            return no_update, no_update
+            return no_update, no_update, no_update
         # The Video Review file-dropdown's value is the file_id
         # (see _update_files); session dropdown is session_dir.
         store.insert_review_event(int(file_id),
@@ -4477,7 +4526,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                     {"source": "queue_click"})
         logger.info("queue/needs-scoring click -> load file_id=%s session=%s",
                     int(file_id), row["session_dir"])
-        return row["session_dir"], int(file_id)
+        # Session + file BOTH set: a same-session click (session unchanged, so
+        # _update_files never fires) applies the file value directly; a
+        # cross-session click has the session change fire _update_files, which
+        # would otherwise race the just-set file value and fall through to the
+        # session's oldest chunk. The requested-file store makes that path
+        # deterministic -- _update_files honours it over the fragile State read.
+        return (row["session_dir"], int(file_id),
+                {"session_dir": row["session_dir"], "file_id": int(file_id)})
 
     # ---- P1-4 predictive prefetch ---- #
     # 2 s after the current file loads (and every 2 s thereafter,
@@ -4531,6 +4587,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-file-dropdown", "value",
                 allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("kbd-event", "data"),
         State("video-file-dropdown", "value"),
         State("video-queue-animal", "value"),
@@ -4538,7 +4595,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     )
     def _hotkey_queue_cycle(ev, current_file_id, animal_value):
         if not ev or ev.get("action") not in ("next", "prev"):
-            return no_update, no_update
+            return no_update, no_update, no_update
         direction = 1 if ev["action"] == "next" else -1
         email = current_user_email() or ""
         sd, new_file_id = _resolve_next_in_queue(
@@ -4547,13 +4604,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             email, queue_limit=queue_limit, direction=direction,
         )
         if new_file_id is None:
-            return no_update, no_update
+            return no_update, no_update, no_update
         # Log a claim event so the PI audit log knows the
         # reviewer touched this file even if they hop past it.
         store.insert_review_event(int(new_file_id), email or "anon",
                                     "claim",
                                     {"source": f"hotkey_{ev['action']}"})
-        return sd, new_file_id
+        return (sd, new_file_id,
+                {"session_dir": sd, "file_id": int(new_file_id)})
 
     # ---- Hotkey: U / Undo button reopens the last decision ---- #
     # Reads kbd-undo State to find what to reopen, validates the
@@ -4570,6 +4628,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("kbd-undo", "data", allow_duplicate=True),
         Output("video-review-status", "children",
                 allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("kbd-event", "data"),
         Input("kbd-undo-button", "n_clicks"),
         State("kbd-undo", "data"),
@@ -4580,26 +4639,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         trig = callback_context.triggered_id
         if trig == "kbd-event":
             if not ev or ev.get("action") not in ("undo", "revert"):
-                return no_update, no_update, no_update, no_update
+                return no_update, no_update, no_update, no_update, no_update
         if not undo or not undo.get("file_id"):
-            return no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update
         # Honour the deadline: a stale U keystroke after the
         # toast already vanished should not reach this far, but
         # belt and braces against clock skew between server and
         # client.
         import time as _time
         if (undo.get("deadline_ms") or 0) < _time.time() * 1000:
-            return no_update, no_update, None, no_update
+            return no_update, no_update, None, no_update, no_update
         file_id = int(undo["file_id"])
         email = current_user_email() or "anon"
         ok = store.reopen_review(
             file_id, email, animal_id=_ma_animal_from_picker(picker_value))
         if not ok:
-            return no_update, no_update, None, no_update
+            return no_update, no_update, None, no_update, no_update
         sd = _session_dir_for_file(store, file_id)
         if sd is None:
-            return no_update, no_update, None, no_update
-        return sd, file_id, None, "↩ Reopened — review again."
+            return no_update, no_update, None, no_update, no_update
+        return (sd, file_id, None, "↩ Reopened — review again.",
+                {"session_dir": sd, "file_id": int(file_id)})
 
     # ---- Step 4: reveal marker + events editor when "Events" picked ---- #
     @app.callback(
@@ -5837,6 +5897,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # next file's channel has no animal, so the old onsets persisted.)
         Output("video-events-store", "data", allow_duplicate=True),
         Output("video-events-current-key", "data", allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("video-review-save-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-review-decision", "value"),
@@ -5858,7 +5919,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                       animal_value, events, channel,
                       pools_view, pool_cursor,
                       cutoff, auc_threshold, auc_window):
-        nop = (no_update,) * 10
+        nop = (no_update,) * 11
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
                     else no_update, *nop[1:])
@@ -5983,7 +6044,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if pooled is not None:
             p_session, p_file, new_cursor = pooled
             return (badge, [], None, "",
-                    p_session, p_file, undo_payload, new_cursor, [], None)
+                    p_session, p_file, undo_payload, new_cursor, [], None,
+                    _req_file(p_session, p_file))
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
             queue_limit=queue_limit,
@@ -5993,9 +6055,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # state via _render_queue.
         if next_file is None:
             return (badge, [], None, "",
-                    no_update, no_update, undo_payload, no_update, [], None)
+                    no_update, no_update, undo_payload, no_update, [], None,
+                    no_update)
         return (badge, [], None, "",
-                next_session, next_file, undo_payload, no_update, [], None)
+                next_session, next_file, undo_payload, no_update, [], None,
+                _req_file(next_session, next_file))
 
     # DEPRECATED / UNWIRED: the "EEG onset -> CSV + flag" button was removed
     # in the single-Submit redesign -- Submit now routes scored-but-incomplete
@@ -6014,6 +6078,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 allow_duplicate=True),
         Output("video-ma-pool-cursor", "data",
                 allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("video-review-partial-btn", "n_clicks"),
         State("video-file-dropdown", "value"),
         State("video-events-store", "data"),
@@ -6030,23 +6095,23 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                          animal_value, pools_view, pool_cursor,
                          cutoff, auc_threshold, auc_window):
         if not n_clicks or not file_id:
-            return (no_update,) * 5
+            return (no_update,) * 6
         email = current_user_email()
         if not email:
             return ("Not signed in -- can't export.",
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update)
         events = list(events or [])
         has_eo = any(e.get("EO_sec") not in (None, "") for e in events)
         if not has_eo:
             return ("Drop at least one EEG onset (EO) before exporting.",
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update)
         # Both the CSV row AND the needs-scoring flag are scoped to the
         # scored channel's animal -- one source, never file-wide.
         animal = _animal_for_channel(store, file_id, channel)
         if not animal:
             return ("Pick the animal's brain channel (Step 1) before "
                      "exporting — onsets are filed per animal.",
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update)
         try:
             n_rows, csv_name = _export_partial_csv(
                 store, config, int(file_id), channel, events,
@@ -6055,7 +6120,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:  # noqa: BLE001 -- surface, never crash UI
             logger.warning("partial CSV export failed: %s", e)
             return (f"Partial export failed: {e}",
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update)
         # Keep the file flagged: drafts + needs_scoring (same pool as the
         # quick-flag path), with a note recording the preliminary export.
         drafts = [{**e, "draft": True} for e in events]
@@ -6068,7 +6133,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         except Exception as e:
             logger.warning("partial-export mark_review failed: %s", e)
             return (f"Exported to {csv_name} but flagging failed: {e}",
-                    no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update)
         from datetime import datetime as _dt
         badge = (f"Exported {n_rows} row{'' if n_rows == 1 else 's'} to "
                  f"{csv_name} at {_dt.now().strftime('%H:%M')}  ·  kept in "
@@ -6076,7 +6141,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         pooled = _next_in_pool(store, pools_view, pool_cursor, int(file_id))
         if pooled is not None:
             p_session, p_file, new_cursor = pooled
-            return (badge, [], p_session, p_file, new_cursor)
+            return (badge, [], p_session, p_file, new_cursor,
+                    _req_file(p_session, p_file))
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
             queue_limit=queue_limit)
@@ -6085,8 +6151,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             # store (the [] paths above are safe only because they hand off to a
             # new file whose drafts _rescope_events reloads); clearing here would
             # blank the onsets the reviewer just exported and can still edit.
-            return (badge, no_update, no_update, no_update, no_update)
-        return (badge, [], next_session, next_file, no_update)
+            return (badge, no_update, no_update, no_update, no_update, no_update)
+        return (badge, [], next_session, next_file, no_update,
+                _req_file(next_session, next_file))
 
     # ---- file/channel options ---- #
     @app.callback(
@@ -6094,24 +6161,26 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-file-dropdown", "value"),
         Input("video-session-dropdown", "value"),
         State("lfp-to-video-bridge", "data"),
+        State("video-requested-file", "data"),
         State("video-file-dropdown", "value"),
     )
-    def _update_files(session_dir, bridge, current_value):
+    def _update_files(session_dir, bridge, requested, current_value):
         """Repopulate the file dropdown when the session changes.
 
         Priority for the default value:
-          1. LFP-Browser bridge -- explicit hand-off.
-          2. ``current_value`` if it's already in the new options.
-             This is the path the queue button + J/K hotkey rely
-             on: ``_load_from_queue`` writes (session, file_id) in
-             one shot, and this callback fires from the session
-             change a millisecond later. Without the preservation
-             check, ``_update_files`` would overwrite the just-set
-             file_id with ``options[0]`` (the newest file in the
-             session) -- which is why the queue highlight tracked
-             the wrong file AND the LFP loaded a different chunk
-             than the one the reviewer clicked.
-          3. ``options[0]`` (newest file) as the legacy default.
+          1. LFP-Browser bridge -- fresh explicit hand-off.
+          2. ``video-requested-file`` -- a queue/needs click's explicit
+             (session, file) request. ``_load_from_queue`` writes it alongside
+             the session + file in one shot; on a CROSS-SESSION click the
+             session change fires this callback, and the ``State`` read of the
+             just-set file value is unreliable (it can still be the previous
+             session's file), so relying on ``current_value`` fell through to
+             ``options[0]`` -- the reviewer clicked a flagged 5-days-later file
+             and got hour 1 of the session instead. The explicit request is
+             deterministic. (Kept for the session it names, mirroring the
+             bridge, so returning to that session reloads what you last opened.)
+          3. ``current_value`` if it's already in the new options.
+          4. ``options[0]`` (oldest file) as the legacy default.
         """
         files = _files_with_video(store, session_dir)
         options = [
@@ -6119,17 +6188,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
              "value": f["id"]}
             for f in files
         ]
-        default = None
-        if (bridge and isinstance(bridge, dict)
-                and bridge.get("session_dir") == session_dir):
-            wanted = bridge.get("file_id")
-            if any(o["value"] == wanted for o in options):
-                default = wanted
-        if default is None and current_value is not None:
-            if any(o["value"] == current_value for o in options):
-                default = current_value
-        if default is None:
-            default = options[0]["value"] if options else None
+        default = _pick_file_default(
+            [o["value"] for o in options], session_dir, bridge, requested,
+            current_value)
         return options, default
 
     # ---- video player + history + channel options ---- #
@@ -8225,6 +8286,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-analysis-feature", "value",
                 allow_duplicate=True),
         Output("video-ma-pool-status", "children"),
+        Output("video-requested-file", "data", allow_duplicate=True),
         Input("video-ma-browse-p1", "n_clicks"),
         Input("video-ma-browse-p2", "n_clicks"),
         Input("video-ma-browse-p3", "n_clicks"),
@@ -8251,10 +8313,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not any((t.get("value") or 0)
                     for t in (callback_context.triggered or [])):
             return (no_update, no_update, no_update,
-                    no_update, no_update)
+                    no_update, no_update, no_update)
         if not pools:
             return (no_update, no_update, no_update,
-                    no_update, "Run a scan first.")
+                    no_update, "Run a scan first.", no_update)
         trig = callback_context.triggered_id
         cursor = cursor or {"active": None, "idx": 0}
         active = cursor.get("active")
@@ -8272,14 +8334,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             idx = idx + 1
         if active not in ("1", "2", "3"):
             return (no_update, no_update, no_update,
-                    no_update, "Pick a pool to browse.")
+                    no_update, "Pick a pool to browse.", no_update)
         key = {"1": "pool1", "2": "pool2", "3": "pool3"}[active]
         files = pools.get(key, [])
         n = len(files)
         if n == 0:
             return ({"active": active, "idx": 0},
                     no_update, no_update, no_update,
-                    f"Pool {active} is empty.")
+                    f"Pool {active} is empty.", no_update)
         idx = min(idx, n - 1)
         entry = files[idx]
         # pool3 entries are {file_id, only}; pool1/2 are bare ids.
@@ -8298,13 +8360,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ({"active": active, "idx": idx},
                     no_update, no_update, no_update,
                     f"Pool {active} · file {idx + 1} of {n} "
-                    "(missing)")
+                    "(missing)", no_update)
         badge = ""
         if isinstance(entry, dict):
             badge = f" ({entry.get('only')}-only)"
         status = f"Pool {active} · file {idx + 1} of {n}{badge}"
         return ({"active": active, "idx": idx},
-                row["session_dir"], file_id, feature_out, status)
+                row["session_dir"], file_id, feature_out, status,
+                _req_file(row["session_dir"], file_id))
 
     # Keep the "Pool N · file x of y" counter in sync with the cursor on
     # EVERY move -- including the auto-advance after Mark-done / Flag for
