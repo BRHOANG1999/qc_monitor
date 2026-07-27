@@ -22,6 +22,7 @@ embedding and is instant.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import threading
@@ -43,6 +44,7 @@ from src.dashboard.design import (COLOR_ACCENT, COLOR_DIVIDER, COLOR_SUCCESS,
                                   FONT_SIZE_CAPTION, FONT_SIZE_TITLE, RADIUS_SM,
                                   SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5)
 from src.periictal import config as _cfg
+from src.periictal import embed_io as _eio
 from src.periictal import forecast as _fc
 from src.periictal import palette as _pal
 from src.periictal import passive as _passive
@@ -246,13 +248,40 @@ def scope_bar(store):
              html.Div(id="pex-status", style={"color": COLOR_TEXT_SECONDARY,
                                               "fontSize": FONT_SIZE_CAPTION,
                                               "minHeight": "14px"}),
+             _save_load_row(),
              style={"marginTop": SPACE_3}),
         dcc.Interval(id="pex-poll", interval=1200, disabled=True),
         # storage_type="session" is how a dcc.Store persists its data across
         # sub-tab swaps (Store has no `persistence` prop) — so a lens can redraw
         # from the module cache on remount using the retained job id.
         dcc.Store(id="pex-job", storage_type="session"),
+        dcc.Download(id="pex-export-dl"),
     ])
+
+
+def _save_load_row() -> html.Div:
+    """Export the currently-built embedding to a file, and import one back to
+    restore the exact context (scatter + trend + PDF/CDF + forecasting) without
+    rebuilding. See periictal.embed_io."""
+    # The import control is a button-STYLED dcc.Upload, not a <button> inside an
+    # Upload: a real button child captures the click and the file dialog never
+    # opens. Styling the Upload itself keeps the whole area as the file target.
+    up_style = {"display": "inline-block", "padding": "6px 12px",
+                "borderRadius": RADIUS_SM, "border": f"1px solid {COLOR_DIVIDER}",
+                "color": COLOR_TEXT_PRIMARY, "background": COLOR_SURFACE_2,
+                "cursor": "pointer", "fontSize": FONT_SIZE_CAPTION,
+                "userSelect": "none"}
+    return html.Div([
+        button("⬇ Export embedding", "pex-export-btn", variant="secondary",
+               **{"title": "Save the current built embedding to a file you can "
+                           "re-import later."}),
+        dcc.Upload(id="pex-import-up", multiple=False,
+                   children="⬆ Import embedding", style=up_style),
+        html.Span(id="pex-io-status",
+                  style={"color": COLOR_TEXT_SECONDARY,
+                         "fontSize": FONT_SIZE_CAPTION, "marginLeft": SPACE_3}),
+    ], style={"display": "flex", "alignItems": "center", "gap": SPACE_3,
+              "flexWrap": "wrap", "marginTop": SPACE_2})
 
 
 def layout_embedding(store):
@@ -2051,6 +2080,93 @@ def register_callbacks(app, store, config):
               window_h, method, cap, sv, cfg)
         prog = (_JOBS.get(jid) or {}).get("progress", "starting…")
         return f"⏳ {prog}", False, no_update
+
+    # ---- Export / import the built embedding (skip the whole rebuild) ---- #
+    def _selection_jid(sel: dict) -> str:
+        """Recompute the cache job id from a saved selection, EXACTLY as
+        _build_or_poll does, so an imported context lands under the same key a
+        later Build would use."""
+        variant = sel.get("variant", "evoked")
+        try:
+            sv, cfg = _resolve_window(variant, sel.get("winmode") or "full",
+                                      sel.get("win_from"), sel.get("win_to"),
+                                      sel.get("win_guard"))
+        except ValueError:
+            sv, cfg = "evoked", None
+        return _job_id(sel.get("animal"), sel.get("protocol") or "", variant,
+                       float(sel.get("window_h") or 6.0),
+                       sel.get("method", "pca"), _cfg.INTERACTIVE_POINT_CAP,
+                       _win_token(sv, cfg))
+
+    @app.callback(
+        Output("pex-export-dl", "data"),
+        Output("pex-io-status", "children"),
+        Input("pex-export-btn", "n_clicks"),
+        State("pex-job", "data"),
+        State("pex-animal", "value"), State("pex-protocol", "value"),
+        State("pex-variant", "value"), State("pex-window-h", "value"),
+        State("pex-method", "value"), State("pex-winmode", "value"),
+        State("pex-win-from", "value"), State("pex-win-to", "value"),
+        State("pex-win-guard", "value"),
+        prevent_initial_call=True,
+    )
+    def _export_embedding(_n, jid, animal, protocol, variant, window_h, method,
+                          winmode, wf, wt, wg):
+        cached = _CACHE.get(jid) if jid else None
+        if cached is None or cached.get("empty"):
+            return no_update, "Build an embedding first, then export."
+        selection = {"animal": animal, "protocol": protocol or "",
+                     "variant": variant, "window_h": window_h, "method": method,
+                     "winmode": winmode, "win_from": wf, "win_to": wt,
+                     "win_guard": wg}
+        try:
+            blob = _eio.dumps(selection, cached)
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("embedding export failed: %s", e)
+            return no_update, f"Export failed: {e}"
+        name = _eio.suggested_name(selection)
+        return (dcc.send_bytes(lambda buf: buf.write(blob), name),
+                f"Exported {name} ({len(blob) // 1024} KB).")
+
+    @app.callback(
+        Output("pex-job", "data", allow_duplicate=True),
+        Output("pex-io-status", "children", allow_duplicate=True),
+        Output("pex-animal", "value", allow_duplicate=True),
+        Output("pex-protocol", "value", allow_duplicate=True),
+        Output("pex-variant", "value", allow_duplicate=True),
+        Output("pex-window-h", "value", allow_duplicate=True),
+        Output("pex-method", "value", allow_duplicate=True),
+        Input("pex-import-up", "contents"),
+        prevent_initial_call=True,
+    )
+    def _import_embedding(contents):
+        if not contents:
+            return (no_update,) * 7
+        try:
+            _hdr, _, b64 = contents.partition(",")
+            selection, result = _eio.loads(base64.b64decode(b64))
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("embedding import failed: %s", e)
+            return (no_update, f"Import failed: {e}",
+                    no_update, no_update, no_update, no_update, no_update)
+        jid = _selection_jid(selection)
+        with _LOCK:
+            _CACHE[jid] = result
+            while len(_CACHE) > _CACHE_MAX:
+                _CACHE.popitem(last=False)
+            _JOBS[jid] = {"status": "done", "progress": "imported"}
+            _prune_jobs(_JOBS)
+        n = result.get("n_seizures")
+        method = selection.get("method", "pca")
+        msg = (f"✓ Loaded {selection.get('animal') or ''} · "
+               f"{selection.get('protocol') or 'all'} · {str(method).upper()}"
+               + (f" · n = {n} seizures" if n else "") + " (imported).")
+        # Setting pex-job pulses every lens to redraw from the restored cache;
+        # the dropdowns are set best-effort for a matching UI (the figures do
+        # NOT depend on them, so a cascade reset of protocol is only cosmetic).
+        return (jid, msg, selection.get("animal"),
+                selection.get("protocol") or "", selection.get("variant"),
+                selection.get("window_h"), method)
 
     @app.callback(
         Output("pex-graph", "figure"),
