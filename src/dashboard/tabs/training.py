@@ -254,8 +254,9 @@ def _build_figures(store: Store, file_id: int, channel: int,
 
     *file_path* lets the caller pass an already-resolved live path (the DB
     row's path can be stale and un-updatable when another row owns the live
-    path via UNIQUE(file_path)); falls back to the DB path when omitted."""
-    file_path = file_path or _file_path_for_id(store, file_id)
+    path via UNIQUE(file_path)); falls back to the RESOLVED live path (not the
+    raw DB path) when omitted, so a re-render can't 404 on the stale path."""
+    file_path = file_path or store.live_file_path(file_id)
     if not file_path:
         ph = _empty_lfp_fig("Recording file not found.")
         return ph, ph, 0.0
@@ -430,7 +431,10 @@ def _example_payload(store: Store, config: dict | None, email: str,
     cur = {"file_id": file_id, "channel": channel,
            "validated": validated,
            "session_dir": session_dir, "lfp_dur": lfp_dur,
-           "filename": fname, "animal": animal, "channel_name": chan_name}
+           "filename": fname, "animal": animal, "channel_name": chan_name,
+           # The RESOLVED live path, so re-renders (Hilbert<->AUC toggle) reuse
+           # it instead of re-deriving the stale DB path.
+           "mat_path": mat_path}
     who = f"{animal} · Ch{channel} {chan_name}" if animal else \
         f"Ch{channel} {chan_name}".strip()
     now = (f"Example {idx + 1} of {rnd['examples']}  ·  {who}  ·  {fname}")
@@ -925,7 +929,8 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return no_update
         fig = _filtered_trace(store, int(current["file_id"]),
                               int(current.get("channel") or 0),
-                              mode or "hilbert")
+                              mode or "hilbert",
+                              file_path=current.get("mat_path"))
         # The fresh panel has no onset lines yet; re-add them so switching
         # Hilbert<->AUC mid-scoring doesn't drop the student's red markers.
         lines = _eo_line_shapes(events)

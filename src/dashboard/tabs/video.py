@@ -1132,7 +1132,13 @@ def _render_hilbert_trace(store, file_id: int,
     lab's BHZ_DETECTOR defaults (0.05 and 150 s).
     """
     assert isinstance(file_id, int), "file_id must be int"
-    file_path = file_path or _file_path_for_id(store, file_id)
+    # live_file_path, NOT _file_path_for_id: a Training historical example can
+    # hold a stale, un-updatable DB path (another row owns the located path via
+    # UNIQUE), so the raw DB path 404s. live_file_path returns the resolved copy
+    # (from the training resolver's cached EEG location) -- otherwise re-renders
+    # like the Hilbert/AUC mode toggle fail with "No such file" even though the
+    # initial load (which was handed the resolved path) worked.
+    file_path = file_path or store.live_file_path(file_id)
     if not file_path:
         return (_empty_lfp_fig("File not found in DB."), "")
     if channel is None:
@@ -1785,7 +1791,13 @@ def _render_auc_trace(store, file_id: int, channel: int | None,
     stay near zero -- the visual the PI uses to rescue low-amplitude
     events the peak detector misses."""
     assert isinstance(file_id, int), "file_id must be int"
-    file_path = file_path or _file_path_for_id(store, file_id)
+    # live_file_path, NOT _file_path_for_id: a Training historical example can
+    # hold a stale, un-updatable DB path (another row owns the located path via
+    # UNIQUE), so the raw DB path 404s. live_file_path returns the resolved copy
+    # (from the training resolver's cached EEG location) -- otherwise re-renders
+    # like the Hilbert/AUC mode toggle fail with "No such file" even though the
+    # initial load (which was handed the resolved path) worked.
+    file_path = file_path or store.live_file_path(file_id)
     if not file_path:
         return (_empty_lfp_fig("File not found in DB."), "")
     if channel is None:
