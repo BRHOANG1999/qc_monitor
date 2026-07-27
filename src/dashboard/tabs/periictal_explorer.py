@@ -243,7 +243,7 @@ def scope_bar(store):
     return html.Div([
         _title_block(),
         card(section_header("Selection"), _controls(store, animals, a0),
-             _window_panel()),
+             _window_panel(), _seizure_panel()),
         card(html.Div(id="pex-preview", style={"marginBottom": SPACE_2}),
              html.Div(id="pex-status", style={"color": COLOR_TEXT_SECONDARY,
                                               "fontSize": FONT_SIZE_CAPTION,
@@ -946,6 +946,51 @@ def _controls(store, animals, a0) -> html.Div:
 _GRP = {"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
         "alignItems": "flex-start"}
 _WIN_INP = {**DROPDOWN_STYLE, "width": "90px"}
+
+
+def _seizure_panel() -> html.Details:
+    """Collapsed 'Seizure events' panel: an include/exclude checkbox per scored
+    seizure so bad-data-period seizures can be dropped from the embedding.
+    Persistent per animal; the list is filled by a callback on animal/protocol."""
+    return html.Details([
+        html.Summary("Seizure events — exclude bad-data periods",
+                     style={"cursor": "pointer", "color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION, "userSelect": "none"}),
+        html.Div(id="pex-seizure-list",
+                 style={"maxHeight": "220px", "overflowY": "auto",
+                        "marginTop": SPACE_2}),
+        html.Div(id="pex-seizure-status",
+                 style={"color": COLOR_TEXT_TERTIARY,
+                        "fontSize": FONT_SIZE_CAPTION, "marginTop": SPACE_1}),
+    ], style={"marginTop": SPACE_2})
+
+
+def _seizures_in_scope(store, animal, protocol) -> list:
+    """The scored seizures for an (animal, protocol) scope, chronological."""
+    if not animal:
+        return []
+    return [s for s in scored_seizures(store, animal)
+            if not protocol or protocol in _tok(s.session_dir)]
+
+
+def _seizure_key(s) -> str:
+    """Stable checklist value for a seizure: file + rounded onset offset."""
+    return f"{int(s.file_id)}:{round(float(s.eo_sec), 2)}"
+
+
+def _seizure_label(s) -> str:
+    try:
+        when = datetime.fromtimestamp(s.onset_epoch).strftime("%Y-%m-%d %H:%M")
+    except (OSError, ValueError, OverflowError):
+        when = "?"
+    rac = f"Racine {s.racine}" if s.racine is not None else "Racine —"
+    typ = f" · {s.seizure_type}" if s.seizure_type else ""
+    return f" {when} · {rac}{typ}"
+
+
+def _keep_status(kept: int, excluded: int, total: int) -> str:
+    return (f"{kept} kept · {excluded} excluded of {total}"
+            + (" — press ▶ Build to apply." if excluded else ""))
 
 
 def _window_panel() -> html.Details:
@@ -2167,6 +2212,59 @@ def register_callbacks(app, store, config):
         return (jid, msg, selection.get("animal"),
                 selection.get("protocol") or "", selection.get("variant"),
                 selection.get("window_h"), method)
+
+    # ---- Seizure-event include/exclude (persistent per animal) ---- #
+    _seiz_hint = {"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION}
+
+    @app.callback(
+        Output("pex-seizure-list", "children"),
+        Output("pex-seizure-status", "children"),
+        Input("pex-animal", "value"),
+        Input("pex-protocol", "value"),
+    )
+    def _render_seizure_keeplist(animal, protocol):
+        if not animal:
+            return html.Span("Pick an animal.", style=_seiz_hint), ""
+        szs = _seizures_in_scope(store, animal, protocol)
+        if not szs:
+            return html.Span("No scored seizures in this scope.",
+                             style=_seiz_hint), ""
+        excl = store.excluded_seizure_keys(animal)
+        opts, keep = [], []
+        for s in szs:
+            opts.append({"label": _seizure_label(s), "value": _seizure_key(s)})
+            if store.seizure_excl_key(s.file_id, s.eo_sec) not in excl:
+                keep.append(_seizure_key(s))
+        lst = dcc.Checklist(
+            id="pex-seizure-keep", options=opts, value=keep,
+            labelStyle={"display": "block", "color": COLOR_TEXT_PRIMARY,
+                        "fontSize": FONT_SIZE_CAPTION, "cursor": "pointer"},
+            inputStyle={"marginRight": "6px"})
+        return lst, _keep_status(len(keep), len(szs) - len(keep), len(szs))
+
+    @app.callback(
+        Output("pex-seizure-status", "children", allow_duplicate=True),
+        Input("pex-seizure-keep", "value"),
+        State("pex-animal", "value"),
+        State("pex-protocol", "value"),
+        prevent_initial_call=True,
+    )
+    def _persist_seizure_keep(keep, animal, protocol):
+        if not animal:
+            return no_update
+        keep = set(keep or [])
+        szs = _seizures_in_scope(store, animal, protocol)
+        scope = {store.seizure_excl_key(s.file_id, s.eo_sec): s for s in szs}
+        want_excl = {k for k, s in scope.items() if _seizure_key(s) not in keep}
+        cur = store.excluded_seizure_keys(animal)
+        # Only touch the diff within THIS scope; other protocols' marks stand.
+        for k in want_excl - cur:
+            s = scope[k]
+            store.set_seizure_excluded(animal, s.file_id, s.eo_sec, True)
+        for k in (cur & set(scope)) - want_excl:
+            s = scope[k]
+            store.set_seizure_excluded(animal, s.file_id, s.eo_sec, False)
+        return _keep_status(len(szs) - len(want_excl), len(want_excl), len(szs))
 
     @app.callback(
         Output("pex-graph", "figure"),

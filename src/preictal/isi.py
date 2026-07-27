@@ -105,6 +105,22 @@ def behavioral_seizures(store, animal_id: str,
     return out
 
 
+def included_seizures(store, animal_id: str) -> list:
+    """``scored_seizures`` minus the ones the user marked out of the peri-ictal
+    analysis (bad-data periods; ``Store.excluded_seizure_keys``). The single
+    entry point the peri-ictal matrix + its cache signature use, so excluding a
+    seizure both drops its stimuli AND invalidates the cached matrix."""
+    szs = scored_seizures(store, animal_id)
+    try:
+        excl = store.excluded_seizure_keys(animal_id)
+    except Exception:                                  # noqa: BLE001
+        excl = set()
+    if not excl:
+        return szs
+    return [s for s in szs
+            if store.seizure_excl_key(s.file_id, s.eo_sec) not in excl]
+
+
 def _load_markers(markers_json) -> list:
     try:
         return json.loads(markers_json or "[]")

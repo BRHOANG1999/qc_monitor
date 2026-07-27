@@ -5743,6 +5743,53 @@ class Store:
         """notification_log digest identifying one (animal, flagged file) email."""
         return f"flag_email:{animal_id}:{int(file_id)}"
 
+    # A seizure's stable identity for exclusion: (file_id, eo_sec) within an
+    # animal. eo_sec is rounded so tiny float drift can't orphan a mark.
+    @staticmethod
+    def seizure_excl_key(file_id, eo_sec) -> tuple:
+        return (int(file_id), round(float(eo_sec), 2))
+
+    def set_seizure_excluded(self, animal_id: str, file_id: int, eo_sec: float,
+                             excluded: bool, note: str | None = None) -> None:
+        """Mark one scored seizure OUT of (or back INTO) the peri-ictal analysis
+        (Explorer 'Seizure events' panel). Persistent per animal. Un-excluding
+        DELETES the row so the table stays sparse (only exclusions are stored)."""
+        assert animal_id, "animal_id required"
+        eo = round(float(eo_sec), 2)
+        conn = self._connect()
+        try:
+            if excluded:
+                conn.execute(
+                    """INSERT INTO periictal_seizure_exclusion
+                           (animal_id, file_id, eo_sec, excluded, note, updated_at)
+                       VALUES (?,?,?,1,?,?)
+                       ON CONFLICT(animal_id, file_id, eo_sec) DO UPDATE SET
+                           excluded=1, note=excluded.note,
+                           updated_at=excluded.updated_at""",
+                    (animal_id, int(file_id), eo, note,
+                     datetime.now().isoformat()))
+            else:
+                conn.execute(
+                    "DELETE FROM periictal_seizure_exclusion "
+                    "WHERE animal_id=? AND file_id=? AND eo_sec=?",
+                    (animal_id, int(file_id), eo))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def excluded_seizure_keys(self, animal_id: str) -> set:
+        """``{(file_id, eo_sec_rounded), ...}`` for *animal_id*'s seizures marked
+        excluded -- used to drop them from the peri-ictal matrix."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT file_id, eo_sec FROM periictal_seizure_exclusion "
+                "WHERE animal_id=? AND excluded=1", (animal_id,)).fetchall()
+            return {self.seizure_excl_key(r["file_id"], r["eo_sec"])
+                    for r in rows}
+        finally:
+            conn.close()
+
     def seed_flag_email_baseline(self, animal_id: str) -> int:
         """Claim every CURRENTLY-flagged file for *animal_id* so enabling the
         alert does not email the whole standing backlog -- only files flagged

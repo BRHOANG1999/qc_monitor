@@ -30,8 +30,8 @@ from src.evoked_figures.data import _nan, iter_animal_sidecars, parse_iso
 from src.periictal import config as _cfg
 from src.periictal import passive as _passive
 from src.periictal import stim_map as _sm
-from src.preictal.isi import (leadtime_bins, lookback_ceilings,
-                              scored_seizures)
+from src.preictal.isi import (included_seizures, leadtime_bins,
+                              lookback_ceilings)
 
 _MAX_FILES = 2_000_000        # NASA Rule 2: explicit scan bound.
 
@@ -162,7 +162,7 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
     feature_cfg = feature_cfg if feature_cfg is not None else passive_cfg
     if sidecar_variant is None:
         sidecar_variant = "passive" if variant == "passive" else "evoked"
-    seizures = scored_seizures(store, animal)
+    seizures = included_seizures(store, animal)
     onsets = np.array([s.onset_epoch for s in seizures], dtype=np.float64)
     if onsets.size < 2:
         return _empty_frame(metrics)

@@ -779,6 +779,22 @@ CREATE TABLE IF NOT EXISTS flag_email_subscription (
     updated_at TEXT NOT NULL
 );
 
+-- Per-seizure opt-OUT of the peri-ictal analysis: seizures scored during a
+-- period of poor/bad data collection can be excluded so they don't define
+-- preictal windows or interictal boundaries in the embedding. A seizure is
+-- identified by (animal, recording file, EEG-onset offset) -- eo_sec is the raw
+-- scored value, stable across rebuilds. Persistent (mark-once), so it also
+-- flows into the headless report + exported embeddings.
+CREATE TABLE IF NOT EXISTS periictal_seizure_exclusion (
+    animal_id  TEXT NOT NULL,
+    file_id    INTEGER NOT NULL,
+    eo_sec     REAL NOT NULL,
+    excluded   INTEGER NOT NULL DEFAULT 1,
+    note       TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (animal_id, file_id, eo_sec)
+);
+
 -- ----------------------------------------------------------------------
 -- Pre-ictal CWT sweep engine (thesis subsystem). Discovers the time-scale
 -- at which the pre-ictal trajectory is cleanest. Heavy compute runs in a

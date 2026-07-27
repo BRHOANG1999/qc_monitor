@@ -20,7 +20,7 @@ import pandas as pd
 from src.evoked_figures.run import inputs_signature
 from src.periictal import matrix as _matrix
 from src.periictal import passive as _passive
-from src.preictal.isi import scored_seizures
+from src.preictal.isi import included_seizures
 from src.utils.evoked_output import (animals_in_filename, feature_sidecar_path,
                                      list_evoked_files)
 
@@ -78,8 +78,10 @@ def _sidecar_inputs(animal: str, evoked_dir: str, sidecar_variant: str) -> list:
 
 
 def _seizure_sig(store, animal: str) -> str:
+    # included_seizures (not scored_seizures): excluding a bad-data seizure
+    # changes the onset set here too, so the cached matrix invalidates.
     h = hashlib.sha256()
-    for s in scored_seizures(store, animal):
+    for s in included_seizures(store, animal):
         h.update(f"{s.onset_epoch:.1f}|".encode("ascii"))
     return h.hexdigest()
 
