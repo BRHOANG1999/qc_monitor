@@ -129,11 +129,18 @@ def warm_variant(animal: str, evoked_dir: str, variant: str, cfg: FeatureConfig,
     files = [f for f in eo.list_evoked_files(evoked_dir)
              if animal in eo.animals_in_filename(f)
              and (not protocol or protocol in eo.parse_session(f))]
+    import gc
     built = 0
     for i, fp in enumerate(files):
         assert i < _MAX_FILES, "variant warm runaway"
         if eo.read_feature_sidecar(fp, animal, variant, sig) is None:
             built += build_variant_sidecar(fp, animal, variant, cfg) and 1 or 0
+            # Each file reads a ~600 MB .mat; force a collection so a long
+            # custom-window warm can't let per-file garbage stack up in a
+            # long-lived, memory-pressured server (the build thread's process
+            # also holds the dashboard's caches). The compute itself is clean;
+            # this is cheap insurance, not a fix for a leak.
+            gc.collect()
         if progress:
             progress(i + 1, len(files), fp)
     return built, len(files)

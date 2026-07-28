@@ -1006,12 +1006,12 @@ def _window_panel() -> html.Details:
             _ctl("Evoked mode", dcc.RadioItems(
                 id="pex-winmode", value="full", inline=True,
                 labelStyle=_RADIO_LABEL, inputStyle=_RADIO_INPUT,
-                options=[{"label": "full trace (fast)", "value": "full"},
+                options=[{"label": "[1–200 ms] (fast)", "value": "full"},
                          {"label": "custom window", "value": "custom"}]),
-                "Full = the toolkit's extracted trace (fast, but INCLUDES the "
-                "stim artifact at t=0). Custom = recompute features over the ms "
-                "window below, excluding the artifact. (Passive is always a "
-                "window.)"),
+                "Default = the shared sidecar, now windowed to [1–200 ms] "
+                "post-stim (fast, pre-computed — use this). Custom = recompute "
+                "features over a DIFFERENT ms window from the raw traces (slow "
+                "first build). (Passive is always a window.)"),
             _ctl("From (ms)", dcc.Input(id="pex-win-from", type="number", value=1,
                                         step="any", debounce=True, style=_WIN_INP),
                  "Window start relative to the stimulus (t=0)."),
@@ -1024,10 +1024,10 @@ def _window_panel() -> html.Details:
                 "Exclude ±this many ms around t=0 (the stim artifact); the bound "
                 "nearest 0 is pushed out to here."),
         ], style=_GRP),
-        html.Div("t = 0 is the stimulus. Evoked = a POST-stim window (e.g. 1→200 "
-                 "ms); passive = PRE-stim (−200→−1). A custom window recomputes "
-                 "features from the raw traces — a one-time background warm, then "
-                 "cached.",
+        html.Div("t = 0 is the stimulus. Evoked = a POST-stim window (default "
+                 "[1→200] ms); passive = PRE-stim (−200→−1). The default reads "
+                 "the pre-computed sidecar; a CUSTOM window recomputes features "
+                 "from the raw traces (slow first build, then cached).",
                  style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
                         "marginTop": SPACE_2, "maxWidth": "90ch"}),
     ], style={"marginTop": SPACE_3})
@@ -1554,7 +1554,9 @@ def _preview_panel(store, animal, protocol, variant, window_h,
 def _window_label(sidecar_variant, cfg) -> str:
     """Human label for the active feature window."""
     if cfg is None:
-        return "full trace, incl. artifact"
+        # The default sidecar is now the [1, 200] ms post-stim window
+        # (evoked_output.DEFAULT_EVOKED_CFG), not the full trace.
+        return "1 to 200 ms"
     return f"{cfg.window_start_ms:g} to {cfg.window_end_ms:g} ms"
 
 

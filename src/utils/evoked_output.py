@@ -169,7 +169,21 @@ def list_animals(evoked_dir: str) -> list[str]:
 #     span-normalised, the slow baseline is a real median, and a positive decay
 #     constant is rejected. See evoked_features.trial_moving_average and
 #     _transition_indices.
-_FEATURE_SIDECAR_VERSION = "4"
+# v5: the DEFAULT sidecar now crops to the [1, 200] ms post-stim analysis window
+#     (DEFAULT_EVOKED_CFG) before computing EVERY feature -- previously only the
+#     Chang morphology + area columns were windowed while the ~23 cheap/spectral/
+#     wavelet columns ran on the full +/-500 ms epoch (artifact + pre-stim
+#     baseline included). So "full trace (fast)" now equals "custom window 1-200"
+#     instead of silently disagreeing. Changes the cheap/spectral/wavelet columns
+#     everywhere the default sidecar is read (peri-ictal, chronic_evoked,
+#     evoked_figures); the corpus needs a re-warm (background warmer, unattended).
+_FEATURE_SIDECAR_VERSION = "5"
+
+# The default post-stim analysis window for the shared 'evoked' sidecar. Crop
+# only (no filtering); matches _CHANG_GUARD_MS / _CHANG_POST_MS so the whole
+# feature set uses one window. compute_feature_rows applies it when no cfg is
+# passed, so the default is windowed rather than full-trace.
+DEFAULT_EVOKED_CFG = ef.FeatureConfig(window_start_ms=1.0, window_end_ms=200.0)
 
 # Versions whose rows are still USABLE.
 #
@@ -187,14 +201,14 @@ _FEATURE_SIDECAR_VERSION = "4"
 # the kind of artefact these features exist to detect. So v2/v3 are rejected and
 # the corpus needs a re-warm. The background warmer does that unattended, and
 # the build reports an empty result with a reason rather than hanging.
-_COMPATIBLE_SIDECAR_VERSIONS = {"4"}
+_COMPATIBLE_SIDECAR_VERSIONS = {"5"}
 
 # Versions whose WAVELET columns still mean what they mean now, i.e. from which
 # the incremental upgrade may salvage them instead of recomputing the Morlet CWT
 # (which dominates a warm). Separate from the set above because a bump can
 # invalidate cheap columns while leaving the expensive ones intact -- v4 does
 # not, since trial-averaging changes the wavelet columns too.
-_WAVELET_STABLE_VERSIONS = {"4"}
+_WAVELET_STABLE_VERSIONS = {"5"}
 
 
 def feature_sidecar_path(mat_path: str, animal: str,
@@ -441,8 +455,16 @@ def compute_feature_rows(path: str, animal: str, cfg=None,
     Features are computed on a centred *trial_avg*-trial sliding average rather
     than on the raw single epoch (default ``evoked_features.TRIAL_AVG_N``); pass
     1 to disable. Still one row per stimulus.
+
+    *cfg* is the feature window/filter. When omitted the default is the
+    ``[1, 200] ms`` post-stim analysis window (``DEFAULT_EVOKED_CFG``), NOT the
+    full trace -- so the shared 'evoked' sidecar windows every feature, matching
+    the Chang morphology columns instead of leaving the cheap/spectral columns on
+    the full +/-500 ms epoch.
     """
     assert path and animal, "path and animal required"
+    if cfg is None:
+        cfg = DEFAULT_EVOKED_CFG
     chans = read_file_evoked(path, only_animals=[animal])
     rec_iso = (parse_recording_dt(path) or datetime.min).isoformat()
     session = parse_session(path)
