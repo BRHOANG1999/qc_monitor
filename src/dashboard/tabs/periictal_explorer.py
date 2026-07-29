@@ -26,6 +26,7 @@ import base64
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime
 
@@ -61,6 +62,7 @@ from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
 from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
+from src.utils import sidecar_warm as _sw
 
 logger = logging.getLogger(__name__)
 
@@ -249,14 +251,47 @@ def scope_bar(store):
                                               "fontSize": FONT_SIZE_CAPTION,
                                               "minHeight": "14px"}),
              _save_load_row(),
+             # Live feature-warmer activity so a re-warm reads as "working, next
+             # batch in Ns", never "frozen". Ticks independently of a build.
+             html.Div(id="pex-warm-status",
+                      style={"color": COLOR_TEXT_TERTIARY,
+                             "fontSize": FONT_SIZE_CAPTION, "marginTop": SPACE_2,
+                             "fontFamily": "monospace"}),
              style={"marginTop": SPACE_3}),
         dcc.Interval(id="pex-poll", interval=1200, disabled=True),
+        dcc.Interval(id="pex-warm-tick", interval=2500),
         # storage_type="session" is how a dcc.Store persists its data across
         # sub-tab swaps (Store has no `persistence` prop) — so a lens can redraw
         # from the module cache on remount using the retained job id.
         dcc.Store(id="pex-job", storage_type="session"),
         dcc.Download(id="pex-export-dl"),
     ])
+
+
+def _warm_status_line(st: dict) -> str:
+    """One live line for the feature warmer -- the reviewer's 'alive vs frozen'
+    signal. Warming shows the current file + seconds elapsed; sleeping shows a
+    countdown to the next batch; both show the running built count."""
+    built, failed = int(st.get("built", 0)), int(st.get("failed", 0))
+    tail = (f" · {built} built" + (f", {failed} failed" if failed else "")
+            + " this run")
+    phase = st.get("phase")
+    if phase == "warming":
+        started = st.get("started_at")
+        ago = int(time.time() - started) if started else 0
+        pos = st.get("pos")
+        posn = f" [{pos[0]}/{pos[1]}]" if pos else ""
+        who = st.get("animal") or ""
+        return (f"⟳ warmer: computing {who}{posn} · {st.get('file') or ''} "
+                f"— {ago}s{tail}")
+    if phase == "idle":
+        return f"✓ warmer: corpus up to date{tail}"
+    if phase in ("sleeping", "error"):
+        nxt = st.get("next_at")
+        rem = max(0, int(nxt - time.time())) if nxt else 0
+        label = "retry" if phase == "error" else "next batch"
+        return f"⏸ warmer: waiting — {label} in {rem}s{tail}"
+    return "warmer: starting…"
 
 
 def _save_load_row() -> html.Div:
@@ -2221,6 +2256,17 @@ def register_callbacks(app, store, config):
         return (jid, msg, selection.get("animal"),
                 selection.get("protocol") or "", selection.get("variant"),
                 selection.get("window_h"), method)
+
+    # ---- Live feature-warmer status (alive vs frozen) ---- #
+    @app.callback(
+        Output("pex-warm-status", "children"),
+        Input("pex-warm-tick", "n_intervals"),
+    )
+    def _render_warm_status(_n):
+        try:
+            return _warm_status_line(_sw.status())
+        except Exception:                             # noqa: BLE001
+            return ""
 
     # ---- Seizure-event include/exclude (persistent per animal) ---- #
     _seiz_hint = {"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION}

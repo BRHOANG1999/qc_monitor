@@ -36,6 +36,29 @@ _MIN_INTERVAL_SEC = 30.0
 _thread: threading.Thread | None = None
 _lock = threading.Lock()
 
+# Live status the dashboard polls so a reviewer can tell "slow" from "frozen".
+# In-process (the warmer runs in the dashboard's process) -> no DB / share cost.
+_status: dict = {"phase": "starting", "file": None, "animal": None,
+                 "started_at": None, "next_at": None, "pos": None,
+                 "built": 0, "failed": 0}
+_status_lock = threading.Lock()
+
+
+def _set_status(**kw) -> None:
+    with _status_lock:
+        _status.update(kw)
+
+
+def _incr(key: str, n: int = 1) -> None:
+    with _status_lock:
+        _status[key] = int(_status.get(key, 0)) + n
+
+
+def status() -> dict:
+    """A snapshot of what the warmer is doing right now (dashboard poll)."""
+    with _status_lock:
+        return dict(_status)
+
 
 def _cfg(config: dict) -> dict:
     return ((config or {}).get("chronic_evoked", {}) or {}).get(
@@ -96,20 +119,28 @@ def find_pending(config: dict, limit: int = 50, upgrade_outdated: bool = False):
 
 def warm_batch(config: dict, batch: int = DEFAULT_BATCH,
                upgrade_outdated: bool = False) -> dict:
-    """Build up to *batch* pending sidecars. Returns a summary; never raises."""
+    """Build up to *batch* pending sidecars. Returns a summary; never raises.
+    Publishes per-file live status (``status()``) so the dashboard can show
+    active progress."""
+    import os
     from src.utils.evoked_output import read_or_compute_sidecar
     built = failed = 0
     pending = find_pending(config, limit=batch,
                            upgrade_outdated=upgrade_outdated)
-    for fp, animal in pending:
+    for i, (fp, animal) in enumerate(pending):
+        _set_status(phase="warming", file=os.path.basename(fp), animal=animal,
+                    started_at=time.time(), pos=(i + 1, len(pending)))
         try:
             rows = read_or_compute_sidecar(fp, animal)
             if rows:
                 built += 1
+                _incr("built")
             else:
                 failed += 1
+                _incr("failed")
         except Exception as e:              # noqa: BLE001 -- one bad file
             failed += 1
+            _incr("failed")
             logger.debug("sidecar warm failed for %s/%s: %s", fp, animal, e)
     return {"built": built, "failed": failed, "pending_seen": len(pending)}
 
@@ -125,8 +156,14 @@ def _run(store, config: dict) -> None:
                 logger.info("sidecar warm: built %d, failed %d "
                             "(%d pending this pass)",
                             s["built"], s["failed"], s["pending_seen"])
+            # Sleeping with a next-batch time so the dashboard shows a countdown
+            # (idle between 5-min batches must not read as "frozen").
+            _set_status(phase="idle" if s["pending_seen"] == 0 else "sleeping",
+                        file=None, animal=None, pos=None,
+                        next_at=time.time() + interval)
         except Exception as e:              # noqa: BLE001 -- never kill the loop
             logger.warning("sidecar warm loop error: %s", e)
+            _set_status(phase="error", next_at=time.time() + interval)
         time.sleep(interval)
 
 
