@@ -63,7 +63,8 @@ def find_pending(config: dict, limit: int = 50, upgrade_outdated: bool = False):
     missing sidecars; with *upgrade_outdated* also older-schema ones."""
     from src.utils.evoked_output import (animals_in_filename,
                                          feature_sidecar_path,
-                                         list_evoked_files, sidecar_is_current)
+                                         list_evoked_files, read_feature_sidecar,
+                                         sidecar_is_current)
     import os
     evoked_dir = ((config or {}).get("chronic_evoked", {}) or {}).get(
         "evoked_output_dir", "")
@@ -77,8 +78,16 @@ def find_pending(config: dict, limit: int = 50, upgrade_outdated: bool = False):
         for a in animals_in_filename(fp):
             if len(out) >= limit:
                 break
-            exists = os.path.exists(feature_sidecar_path(fp, a))
-            if not exists:
+            if not os.path.exists(feature_sidecar_path(fp, a)):
+                out.append((fp, a))              # missing
+            elif read_feature_sidecar(fp, a) is None:
+                # Exists but the BUILD would REJECT it -- a non-additive schema
+                # bump (v5) makes every old sidecar unreadable, so it is
+                # effectively missing and MUST be rebuilt regardless of the
+                # 'upgrade_outdated' flag (which only gates the optional refresh
+                # of a still-READABLE older-but-additive sidecar). Without this
+                # the corpus never re-warms after a non-additive bump and every
+                # build stays empty.
                 out.append((fp, a))
             elif upgrade_outdated and not sidecar_is_current(fp, a):
                 out.append((fp, a))

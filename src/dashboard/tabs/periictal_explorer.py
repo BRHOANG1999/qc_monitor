@@ -1744,23 +1744,30 @@ def _empty_reason(store, evoked_dir, animal, protocol) -> str:
     have = tot = 0
     try:
         from src.utils.evoked_output import (animals_in_filename,
-                                             feature_sidecar_path,
-                                             list_evoked_files)
+                                             list_evoked_files,
+                                             sidecar_is_current)
         for fp in list_evoked_files(evoked_dir):
             if animal not in animals_in_filename(fp):
                 continue
             if protocol and protocol not in os.path.basename(fp):
                 continue
             tot += 1
-            if os.path.exists(feature_sidecar_path(fp, animal)):
+            # sidecar_is_current, NOT os.path.exists: after a schema bump every
+            # recording still HAS a sidecar (the old version), so counting
+            # existence read "196 of 197" and never moved while the warmer
+            # rebuilt them -- the build needs the CURRENT (v5) sidecar.
+            if sidecar_is_current(fp, animal):
                 have += 1
     except Exception:                                   # noqa: BLE001
         return _EMPTY_MSG
     if tot and have < tot:
         scope = f"{animal}" + (f" / {protocol}" if protocol else "")
-        return (f"Features aren't computed yet for {scope}: {have} of {tot} "
-                "recordings have a feature sidecar. The background warmer is "
-                "catching up — rebuild in a few minutes.")
+        pct = int(100 * have / tot) if tot else 0
+        return (f"Features for {scope} are being (re)computed: {have} of {tot} "
+                f"recordings up to date ({pct}%). The background warmer is "
+                "re-reading each recording (slow — minutes/file); rebuild once "
+                "it climbs. A recording that failed MATLAB has no evoked data "
+                "and never reaches 100%.")
     return _EMPTY_MSG
 
 

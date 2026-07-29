@@ -101,6 +101,40 @@ def test_sidecar_is_current_false_when_absent(tmp_path):
     assert EO.sidecar_is_current(str(mat), "BCH111") is False
 
 
+# ------------------------------------------------ find_pending re-warm --- #
+
+def _evoked_dir_cfg(d):
+    return {"chronic_evoked": {"evoked_output_dir": str(d)}}
+
+
+def test_find_pending_rebuilds_rejected_version_without_the_flag(tmp_path):
+    """The bug: after a NON-additive bump the old sidecar still EXISTS, so
+    find_pending (upgrade_outdated=False) skipped it and the corpus never
+    re-warmed -- every build stayed empty. A build-REJECTED sidecar must be
+    pending regardless of the flag."""
+    mat = tmp_path / "sess__stimCopy_BCH111SR___2026_03_02__00_00_00_evoked.mat"
+    mat.write_bytes(b"x")
+    _write_sidecar(mat, "BCH111", "3")                 # old, v5 rejects it
+    pend = SW.find_pending(_evoked_dir_cfg(tmp_path), limit=10,
+                           upgrade_outdated=False)
+    assert (str(mat), "BCH111") in pend
+
+
+def test_find_pending_skips_a_current_sidecar(tmp_path):
+    mat = tmp_path / "sess__stimCopy_BCH111SR___2026_03_02__00_00_00_evoked.mat"
+    mat.write_bytes(b"x")
+    _write_sidecar(mat, "BCH111", EO._FEATURE_SIDECAR_VERSION)   # v5, mtime-fresh
+    pend = SW.find_pending(_evoked_dir_cfg(tmp_path), limit=10)
+    assert (str(mat), "BCH111") not in pend
+
+
+def test_find_pending_reports_a_missing_sidecar(tmp_path):
+    mat = tmp_path / "sess__stimCopy_BCH111SR___2026_03_02__00_00_00_evoked.mat"
+    mat.write_bytes(b"x")                               # no sidecar written
+    pend = SW.find_pending(_evoked_dir_cfg(tmp_path), limit=10)
+    assert (str(mat), "BCH111") in pend
+
+
 # ------------------------------------------------------------- settings --- #
 
 def _cfg(**over):
