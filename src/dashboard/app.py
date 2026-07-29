@@ -258,6 +258,13 @@ from src.dashboard.data_helpers import (  # noqa: E402,F401
 def create_app(config: dict, store: Store) -> Dash:
     refresh_sec = config.get("dashboard", {}).get("refresh_interval_sec", 10)
 
+    # Opt-in memory-leak tracer (debug.memtrace / env QC_MEMTRACE). No-op unless
+    # enabled; when on, logs the top memory-GROWTH sites every interval so an
+    # unbounded process names its own leaking file:line. Start first so it sees
+    # allocations from the rest of boot onward.
+    from src.utils import memtrace as _memtrace
+    _memtrace.start(config)
+
     # Warm the Reviewer Assignments cache in a daemon thread so the
     # Video Review picker never blocks on the Sheets API in any
     # render path. Idempotent across reloads.
