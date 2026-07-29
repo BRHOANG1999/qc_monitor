@@ -401,12 +401,17 @@ chronic_evoked:
   # Background sidecar builder. Sidecars used to be created only when someone
   # opened this tab, so new recordings accumulated without features forever
   # (the coverage monitor's "evoked recordings unanalyzed" gap). This fills
-  # them a few at a time. Deliberately slow: each one reads a whole multi-GB
-  # recording off the share, so a flat-out catch-up would starve the UI.
+  # them a few at a time, newest recordings first.
   sidecar_warm:
     enabled: true
-    interval_sec: 300     # sleep between batches
-    batch: 4              # sidecars per batch (newest recordings first)
+    # Cadence auto-tunes to where evoked_output_dir lives (see _path_is_local):
+    #   LOCAL fixed disk  -> brisk (batch 20 / 60 s idle), near-continuous;
+    #   network share/UNC -> gentle (batch 4 / 300 s idle) so a multi-GB SMB
+    #                        read never starves the UI or the analysis sweeps.
+    # It stays SERIAL either way (one recording in memory at a time). Uncomment
+    # to pin an explicit cadence that overrides the auto choice:
+    # interval_sec: 300
+    # batch: 4
     # Older-schema sidecars are still READ fine (new columns come back NaN),
     # so re-computing them is optional. Turn on to backfill the newer feature
     # columns across the archive.

@@ -7,13 +7,22 @@ any view that needs features either showed nothing or tried to compute them
 inline and appeared to hang.
 
 This worker fills that gap the boring way: every *interval* it computes a small
-BATCH of missing sidecars, one file at a time, then sleeps. Deliberately slow
-and low-priority --
+BATCH of missing sidecars, one file at a time, then sleeps. Low-priority and
+self-limiting -- it shrinks as the backlog closes and becomes a cheap no-op scan
+once coverage is complete.
 
-* computing one sidecar reads a whole multi-GB recording off the SMB share, so
-  a flat-out catch-up would starve the dashboard and the analysis sweeps;
-* the work is naturally self-limiting: it shrinks as the backlog closes and
-  becomes a cheap no-op scan once coverage is complete.
+The cadence auto-tunes to WHERE ``evoked_output_dir`` lives (``_path_is_local``):
+
+* on a network share, one sidecar reads a multi-GB recording over SMB, so a
+  flat-out catch-up would starve the dashboard and the analysis sweeps -- keep
+  the gentle default (a small batch every few minutes);
+* on a LOCAL fixed disk those reads are fast and private, so the multi-minute
+  idle between batches is pure wasted wall-clock -- run near-continuously
+  instead. Still SERIAL (one recording in memory at a time), so the memory
+  profile is unchanged; only the idle shrinks.
+
+An explicit ``interval_sec`` / ``batch`` in config always overrides the auto
+choice.
 
 It builds MISSING sidecars first (those are pure coverage gaps). Upgrading an
 older-but-readable sidecar to the current schema is optional and off by default,
@@ -24,14 +33,22 @@ columns.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
 logger = logging.getLogger("qc_monitor.sidecar_warm")
 
+# Gentle cadence for a network share (a multi-GB SMB read per sidecar).
 DEFAULT_INTERVAL_SEC = 300.0
 DEFAULT_BATCH = 4
+# Brisk cadence for a local fixed disk: a short breather between batches instead
+# of the multi-minute share-recovery idle. Still one recording in memory at a
+# time -- only the idle changes, not the peak footprint.
+LOCAL_INTERVAL_SEC = 60.0
+LOCAL_BATCH = 20
 _MIN_INTERVAL_SEC = 30.0
+_DRIVE_FIXED = 3                    # Windows GetDriveType: local fixed disk
 
 _thread: threading.Thread | None = None
 _lock = threading.Lock()
@@ -65,17 +82,55 @@ def _cfg(config: dict) -> dict:
         "sidecar_warm", {}) or {}
 
 
+def _evoked_dir(config: dict) -> str:
+    return ((config or {}).get("chronic_evoked", {}) or {}).get(
+        "evoked_output_dir", "") or ""
+
+
+def _path_is_local(path: str) -> bool:
+    """True only when *path* sits on a local FIXED disk (fast, private I/O).
+
+    A UNC path, a mapped network drive, or anything we cannot positively
+    classify counts as REMOTE -- the gentle SMB-friendly cadence stays the
+    default whenever we are unsure, so this never accelerates a real share read
+    by mistake. Windows-only detection via ``GetDriveTypeW``; degrades to False
+    (remote / gentle) on any error or non-Windows host."""
+    raw = (path or "").strip()
+    if not raw or raw.startswith("\\\\") or raw.startswith("//"):
+        return False                                  # empty or UNC -> network
+    p = os.path.abspath(raw)
+    if p.startswith("\\\\"):                           # abspath'd UNC
+        return False
+    drive = os.path.splitdrive(p)[0]                   # e.g. "D:"
+    if not drive:
+        return False
+    try:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetDriveTypeW(
+            drive + "\\")) == _DRIVE_FIXED
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def _default_cadence(config: dict) -> tuple[str, float, int]:
+    """(mode, interval, batch) chosen from where the evoked dir lives."""
+    if _path_is_local(_evoked_dir(config)):
+        return "local", LOCAL_INTERVAL_SEC, LOCAL_BATCH
+    return "remote", DEFAULT_INTERVAL_SEC, DEFAULT_BATCH
+
+
 def _settings(config: dict) -> tuple[bool, float, int, bool]:
     c = _cfg(config)
+    _mode, d_interval, d_batch = _default_cadence(config)
     enabled = bool(c.get("enabled", True))
     try:
-        interval = float(c.get("interval_sec", DEFAULT_INTERVAL_SEC))
+        interval = float(c.get("interval_sec", d_interval))
     except (TypeError, ValueError):
-        interval = DEFAULT_INTERVAL_SEC
+        interval = d_interval
     try:
-        batch = int(c.get("batch", DEFAULT_BATCH))
+        batch = int(c.get("batch", d_batch))
     except (TypeError, ValueError):
-        batch = DEFAULT_BATCH
+        batch = d_batch
     upgrade = bool(c.get("upgrade_outdated", False))
     return enabled, max(_MIN_INTERVAL_SEC, interval), max(1, batch), upgrade
 
@@ -147,8 +202,9 @@ def warm_batch(config: dict, batch: int = DEFAULT_BATCH,
 
 def _run(store, config: dict) -> None:
     enabled, interval, batch, upgrade = _settings(config)
-    logger.info("sidecar warm worker started (batch=%d every %.0f s, "
-                "upgrade_outdated=%s)", batch, interval, upgrade)
+    mode, _di, _db = _default_cadence(config)
+    logger.info("sidecar warm worker started (%s dir: batch=%d every %.0f s, "
+                "upgrade_outdated=%s)", mode, batch, interval, upgrade)
     while True:
         try:
             s = warm_batch(config, batch=batch, upgrade_outdated=upgrade)

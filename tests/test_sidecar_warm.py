@@ -153,6 +153,51 @@ def test_settings_defaults_and_clamps():
     assert SW._settings({})[0] is True          # enabled by default
 
 
+# ------------------------------------------------ locality-aware cadence --- #
+
+def _cadence_cfg(evoked_dir, **warm):
+    return {"chronic_evoked": {"evoked_output_dir": evoked_dir,
+                               "sidecar_warm": {"enabled": True, **warm}}}
+
+
+def test_local_dir_gets_the_brisk_default_cadence(monkeypatch):
+    """A local fixed disk drops the multi-minute share-recovery idle."""
+    monkeypatch.setattr(SW, "_path_is_local", lambda p: True)
+    _e, interval, batch, _u = SW._settings(_cadence_cfg("D:/x/evokedOutput"))
+    assert (interval, batch) == (SW.LOCAL_INTERVAL_SEC, SW.LOCAL_BATCH)
+    assert SW._default_cadence(_cadence_cfg("D:/x"))[0] == "local"
+
+
+def test_remote_dir_keeps_the_gentle_default_cadence(monkeypatch):
+    monkeypatch.setattr(SW, "_path_is_local", lambda p: False)
+    _e, interval, batch, _u = SW._settings(
+        _cadence_cfg("//100.106.104.22/db/evokedOutput"))
+    assert (interval, batch) == (SW.DEFAULT_INTERVAL_SEC, SW.DEFAULT_BATCH)
+    assert SW._default_cadence(_cadence_cfg("//srv/s"))[0] == "remote"
+
+
+def test_explicit_cadence_overrides_locality(monkeypatch):
+    """A pinned interval/batch wins over the auto choice, even on a local dir."""
+    monkeypatch.setattr(SW, "_path_is_local", lambda p: True)
+    _e, interval, batch, _u = SW._settings(
+        _cadence_cfg("D:/x", interval_sec=300, batch=4))
+    assert (interval, batch) == (300.0, 4)
+
+
+def test_path_is_local_rejects_unc_and_empty():
+    assert SW._path_is_local("//100.106.104.22/database/evokedOutput") is False
+    assert SW._path_is_local(r"\\100.106.104.22\database") is False
+    assert SW._path_is_local("") is False
+    assert SW._path_is_local(None) is False
+
+
+def test_path_is_local_accepts_a_fixed_drive():
+    """The project's own drive is a local fixed disk on the Windows lab box."""
+    if sys.platform != "win32":
+        return
+    assert SW._path_is_local(os.path.abspath(".")) is True
+
+
 def test_start_worker_respects_disabled():
     assert SW.start_worker(object(), _cfg(enabled=False)) is False
 
