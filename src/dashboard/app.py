@@ -153,6 +153,10 @@ SUBTAB_TO_GROUP: dict[str, str] = {
     sub["id"]: g["id"] for g in NAV_GROUPS for sub in g["subs"]
 }
 GROUP_BY_ID: dict[str, dict] = {g["id"]: g for g in NAV_GROUPS}
+# Sub-tab id -> friendly label, for the live "Loading <Tab>…" status pill.
+_TAB_LABEL_MAP: dict[str, str] = {
+    sub["id"]: sub["label"] for g in NAV_GROUPS for sub in g["subs"]
+}
 
 # Sub-tab styling — slightly smaller / quieter than the top group tabs.
 SUBTAB_STYLE = {
@@ -384,10 +388,40 @@ def create_app(config: dict, store: Store) -> Dash:
                     "letterSpacing": "0.2px",
                 },
             ),
+            # Live software-status pill: centered in the header, driven
+            # CLIENTSIDE so it updates the instant a tab is clicked -- even
+            # while the server is busy building the (possibly heavy) tab
+            # layout. Flips "Loading <Tab>…" -> "Ready" so a slow render
+            # never reads as a freeze. See _app_load_status clientside cb.
+            dcc.Store(id="tab-label-map", data=_TAB_LABEL_MAP),
+            html.Span(
+                "● Ready",
+                id="app-load-status",
+                title="Live app status — shows which tab is loading so a "
+                       "slow render isn't mistaken for a freeze.",
+                style={
+                    "position": "absolute",
+                    "left": "50%",
+                    "top": "50%",
+                    "transform": "translate(-50%, -50%)",
+                    "padding": "3px 12px",
+                    "borderRadius": "11px",
+                    "background": COLOR_SURFACE_2,
+                    "color": "#30d158",
+                    "border": "1px solid rgba(48, 209, 88, 0.35)",
+                    "fontSize": FONT_SIZE_CAPTION,
+                    "fontWeight": "600",
+                    "letterSpacing": "0.2px",
+                    "whiteSpace": "nowrap",
+                    "pointerEvents": "none",
+                    "zIndex": "5",
+                },
+            ),
         ], id="app-header",
            style={"padding": f"{SPACE_4} {SPACE_6}",
                   "background": COLOR_SURFACE_0,
-                  "borderBottom": f"1px solid {COLOR_DIVIDER}"}),
+                  "borderBottom": f"1px solid {COLOR_DIVIDER}",
+                  "position": "relative"}),
 
         # Top-level nav: 5 groups. Apple HIG "reduce" — each group fits
         # comfortably without horizontal scrolling.
@@ -660,6 +694,43 @@ def create_app(config: dict, store: Store) -> Dash:
         Output("kbd-event", "data", allow_duplicate=True),
         Input("kbd-help-hint", "n_clicks"),
         prevent_initial_call=True,
+    )
+
+    # Live software-status pill. Runs CLIENTSIDE so it reacts the instant a
+    # tab is clicked -- while the server is still building the layout the
+    # browser has nothing else to show, so without this a heavy tab reads as
+    # a freeze. tabs.value fires on click -> "Loading <Tab>…" (amber); when
+    # render_tab's tab-content.children lands -> "● Ready" (green). The full
+    # style is rebuilt each call because a returned style dict REPLACES the
+    # prop, so the absolute-centering must be re-emitted every time.
+    app.clientside_callback(
+        """
+        function (tabValue, content, labelMap) {
+            var base = {position:'absolute', left:'50%', top:'50%',
+                transform:'translate(-50%, -50%)', padding:'3px 12px',
+                borderRadius:'11px', background:'#1c1c2c', fontSize:'11px',
+                fontWeight:'600', letterSpacing:'0.2px', whiteSpace:'nowrap',
+                pointerEvents:'none', zIndex:'5'};
+            var ctx = window.dash_clientside.callback_context;
+            var trig = (ctx && ctx.triggered && ctx.triggered.length)
+                ? ctx.triggered[0].prop_id : '';
+            if (trig.indexOf('tabs.value') === 0 && tabValue) {
+                var label = (labelMap && labelMap[tabValue])
+                    ? labelMap[tabValue] : tabValue;
+                base.color = '#ff9f0a';
+                base.border = '1px solid rgba(255,159,10,0.40)';
+                return ['\\u23f3 Loading ' + label + '\\u2026', base];
+            }
+            base.color = '#30d158';
+            base.border = '1px solid rgba(48,209,88,0.35)';
+            return ['\\u25cf Ready', base];
+        }
+        """,
+        Output("app-load-status", "children"),
+        Output("app-load-status", "style"),
+        Input("tabs", "value"),
+        Input("tab-content", "children"),
+        State("tab-label-map", "data"),
     )
 
     # Pulsate "+ Add event" when the reviewer picked "Events
