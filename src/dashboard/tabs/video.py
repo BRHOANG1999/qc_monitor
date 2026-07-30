@@ -4016,8 +4016,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-queue-progress", "children"),
         Input("video-queue-animal", "value"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
     )
-    def _render_queue_progress(animal_value, _refresh):
+    def _render_queue_progress(animal_value, _refresh, _tab):
+        if _tab != "video":            # skip off-tab refresh-trigger fan-out
+            return no_update
         email = current_user_email() or ""
         if not email:
             return ""
@@ -4102,9 +4105,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-position", "data"),
         Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
         prevent_initial_call="initial_duplicate",
     )
-    def _render_queue_card(animal_value, position, mode, _refresh):
+    def _render_queue_card(animal_value, position, mode, _refresh, _tab):
+        if _tab != "video":            # skip off-tab refresh-trigger fan-out
+            return (no_update,) * 6
         # nav-wrap visibility: hidden (slim hint instead) until there's a
         # queue to browse; shown once we have rows.
         _HIDE = {"display": "none"}
@@ -4291,8 +4297,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-mode", "value"),
         Input("refresh-trigger", "data"),
         Input("video-file-dropdown", "value"),
+        State("tabs", "value"),
     )
-    def _render_needs_scoring(animal_value, mode, _refresh, active_file_id):
+    def _render_needs_scoring(animal_value, mode, _refresh, active_file_id,
+                               _tab):
+        if _tab != "video":            # skip off-tab refresh-trigger fan-out
+            return (no_update,) * 3
         mode = mode or "queue"
         title, sub = _POOL_LIST_HEADER.get(mode, _POOL_LIST_HEADER["queue"])
         sub = f" · {sub}"
@@ -4374,8 +4384,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-queue-animal", "value"),
         Input("refresh-trigger", "data"),
         Input("video-file-dropdown", "value"),
+        State("tabs", "value"),
     )
-    def _render_queue(animal_value, _refresh, active_file_id):
+    def _render_queue(animal_value, _refresh, active_file_id, _tab):
+        if _tab != "video":            # skip off-tab refresh-trigger fan-out
+            return no_update
         """Render EVERY recording for the animal, regardless of review pool --
         the pool-INDEPENDENT 'Show all timestamps' list. (The pool-filtered
         view is the separate pool-list card.) Each item is a Button with a
@@ -5509,8 +5522,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("video-file-dropdown", "value"),
         Input("refresh-trigger", "data"),
         State("video-pi-quality-panel", "style"),
+        State("tabs", "value"),
     )
-    def _toggle_pi_quality_panel(_file_id, _refresh, current):
+    def _toggle_pi_quality_panel(_file_id, _refresh, current, _tab):
+        if _tab != "video":            # skip off-tab refresh-trigger fan-out
+            return (no_update,) * 2
         email = (current_user_email() or "").lower()
         is_pi = bool(email and email in pi_email_set)
         base = dict(current or {})

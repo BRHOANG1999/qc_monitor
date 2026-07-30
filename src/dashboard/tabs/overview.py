@@ -4482,8 +4482,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("overview-hist24-poll", "n_intervals"),
         Input("overview-hist24-n", "value"),
         State("overview-thumb-sig", "data"),
+        State("tabs", "value"),
     )
-    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n, last_sig):
+    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n, last_sig,
+                                    _tab):
+        if _tab != "overview":         # skip off-tab refresh fan-out
+            return no_update, no_update, no_update
         mode = trace_mode or "mean"
         if mode == "hist24":
             # hist24 has its own cache + poll; let it manage rebuilds.
@@ -4548,8 +4552,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-snapshot-img", "src"),
         Output("overview-snapshot-caption", "children"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
     )
-    def refresh_overview_snapshot(_n):
+    def refresh_overview_snapshot(_n, _tab):
+        if _tab != "overview":         # skip off-tab refresh fan-out
+            return no_update, no_update
         # ?t= cache-buster forces the browser to re-fetch each tick;
         # the Flask side caches the JPEG for ~8s so we don't actually
         # pummel the SMB share.

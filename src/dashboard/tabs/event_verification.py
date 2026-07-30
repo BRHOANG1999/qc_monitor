@@ -1003,8 +1003,11 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("evtv-refresh-btn", "n_clicks"),
         Input("refresh-trigger", "data"),
         State("evtv-list-sig", "data"),
+        State("tabs", "value"),
     )
-    def _render_list(_n, _refresh, prev_sig):
+    def _render_list(_n, _refresh, prev_sig, _tab):
+        if _tab != "event_verification":   # skip off-tab refresh fan-out
+            return no_update, no_update, no_update
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return [], "", no_update
@@ -1110,8 +1113,11 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("evtv-refresh-btn", "n_clicks"),
         Input("refresh-trigger", "data"),
         State("evtv-fs-sig", "data"),
+        State("tabs", "value"),
     )
-    def _render_flagged(_n, _refresh, prev_sig):
+    def _render_flagged(_n, _refresh, prev_sig, _tab):
+        if _tab != "event_verification":   # skip off-tab refresh fan-out
+            return no_update, no_update, no_update, no_update
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return [], no_update, no_update, no_update
@@ -1413,9 +1419,12 @@ def register_callbacks(app, store, config: dict) -> None:
     @app.callback(
         Output("evtv-af-table", "data", allow_duplicate=True),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def _af_refresh_table(_n):
+    def _af_refresh_table(_n, _tab):
+        if _tab != "event_verification":   # skip off-tab refresh fan-out
+            return no_update
         email = (current_user_email() or "").lower()
         if not _is_pi(config or {}, email):
             return no_update

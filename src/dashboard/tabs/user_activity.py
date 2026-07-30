@@ -628,8 +628,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("user-activity-user", "options"),
         Input("user-activity-tick", "n_intervals"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
     )
-    def _refresh_active(_t, _r):
+    def _refresh_active(_t, _r, _tab):
+        if _tab != "user_activity":    # skip off-tab refresh fan-out
+            return no_update, no_update
         email = (current_user_email() or "").lower()
         if not _can_view(store, config, email):
             return [], []
@@ -643,8 +646,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("user-activity-area", "value"),
         Input("user-activity-hours", "value"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
     )
-    def _refresh_feed(user, area, hours, _r):
+    def _refresh_feed(user, area, hours, _r, _tab):
+        if _tab != "user_activity":    # skip off-tab refresh fan-out
+            return no_update
         email = (current_user_email() or "").lower()
         if not _can_view(store, config, email):
             return []
@@ -655,8 +661,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("ua-train-student", "options"),
         Input("user-activity-tick", "n_intervals"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
     )
-    def _train_students(_t, _r):
+    def _train_students(_t, _r, _tab):
+        if _tab != "user_activity":    # skip off-tab refresh fan-out
+            return no_update
         email = (current_user_email() or "").lower()
         if not _can_view(store, config, email):
             return []
