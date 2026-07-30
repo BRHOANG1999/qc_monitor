@@ -114,7 +114,11 @@ def _process_one_file(store, file_id: int, gains) -> int:
     stim = _stim_params(store, file_id, session_dir)
     file_base = os.path.basename(meta.get("file_path") or "")
     session_name = meta.get("session_name") or ""
-    n = 0
+    # Accumulate every channel's row, then write them in ONE batched, locked
+    # transaction (store.upsert_channel_impedance_batch) -- not one tiny
+    # connect->commit per channel, which was the main 'database is locked'
+    # source when a backfill swept thousands of files.
+    batch = []
     for wf in waveforms:
         ch_name = wf.get("channel_name") or ""
         if not ch_name or not is_animal_channel(ch_name):
@@ -126,11 +130,10 @@ def _process_one_file(store, file_id: int, gains) -> int:
         gain = resolve_gain(gains, session_name, file_base, ch_name,
                             animal or "", elec or "")
         rec = _access_r_record(wf, gain, stim)
-        store.upsert_channel_impedance(
-            file_id, int(wf.get("channel") or 0), ch_name,
-            animal or "", elec or "", rec)
-        n += 1
-    return n
+        batch.append((file_id, int(wf.get("channel") or 0), ch_name,
+                      animal or "", elec or "", rec))
+    store.upsert_channel_impedance_batch(batch)
+    return len(batch)
 
 
 def _access_r_record(wf: dict, gain, stim: dict) -> dict:

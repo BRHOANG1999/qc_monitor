@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from .schema import SCHEMA_SQL
@@ -43,6 +44,20 @@ class Store:
     # returns to the pool.
     CLAIM_TTL_MINUTES = 20
 
+    # Process-global WRITE serializer. The daemon watch loop, ~6 background
+    # writer threads (impedance, heartbeat, mass_analyze, preictal, ...) AND
+    # the dashboard all run in ONE process (main.py runs the dashboard in a
+    # thread -- see main.py run_dashboard) and share one DB file. SQLite allows
+    # exactly ONE writer at a time; when many writers open their own connections
+    # and fire concurrently they FIGHT SQLite's file lock, wait out the 30s
+    # busy_timeout, and pile up past it -> 'database is locked' + multi-second
+    # stalls that also block the dashboard. Class-level (shared across every
+    # Store instance in the process) so it coordinates them all. Writers take
+    # this so they QUEUE in-process instead of fighting; READS never take it, so
+    # WAL keeps serving them concurrently. RLock so a locked write that calls
+    # another locked write on the same thread doesn't self-deadlock.
+    _WRITE_LOCK = threading.RLock()
+
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
@@ -75,16 +90,19 @@ class Store:
         INSTANT, non-retryable 'database is locked' (the busy handler does not
         cover upgrades). IMMEDIATE takes the write lock up front, so the busy
         handler actually waits it out instead."""
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        # Serialize with every other writer in the process (see _WRITE_LOCK):
+        # these blocks queue instead of racing SQLite's single write lock.
+        with self._WRITE_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     @contextmanager
     def connection(self):
@@ -1829,37 +1847,57 @@ class Store:
         """
         assert isinstance(file_id, int) and file_id > 0, "file_id > 0"
         assert isinstance(channel, int), "channel int"
-        conn = self._connect()
-        try:
-            conn.execute(
-                """INSERT OR REPLACE INTO channel_impedance
-                   (file_id, channel, channel_name, animal_id, electrode,
-                    gain, charge_nc, pulse_width_us, neg_ratio,
-                    v_pos_raw, v_neg_raw, i_pos_ua, i_neg_ua,
-                    impedance_pos_kohm, impedance_neg_kohm,
-                    access_r_kohm, access_r_reversal_kohm,
-                    access_r_offset_kohm, slow_ss_raw, slow_ss_kohm,
-                    computed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    file_id, channel, channel_name, animal_id, electrode,
-                    rec.get("gain"), rec.get("charge_nc"),
-                    rec.get("pulse_width_us"), rec.get("neg_ratio"),
-                    rec.get("v_pos_raw"), rec.get("v_neg_raw"),
-                    rec.get("i_pos_ua"), rec.get("i_neg_ua"),
-                    rec.get("impedance_pos_kohm"),
-                    rec.get("impedance_neg_kohm"),
-                    rec.get("access_r_kohm"),
-                    rec.get("access_r_reversal_kohm"),
-                    rec.get("access_r_offset_kohm"),
-                    rec.get("slow_ss_raw"),
-                    rec.get("slow_ss_kohm"),
-                    datetime.now().isoformat(),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        self.upsert_channel_impedance_batch(
+            [(file_id, channel, channel_name, animal_id, electrode, rec)])
+
+    _IMPEDANCE_INSERT_SQL = (
+        """INSERT OR REPLACE INTO channel_impedance
+           (file_id, channel, channel_name, animal_id, electrode,
+            gain, charge_nc, pulse_width_us, neg_ratio,
+            v_pos_raw, v_neg_raw, i_pos_ua, i_neg_ua,
+            impedance_pos_kohm, impedance_neg_kohm,
+            access_r_kohm, access_r_reversal_kohm,
+            access_r_offset_kohm, slow_ss_raw, slow_ss_kohm,
+            computed_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""")
+
+    def upsert_channel_impedance_batch(self, rows: list) -> None:
+        """Insert/replace MANY (file, channel) impedance rows in ONE locked
+        transaction. *rows* is a list of
+        ``(file_id, channel, channel_name, animal_id, electrode, rec)`` tuples.
+
+        The impedance refresh used to call the per-channel upsert (a separate
+        connect->INSERT->commit->close, i.e. a fresh write-lock acquisition) for
+        EVERY channel of EVERY file -- thousands of tiny lock grabs that were the
+        dominant 'database is locked' source. Batching per file collapses that
+        to one transaction, and the _WRITE_LOCK serializes it with the other
+        writers instead of racing them."""
+        if not rows:
+            return
+        now = datetime.now().isoformat()
+        params = [
+            (file_id, int(channel), channel_name, animal_id, electrode,
+             rec.get("gain"), rec.get("charge_nc"), rec.get("pulse_width_us"),
+             rec.get("neg_ratio"), rec.get("v_pos_raw"), rec.get("v_neg_raw"),
+             rec.get("i_pos_ua"), rec.get("i_neg_ua"),
+             rec.get("impedance_pos_kohm"), rec.get("impedance_neg_kohm"),
+             rec.get("access_r_kohm"), rec.get("access_r_reversal_kohm"),
+             rec.get("access_r_offset_kohm"), rec.get("slow_ss_raw"),
+             rec.get("slow_ss_kohm"), now)
+            for (file_id, channel, channel_name, animal_id, electrode, rec)
+            in rows
+        ]
+        with self._WRITE_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(self._IMPEDANCE_INSERT_SQL, params)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def files_missing_impedance(self, limit: int | None = None) -> list[int]:
         """File ids that have evoked_waveforms but no channel_impedance row
