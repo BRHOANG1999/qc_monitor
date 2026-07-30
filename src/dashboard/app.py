@@ -481,10 +481,11 @@ def create_app(config: dict, store: Store) -> Dash:
             },
         ),
         html.Span(
-            "● Ready",
+            "",
             id="app-load-status",
-            title="Live app status — shows which tab is loading so a "
-                   "slow render isn't mistaken for a freeze.",
+            title="Live status for the tab you're viewing — shows while it "
+                   "loads so a slow render isn't mistaken for a freeze, then "
+                   "fades once it's ready.",
             style={
                 "position": "fixed", "bottom": "14px", "right": "16px",
                 "padding": "3px 12px", "borderRadius": "11px",
@@ -494,6 +495,7 @@ def create_app(config: dict, store: Store) -> Dash:
                 "letterSpacing": "0.2px", "whiteSpace": "nowrap",
                 "pointerEvents": "none", "zIndex": "1000",
                 "boxShadow": "0 2px 8px rgba(0,0,0,0.4)",
+                "opacity": "0", "transition": "opacity 0.4s ease",
             },
         ),
 
@@ -815,44 +817,57 @@ def create_app(config: dict, store: Store) -> Dash:
         function (tabValue, content, tick, labelMap, st) {
             var dc = window.dash_clientside;
             var nu = dc.no_update;
-            function style(color, brd) {
+            function style(color, brd, op) {
                 return {position:'fixed', bottom:'14px', right:'16px',
                     padding:'3px 12px', borderRadius:'11px',
                     background:'#1c1c2c', fontSize:'11px', fontWeight:'600',
                     letterSpacing:'0.2px', whiteSpace:'nowrap',
                     pointerEvents:'none', zIndex:'1000',
                     boxShadow:'0 2px 8px rgba(0,0,0,0.4)',
+                    transition:'opacity 0.4s ease',
+                    opacity:(op === undefined ? '1' : String(op)),
                     color:color, border:brd};
             }
-            var AMBER = style('#ff9f0a', '1px solid rgba(255,159,10,0.40)');
-            var GREEN = style('#30d158', '1px solid rgba(48,209,88,0.35)');
+            function amber(){return style('#ff9f0a','1px solid rgba(255,159,10,0.40)',1);}
+            function green(op){return style('#30d158','1px solid rgba(48,209,88,0.35)',op);}
             var now = Date.now();
             var ctx = dc.callback_context;
             var trig = (ctx && ctx.triggered && ctx.triggered.length)
                 ? ctx.triggered[0].prop_id : '';
-            // Tab clicked -> start the loading clock (fires instantly, before
-            // the server has built anything).
+            // Tab clicked -> start the loading clock for the tab being viewed
+            // (fires instantly, before the server has built anything).
             if (trig.indexOf('tabs.value') === 0 && tabValue) {
                 var label = (labelMap && labelMap[tabValue])
                     ? labelMap[tabValue] : tabValue;
-                return ['\\u23f3 Loading ' + label + '\\u2026 0.0s', AMBER,
+                return ['\\u23f3 Loading ' + label + '\\u2026 0.0s', amber(),
                         {loading: 1, label: label, t0: now}];
             }
-            // Server delivered the tab body -> done.
+            // Server delivered the current tab's body -> flash "Ready".
             if (trig.indexOf('tab-content') === 0) {
-                return ['\\u25cf Ready', GREEN, {loading: 0}];
+                return ['\\u25cf Ready', green(1), {loading: 0, readyAt: now}];
             }
-            // Timer tick: while loading, tick the elapsed seconds up so a slow
-            // render visibly keeps counting instead of looking frozen.
+            // Timer tick.
             if (trig.indexOf('nav-load-tick') === 0) {
-                if (!st || !st.loading || !st.t0) { return [nu, nu, nu]; }
-                var secs = (now - st.t0) / 1000;
-                var txt = '\\u23f3 Loading ' + (st.label || '')
-                    + '\\u2026 ' + secs.toFixed(1) + 's';
-                if (secs >= 8) {
-                    txt += '  \\u00b7 still working, no need to refresh';
+                if (st && st.loading && st.t0) {   // still loading: tick elapsed
+                    var secs = (now - st.t0) / 1000;
+                    var txt = '\\u23f3 Loading ' + (st.label || '')
+                        + '\\u2026 ' + secs.toFixed(1) + 's';
+                    if (secs >= 8) {
+                        txt += '  \\u00b7 still working, no need to refresh';
+                    }
+                    return [txt, nu, nu];
                 }
-                return [txt, nu, nu];
+                if (st && st.hidden) { return [nu, nu, nu]; }   // already gone
+                // Keep "Ready" for a beat, then FADE OUT -- a persistent "Ready"
+                // while cards are still filling reads as misleading; the pill is
+                // only meant to signal the CURRENT view's load, then get out of
+                // the way.
+                if (st && st.readyAt && (now - st.readyAt) < 2500) {
+                    return [nu, nu, nu];
+                }
+                var next = {}; for (var k in (st||{})) { next[k] = st[k]; }
+                next.hidden = 1;
+                return [nu, green(0), next];
             }
             return [nu, nu, nu];
         }
