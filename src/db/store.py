@@ -2626,19 +2626,27 @@ class Store:
         assert isinstance(file_id, int), "file_id must be int"
         conn = self._connect()
         try:
+            # Tie-break on id DESC (newest-inserted wins) so the pick is
+            # DETERMINISTIC when several rows share updated_at. A bulk migration
+            # (e.g. revert_stranded_drafts flipping many rows to 'abandoned' in
+            # one pass) stamps an identical updated_at across siblings; ordering
+            # by updated_at alone lets SQLite return an arbitrary sibling -- and
+            # it picked the OLD empty row over the newer markers-bearing one,
+            # silently hiding restored onsets (BCH062 Flag pool, 2026-07). See
+            # the "MAX(id) not MAX(updated_at)" rule in the review scoping notes.
             if animal_id:
                 row = conn.execute(
                     """SELECT * FROM review_state
                        WHERE file_id = ?
                          AND animal_id = ?
-                       ORDER BY updated_at DESC LIMIT 1""",
+                       ORDER BY updated_at DESC, id DESC LIMIT 1""",
                     (file_id, animal_id),
                 ).fetchone()
             else:
                 row = conn.execute(
                     """SELECT * FROM review_state
                        WHERE file_id = ?
-                       ORDER BY updated_at DESC LIMIT 1""",
+                       ORDER BY updated_at DESC, id DESC LIMIT 1""",
                     (file_id,),
                 ).fetchone()
             return dict(row) if row else None
