@@ -10,7 +10,14 @@ clip extraction has its own worker. This tab surfaces all of them with a
 
 from __future__ import annotations
 
-from dash import Input, Output, dash_table, dcc, html
+import threading
+
+from dash import Input, Output, dash_table, dcc, html, no_update
+
+# Single-flight guard: list_active_jobs was observed at ~5s while the poll
+# fired every 2s, so ticks overlapped and pinned several server threads. Skip a
+# tick if the previous one is still running.
+_JOBS_REFRESH_LOCK = threading.Lock()
 
 from src.dashboard.components import (
     DARK_TABLE_STYLE, ZEBRA_STRIPE, loading_icon)
@@ -38,7 +45,7 @@ def layout(store):
         html.Div(id="jobs-monitor-summary",
                  style={"color": "#cfd0d6", "fontSize": "13px",
                         "fontWeight": "600", "marginBottom": "10px"}),
-        dcc.Interval(id="jobs-monitor-poll", interval=2000, disabled=False),
+        dcc.Interval(id="jobs-monitor-poll", interval=5000, disabled=False),
         dcc.Loading(
             custom_spinner=loading_icon("Loading jobs…", small=True),
             delay_show=150,
@@ -60,12 +67,17 @@ def register_callbacks(app, store, config: dict) -> None:
         Input("jobs-monitor-poll", "n_intervals"),
     )
     def _refresh(_n):
+        if not _JOBS_REFRESH_LOCK.acquire(blocking=False):
+            return no_update, no_update      # previous tick still running
         try:
-            jobs = _ma.list_active_jobs(store)
-        except Exception as e:  # noqa: BLE001 -- never crash the monitor
-            return [], f"Error reading jobs: {e}"
-        warming = _warming_rows()
-        return _rows_for_table(jobs) + warming, _summary(jobs, warming)
+            try:
+                jobs = _ma.list_active_jobs(store)
+            except Exception as e:  # noqa: BLE001 -- never crash the monitor
+                return [], f"Error reading jobs: {e}"
+            warming = _warming_rows()
+            return _rows_for_table(jobs) + warming, _summary(jobs, warming)
+        finally:
+            _JOBS_REFRESH_LOCK.release()
 
 
 # --------------------------------------------------------------------- #
