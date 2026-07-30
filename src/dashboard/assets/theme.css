@@ -659,6 +659,15 @@ details.qc-expandable:hover {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
+/* Disabled (e.g. an action button while its load is in flight): dim + a
+   wait cursor so it's unmistakably "busy, please wait", not "broken". */
+.qc-btn:disabled,
+.qc-btn[disabled] {
+    opacity: 0.5;
+    cursor: progress;
+    filter: saturate(0.7);
+    transform: none;
+}
 /* Primary: solid fill (accent/success/danger set inline). A subtle lift
    on hover makes the dominant action feel tactile, not painted-on. */
 .qc-btn-primary { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); }

@@ -30,7 +30,7 @@ from dash import (Input, Output, State, Patch, dcc, html, no_update, ALL,
 from src.dashboard import activity as _activity
 from src.dashboard.auth import current_user_email
 from src.dashboard.components import (
-    button, empty_state, LABEL_STYLE, card)
+    button, empty_state, LABEL_STYLE, card, loading_icon)
 from src.dashboard.design import (
     COLOR_ACCENT, COLOR_SUCCESS, COLOR_WARNING, COLOR_DANGER,
     COLOR_SURFACE_1, COLOR_SURFACE_2, COLOR_DIVIDER, COLOR_TEXT_PRIMARY,
@@ -693,9 +693,13 @@ def layout(store: Store, config: dict | None = None):
                                       "display": "flex",
                                       "alignItems": "center",
                                       "justifyContent": "center"}),
-                    type="default"),
+                    custom_spinner=loading_icon(
+                        "Loading video… a full recording is large, so this "
+                        "can take a moment")),
             ]),
-            dcc.Loading(html.Div([
+            dcc.Loading(custom_spinner=loading_icon(
+                "Loading EEG… reading and filtering the full recording"),
+                children=html.Div([
                 dcc.Graph(id="training-lfp",
                           figure=_empty_lfp_fig("Load an example below."),
                           config={"displayModeBar": True,
@@ -722,7 +726,7 @@ def layout(store: Store, config: dict | None = None):
                           config={"displayModeBar": True,
                                    "displaylogo": False,
                                    "scrollZoom": True}),
-            ]), type="default"),
+            ])),
         ], style={"display": "grid",
                    "gridTemplateColumns": "minmax(320px,1fr) "
                                            "minmax(320px,1fr)",
@@ -870,6 +874,41 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     "Ready to certify — ask your PI" if value == 3
                     else "Ready to advance — ask your PI", COLOR_WARNING)
         return opts, value, hint, badge
+
+    # ---- Load-example feedback (Nielsen #1: visibility of system status) ----
+    # A full recording is large; the load can take many seconds (the video +
+    # filtered EEG are read from the share). Without feedback the button looks
+    # broken and users click it repeatedly. On click we INSTANTLY (clientside,
+    # no server round-trip) disable the button and say what's happening; the
+    # server _load_example overwrites training-now with the recording info when
+    # it lands, and _reenable_load_btn re-enables the button once the new video
+    # renders (success or "no recordings" alike).
+    app.clientside_callback(
+        """
+        function (n) {
+            if (!n) { return window.dash_clientside.no_update; }
+            return [true,
+                '\\u23f3 Loading the next recording\\u2026 a full session is '
+                + 'large, so this can take a while. The button is disabled '
+                + 'until it is ready \\u2014 no need to click again.'];
+        }
+        """,
+        Output("training-next-btn", "disabled", allow_duplicate=True),
+        Output("training-now", "children", allow_duplicate=True),
+        Input("training-next-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    @app.callback(
+        Output("training-next-btn", "disabled"),
+        Input("training-video", "children"),
+        prevent_initial_call=True,
+    )
+    def _reenable_load_btn(_video):
+        # training-video.children changes exactly when a load finishes (the
+        # real video or a placeholder), so this fires on completion of every
+        # load path. Idempotent: re-enabling an enabled button is harmless.
+        return False
 
     # ---- Load the next example ---- #
     @app.callback(
