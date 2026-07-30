@@ -457,54 +457,45 @@ def create_app(config: dict, store: Store) -> Dash:
             # readout is only needed during a slow render. 800 ms is plenty.
             dcc.Interval(id="nav-stage-poll", interval=800, n_intervals=0,
                          disabled=True),
-            html.Span(
-                "● Ready",
-                id="app-load-status",
-                title="Live app status — shows which tab is loading so a "
-                       "slow render isn't mistaken for a freeze.",
-                style={
-                    "position": "absolute",
-                    "left": "50%",
-                    "top": "50%",
-                    "transform": "translate(-50%, -50%)",
-                    "padding": "3px 12px",
-                    "borderRadius": "11px",
-                    "background": COLOR_SURFACE_2,
-                    "color": "#30d158",
-                    "border": "1px solid rgba(48, 209, 88, 0.35)",
-                    "fontSize": FONT_SIZE_CAPTION,
-                    "fontWeight": "600",
-                    "letterSpacing": "0.2px",
-                    "whiteSpace": "nowrap",
-                    "pointerEvents": "none",
-                    "zIndex": "5",
-                },
-            ),
-            # Live pipeline-stage detail, sits just under the pill. Populated
-            # by _nav_stage_detail (server poll) with what's building right now
-            # (e.g. "▸ Behavioral seizure status (3/12)"); empty when idle.
-            html.Span(
-                "",
-                id="app-load-detail",
-                style={
-                    "position": "absolute",
-                    "left": "50%",
-                    "top": "50%",
-                    "transform": "translate(-50%, 16px)",
-                    "color": COLOR_TEXT_TERTIARY,
-                    "fontSize": "10px",
-                    "fontFamily": "ui-monospace, monospace",
-                    "letterSpacing": "0.2px",
-                    "whiteSpace": "nowrap",
-                    "pointerEvents": "none",
-                    "zIndex": "5",
-                },
-            ),
         ], id="app-header",
            style={"padding": f"{SPACE_4} {SPACE_6}",
                   "background": COLOR_SURFACE_0,
-                  "borderBottom": f"1px solid {COLOR_DIVIDER}",
-                  "position": "relative"}),
+                  "borderBottom": f"1px solid {COLOR_DIVIDER}"}),
+
+        # Live app-status indicator, pinned to the BOTTOM-RIGHT like an IDE
+        # status bar / toast region (the standard home for a persistent
+        # loading/ready indicator). position:fixed relative to the viewport, so
+        # it stays put and can't be dislodged by callbacks that rewrite header
+        # styles (the focus-mode toggle rewrites app-header.style). The stage
+        # detail sits just above the pill.
+        html.Span(
+            "",
+            id="app-load-detail",
+            style={
+                "position": "fixed", "bottom": "40px", "right": "16px",
+                "color": COLOR_TEXT_TERTIARY, "fontSize": "10px",
+                "fontFamily": "ui-monospace, monospace",
+                "letterSpacing": "0.2px", "whiteSpace": "nowrap",
+                "pointerEvents": "none", "zIndex": "1000",
+                "textAlign": "right",
+            },
+        ),
+        html.Span(
+            "● Ready",
+            id="app-load-status",
+            title="Live app status — shows which tab is loading so a "
+                   "slow render isn't mistaken for a freeze.",
+            style={
+                "position": "fixed", "bottom": "14px", "right": "16px",
+                "padding": "3px 12px", "borderRadius": "11px",
+                "background": COLOR_SURFACE_2, "color": "#30d158",
+                "border": "1px solid rgba(48, 209, 88, 0.35)",
+                "fontSize": FONT_SIZE_CAPTION, "fontWeight": "600",
+                "letterSpacing": "0.2px", "whiteSpace": "nowrap",
+                "pointerEvents": "none", "zIndex": "1000",
+                "boxShadow": "0 2px 8px rgba(0,0,0,0.4)",
+            },
+        ),
 
         # Top-level nav: 5 groups. Apple HIG "reduce" — each group fits
         # comfortably without horizontal scrolling.
@@ -825,11 +816,13 @@ def create_app(config: dict, store: Store) -> Dash:
             var dc = window.dash_clientside;
             var nu = dc.no_update;
             function style(color, brd) {
-                return {position:'absolute', left:'50%', top:'50%',
-                    transform:'translate(-50%, -50%)', padding:'3px 12px',
-                    borderRadius:'11px', background:'#1c1c2c', fontSize:'11px',
-                    fontWeight:'600', letterSpacing:'0.2px', whiteSpace:'nowrap',
-                    pointerEvents:'none', zIndex:'5', color:color, border:brd};
+                return {position:'fixed', bottom:'14px', right:'16px',
+                    padding:'3px 12px', borderRadius:'11px',
+                    background:'#1c1c2c', fontSize:'11px', fontWeight:'600',
+                    letterSpacing:'0.2px', whiteSpace:'nowrap',
+                    pointerEvents:'none', zIndex:'1000',
+                    boxShadow:'0 2px 8px rgba(0,0,0,0.4)',
+                    color:color, border:brd};
             }
             var AMBER = style('#ff9f0a', '1px solid rgba(255,159,10,0.40)');
             var GREEN = style('#30d158', '1px solid rgba(48,209,88,0.35)');
