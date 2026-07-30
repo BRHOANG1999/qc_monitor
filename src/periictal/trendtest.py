@@ -23,6 +23,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.stats import binomtest, spearmanr, wilcoxon
 
+from src.periictal import resample as _res
+
 _MAX_SEIZURES = 1_000_000        # NASA Rule 2: explicit loop bound.
 _MAX_PERM = 100_000
 
@@ -194,3 +196,133 @@ def surrogate_p(df, feature: str, *, n_perm: int = 1000, seed: int = 0,
             ge += 1
     return {"p": float((ge + 1) / (int(n_perm) + 1)), "n_perm": int(n_perm),
             "observed": float(obs)}
+
+
+# --------------------------------------------------------------------- #
+#  Small-k honesty: the sign-flip floor
+# --------------------------------------------------------------------- #
+
+def sign_flip_floor(k: int) -> float:
+    """Minimum attainable TWO-SIDED p of any per-unit sign-flip null on *k* units
+    = 1/2^(k-1) (the paired sign test AND Wilcoxon signed-rank both inherit it --
+    see docs/periictal_methods_evidence.md, C1/C2). k=3 -> 0.25, k=5 -> 0.0625,
+    k=6 -> 0.03125 (the first that clears 0.05). Print next to any sign-flip p so
+    p=1.000 at k=3 is read as 'directions disagree', not 'no effect'."""
+    k = int(k)
+    return 1.0 if k < 1 else float(2.0 ** (-(k - 1)))
+
+
+# --------------------------------------------------------------------- #
+#  Per-seizure SLOPE forest (continuous lead-time; block-bootstrap CI)
+# --------------------------------------------------------------------- #
+
+def _ols_slope(x: np.ndarray, y: np.ndarray) -> float:
+    """OLS slope dy/dx, or NaN when undefined (< 3 points / no x-variance)."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 3 or np.ptp(x) == 0:
+        return float("nan")
+    xm = x - x.mean()
+    denom = float(np.dot(xm, xm))
+    return float(np.dot(xm, y - y.mean()) / denom) if denom > 0 else float("nan")
+
+
+def per_seizure_slope_forest(df, feature: str, *, n_boot: int = 2000,
+                             seed: int = 0, min_n: int = 5) -> list:
+    """Per-seizure slope of *feature* vs ``time_to_onset_sec`` over the PASSED
+    rows (caller passes the pre-onset subset), each with a within-seizure
+    block-bootstrap CI (resampling contiguous (tto, feature) pairs, preserving
+    autocorrelation) and Spearman rho. The continuous-lead-time counterpart of
+    the AUC forest. Returns one dict per seizure."""
+    assert feature in df.columns, f"feature '{feature}' not in df"
+    for c in ("time_to_onset_sec", "seizure_idx", "t_epoch"):
+        assert c in df.columns, f"matrix missing '{c}'"
+    v = df[feature].to_numpy(dtype=float)
+    tto = df["time_to_onset_sec"].to_numpy(dtype=float)
+    sid = df["seizure_idx"].to_numpy()
+    t = df["t_epoch"].to_numpy(dtype=float)
+    out: list = []
+    for s in np.unique(sid):
+        m = sid == s
+        order = np.argsort(t[m])                  # time-order within the seizure
+        y, x = v[m][order], tto[m][order]
+        ok = np.isfinite(y) & np.isfinite(x)
+        if int(ok.sum()) < min_n:
+            continue
+        y, x = y[ok], x[ok]
+        block = _res.block_length(y)
+        rng = np.random.default_rng(seed + int(s))
+        bs = np.array([_ols_slope(x[idx], y[idx]) for idx in
+                       (_res.block_index(y.size, block, rng)
+                        for _ in range(int(n_boot)))], dtype=float)
+        bs = bs[np.isfinite(bs)]
+        lo, hi = (np.percentile(bs, [2.5, 97.5]) if bs.size
+                  else (float("nan"), float("nan")))
+        rho = _safe_spearman(y, x)
+        out.append({"seizure_idx": int(s), "slope": _ols_slope(x, y),
+                    "rho": float(rho) if rho is not None else float("nan"),
+                    "n": int(y.size), "ci_lo": float(lo), "ci_hi": float(hi),
+                    "block": int(block), "n_blocks_eff": float(y.size / block)})
+    return out
+
+
+# --------------------------------------------------------------------- #
+#  Circular-shift surrogate: a DIFFERENT null (escapes the sign-flip floor)
+# --------------------------------------------------------------------- #
+
+def _ordered_preonset(df, feature: str, min_n: int):
+    """Per-seizure time-ordered (feature, tto) arrays over the pre-onset rows."""
+    pre = df[df["phase"] == "pre"]
+    seiz = []
+    for sid in np.unique(pre["seizure_idx"].to_numpy()):
+        g = pre[pre["seizure_idx"] == sid]
+        order = np.argsort(g["t_epoch"].to_numpy(dtype=float))
+        y = g[feature].to_numpy(dtype=float)[order]
+        x = g["time_to_onset_sec"].to_numpy(dtype=float)[order]
+        ok = np.isfinite(y) & np.isfinite(x)
+        if int(ok.sum()) >= min_n:
+            seiz.append((y[ok], x[ok]))
+    return seiz
+
+
+def circular_shift_surrogate_p(df, feature: str, *, n_surrogates: int = 1000,
+                               seed: int = 0, min_n: int = 5) -> dict:
+    """Graded aggregate null for the pre-onset trend. Within each seizure,
+    circularly SHIFT the (already-clean, ISI-guarded) feature series against
+    ``time_to_onset_sec`` -- preserving within-seizure autocorrelation, breaking
+    the onset alignment -- then recompute the across-seizure ``|median rho|`` and
+    place the observed value in that null (+1-smoothed p).
+
+    Tests ALIGNMENT TO ONSET (a different hypothesis than directional consistency
+    across seizures) and is NOT a power upgrade: the achievable p reflects
+    n_surrogates while the real information is the seizure count (see
+    docs/periictal_methods_evidence.md, E3). Reports ``n_eff_shifts`` = median
+    independent circular offsets (n / autocorr_time) per seizure, so a graded p
+    it has not earned is visible."""
+    assert feature in df.columns and "phase" in df.columns, "bad matrix"
+    assert 1 <= int(n_surrogates) <= _MAX_PERM, "n_surrogates out of bounds"
+    per = per_seizure_trend(df[df["phase"] == "pre"], feature, min_n=min_n)
+    obs = abs(across_seizure_test([r["rho"] for r in per])["median_rho"])
+    seiz = _ordered_preonset(df, feature, min_n)
+    if not np.isfinite(obs) or not seiz:
+        return {"p": float("nan"), "observed": float(obs), "n_surrogates": 0,
+                "n_seizures": len(seiz), "n_eff_shifts": float("nan")}
+    n_eff = float(np.median([yx[0].size / _res.autocorr_time(yx[0])
+                             for yx in seiz]))
+    rng = np.random.default_rng(seed)
+    ge = 0
+    for i in range(int(n_surrogates)):
+        assert i < _MAX_PERM, "surrogate runaway"
+        rhos = []
+        for y, x in seiz:
+            off = int(rng.integers(1, y.size)) if y.size > 1 else 0
+            r = _safe_spearman(np.roll(y, off), x)
+            if r is not None:
+                rhos.append(r)
+        stat = abs(across_seizure_test(rhos)["median_rho"]) if rhos else np.nan
+        if np.isfinite(stat) and stat >= obs - 1e-12:
+            ge += 1
+    return {"p": float((ge + 1) / (int(n_surrogates) + 1)),
+            "observed": float(obs), "n_surrogates": int(n_surrogates),
+            "n_seizures": len(seiz), "n_eff_shifts": n_eff}

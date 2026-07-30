@@ -29,6 +29,7 @@ import numpy as np
 from scipy.stats import rankdata
 
 from src.periictal import config as _cfg
+from src.periictal import resample as _res
 from src.preictal.scoring import rank_auc
 from src.periictal.trendtest import _bh_qvalues
 
@@ -240,6 +241,115 @@ def paired_seizure_test(df, feature: str) -> dict:
             p = 1.0
     return {"feature": feature, "n_seizures": n, "auc": auc, "p": p,
             "direction": direction}
+
+
+# --------------------------------------------------------------------- #
+#  Within-seizure standardization (fixes the composition artifact in the
+#  SCALE-dependent views only; per-seizure AUC is rank-invariant to it -- see
+#  docs/periictal_methods_evidence.md, A2 / L3)
+# --------------------------------------------------------------------- #
+
+def standardize_to_interictal(df, *, by: str = "seizure_idx", features=None,
+                              mode: str = "interictal"):
+    """Express each feature in within-*by* reference-SD units, so a between-group
+    (e.g. between-seizure) offset can no longer masquerade as a class effect in
+    the POOLED AUC / PDF / logistic coefficients.
+
+    mode='interictal' (default): centre+scale each group by that group's
+    INTERICTAL-class mean/SD, so interictal sits at ~0 and a preictal shift is in
+    interictal-SD units (unbiased -- the SD does not include the between-class
+    variance). Requires a 'class' column (call label_classes first).
+    mode='grand': centre+scale by the group's overall mean/SD (the biased variant
+    kept as a toggle). Does not mutate the input.
+    """
+    assert by in df.columns, f"matrix missing '{by}'"
+    assert mode in ("interictal", "grand"), "mode must be interictal|grand"
+    feats = [f for f in (features or _cfg.CHEAP_METRICS) if f in df.columns]
+    out = df.copy()
+    groups = out[by].to_numpy()
+    cls = out["class"].to_numpy() if "class" in out.columns else None
+    ref_ok = (mode == "grand") or (cls is not None)
+    for f in feats:
+        vals = out[f].to_numpy(dtype=float)
+        newv = vals.copy()
+        for g in np.unique(groups):
+            m = groups == g
+            ref = m if (mode == "grand" or not ref_ok) else (m & (cls == CLASS_INTERICTAL))
+            r = vals[ref]
+            r = r[np.isfinite(r)]
+            if r.size < 2:
+                continue
+            sd = float(np.std(r, ddof=1))
+            if not np.isfinite(sd) or sd <= 0.0:
+                continue
+            newv[m] = (vals[m] - float(np.mean(r))) / sd
+        out[f] = newv
+    return out
+
+
+# --------------------------------------------------------------------- #
+#  Per-seizure AUC forest (the honest headline) with dependence-aware CIs
+# --------------------------------------------------------------------- #
+
+def block_bootstrap_auc_ci(pre, inter, *, n_boot: int = 2000, seed: int = 0,
+                           alpha: float = 0.05) -> dict:
+    """Percentile CI for AUC(pre, inter) by moving-block bootstrap of each
+    TIME-ORDERED class series (preserves within-class autocorrelation, so the CI
+    is not the fake-tight trial-level interval). Returns ``{ci_lo, ci_hi,
+    block_pre, block_inter, n_blocks_eff}``. Caller passes time-ordered arrays."""
+    pre = np.asarray(pre, dtype=float)
+    inter = np.asarray(inter, dtype=float)
+    assert pre.ndim == 1 and inter.ndim == 1, "1-D arrays required"
+    assert 1 <= int(n_boot) <= 200_000, "n_boot out of bounds"
+    nan = {"ci_lo": float("nan"), "ci_hi": float("nan"), "block_pre": 1,
+           "block_inter": 1, "n_blocks_eff": float("nan")}
+    if pre.size < 2 or inter.size < 2:
+        return nan
+    bp, bi = _res.block_length(pre), _res.block_length(inter)
+    rng = np.random.default_rng(seed)
+    stats = np.empty(int(n_boot), dtype=float)
+    for b in range(int(n_boot)):
+        assert b < 200_000, "bootstrap runaway"
+        stats[b] = rank_auc(_res.moving_block_resample(pre, bp, rng),
+                            _res.moving_block_resample(inter, bi, rng))
+    lo, hi = np.percentile(stats, [100 * alpha / 2.0, 100 * (1 - alpha / 2.0)])
+    n_eff = pre.size / bp + inter.size / bi
+    return {"ci_lo": float(lo), "ci_hi": float(hi), "block_pre": int(bp),
+            "block_inter": int(bi), "n_blocks_eff": float(n_eff)}
+
+
+def per_seizure_auc_forest(df, feature: str, *, n_boot: int = 2000,
+                           seed: int = 0, min_n: int = 5) -> list:
+    """One AUC per seizure (preictal vs interictal) for *feature*, each with a
+    within-seizure block-bootstrap CI and its effective block count -- the plan's
+    headline statistic. Rank-invariant to standardization, so valid on raw
+    features. Requires a 'class' column. Returns a list sorted by seizure."""
+    assert "class" in df.columns, "call label_classes(df) first"
+    assert feature in df.columns, f"feature '{feature}' not in df"
+    for c in ("seizure_idx", "t_epoch"):
+        assert c in df.columns, f"matrix missing '{c}'"
+    v = df[feature].to_numpy(dtype=float)
+    cls = df["class"].to_numpy()
+    sid = df["seizure_idx"].to_numpy()
+    t = df["t_epoch"].to_numpy(dtype=float)
+    out: list = []
+    sids = np.unique(sid)
+    assert sids.size < _MAX_SEIZURES, "seizure count runaway"
+    for s in sids:
+        m = sid == s
+        order = np.argsort(t[m])                 # time-order within the seizure
+        vm, cm = v[m][order], cls[m][order]
+        pre = vm[cm == CLASS_PREICTAL]
+        inter = vm[cm == CLASS_INTERICTAL]
+        pre, inter = pre[np.isfinite(pre)], inter[np.isfinite(inter)]
+        if pre.size < min_n or inter.size < min_n:
+            continue
+        ci = block_bootstrap_auc_ci(pre, inter, n_boot=n_boot, seed=seed + int(s))
+        out.append({"seizure_idx": int(s), "auc": float(rank_auc(pre, inter)),
+                    "ci_lo": ci["ci_lo"], "ci_hi": ci["ci_hi"],
+                    "n_pre": int(pre.size), "n_inter": int(inter.size),
+                    "n_blocks_eff": ci["n_blocks_eff"]})
+    return out
 
 
 # --------------------------------------------------------------------- #
