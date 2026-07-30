@@ -1654,6 +1654,20 @@ class Store:
         finally:
             conn.close()
 
+    def newest_health(self) -> dict | None:
+        """The single most recent system_health row (uses idx_system_health_ts),
+        or None. The header health-dot needs only this -- fetching a whole hour
+        of rows just to take the last was a full-table scan (18-23s under load;
+        this is O(1) on the index)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM system_health ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
     def get_files_processed_last_hour(self) -> int:
         conn = self._connect()
         try:

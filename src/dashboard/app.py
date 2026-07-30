@@ -4,6 +4,7 @@ electrode health, session compare, activity log, and annotations."""
 import logging
 import os
 import time
+import threading as _threading
 from datetime import datetime, date
 
 from dash import Dash, html, dcc, no_update, ALL
@@ -21,16 +22,33 @@ from src.dashboard import perf as _perf
 # last value instantly and stops the recurring DB hit. Coarse indicators, so a
 # few seconds of staleness is fine. Concurrent misses just recompute once.
 _GLOBAL_TTL_CACHE: dict = {}
+_TTL_LOCK = _threading.Lock()
 
 
 def _ttl_cached(key: str, ttl_sec: float, producer):
+    """Stale-while-revalidate TTL memo. Prevents a cache STAMPEDE: when the
+    entry expires, only ONE caller recomputes; concurrent callers that already
+    have a (stale) value serve it immediately instead of all running producer()
+    at once (which, when producer() was a slow DB read, meant a dozen 20s
+    recomputes piling up -- exactly what the header-dot log showed)."""
     now = time.time()
     hit = _GLOBAL_TTL_CACHE.get(key)
     if hit is not None and (now - hit[0]) < ttl_sec:
         return hit[1]
-    val = producer()
-    _GLOBAL_TTL_CACHE[key] = (now, val)
-    return val
+    # Expired/missing. Only block for the lock if we have NOTHING to serve;
+    # otherwise serve stale and let whoever holds the lock refresh.
+    got = _TTL_LOCK.acquire(blocking=(hit is None))
+    if not got:
+        return hit[1]
+    try:
+        h2 = _GLOBAL_TTL_CACHE.get(key)          # re-check under the lock
+        if h2 is not None and (time.time() - h2[0]) < ttl_sec:
+            return h2[1]
+        val = producer()
+        _GLOBAL_TTL_CACHE[key] = (time.time(), val)
+        return val
+    finally:
+        _TTL_LOCK.release()
 from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
@@ -1106,10 +1124,9 @@ def create_app(config: dict, store: Store) -> Dash:
 
     def _compute_header_dot():
         try:
-            history = store.get_health_history(hours=1)
+            latest = store.newest_health() or {}
         except Exception:
-            history = []
-        latest = history[-1] if history else {}
+            latest = {}
         net_ok = bool(latest.get("network_share_accessible"))
         # Crude queue-stalled heuristic: 0 files processed in the last
         # hour while there's a non-empty pending queue. Cheap to compute.

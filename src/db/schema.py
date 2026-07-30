@@ -362,6 +362,12 @@ CREATE TABLE IF NOT EXISTS system_health (
     queue_depth INTEGER,
     files_processed_last_hour INTEGER
 );
+-- The heartbeat writes a row every 30s, so this table grows without bound
+-- (187k+ rows). The header health-dot + get_health_history filter/sort by
+-- timestamp; without this index every call full-scanned the whole table, which
+-- under disk load cost 18-23s. Indexed, "latest row" is instant.
+CREATE INDEX IF NOT EXISTS idx_system_health_ts
+    ON system_health(timestamp);
 
 -- Authenticated users (identity comes from Cloudflare Access)
 CREATE TABLE IF NOT EXISTS users (
