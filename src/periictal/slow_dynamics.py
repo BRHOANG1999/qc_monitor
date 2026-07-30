@@ -79,22 +79,23 @@ def fit_ar1(y, *, dt: float = 1.0, alpha: float = 0.05) -> dict:
             "lambda": lambda_from_phi(phi, dt), "n": n}
 
 
-def _detrend(y: np.ndarray, win: int) -> np.ndarray:
+def detrend(y: np.ndarray, win: int) -> np.ndarray:
     """High-pass by subtracting a centered rolling mean far wider than the AR
-    window -- removes the slow trend that would otherwise inflate phi/variance."""
+    window -- removes the slow trend that would otherwise inflate phi/variance
+    (the rho~0.67 circadian-inflation guard)."""
     if win <= 1:
-        return y
-    return y - rolling_centered(y, win, "mean")
+        return np.asarray(y, dtype=float)
+    return np.asarray(y, dtype=float) - rolling_centered(y, win, "mean")
 
 
-def _sliding(series, win: int, kind: str, detrend: bool, detrend_win) -> np.ndarray:
+def _sliding(series, win: int, kind: str, do_detrend: bool, detrend_win) -> np.ndarray:
     """Sliding AR(1)/variance over each gap-free segment (NaN across gaps)."""
     out = np.full(series.n, np.nan)
     dwin = int(detrend_win or max(win * 4, win + 1))
     for sl in series.segments():
         y = np.asarray(series.values[sl], dtype=float)
-        if detrend:
-            y = _detrend(y, dwin)
+        if do_detrend:
+            y = detrend(y, dwin)
         if kind == "ar1":
             out[sl] = rolling_centered(y, win, "ar1")
         else:                                        # variance

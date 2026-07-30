@@ -123,6 +123,7 @@ NAV_GROUPS = [
         {"id": "periictal_trend", "label": "Trend & test"},
         {"id": "periictal_pdfcdf", "label": "Preictal vs interictal"},
         {"id": "periictal_waveform", "label": "Waveform"},
+        {"id": "periictal_slow", "label": "Slow dynamics"},
     ]},
     {"id": "quality", "label": "Quality", "subs": [
         {"id": "signal", "label": "Signal quality"},
@@ -1067,6 +1068,9 @@ def create_app(config: dict, store: Store) -> Dash:
             elif tab == "periictal_waveform":
                 return _enable_persistence(
                     tabs_periictal_explorer.layout_waveform(store))
+            elif tab == "periictal_slow":
+                return _enable_persistence(
+                    tabs_periictal_explorer.layout_slow_dynamics(store))
             elif tab == "jobs_monitor":
                 return _enable_persistence(tabs_jobs_monitor.layout(store))
             elif tab == "workers_monitor":
@@ -1256,6 +1260,7 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_periictal_explorer.layout_trend,
         tabs_periictal_explorer.layout_pdfcdf,
         tabs_periictal_explorer.layout_waveform,
+        tabs_periictal_explorer.layout_slow_dynamics,
         tabs_jobs_monitor.layout,
         tabs_workers_monitor.layout,
         tabs_settings.layout,

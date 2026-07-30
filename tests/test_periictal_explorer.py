@@ -211,7 +211,10 @@ def test_three_sub_tab_layouts_build_with_scope_and_lens_ids(tmp_path):
                               "pex-pc-roc", "pex-pc-phaseauc", "pex-pc-coef",
                               "pex-pc-fverdict"},
             "layout_waveform": {"pex-erp", "pex-erp-wave", "pex-erp-seizure",
-                                "pex-erp-job", "pex-erp-col"}}
+                                "pex-erp-job", "pex-erp-col"},
+            "layout_slow_dynamics": {"pex-sd-phi", "pex-sd-circ", "pex-sd-feature",
+                                     "pex-sd-win", "pex-sd-build", "pex-sd-job",
+                                     "pex-sd-readout", "pex-sd-poll"}}
     for name, want in lens.items():
         acc: list = []
         _all_ids(getattr(pex, name)(store), acc)
@@ -233,7 +236,7 @@ def test_nav_group_promoted_to_top_level():
     assert grp is not None
     assert [s["id"] for s in grp["subs"]] == [
         "periictal_embedding", "periictal_trend", "periictal_pdfcdf",
-        "periictal_waveform"]
+        "periictal_waveform", "periictal_slow"]
     # the old single sub-tab is gone from every group
     assert all(s["id"] != "periictal_explorer"
                for g in _app.NAV_GROUPS for s in g["subs"])

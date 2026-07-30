@@ -58,6 +58,8 @@ from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
                                     sliding_trial_average)
 from src.periictal.selection import summarize_selection
 from src.periictal import trendtest as _tt
+from src.periictal import slow_report as _slow
+from src.periictal.trial_series import build_trial_series
 from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
 from src.utils.evoked_features import FeatureConfig
@@ -2041,6 +2043,193 @@ def _erp_render(gathered, n, overlap, contrast, key, mode="amplitude"):
             f"✓ built from {nt:,} trials", True, key, warn)
 
 
+# --------------------------------------------------------------------- #
+#  Slow-dynamics lens (Part B): across-trial eigenvalue + circadian control
+# --------------------------------------------------------------------- #
+
+_SD_JOBS: dict = {}
+_SD_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_SD_CACHE_MAX = 6
+
+
+def _sd_key(animal, feature, win) -> str:
+    return f"{animal}|{feature}|{int(win)}"
+
+
+def _sd_set(key, **kw):
+    with _LOCK:
+        _SD_JOBS.setdefault(key, {}).update(kw)
+        _prune_jobs(_SD_JOBS)
+
+
+def _sd_finish(key, result):
+    with _LOCK:
+        _SD_CACHE[key] = result
+        while len(_SD_CACHE) > _SD_CACHE_MAX:
+            _SD_CACHE.popitem(last=False)
+        _SD_JOBS[key] = {"status": "done", "progress": "done"}
+        _prune_jobs(_SD_JOBS)
+
+
+def _sd_kick(store, evoked_dir, key, animal, feature, win):
+    with _LOCK:
+        if key in _SD_CACHE:
+            return
+        st = _SD_JOBS.get(key)
+        if st and st.get("status") == "running":
+            return
+        _SD_JOBS[key] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_SD_JOBS)
+    threading.Thread(
+        target=_sd_worker, name=f"periictal-sd-{key}", daemon=True,
+        args=(store, evoked_dir, key, animal, feature, win)).start()
+
+
+def _sd_worker(store, evoked_dir, key, animal, feature, win):
+    """Build the full-timeline feature series (heavy: reads every sidecar) and run
+    the Part B slow-dynamics summary. Never raises."""
+    try:
+        _sd_set(key, progress="reading the full feature timeline…")
+        series = build_trial_series(store, animal, feature, evoked_dir)
+        if series.n == 0:
+            _sd_finish(key, {"summary": {"insufficient": True, "n": 0}})
+            return
+        _sd_set(key, progress=f"fitting slow dynamics on {series.n:,} stimuli…")
+        _sd_finish(key, {"summary": _slow.summarize(series, win=int(win))})
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("slow-dynamics build failed (key=%s): %s", key, e)
+        _sd_set(key, status="error", progress=f"error: {e}")
+
+
+def _sd_dark(fig):
+    fig.update_layout(paper_bgcolor=COLOR_SURFACE_2, plot_bgcolor=COLOR_SURFACE_2,
+                      font_color=COLOR_TEXT_SECONDARY, margin=dict(l=48, r=16, t=28, b=40),
+                      height=280)
+    fig.update_xaxes(gridcolor=COLOR_DIVIDER, zeroline=False)
+    fig.update_yaxes(gridcolor=COLOR_DIVIDER, zeroline=False)
+    return fig
+
+
+def _sd_phi_fig(s):
+    """AR(1) phi vs lead time (near-onset on the right). Rising toward onset ->
+    the state is slowing (eigenvalue -> 0)."""
+    if not s or s.get("insufficient"):
+        return empty_fig("Not enough trials for a slow-dynamics fit")
+    lead = s["phi_leadtime"]
+    fig = go.Figure(go.Scatter(x=lead["centers_h"], y=lead["phi"],
+                               mode="lines+markers",
+                               line=dict(color=COLOR_ACCENT, width=2)))
+    fig.update_xaxes(autorange="reversed", title="hours before onset")
+    fig.update_yaxes(title="AR(1) φ (detrended)")
+    return _sd_dark(fig)
+
+
+def _sd_circ_fig(s):
+    """Preictal AUC: standard same-day baseline vs the circadian-matched control.
+    Collapse toward 0.5 under matching => the effect was circadian."""
+    if not s or s.get("insufficient"):
+        return empty_fig("Circadian control needs non-seizure-day stimuli")
+    y = [s.get("sameday_auc", float("nan")), s.get("matched_auc", float("nan"))]
+    fig = go.Figure(go.Bar(x=["same-day (60–90 min)", "circadian-matched"], y=y,
+                           marker_color=[COLOR_WARNING, COLOR_SUCCESS]))
+    fig.add_hline(y=0.5, line_dash="dot", line_color=COLOR_TEXT_TERTIARY)
+    fig.update_yaxes(title="preictal AUC", range=[0, 1])
+    return _sd_dark(fig)
+
+
+def _sd_line(label, value, note=""):
+    return html.Div([
+        html.Span(f"{label}: ", style={"color": COLOR_TEXT_TERTIARY}),
+        html.Span(value, style={"color": COLOR_TEXT_PRIMARY, "fontWeight": 600}),
+        html.Span(f"  {note}" if note else "",
+                  style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION})],
+        style={"marginBottom": SPACE_1})
+
+
+def _fmt(v, nd=3):
+    try:
+        return f"{float(v):.{nd}f}" if np.isfinite(float(v)) else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _sd_readout_view(s):
+    if not s or s.get("insufficient"):
+        return html.Div("Build to compute the across-trial eigenvalue.",
+                        style={"color": COLOR_TEXT_TERTIARY})
+    rho = s.get("coupling_rho")
+    csd = ("consistent with critical slowing (φ & variance rise together)"
+           if (rho is not None and np.isfinite(rho) and rho > 0.4)
+           else "variance/φ decoupled → injected noise, not slowing"
+           if (rho is not None and np.isfinite(rho)) else "n/a")
+    return html.Div([
+        _sd_line("Eigenvalue φ near→far onset",
+                 f"{_fmt(s['phi_near'])} → {_fmt(s['phi_far'])}",
+                 "(→1 = slowing; reported as φ/λ, never τ)"),
+        _sd_line("λ = ln(φ)/Δt (near, far)",
+                 f"{_fmt(s['lambda_near'], 5)}, {_fmt(s['lambda_far'], 5)} /s"),
+        _sd_line("variance–φ coupling ρ", _fmt(rho), csd),
+        _sd_line("infraslow band fraction (0.001–0.01 Hz)", _fmt(s.get("band_frac"))),
+        _sd_line("preictal AUC: same-day → matched",
+                 f"{_fmt(s.get('sameday_auc'))} → {_fmt(s.get('matched_auc'))}",
+                 "(collapse toward 0.5 = circadian artefact)"),
+        html.Div(f"n = {s.get('n_seizures', 0)} seizures · "
+                 f"{s.get('n', 0):,} stimuli · channel {s.get('channel') or '?'} · "
+                 "power scales with SEIZURE count, not trials — treat as elimination, "
+                 "not demonstration.",
+                 style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                        "marginTop": SPACE_2, "fontStyle": "italic"}),
+    ])
+
+
+def _sd_controls(a0):
+    return html.Div([
+        html.Div([
+            html.Label("Feature", style=LABEL_STYLE),
+            dcc.Dropdown(id="pex-sd-feature",
+                         options=[{"label": m, "value": m} for m in _cfg.CHEAP_METRICS],
+                         value=_cfg.PAPER_BEST5[0], clearable=False,
+                         style=DROPDOWN_STYLE)],
+            style={"flex": "2", "minWidth": "220px"}),
+        html.Div([
+            html.Label("φ window (trials)", style=LABEL_STYLE),
+            dcc.Input(id="pex-sd-win", type="number", value=300, min=30, step=10,
+                      style={"width": "100%"})],
+            style={"flex": "1", "minWidth": "120px"}),
+        html.Div(button("Analyse", "pex-sd-build"),
+                 style={"alignSelf": "flex-end"}),
+    ], style={"display": "flex", "gap": SPACE_3, "alignItems": "flex-start",
+              "flexWrap": "wrap", "marginBottom": SPACE_3})
+
+
+def layout_slow_dynamics(store):
+    """Slow-dynamics lens (Part B): the across-trial eigenvalue φ/λ vs lead time,
+    the variance/φ decoupling verdict, infraslow band power, and the
+    circadian-matched preictal AUC — the confound-robust readouts the evoked
+    features (within-waveform, ms-scale) cannot give."""
+    _animals, a0 = _animals_a0(store)
+    return html.Div([
+        scope_bar(store),
+        card(
+            section_header("Slow dynamics — across-trial eigenvalue & circadian control"),
+            html.Div("The evoked features are within-waveform (ms-scale) and cannot "
+                     "see a minute-scale mode; the slow eigenvalue lives in the "
+                     "trial-to-trial series. AR(1) φ = exp(λΔt).",
+                     style={"color": COLOR_TEXT_TERTIARY, "fontSize": FONT_SIZE_CAPTION,
+                            "marginBottom": SPACE_2}),
+            _sd_controls(a0),
+            html.Div(id="pex-sd-status", style={"color": COLOR_TEXT_SECONDARY,
+                                                "fontSize": FONT_SIZE_CAPTION,
+                                                "minHeight": "16px"}),
+            html.Div(id="pex-sd-readout", style={"marginTop": SPACE_2}),
+            dcc.Graph(id="pex-sd-phi", figure=empty_fig("φ vs lead time")),
+            dcc.Graph(id="pex-sd-circ", figure=empty_fig("circadian-matched AUC")),
+            style={"marginTop": SPACE_3}),
+        dcc.Interval(id="pex-sd-poll", interval=1500, disabled=True),
+        dcc.Store(id="pex-sd-job"),
+    ], style={"padding": SPACE_4})
+
+
 def register_callbacks(app, store, config):
     global _CACHE_DIR
     _CACHE_DIR = _default_cache_dir()
@@ -2592,3 +2781,38 @@ def register_callbacks(app, store, config):
         fig, lbl = _erp_wave_figure(gathered, navg or 20, overlap or 50,
                                     col if col is not None else 0)
         return fig, lbl
+
+    # ---- Slow-dynamics lens: across-trial eigenvalue + circadian control ---- #
+    @app.callback(
+        Output("pex-sd-phi", "figure"),
+        Output("pex-sd-circ", "figure"),
+        Output("pex-sd-readout", "children"),
+        Output("pex-sd-status", "children"),
+        Output("pex-sd-poll", "disabled"),
+        Output("pex-sd-job", "data"),
+        Input("pex-sd-build", "n_clicks"),
+        Input("pex-sd-poll", "n_intervals"),
+        State("pex-animal", "value"),
+        State("pex-sd-feature", "value"),
+        State("pex-sd-win", "value"),
+        prevent_initial_call=True,
+    )
+    def _sd_build_or_poll(_n, _iv, animal, feature, win):
+        if not animal or not feature:
+            return (no_update, no_update, no_update, "Pick an animal and feature.",
+                    True, no_update)
+        win = int(win or 300)
+        key = _sd_key(animal, feature, win)
+        with _LOCK:
+            cached = _SD_CACHE.get(key)
+            state = dict(_SD_JOBS.get(key) or {})
+        if cached is not None:
+            s = cached.get("summary")
+            return (_sd_phi_fig(s), _sd_circ_fig(s), _sd_readout_view(s),
+                    "done", True, key)
+        if state.get("status") == "error":
+            return (no_update, no_update, no_update,
+                    state.get("progress", "error"), True, no_update)
+        _sd_kick(store, evoked_dir, key, animal, feature, win)
+        prog = (_SD_JOBS.get(key) or {}).get("progress", "starting…")
+        return no_update, no_update, no_update, f"⏳ {prog}", False, no_update
