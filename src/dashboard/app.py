@@ -431,7 +431,13 @@ def create_app(config: dict, store: Store) -> Dash:
             # timer (see the _app_load_status clientside cb). The 200 ms tick
             # runs always but only rewrites the pill while a tab is loading.
             dcc.Store(id="nav-load-state", data={}),
+            # Fast CLIENTSIDE-only tick for the elapsed timer (no server cost).
             dcc.Interval(id="nav-load-tick", interval=200, n_intervals=0),
+            # Slower SERVER poll for the live stage detail, so the readout never
+            # adds meaningful load to an already-busy server (a 200 ms server
+            # round-trip would compete for the very threads a slow tab is
+            # starving). 800 ms is plenty for a human-readable stage line.
+            dcc.Interval(id="nav-stage-poll", interval=800, n_intervals=0),
             html.Span(
                 "● Ready",
                 id="app-load-status",
@@ -1310,7 +1316,7 @@ def create_app(config: dict, store: Store) -> Dash:
     # currently building. Empty string when idle -> the detail line vanishes.
     @app.callback(
         Output("app-load-detail", "children"),
-        Input("nav-load-tick", "n_intervals"),
+        Input("nav-stage-poll", "n_intervals"),
         prevent_initial_call=True,
     )
     def _nav_stage_detail(_n):

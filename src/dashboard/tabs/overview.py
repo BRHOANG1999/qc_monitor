@@ -59,8 +59,13 @@ from src.dashboard.design import (
     SPACE_5,
 )
 from src.db.store import Store, _current_fidelity_pct
+from src.dashboard import perf as _perf
 
 logger = logging.getLogger("qc_monitor.dashboard.overview")
+
+# Guards the auto-refresh callback so a slow refresh tick can't overlap itself
+# and pile heavy builds onto a fixed server thread pool. Non-blocking acquire.
+_REFRESH_LOCK = threading.Lock()
 
 # Shared row style for the "today at the lab" home-grid block rows.
 _HOME_ROW_STYLE = {
@@ -4335,20 +4340,38 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-current-fidelity", "children"),
         Output("overview-region-drift", "children"),
         Input("refresh-trigger", "data"),
+        State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def refresh_overview_dynamic(_n):
-        from datetime import date as _date
-        return (
-            _build_overview_cards(store),
-            _build_overview_queue(store),
-            _build_home_grid_children(store, config, _date.today()),
-            _build_km_log_section(config),
-            _build_impedance_trend_card(store, config),
-            _build_zss_consistency_card(store, config),
-            _build_current_fidelity_card(store, config),
-            _build_region_drift_card(store, config),
-        )
+    def refresh_overview_dynamic(_n, current_tab):
+        nout = (no_update,) * 8
+        # refresh-trigger is GLOBAL (fires every ~10 s on every tab), and this
+        # callback's Input always exists -- so without this gate the 8 heavy
+        # card builds below ran on EVERY tab and were thrown away when the
+        # Overview divs weren't mounted. On a fixed thread pool (waitress) a
+        # build slower than the interval then piled up until the pool starved
+        # and navigation froze. Only do the work when Overview is actually shown.
+        if current_tab != "overview":
+            return nout
+        # And never let a slow refresh overlap itself: if the previous tick is
+        # still building, skip this one rather than stacking another 8 builds.
+        if not _REFRESH_LOCK.acquire(blocking=False):
+            return nout
+        try:
+            with _perf.Timer("cb:overview-auto-refresh"):
+                from datetime import date as _date
+                return (
+                    _build_overview_cards(store),
+                    _build_overview_queue(store),
+                    _build_home_grid_children(store, config, _date.today()),
+                    _build_km_log_section(config),
+                    _build_impedance_trend_card(store, config),
+                    _build_zss_consistency_card(store, config),
+                    _build_current_fidelity_card(store, config),
+                    _build_region_drift_card(store, config),
+                )
+        finally:
+            _REFRESH_LOCK.release()
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
     # user clicks, and lives outside the refreshed card so it persists.
