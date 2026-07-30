@@ -1797,7 +1797,12 @@ def _worker_loop(store) -> None:
     interval = 2.0
     max_iter = 10 ** 9
     i = 0
-    last_sweep = 0.0
+    # Delay the FIRST auto-filter sweep ~120s instead of firing it at t=0.
+    # last_sweep=0 made the sweep (serial over every animal x pending file)
+    # kick the instant the daemon booted, piling onto the impedance backfill +
+    # dashboard + processing -> disk/lock starvation. Seed it so the first
+    # sweep waits out most of the boot burst; steady-state cadence is unchanged.
+    last_sweep = time.monotonic() - _AUTO_FILTER_INTERVAL + 120.0
     while True:
         assert i < max_iter, "worker loop runaway"
         i += 1

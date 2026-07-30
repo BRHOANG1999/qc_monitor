@@ -211,11 +211,17 @@ def main():
     # the impedance cadence in the loop below (cheap once caught up).
     def _impedance_backfill():
         try:
+            # Let the dashboard + first file-processing settle before this
+            # heavy sweep starts -- otherwise it kicks at t=0 alongside every
+            # other worker and the disk/write-lock contention makes the
+            # dashboard unusable for the first minutes. Then throttle between
+            # files so it keeps YIELDING to interactive use.
+            time.sleep(90)
             purged = store.purge_nonstimulated_impedance()
             if purged:
                 logger.info("Impedance: purged %d record-only channel rows",
                             purged)
-            refresh_impedance(store, config)
+            refresh_impedance(store, config, throttle_sec=0.03)
         except Exception:
             logger.exception("initial impedance backfill failed")
     threading.Thread(target=_impedance_backfill, daemon=True,

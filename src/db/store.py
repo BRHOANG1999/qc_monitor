@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import os
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from .schema import SCHEMA_SQL
@@ -5062,20 +5063,26 @@ class Store:
         if not examples:
             return 0
         now = datetime.now().isoformat()
-        conn = self._connect()
+        # Chunk into per-transaction batches (was ONE connection + a single
+        # commit over all ~1245 recordings, which held the write lock for the
+        # whole import and starved the WAL checkpoint + every other writer).
+        # Each chunk is its own transaction() -> the lock is RELEASED between
+        # chunks, and a tiny sleep lets the dashboard/daemon interleave.
+        CHUNK = 50
         n = 0
-        try:
-            for i, ex in enumerate(examples):
-                assert i < 1_000_000, "historical import runaway"
-                fid = self._upsert_historical_file(conn, ex, now)
-                if fid is None:
-                    continue
-                self._upsert_historical_session(conn, ex, now)
-                self._upsert_external_example(conn, fid, ex, now)
-                n += 1
-            conn.commit()
-        finally:
-            conn.close()
+        i = 0
+        for start in range(0, len(examples), CHUNK):
+            with self.transaction() as conn:
+                for ex in examples[start:start + CHUNK]:
+                    assert i < 1_000_000, "historical import runaway"
+                    i += 1
+                    fid = self._upsert_historical_file(conn, ex, now)
+                    if fid is None:
+                        continue
+                    self._upsert_historical_session(conn, ex, now)
+                    self._upsert_external_example(conn, fid, ex, now)
+                    n += 1
+            time.sleep(0.02)      # yield the write lock between chunks
         return n
 
     @staticmethod

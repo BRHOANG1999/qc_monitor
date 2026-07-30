@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 
 from src.utils.amplifier_records import load_amplifier_gains, resolve_gain
 from src.utils.animal import is_animal_channel, split_animal_electrode
@@ -173,11 +174,16 @@ def _as_float(x):
 
 
 def refresh_impedance(store, config: dict, *, limit: int | None = None,
-                      log_every: int = 200) -> int:
+                      log_every: int = 200, throttle_sec: float = 0.0) -> int:
     """Backfill/refresh channel_impedance. Returns channel rows written.
 
     Processes files with no impedance yet plus gain-was-missing retries,
     newest first. Emits progress logs so a long backfill isn't silent.
+
+    *throttle_sec*: sleep this long between files so a big boot-time backfill
+    YIELDS the disk + WAL write lock to the dashboard instead of starving it
+    (the sweep read large per-channel waveform arrays flat-out). 0 = no throttle
+    (interactive callers that want it fast).
     """
     assert store is not None, "store required"
     gains = load_amplifier_gains(config or {})
@@ -202,6 +208,8 @@ def refresh_impedance(store, config: dict, *, limit: int | None = None,
         if (idx + 1) % log_every == 0:
             logger.info("  impedance %d/%d files (%d channel rows)",
                         idx + 1, total, rows)
+        if throttle_sec:
+            time.sleep(throttle_sec)
     logger.info("Impedance refresh done: %d file(s), %d channel rows",
                 total, rows)
     return rows
