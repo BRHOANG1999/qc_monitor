@@ -264,25 +264,30 @@ def standardize_to_interictal(df, *, by: str = "seizure_idx", features=None,
     """
     assert by in df.columns, f"matrix missing '{by}'"
     assert mode in ("interictal", "grand"), "mode must be interictal|grand"
+    # mode='interictal' needs the class labels; don't silently degrade to the
+    # biased grand-reference (whose SD includes the between-class variance).
+    assert mode == "grand" or "class" in df.columns, \
+        "mode='interictal' requires a 'class' column (call label_classes first)"
     feats = [f for f in (features or _cfg.CHEAP_METRICS) if f in df.columns]
     out = df.copy()
     groups = out[by].to_numpy()
     cls = out["class"].to_numpy() if "class" in out.columns else None
-    ref_ok = (mode == "grand") or (cls is not None)
     for f in feats:
         vals = out[f].to_numpy(dtype=float)
         newv = vals.copy()
         for g in np.unique(groups):
             m = groups == g
-            ref = m if (mode == "grand" or not ref_ok) else (m & (cls == CLASS_INTERICTAL))
+            ref = (m & (cls == CLASS_INTERICTAL)) if mode == "interictal" else m
             r = vals[ref]
             r = r[np.isfinite(r)]
-            if r.size < 2:
+            if r.size == 0:
                 continue
-            sd = float(np.std(r, ddof=1))
+            mean = float(np.mean(r))
+            sd = float(np.std(r, ddof=1)) if r.size >= 2 else 0.0
             if not np.isfinite(sd) or sd <= 0.0:
-                continue
-            newv[m] = (vals[m] - float(np.mean(r))) / sd
+                newv[m] = vals[m] - mean          # at least remove the offset
+            else:
+                newv[m] = (vals[m] - mean) / sd
         out[f] = newv
     return out
 

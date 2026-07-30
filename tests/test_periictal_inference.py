@@ -95,9 +95,11 @@ def test_positive_recovers_within_seizure_effect():
     forest = fc.per_seizure_auc_forest(df, "feat", n_boot=200, min_n=5)
     aucs = np.array([f["auc"] for f in forest])
     assert np.all(aucs > 0.6), aucs                   # preictal > interictal
-    slopes = tt.per_seizure_slope_forest(df, "feat", n_boot=100, min_n=5)
+    slopes = tt.per_seizure_slope_forest(df, "feat", n_boot=200, min_n=5)
     assert np.all([s["slope"] < 0 for s in slopes])   # feature falls as tto rises
     assert np.all([s["rho"] < 0 for s in slopes])
+    # exercise the block-bootstrap CI itself: the whole CI is below zero
+    assert np.all([s["ci_hi"] < 0 for s in slopes]), [s["ci_hi"] for s in slopes]
 
 
 # -------------------------------------------------- standardization unit --- #
@@ -143,12 +145,21 @@ def test_sign_flip_floor_values():
 
 # ------------------------------------------- circular-shift surrogate --- #
 
-def test_circular_shift_surrogate_reports_effective_shifts():
-    df = _synth(effect=3.0, offsets=(0.0, 0.0, 0.0),
-                counts=((200, 200), (200, 200), (200, 200)), seed=8)
-    out = tt.circular_shift_surrogate_p(df, "feat", n_surrogates=200, seed=0)
-    assert 0.0 < out["p"] <= 1.0
-    assert out["n_seizures"] == 3
-    # effective independent offsets < the raw pre-onset length (autocorrelation)
-    assert np.isfinite(out["n_eff_shifts"]) and out["n_eff_shifts"] < 400
-    assert out["observed"] > 0.2                      # a real onset-aligned trend
+def test_circular_shift_surrogate_is_calibrated():
+    """A planted onset-aligned trend must yield a SMALL surrogate p; a no-signal
+    matrix must NOT -- otherwise the null is broken (SUR-2/FOR-1)."""
+    pos = tt.circular_shift_surrogate_p(
+        _synth(effect=3.0, offsets=(0.0, 0.0, 0.0),
+               counts=((200, 200), (200, 200), (200, 200)), seed=8),
+        "feat", n_surrogates=200, seed=0)
+    nul = tt.circular_shift_surrogate_p(
+        _synth(effect=0.0, offsets=(0.0, 0.0, 0.0),
+               counts=((200, 200), (200, 200), (200, 200)), seed=9),
+        "feat", n_surrogates=200, seed=0)
+    assert pos["p"] < 0.05, pos["p"]                  # real trend clears the floor
+    assert pos["p"] < nul["p"]                        # ...and beats the null
+    assert nul["p"] > 0.1, nul["p"]                   # null is not systematically small
+    # diagnostics: 3 contributing seizures, effective offsets < raw length
+    assert pos["n_seizures"] == 3
+    assert np.isfinite(pos["n_eff_shifts"]) and pos["n_eff_shifts"] < 400
+    assert pos["observed"] > 0.2 and nul["observed"] < 0.15

@@ -281,7 +281,11 @@ def _ordered_preonset(df, feature: str, min_n: int):
         y = g[feature].to_numpy(dtype=float)[order]
         x = g["time_to_onset_sec"].to_numpy(dtype=float)[order]
         ok = np.isfinite(y) & np.isfinite(x)
-        if int(ok.sum()) >= min_n:
+        # Match per_seizure_trend / _safe_spearman: a seizure only contributes if
+        # BOTH series have variance, else n_seizures / n_eff_shifts would count
+        # seizures that never enter the statistic.
+        if (int(ok.sum()) >= min_n and np.unique(y[ok]).size >= 2
+                and np.unique(x[ok]).size >= 2):
             seiz.append((y[ok], x[ok]))
     return seiz
 
