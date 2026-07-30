@@ -520,6 +520,11 @@ def create_app(config: dict, store: Store) -> Dash:
 
         dcc.Interval(id="refresh", interval=refresh_sec * 1000, n_intervals=0,
                      disabled=False),  # auto-refresh ON by default
+        # True while this browser tab is foregrounded. A visibilitychange
+        # listener (installed clientside) flips it, and the auto-refresh
+        # Interval is disabled whenever it's False -- so a backgrounded tab
+        # stops polling the server entirely (standard: don't poll when hidden).
+        dcc.Store(id="page-visible", data=True),
         html.Div([
             _kbd.kbd_help_hint(),
             html.Button("Focus", id="focus-toggle-btn",
@@ -639,12 +644,40 @@ def create_app(config: dict, store: Store) -> Dash:
     # ------------------------------------------------------------------ #
     #  Refresh + focus-mode controls
     # ------------------------------------------------------------------ #
-    @app.callback(
+    # Auto-refresh is disabled unless BOTH the toggle is on AND this browser
+    # tab is foregrounded. Clientside so visibility flips take effect with no
+    # server round-trip. Replaces the old server toggle (which ignored
+    # visibility and kept polling a hidden tab).
+    app.clientside_callback(
+        """
+        function (toggleVal, visible) {
+            var on = toggleVal && toggleVal.length > 0;
+            return !(on && visible);      // Interval.disabled
+        }
+        """,
         Output("refresh", "disabled"),
-        [Input("auto-refresh-toggle", "value")]
+        Input("auto-refresh-toggle", "value"),
+        Input("page-visible", "data"),
     )
-    def toggle_auto_refresh(val):
-        return not bool(val)
+
+    # Install the visibilitychange listener ONCE; it imperatively updates
+    # page-visible via set_props, which re-evaluates the disabled clientside cb.
+    app.clientside_callback(
+        """
+        function (_) {
+            if (!window.__qcVisWired) {
+                window.__qcVisWired = true;
+                document.addEventListener('visibilitychange', function () {
+                    window.dash_clientside.set_props('page-visible',
+                        {data: document.visibilityState === 'visible'});
+                });
+            }
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("page-visible", "data"),
+        Input("page-version", "data"),
+    )
 
     @app.callback(
         Output("refresh", "interval"),
