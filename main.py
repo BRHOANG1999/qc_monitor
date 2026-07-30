@@ -221,6 +221,25 @@ def main():
     threading.Thread(target=_impedance_backfill, daemon=True,
                      name="qc-impedance-backfill").start()
 
+    # Periodic WAL checkpoint. Without it, a long-held reader (e.g. a slow
+    # dashboard render) pins the WAL so the automatic checkpoint can't reclaim
+    # it -- the log grows unbounded, every write gets slower, and writers start
+    # timing out with "database is locked" (a feedback loop). PASSIVE never
+    # blocks a reader/writer; it reclaims whatever frames it can each pass.
+    def _wal_checkpoint():
+        ck_iter, ck_max = 0, 10 ** 12
+        while True:
+            assert ck_iter < ck_max, "wal checkpoint runaway"
+            ck_iter += 1
+            try:
+                with store.connection() as conn:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                logger.debug("wal checkpoint failed", exc_info=True)
+            time.sleep(120)
+    threading.Thread(target=_wal_checkpoint, daemon=True,
+                     name="qc-wal-checkpoint").start()
+
     # Dedicated heartbeat: write a health row every 30 s INDEPENDENT of the
     # main processing loop. The loop also inserts health, but it shares its
     # thread with file processing (MATLAB, up to ~20 min) + impedance refresh,
@@ -265,7 +284,14 @@ def main():
 
     # Main loop
     last_health_time = 0
-    last_impedance_time = 0
+    # Seed to NOW (not 0) so the loop's first impedance tick is deferred one
+    # full interval. Starting at 0 made the loop run refresh_impedance on its
+    # very first iteration -- concurrently with the qc-impedance-backfill thread
+    # started above, which ALSO runs refresh_impedance -> two impedance write
+    # storms fighting the same channel_impedance rows + the single WAL write
+    # lock, which starved the dashboard (30s+ tab renders) and threw
+    # "database is locked". The backfill thread owns the initial refresh.
+    last_impedance_time = time.time()
     consecutive_network_failures = 0
     files_since_scan = 10  # force initial scan
 

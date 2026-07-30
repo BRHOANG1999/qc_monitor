@@ -65,10 +65,19 @@ class Store:
         review_state change plus its audit event, or moving a review between
         animals -- so a crash / WAL-lock mid-way can't leave half-applied
         state. sqlite3's implicit-BEGIN is deferred and unpredictable, hence
-        the explicit BEGIN."""
+        the explicit BEGIN.
+
+        BEGIN IMMEDIATE (not plain BEGIN=DEFERRED): these blocks are WRITES, and
+        several read-then-write before their first write (e.g. reattribute /
+        review finalize read current state first). A DEFERRED txn takes only a
+        read lock at BEGIN, then must UPGRADE to a write lock on the first
+        write -- and if another writer holds it, that upgrade fails with an
+        INSTANT, non-retryable 'database is locked' (the busy handler does not
+        cover upgrades). IMMEDIATE takes the write lock up front, so the busy
+        handler actually waits it out instead."""
         conn = self._connect()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
