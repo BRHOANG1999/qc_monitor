@@ -3,6 +3,7 @@ electrode health, session compare, activity log, and annotations."""
 
 import logging
 import os
+import time
 from datetime import datetime, date
 
 from dash import Dash, html, dcc, no_update, ALL
@@ -11,6 +12,7 @@ from dash.dependencies import Input, Output, State
 from src.db.store import Store
 from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard import nav_progress as _nav_progress
+from src.dashboard import perf as _perf
 from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
@@ -32,6 +34,7 @@ from src.dashboard.tabs import chronic_evoked as tabs_chronic_evoked
 from src.dashboard.tabs import periictal_explorer as tabs_periictal_explorer
 from src.dashboard.tabs import jobs_monitor as tabs_jobs_monitor
 from src.dashboard.tabs import workers_monitor as tabs_workers_monitor
+from src.dashboard.tabs import perf_monitor as tabs_perf_monitor
 from src.dashboard.tabs import lfp_browser as tabs_lfp_browser
 from src.dashboard.tabs import overview as tabs_overview
 from src.dashboard.tabs import session_compare as tabs_session_compare
@@ -140,6 +143,7 @@ NAV_GROUPS = [
     {"id": "system", "label": "System", "subs": [
         {"id": "jobs_monitor", "label": "Jobs"},
         {"id": "workers_monitor", "label": "Workers"},
+        {"id": "perf_monitor", "label": "Performance"},
         {"id": "annotations", "label": "Notes"},
         {"id": "review_status", "label": "Review status"},
         {"id": "event_verification",
@@ -318,6 +322,34 @@ def create_app(config: dict, store: Store) -> Dash:
     # attach to the underlying Flask server.
     register_auth(app.server, store, config)
     register_media_routes(app.server, store, config)
+
+    # Performance ledger: time EVERY Dash callback centrally (one hook covers
+    # all ~285 of them) so "everything is slow" becomes a ranked list of which
+    # callbacks actually cost. Slow ones are also logged. See the Performance
+    # tab (System > Performance) which reads perf.top(). Best-effort throughout.
+    _slow_ms = float(config.get("dashboard", {}).get("slow_callback_ms", 800))
+
+    @app.server.before_request
+    def _perf_before():                       # noqa: ANN202
+        from flask import g
+        g._perf_t0 = time.perf_counter()
+
+    @app.server.after_request
+    def _perf_after(response):                # noqa: ANN202
+        try:
+            from flask import g, request
+            t0 = getattr(g, "_perf_t0", None)
+            if t0 is not None and request.path.endswith(
+                    "/_dash-update-component"):
+                dt = (time.perf_counter() - t0) * 1000.0
+                body = request.get_json(silent=True) or {}
+                label = "cb:" + str(body.get("output") or "?")[:120]
+                _perf.record(label, dt)
+                if dt >= _slow_ms:
+                    logger.info("slow callback %.0f ms  %s", dt, label)
+        except Exception:                     # telemetry must never 500
+            pass
+        return response
 
     app.layout = html.Div([
         # Header — quiet chrome, content-first.
@@ -1171,6 +1203,8 @@ def create_app(config: dict, store: Store) -> Dash:
             _nav_email = None
         _nav_progress.begin(_nav_email)
         _nav_progress.stage(f"Building {_TAB_LABEL_MAP.get(tab, tab)}…")
+        _tab_perf = _perf.Timer(f"tab:{_TAB_LABEL_MAP.get(tab, tab)}")
+        _tab_perf.__enter__()
         try:
             # Per-user navigation tracking (User Activity tab + presence).
             from src.dashboard import activity as _activity
@@ -1206,6 +1240,8 @@ def create_app(config: dict, store: Store) -> Dash:
                 return _enable_persistence(tabs_jobs_monitor.layout(store))
             elif tab == "workers_monitor":
                 return _enable_persistence(tabs_workers_monitor.layout(store))
+            elif tab == "perf_monitor":
+                return _enable_persistence(tabs_perf_monitor.layout(store))
             elif tab == "criticality":
                 return _enable_persistence(tabs_criticality.layout(store))
             elif tab == "lfp":
@@ -1266,6 +1302,7 @@ def create_app(config: dict, store: Store) -> Dash:
             return html.Div(f"Error rendering tab: {e}",
                             style={"color": COLOR_DANGER, "padding": SPACE_5})
         finally:
+            _tab_perf.__exit__(None, None, None)
             _nav_progress.end()
 
     # Live pipeline-stage readout under the header pill. Runs on the poll
@@ -1344,6 +1381,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_periictal_explorer.register_callbacks(app, store, config)
     tabs_jobs_monitor.register_callbacks(app, store, config)
     tabs_workers_monitor.register_callbacks(app, store, config)
+    tabs_perf_monitor.register_callbacks(app, store, config)
     tabs_settings.register_callbacks(app, store, config)
     tabs_lfp_browser.register_callbacks(app, store, config)
     tabs_overview.register_callbacks(app, store, config)
@@ -1412,6 +1450,7 @@ def _known_component_ids(store: Store, config: dict) -> set:
         tabs_periictal_explorer.layout_slow_dynamics,
         tabs_jobs_monitor.layout,
         tabs_workers_monitor.layout,
+        tabs_perf_monitor.layout,
         tabs_settings.layout,
         tabs_video.layout, tabs_surgeries.layout,
         tabs_maintenance.layout, tabs_data_log_xref.layout,

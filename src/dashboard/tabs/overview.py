@@ -2134,9 +2134,20 @@ def _overview_tab(store: Store, config: dict | None = None):
     # "▸ <stage> (i/N)" live while this synchronous build runs. Best-effort:
     # nav_progress swallows its own errors, so it never affects the render.
     from src.dashboard import nav_progress
+    from src.dashboard import perf as _perf
+    import time as _time
     _N = 12
+    _prev = {"label": None, "t": _time.perf_counter()}
 
     def _st(i, label):
+        # Close out the previous stage's timing into the perf ledger, then
+        # announce the next stage for the live header readout.
+        now = _time.perf_counter()
+        if _prev["label"]:
+            _perf.record(f"overview:{_prev['label']}",
+                         (now - _prev["t"]) * 1000.0)
+        _prev["label"] = label
+        _prev["t"] = now
         nav_progress.stage(f"{label} ({i}/{_N})")
 
     _st(1, "Sessions & recent alerts")
@@ -2491,6 +2502,11 @@ def _overview_tab(store: Store, config: dict | None = None):
         ]),
         open_default=False, badge=stim_badge,
         badge_color=stim_badge_color)
+
+    # Flush the final stage's timing (no later _st call closes it).
+    if _prev["label"]:
+        _perf.record(f"overview:{_prev['label']}",
+                     (_time.perf_counter() - _prev["t"]) * 1000.0)
 
     return html.Div([
         cards,         # pills strip, full width
