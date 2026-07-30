@@ -74,7 +74,11 @@ def _serve_waitress(app, host, port, config):
         app.run(host=host, port=port, debug=False, use_reloader=False,
                 threaded=True)
         return
-    threads = int(config.get("dashboard", {}).get("waitress_threads", 8))
+    # Default raised 8 -> 16: the dashboard fans out many short DB reads per
+    # refresh; with only 8 threads a burst (tab switch + pollers) queued behind
+    # each other and a single 30s tab render could starve everyone. WAL handles
+    # the extra concurrent readers fine.
+    threads = int(config.get("dashboard", {}).get("waitress_threads", 16))
     log.info("Serving dashboard via waitress (%d threads)", threads)
     # Dash's WSGI app is app.server (the Flask instance).
     serve(app.server, host=host, port=port, threads=threads)

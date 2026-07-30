@@ -13,6 +13,24 @@ from src.db.store import Store
 from src.dashboard.auth import register_auth, current_user_email
 from src.dashboard import nav_progress as _nav_progress
 from src.dashboard import perf as _perf
+
+# Small TTL memo for GLOBAL header callbacks that fire on every 10s refresh on
+# EVERY tab. Their queries are individually cheap, but under load (the dashboard
+# competing with the background daemon for threads/disk) each call was observed
+# holding a thread for 4-18s -- starving the tab render. Caching returns the
+# last value instantly and stops the recurring DB hit. Coarse indicators, so a
+# few seconds of staleness is fine. Concurrent misses just recompute once.
+_GLOBAL_TTL_CACHE: dict = {}
+
+
+def _ttl_cached(key: str, ttl_sec: float, producer):
+    now = time.time()
+    hit = _GLOBAL_TTL_CACHE.get(key)
+    if hit is not None and (now - hit[0]) < ttl_sec:
+        return hit[1]
+    val = producer()
+    _GLOBAL_TTL_CACHE[key] = (now, val)
+    return val
 from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
@@ -433,11 +451,12 @@ def create_app(config: dict, store: Store) -> Dash:
             dcc.Store(id="nav-load-state", data={}),
             # Fast CLIENTSIDE-only tick for the elapsed timer (no server cost).
             dcc.Interval(id="nav-load-tick", interval=200, n_intervals=0),
-            # Slower SERVER poll for the live stage detail, so the readout never
-            # adds meaningful load to an already-busy server (a 200 ms server
-            # round-trip would compete for the very threads a slow tab is
-            # starving). 800 ms is plenty for a human-readable stage line.
-            dcc.Interval(id="nav-stage-poll", interval=800, n_intervals=0),
+            # Slower SERVER poll for the live stage detail. DISABLED unless a
+            # tab is actively loading (a clientside cb flips it from
+            # nav-load-state), so it never polls the server while idle -- the
+            # readout is only needed during a slow render. 800 ms is plenty.
+            dcc.Interval(id="nav-stage-poll", interval=800, n_intervals=0,
+                         disabled=True),
             html.Span(
                 "● Ready",
                 id="app-load-status",
@@ -855,6 +874,14 @@ def create_app(config: dict, store: Store) -> Dash:
         State("nav-load-state", "data"),
     )
 
+    # Enable the server stage-poll ONLY while a tab is loading, so it adds zero
+    # server round-trips at idle.
+    app.clientside_callback(
+        "function (st) { return !(st && st.loading); }",
+        Output("nav-stage-poll", "disabled"),
+        Input("nav-load-state", "data"),
+    )
+
     # Pulsate "+ Add event" when the reviewer picked "Events
     # seen" but hasn't added any events yet -- a one-time visual
     # nudge so the first event isn't missed.
@@ -1064,7 +1091,12 @@ def create_app(config: dict, store: Store) -> Dash:
     def update_header_status_dot(_n):
         """One-glance health indicator beside the title. Green +
         pulsing when the SMB share is up and the queue isn't stuck;
-        red + pulsing otherwise."""
+        red + pulsing otherwise. Cached ~20s: it's global (fires on every
+        tab's 10s refresh) and its thread-hold under load was starving
+        renders -- the health it reflects changes on the order of minutes."""
+        return _ttl_cached("header_dot", 20.0, _compute_header_dot)
+
+    def _compute_header_dot():
         try:
             history = store.get_health_history(hours=1)
         except Exception:
@@ -1108,10 +1140,14 @@ def create_app(config: dict, store: Store) -> Dash:
         State("header-update-msg", "style"),
     )
     def _check_for_update(_n, page_version, cur_style):
+        # newer_version_available() checks HEAD on disk (git) -- ~1s and it
+        # fires globally every 10s. The deployed version changes on the order
+        # of hours, so cache the boolean for 60s.
+        newer = _ttl_cached(
+            f"newer_version:{page_version}", 60.0,
+            lambda: newer_version_available(page_version))
         base = dict(cur_style or {})
-        base["display"] = ("inline-block"
-                            if newer_version_available(page_version)
-                            else "none")
+        base["display"] = "inline-block" if newer else "none"
         return base
 
     @app.callback(
