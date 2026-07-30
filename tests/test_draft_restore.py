@@ -14,7 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.dashboard.tabs.video import restorable_drafts  # noqa: E402
+from src.dashboard.tabs.video import (  # noqa: E402
+    restorable_drafts,
+    _events_scope_matches,
+)
 from src.db.store import Store  # noqa: E402
 
 
@@ -101,3 +104,31 @@ def test_get_review_state_breaks_updated_at_ties_by_newest_id(tmp_path):
     latest = s.get_review_state(fid, animal_id=animal)
     assert latest is not None and latest["id"] == 4468
     assert restorable_drafts(latest) == _ONSET
+
+
+# ------------------------- cross-file replication guard (scope matching) --- #
+#
+# The store->DB write paths (Submit / autosave) read video-events-store, which
+# lags file navigation by one callback round. Writing in that window filed the
+# PREVIOUS recording's onsets under the new file -- the identical EO=1493.289 on
+# four BCH062 files / EO=729.993 on two BCH111 files (2026-07). Writes now gate
+# on video-events-current-key == "{file}:{animal}".
+
+def test_scope_matches_when_key_is_the_current_file():
+    assert _events_scope_matches("4245:BCH062", 4245, "BCH062") is True
+
+
+def test_scope_rejects_stale_key_after_navigation():
+    """Navigated to 4249 but the store still holds 4245's key -> must NOT write
+    (this is exactly the replication the guard blocks)."""
+    assert _events_scope_matches("4245:BCH062", 4249, "BCH062") is False
+
+
+def test_scope_rejects_wrong_animal():
+    assert _events_scope_matches("4245:BCH061", 4245, "BCH062") is False
+
+
+def test_scope_rejects_unset_or_incomplete():
+    assert _events_scope_matches(None, 4245, "BCH062") is False
+    assert _events_scope_matches("4245:BCH062", None, "BCH062") is False
+    assert _events_scope_matches("4245:BCH062", 4245, None) is False

@@ -460,6 +460,23 @@ def restorable_drafts(latest) -> list:
     return drafts if isinstance(drafts, list) else []
 
 
+def _events_scope_matches(current_key, file_id, animal) -> bool:
+    """True when the live ``video-events-store`` is scoped to (file_id, animal).
+
+    ``_rescope_events`` stamps ``video-events-current-key`` = ``f"{file}:{animal}"``
+    for whatever recording the store currently holds, and it lags file/channel
+    navigation by one callback round. A store->DB write (Submit / autosave) that
+    fires in that lag window would persist the PREVIOUS file's onsets under the
+    newly-selected file -- the cross-file replication that put the identical
+    EO=1493.289 on four different BCH062 recordings and EO=729.993 on two BCH111
+    recordings (2026-07). Every store->DB write MUST gate on this so a stale
+    store can never be written to the wrong file.
+    """
+    if not file_id or not animal:
+        return False
+    return current_key == f"{int(file_id)}:{animal}"
+
+
 def _fetch_queue_by_mode(store, mode, animal_ids, email, floor, limit):
     """Return the carousel rows for the chosen navigation *mode*, normalized so
     every dict carries ``id`` / ``session_dir`` / ``chunk_datetime`` /
@@ -4774,9 +4791,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
         State("video-autosave-state", "data"),
+        State("video-events-current-key", "data"),
         prevent_initial_call=True,
     )
-    def _autosave_draft(_tick, events, file_id, channel, prev):
+    def _autosave_draft(_tick, events, file_id, channel, prev, current_key):
         if not file_id:
             return no_update
         events = list(events or [])
@@ -4785,6 +4803,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         animal = _animal_for_channel(store, file_id, channel)
         if not animal:
             return no_update            # no animal channel -> can't file it
+        # Cross-file guard: the store must already be rescoped to THIS
+        # (file, animal) or we'd flush the previous recording's onsets here.
+        if not _events_scope_matches(current_key, file_id, animal):
+            return no_update            # store lags navigation -> skip this tick
         key = f"{int(file_id)}:{animal}"
         digest = _events_digest(events)
         if prev and prev.get("key") == key and prev.get("hash") == digest:
@@ -5925,12 +5947,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-ma-cutoff-input", "value"),
         State("video-ma-auc-threshold-input", "value"),
         State("video-auc-window-input", "value"),
+        State("video-events-current-key", "data"),
         prevent_initial_call=True,
     )
     def _save_review(n_clicks, file_id, decision, markers, note,
                       animal_value, events, channel,
                       pools_view, pool_cursor,
-                      cutoff, auc_threshold, auc_window):
+                      cutoff, auc_threshold, auc_window,
+                      current_key):
         nop = (no_update,) * 11
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
@@ -5986,6 +6010,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return ("Pick the animal's brain channel (Step 1) before "
                      "saving — the review is filed per animal, not "
                      "per file.", *nop[1:])
+        # Cross-file guard: only persist EVENTS the live store has actually
+        # rescoped to THIS (file, animal). A submit that fires before
+        # _rescope_events catches up would otherwise file the PREVIOUS
+        # recording's onsets here (the 1493.289 / 729.993 replication). The
+        # no-events path writes no markers, so it is exempt.
+        if markers_payload and not _events_scope_matches(
+                current_key, file_id, animal):
+            return ("This recording is still loading its onsets — give it a "
+                     "second, then Submit again so the onsets file under the "
+                     "right recording.", *nop[1:])
         try:
             store.mark_review(
                 int(file_id), email, target_status,
