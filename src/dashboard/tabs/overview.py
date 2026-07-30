@@ -67,6 +67,19 @@ logger = logging.getLogger("qc_monitor.dashboard.overview")
 # and pile heavy builds onto a fixed server thread pool. Non-blocking acquire.
 _REFRESH_LOCK = threading.Lock()
 
+
+def _pending_placeholder(label: str = "Loading…"):
+    """Lightweight stand-in for a not-yet-built Overview card. The tab shell
+    renders these INSTANTLY; the fill callbacks (mount + refresh-trigger)
+    replace them with the real card. Progressive render: the page appears at
+    once and each card populates when its callback lands, instead of the whole
+    tab blocking on ~12 synchronous DB-backed builds in render_tab."""
+    return html.Div(
+        f"⏳ {label}",
+        style={"color": "#6c6c80", "fontSize": "12px",
+               "padding": "14px 6px", "letterSpacing": "0.2px"},
+    )
+
 # Shared row style for the "today at the lab" home-grid block rows.
 _HOME_ROW_STYLE = {
     "display": "flex", "alignItems": "center",
@@ -2135,27 +2148,12 @@ def _build_overview_queue(store: Store):
 
 
 def _overview_tab(store: Store, config: dict | None = None):
-    # Publish each heavy stage to the nav progress channel so the header shows
-    # "▸ <stage> (i/N)" live while this synchronous build runs. Best-effort:
-    # nav_progress swallows its own errors, so it never affects the render.
-    from src.dashboard import nav_progress
-    from src.dashboard import perf as _perf
-    import time as _time
-    _N = 12
-    _prev = {"label": None, "t": _time.perf_counter()}
-
-    def _st(i, label):
-        # Close out the previous stage's timing into the perf ledger, then
-        # announce the next stage for the live header readout.
-        now = _time.perf_counter()
-        if _prev["label"]:
-            _perf.record(f"overview:{_prev['label']}",
-                         (now - _prev["t"]) * 1000.0)
-        _prev["label"] = label
-        _prev["t"] = now
-        nav_progress.stage(f"{label} ({i}/{_N})")
-
-    _st(1, "Sessions & recent alerts")
+    # Progressive shell: only the CHEAP reads (sessions, alerts, channel map)
+    # run here; every heavy card is a placeholder filled by a mount/refresh
+    # callback. render_tab used to build ~12 DB-backed cards synchronously here
+    # AND refresh_overview_dynamic rebuilt 8 of them concurrently on mount --
+    # the self-contending double-build that made stage 1 (a 0.01s query) take
+    # 15-33s. Now render_tab returns fast and cards populate in the background.
     sessions = store.get_sessions()
     active_session = sessions[0] if sessions else {}
     session_dir = active_session.get("session_dir", "")
@@ -2166,9 +2164,10 @@ def _overview_tab(store: Store, config: dict | None = None):
     # Pills as a full-width horizontal strip at the very top of
     # the Overview tab. flexWrap on so the strip wraps to a second
     # row on narrow viewports rather than overflowing.
-    _st(2, "Status pills")
+    # Heavy cards below are deferred: the shell ships placeholders and the fill
+    # callbacks (mount + refresh-trigger) populate them. Keeps render_tab light.
     cards = html.Div(
-        _build_overview_cards(store),
+        _pending_placeholder("status pills"),
         id="overview-cards",
         style={"display": "flex", "flexWrap": "wrap",
                 "gap": "6px", "marginBottom": "10px"},
@@ -2180,30 +2179,25 @@ def _overview_tab(store: Store, config: dict | None = None):
     # "are we keeping up?" with the rate delta; the table
     # below breaks it down per animal so the user can spot
     # which animal is the bottleneck.
-    _st(3, "Behavioral seizure status")
     bsz_status = html.Div(
-        _build_behavioral_seizure_status_card(store, config),
+        _pending_placeholder("behavioral seizure status"),
         id="overview-bsz-status",
         style={"marginBottom": "12px"},
     )
-    _st(4, "Impedance trend")
     impedance_status = html.Div(
-        _build_impedance_trend_card(store, config),
+        _pending_placeholder("impedance trend"),
         id="overview-impedance",
     )
-    _st(5, "Stim-step consistency")
     zss_status = html.Div(
-        _build_zss_consistency_card(store, config),
+        _pending_placeholder("stim-step consistency"),
         id="overview-zss",
     )
-    _st(6, "Current fidelity")
     fidelity_status = html.Div(
-        _build_current_fidelity_card(store, config),
+        _pending_placeholder("current fidelity"),
         id="overview-current-fidelity",
     )
-    _st(7, "Region drift")
     region_status = html.Div(
-        _build_region_drift_card(store, config),
+        _pending_placeholder("region drift"),
         id="overview-region-drift",
     )
     # Stim-artifact overlay: lazily loaded on button click (loading many
@@ -2227,20 +2221,17 @@ def _overview_tab(store: Store, config: dict | None = None):
             dcc.Loading(html.Div(id="overview-artifact-body"), type="dot"),
         ]),
         open_default=False)
-    _st(8, "Failed-MATLAB scan")
     matlab_failed = _build_matlab_failed_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
     # the dashboard read as "card-on-card-on-card."
-    _st(9, "Kaplan–Meier log summary")
     km_section = html.Div(
-        _build_km_log_section(config),
+        _pending_placeholder("Kaplan–Meier log summary"),
         id="overview-km-log",
     )
-    _st(10, "Review queue")
     queue_section = html.Div(
-        _build_overview_queue(store),
+        _pending_placeholder("review queue"),
         id="overview-queue",
     )
 
@@ -2284,8 +2275,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         # thumbnail callback flips its `disabled` once the cache is ready.
         dcc.Interval(id="overview-hist24-poll", interval=1200, disabled=True),
         html.Div(
-            (_st(11, "Evoked thumbnail")
-             or _build_overview_thumbnail(store, config, session_dir, "mean")),
+            _pending_placeholder("evoked thumbnail"),
             id="overview-thumbnail",
         ),
         # Per-client signature of the last-rendered thumbnail (mode + newest
@@ -2370,9 +2360,8 @@ def _overview_tab(store: Store, config: dict | None = None):
     # The container is a flex column so each tile gets the full
     # column width and stacks predictably regardless of how many
     # tiles _build_home_grid_children returns.
-    _st(12, "Lab home grid")
     home_grid = html.Div(
-        _build_home_grid_children(store, config, today),
+        _pending_placeholder("lab home grid"),
         id="overview-home-grid",
         style={
             "display": "flex", "flexDirection": "column",
@@ -2508,12 +2497,10 @@ def _overview_tab(store: Store, config: dict | None = None):
         open_default=False, badge=stim_badge,
         badge_color=stim_badge_color)
 
-    # Flush the final stage's timing (no later _st call closes it).
-    if _prev["label"]:
-        _perf.record(f"overview:{_prev['label']}",
-                     (_time.perf_counter() - _prev["t"]) * 1000.0)
-
     return html.Div([
+        # Fires once, ~120ms after the shell mounts, to kick the card-fill
+        # callbacks (they also listen to refresh-trigger for periodic updates).
+        dcc.Interval(id="overview-mount", interval=120, max_intervals=1),
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
@@ -4340,10 +4327,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-current-fidelity", "children"),
         Output("overview-region-drift", "children"),
         Input("refresh-trigger", "data"),
+        Input("overview-mount", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def refresh_overview_dynamic(_n, current_tab):
+    def refresh_overview_dynamic(_n, _mount, current_tab):
         nout = (no_update,) * 8
         # refresh-trigger is GLOBAL (fires every ~10 s on every tab), and this
         # callback's Input always exists -- so without this gate the 8 heavy
@@ -4372,6 +4360,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 )
         finally:
             _REFRESH_LOCK.release()
+
+    # Behavioral-seizure status card: its own fill callback so it loads in
+    # PARALLEL with the 8-card refresh above (own thread) instead of adding to
+    # that callback's sequential build. Mount + refresh-trigger, tab-gated.
+    @app.callback(
+        Output("overview-bsz-status", "children"),
+        Input("refresh-trigger", "data"),
+        Input("overview-mount", "n_intervals"),
+        State("tabs", "value"),
+        prevent_initial_call=True,
+    )
+    def _fill_bsz_status(_n, _mount, current_tab):
+        if current_tab != "overview":
+            return no_update
+        with _perf.Timer("cb:overview-bsz-status"):
+            return _build_behavioral_seizure_status_card(store, config)
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
     # user clicks, and lives outside the refreshed card so it persists.
@@ -4481,11 +4485,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("refresh-trigger", "data"),
         Input("overview-hist24-poll", "n_intervals"),
         Input("overview-hist24-n", "value"),
+        Input("overview-mount", "n_intervals"),
         State("overview-thumb-sig", "data"),
         State("tabs", "value"),
     )
-    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n, last_sig,
-                                    _tab):
+    def refresh_overview_thumbnail(trace_mode, _n, _poll, hist_n, _mount,
+                                    last_sig, _tab):
         if _tab != "overview":         # skip off-tab refresh fan-out
             return no_update, no_update, no_update
         mode = trace_mode or "mean"
