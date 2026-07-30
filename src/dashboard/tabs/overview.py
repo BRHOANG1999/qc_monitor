@@ -2130,6 +2130,16 @@ def _build_overview_queue(store: Store):
 
 
 def _overview_tab(store: Store, config: dict | None = None):
+    # Publish each heavy stage to the nav progress channel so the header shows
+    # "▸ <stage> (i/N)" live while this synchronous build runs. Best-effort:
+    # nav_progress swallows its own errors, so it never affects the render.
+    from src.dashboard import nav_progress
+    _N = 12
+
+    def _st(i, label):
+        nav_progress.stage(f"{label} ({i}/{_N})")
+
+    _st(1, "Sessions & recent alerts")
     sessions = store.get_sessions()
     active_session = sessions[0] if sessions else {}
     session_dir = active_session.get("session_dir", "")
@@ -2140,6 +2150,7 @@ def _overview_tab(store: Store, config: dict | None = None):
     # Pills as a full-width horizontal strip at the very top of
     # the Overview tab. flexWrap on so the strip wraps to a second
     # row on narrow viewports rather than overflowing.
+    _st(2, "Status pills")
     cards = html.Div(
         _build_overview_cards(store),
         id="overview-cards",
@@ -2153,23 +2164,28 @@ def _overview_tab(store: Store, config: dict | None = None):
     # "are we keeping up?" with the rate delta; the table
     # below breaks it down per animal so the user can spot
     # which animal is the bottleneck.
+    _st(3, "Behavioral seizure status")
     bsz_status = html.Div(
         _build_behavioral_seizure_status_card(store, config),
         id="overview-bsz-status",
         style={"marginBottom": "12px"},
     )
+    _st(4, "Impedance trend")
     impedance_status = html.Div(
         _build_impedance_trend_card(store, config),
         id="overview-impedance",
     )
+    _st(5, "Stim-step consistency")
     zss_status = html.Div(
         _build_zss_consistency_card(store, config),
         id="overview-zss",
     )
+    _st(6, "Current fidelity")
     fidelity_status = html.Div(
         _build_current_fidelity_card(store, config),
         id="overview-current-fidelity",
     )
+    _st(7, "Region drift")
     region_status = html.Div(
         _build_region_drift_card(store, config),
         id="overview-region-drift",
@@ -2195,15 +2211,18 @@ def _overview_tab(store: Store, config: dict | None = None):
             dcc.Loading(html.Div(id="overview-artifact-body"), type="dot"),
         ]),
         open_default=False)
+    _st(8, "Failed-MATLAB scan")
     matlab_failed = _build_matlab_failed_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
     # the dashboard read as "card-on-card-on-card."
+    _st(9, "Kaplan–Meier log summary")
     km_section = html.Div(
         _build_km_log_section(config),
         id="overview-km-log",
     )
+    _st(10, "Review queue")
     queue_section = html.Div(
         _build_overview_queue(store),
         id="overview-queue",
@@ -2249,7 +2268,8 @@ def _overview_tab(store: Store, config: dict | None = None):
         # thumbnail callback flips its `disabled` once the cache is ready.
         dcc.Interval(id="overview-hist24-poll", interval=1200, disabled=True),
         html.Div(
-            _build_overview_thumbnail(store, config, session_dir, "mean"),
+            (_st(11, "Evoked thumbnail")
+             or _build_overview_thumbnail(store, config, session_dir, "mean")),
             id="overview-thumbnail",
         ),
         # Per-client signature of the last-rendered thumbnail (mode + newest
@@ -2334,6 +2354,7 @@ def _overview_tab(store: Store, config: dict | None = None):
     # The container is a flex column so each tile gets the full
     # column width and stacks predictably regardless of how many
     # tiles _build_home_grid_children returns.
+    _st(12, "Lab home grid")
     home_grid = html.Div(
         _build_home_grid_children(store, config, today),
         id="overview-home-grid",

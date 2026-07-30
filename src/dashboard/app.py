@@ -10,6 +10,7 @@ from dash.dependencies import Input, Output, State
 
 from src.db.store import Store
 from src.dashboard.auth import register_auth, current_user_email
+from src.dashboard import nav_progress as _nav_progress
 from src.dashboard import keyboard as _kbd
 from src.utils import assignments as _assignments
 from src.utils import event_clip as _event_clip
@@ -394,6 +395,11 @@ def create_app(config: dict, store: Store) -> Dash:
             # layout. Flips "Loading <Tab>…" -> "Ready" so a slow render
             # never reads as a freeze. See _app_load_status clientside cb.
             dcc.Store(id="tab-label-map", data=_TAB_LABEL_MAP),
+            # Loading-state bookkeeping for the status pill's live elapsed
+            # timer (see the _app_load_status clientside cb). The 200 ms tick
+            # runs always but only rewrites the pill while a tab is loading.
+            dcc.Store(id="nav-load-state", data={}),
+            dcc.Interval(id="nav-load-tick", interval=200, n_intervals=0),
             html.Span(
                 "● Ready",
                 id="app-load-status",
@@ -411,6 +417,26 @@ def create_app(config: dict, store: Store) -> Dash:
                     "border": "1px solid rgba(48, 209, 88, 0.35)",
                     "fontSize": FONT_SIZE_CAPTION,
                     "fontWeight": "600",
+                    "letterSpacing": "0.2px",
+                    "whiteSpace": "nowrap",
+                    "pointerEvents": "none",
+                    "zIndex": "5",
+                },
+            ),
+            # Live pipeline-stage detail, sits just under the pill. Populated
+            # by _nav_stage_detail (server poll) with what's building right now
+            # (e.g. "▸ Behavioral seizure status (3/12)"); empty when idle.
+            html.Span(
+                "",
+                id="app-load-detail",
+                style={
+                    "position": "absolute",
+                    "left": "50%",
+                    "top": "50%",
+                    "transform": "translate(-50%, 16px)",
+                    "color": COLOR_TEXT_TERTIARY,
+                    "fontSize": "10px",
+                    "fontFamily": "ui-monospace, monospace",
                     "letterSpacing": "0.2px",
                     "whiteSpace": "nowrap",
                     "pointerEvents": "none",
@@ -705,32 +731,57 @@ def create_app(config: dict, store: Store) -> Dash:
     # prop, so the absolute-centering must be re-emitted every time.
     app.clientside_callback(
         """
-        function (tabValue, content, labelMap) {
-            var base = {position:'absolute', left:'50%', top:'50%',
-                transform:'translate(-50%, -50%)', padding:'3px 12px',
-                borderRadius:'11px', background:'#1c1c2c', fontSize:'11px',
-                fontWeight:'600', letterSpacing:'0.2px', whiteSpace:'nowrap',
-                pointerEvents:'none', zIndex:'5'};
-            var ctx = window.dash_clientside.callback_context;
+        function (tabValue, content, tick, labelMap, st) {
+            var dc = window.dash_clientside;
+            var nu = dc.no_update;
+            function style(color, brd) {
+                return {position:'absolute', left:'50%', top:'50%',
+                    transform:'translate(-50%, -50%)', padding:'3px 12px',
+                    borderRadius:'11px', background:'#1c1c2c', fontSize:'11px',
+                    fontWeight:'600', letterSpacing:'0.2px', whiteSpace:'nowrap',
+                    pointerEvents:'none', zIndex:'5', color:color, border:brd};
+            }
+            var AMBER = style('#ff9f0a', '1px solid rgba(255,159,10,0.40)');
+            var GREEN = style('#30d158', '1px solid rgba(48,209,88,0.35)');
+            var now = Date.now();
+            var ctx = dc.callback_context;
             var trig = (ctx && ctx.triggered && ctx.triggered.length)
                 ? ctx.triggered[0].prop_id : '';
+            // Tab clicked -> start the loading clock (fires instantly, before
+            // the server has built anything).
             if (trig.indexOf('tabs.value') === 0 && tabValue) {
                 var label = (labelMap && labelMap[tabValue])
                     ? labelMap[tabValue] : tabValue;
-                base.color = '#ff9f0a';
-                base.border = '1px solid rgba(255,159,10,0.40)';
-                return ['\\u23f3 Loading ' + label + '\\u2026', base];
+                return ['\\u23f3 Loading ' + label + '\\u2026 0.0s', AMBER,
+                        {loading: 1, label: label, t0: now}];
             }
-            base.color = '#30d158';
-            base.border = '1px solid rgba(48,209,88,0.35)';
-            return ['\\u25cf Ready', base];
+            // Server delivered the tab body -> done.
+            if (trig.indexOf('tab-content') === 0) {
+                return ['\\u25cf Ready', GREEN, {loading: 0}];
+            }
+            // Timer tick: while loading, tick the elapsed seconds up so a slow
+            // render visibly keeps counting instead of looking frozen.
+            if (trig.indexOf('nav-load-tick') === 0) {
+                if (!st || !st.loading || !st.t0) { return [nu, nu, nu]; }
+                var secs = (now - st.t0) / 1000;
+                var txt = '\\u23f3 Loading ' + (st.label || '')
+                    + '\\u2026 ' + secs.toFixed(1) + 's';
+                if (secs >= 8) {
+                    txt += '  \\u00b7 still working, no need to refresh';
+                }
+                return [txt, nu, nu];
+            }
+            return [nu, nu, nu];
         }
         """,
         Output("app-load-status", "children"),
         Output("app-load-status", "style"),
+        Output("nav-load-state", "data"),
         Input("tabs", "value"),
         Input("tab-content", "children"),
+        Input("nav-load-tick", "n_intervals"),
         State("tab-label-map", "data"),
+        State("nav-load-state", "data"),
     )
 
     # Pulsate "+ Add event" when the reviewer picked "Events
@@ -1111,6 +1162,15 @@ def create_app(config: dict, store: Store) -> Dash:
         State("lfp-to-video-bridge", "data"),
     )
     def render_tab(tab, session_hint, video_bridge):
+        # Publish "which user is building which tab" so the status-poll callback
+        # (running on another server thread) can show live pipeline stages while
+        # this synchronous build blocks. Best-effort; never breaks the render.
+        try:
+            _nav_email = current_user_email()
+        except Exception:
+            _nav_email = None
+        _nav_progress.begin(_nav_email)
+        _nav_progress.stage(f"Building {_TAB_LABEL_MAP.get(tab, tab)}…")
         try:
             # Per-user navigation tracking (User Activity tab + presence).
             from src.dashboard import activity as _activity
@@ -1205,6 +1265,24 @@ def create_app(config: dict, store: Store) -> Dash:
             logger.error("Dashboard render error: %s", e, exc_info=True)
             return html.Div(f"Error rendering tab: {e}",
                             style={"color": COLOR_DANGER, "padding": SPACE_5})
+        finally:
+            _nav_progress.end()
+
+    # Live pipeline-stage readout under the header pill. Runs on the poll
+    # thread, so it reports what render_tab (blocked on another thread) is
+    # currently building. Empty string when idle -> the detail line vanishes.
+    @app.callback(
+        Output("app-load-detail", "children"),
+        Input("nav-load-tick", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _nav_stage_detail(_n):
+        try:
+            email = current_user_email()
+        except Exception:
+            email = None
+        stage = _nav_progress.get(email)
+        return f"▸ {stage}" if stage else ""
 
     # Evoked Features callbacks moved to src/dashboard/tabs/evoked.py.
 
