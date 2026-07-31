@@ -86,13 +86,35 @@ class _WriteSerializingConnection:
         self._acquire()                # scripts may contain writes; lock always
         return self._conn.executescript(sql, *args, **kw)
 
+    def _release(self):
+        if self._held:
+            object.__setattr__(self, "_held", False)
+            self._lock.release()
+
+    def commit(self):
+        # Release on commit, NOT just close: the write lock should be held only
+        # for the actual transaction (first write -> commit), matching SQLite's
+        # own semantics. Holding it until close() would keep the lock across any
+        # slow non-DB work a caller does after committing (e.g. writes a partial
+        # result, then reads a .mat / computes, then closes) -- turning the
+        # serializer into a bottleneck. A later write on the same connection
+        # simply re-acquires.
+        try:
+            return self._conn.commit()
+        finally:
+            self._release()
+
+    def rollback(self):
+        try:
+            return self._conn.rollback()
+        finally:
+            self._release()
+
     def close(self):
         try:
             return self._conn.close()
         finally:
-            if self._held:
-                object.__setattr__(self, "_held", False)
-                self._lock.release()
+            self._release()
 
     def __enter__(self):
         return self._conn.__enter__()
