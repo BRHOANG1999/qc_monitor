@@ -119,12 +119,13 @@ class _CachedBuilder:
 _BSZ_CACHE = _CachedBuilder(45.0)
 
 # Home grid + KM-log cards read GOOGLE SHEETS (surgery / maintenance / schedule /
-# data-log). Even with the new Sheets API socket timeout, a cache-miss costs
-# ~10-20s; these cards otherwise rebuilt on EVERY 10s tick. A 120s single-flight
-# cache keeps the (rare, bounded) Sheets miss off the critical path of the fast
-# DB cards. Sheets data changes on the order of hours, so 120s is plenty fresh.
-_HOME_GRID_CACHE = _CachedBuilder(120.0)
-_KM_LOG_CACHE = _CachedBuilder(120.0)
+# data-log). These live in their OWN callbacks (see _fill_home_grid/_fill_km_log)
+# so a slow/unreachable Sheets read can't block the DB cards. Each build still
+# costs ~10-20s per unreachable sheet (socket timeout), so a 300s single-flight
+# cache keeps that stall to at most once / 5 min. Sheets data changes on the
+# order of hours, so 5 min is plenty fresh.
+_HOME_GRID_CACHE = _CachedBuilder(300.0)
+_KM_LOG_CACHE = _CachedBuilder(300.0)
 
 # Single-flight for the heavy (mean/sem/overlay) evoked-thumbnail build so
 # concurrent ticks (on load / when the newest-recording signature changes)
@@ -4393,11 +4394,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # the white flash that used to happen on every refresh tick. The
     # callback is a no-op when the user's on any other tab (the target
     # divs don't exist in the rendered tree).
+    # FAST DB-backed cards only. The Sheets-backed cards (home grid, KM log) are
+    # deliberately SPLIT into their own callbacks below: those read Google Sheets
+    # which, on a flaky/VPN network, fail-fast at the socket timeout (~10-20s per
+    # sheet) -- bundling them here made the SLOW Sheets cards block the FAST DB
+    # cards (status pills + review queue showed the placeholder for as long as
+    # the unreachable sheets took). Now the DB cards fill in seconds regardless.
     @app.callback(
         Output("overview-cards", "children"),
         Output("overview-queue", "children"),
-        Output("overview-home-grid", "children"),
-        Output("overview-km-log", "children"),
         Output("overview-impedance", "children"),
         Output("overview-zss", "children"),
         Output("overview-current-fidelity", "children"),
@@ -4408,36 +4413,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
     def refresh_overview_dynamic(_n, _mount, current_tab):
-        nout = (no_update,) * 8
-        # refresh-trigger is GLOBAL (fires every ~10 s on every tab), and this
-        # callback's Input always exists -- so without this gate the 8 heavy
-        # card builds below ran on EVERY tab and were thrown away when the
-        # Overview divs weren't mounted. On a fixed thread pool (waitress) a
-        # build slower than the interval then piled up until the pool starved
-        # and navigation froze. Only do the work when Overview is actually shown.
+        nout = (no_update,) * 6
         if current_tab != "overview":
             return nout
-        # And never let a slow refresh overlap itself: if the previous tick is
-        # still building, skip this one rather than stacking another 8 builds.
+        # Single-flight: don't let a slow tick overlap itself.
         if not _REFRESH_LOCK.acquire(blocking=False):
             return nout
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
-                from datetime import date as _date
-                # Home grid + KM log hit Google Sheets -> cached (120s) so a
-                # Sheets miss doesn't run every tick or block the DB cards below.
-                home_grid = _HOME_GRID_CACHE.get(
-                    lambda: _build_home_grid_children(
-                        store, config, _date.today()),
-                    label="cb:overview-home-grid")
-                km_log = _KM_LOG_CACHE.get(
-                    lambda: _build_km_log_section(config),
-                    label="cb:overview-km-log")
                 return (
                     _build_overview_cards(store),
                     _build_overview_queue(store),
-                    home_grid,
-                    km_log,
                     _build_impedance_trend_card(store, config),
                     _build_zss_consistency_card(store, config),
                     _build_current_fidelity_card(store, config),
@@ -4445,6 +4431,38 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 )
         finally:
             _REFRESH_LOCK.release()
+
+    # Home grid (Google Sheets) -- own callback + 120s single-flight cache so a
+    # slow/unreachable Sheets read never blocks the DB cards above.
+    @app.callback(
+        Output("overview-home-grid", "children"),
+        Input("refresh-trigger", "data"),
+        Input("overview-mount", "n_intervals"),
+        State("tabs", "value"),
+        prevent_initial_call=True,
+    )
+    def _fill_home_grid(_n, _mount, current_tab):
+        if current_tab != "overview":
+            return no_update
+        from datetime import date as _date
+        return _HOME_GRID_CACHE.get(
+            lambda: _build_home_grid_children(store, config, _date.today()),
+            label="cb:overview-home-grid")
+
+    # KM-log summary (Google Sheets) -- own callback + 120s cache, same reason.
+    @app.callback(
+        Output("overview-km-log", "children"),
+        Input("refresh-trigger", "data"),
+        Input("overview-mount", "n_intervals"),
+        State("tabs", "value"),
+        prevent_initial_call=True,
+    )
+    def _fill_km_log(_n, _mount, current_tab):
+        if current_tab != "overview":
+            return no_update
+        return _KM_LOG_CACHE.get(
+            lambda: _build_km_log_section(config),
+            label="cb:overview-km-log")
 
     # Behavioral-seizure status card: its own fill callback so it loads in
     # PARALLEL with the 8-card refresh above (own thread) instead of adding to
