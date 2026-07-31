@@ -105,13 +105,19 @@ def _process_one_file(store, file_id: int, gains) -> int:
     meta = _file_meta(store, file_id)
     if meta is None:
         return 0
-    waveforms = store.get_evoked_waveform_by_file(file_id)
-    if not waveforms:
-        return 0
+    # Check for a stimulated channel FIRST (cheap session_config read) and bail
+    # BEFORE the expensive per-file blob read. A non-stim recording never gets a
+    # channel_impedance row, so it stays in files_missing_impedance forever and
+    # was re-read on EVERY backfill run (boot + every 30 min) -- ~939 files of
+    # multi-MB evoked_waveform blobs = GBs of disk reads that saturated the disk
+    # and made the dashboard's Overview builds collide/oscillate (1s <-> minutes).
     session_dir = meta.get("session_dir") or ""
     stim_idx = _session_stim_indices(store, session_dir)
     if not stim_idx:
         return 0                       # no stimulated channel -> nothing to do
+    waveforms = store.get_evoked_waveform_by_file(file_id)
+    if not waveforms:
+        return 0
     stim = _stim_params(store, file_id, session_dir)
     file_base = os.path.basename(meta.get("file_path") or "")
     session_name = meta.get("session_name") or ""
