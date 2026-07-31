@@ -37,98 +37,6 @@ def _current_fidelity_pct(r_reversal, r_offset):
     return 100.0 * (rev - off) / mean
 
 
-class _WriteSerializingConnection:
-    """Wraps a sqlite3.Connection so the process-global write lock is acquired
-    automatically on the FIRST write statement and released on close().
-
-    This is how EVERY write in the process gets serialized without editing all
-    ~60 write methods: they all issue writes through ``conn.execute(...)`` /
-    ``executemany`` / ``executescript`` (verified: no cursor-based writes), so
-    intercepting those three here is complete coverage. A read-only connection
-    never hits a write statement, so it never takes the lock -> WAL keeps
-    serving reads concurrently. The lock is held from the first write until the
-    connection is closed (writes are open->write->commit->close, so that's
-    brief); an RLock lets the same thread nest (e.g. transaction()'s explicit
-    lock + BEGIN IMMEDIATE). Everything else delegates to the real connection.
-    """
-
-    _WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE",
-                       "CREATE", "DROP", "ALTER", "BEGIN IMMEDIATE")
-
-    def __init__(self, conn, lock):
-        object.__setattr__(self, "_conn", conn)
-        object.__setattr__(self, "_lock", lock)
-        object.__setattr__(self, "_held", False)
-
-    def _acquire(self):
-        if not self._held:
-            self._lock.acquire()
-            object.__setattr__(self, "_held", True)
-
-    def _maybe_lock(self, sql):
-        if self._held or not isinstance(sql, str):
-            return
-        s = sql.lstrip().upper()
-        for p in self._WRITE_PREFIXES:
-            if s.startswith(p):
-                self._acquire()
-                return
-
-    def execute(self, sql, *args, **kw):
-        self._maybe_lock(sql)
-        return self._conn.execute(sql, *args, **kw)
-
-    def executemany(self, sql, *args, **kw):
-        self._maybe_lock(sql)
-        return self._conn.executemany(sql, *args, **kw)
-
-    def executescript(self, sql, *args, **kw):
-        self._acquire()                # scripts may contain writes; lock always
-        return self._conn.executescript(sql, *args, **kw)
-
-    def _release(self):
-        if self._held:
-            object.__setattr__(self, "_held", False)
-            self._lock.release()
-
-    def commit(self):
-        # Release on commit, NOT just close: the write lock should be held only
-        # for the actual transaction (first write -> commit), matching SQLite's
-        # own semantics. Holding it until close() would keep the lock across any
-        # slow non-DB work a caller does after committing (e.g. writes a partial
-        # result, then reads a .mat / computes, then closes) -- turning the
-        # serializer into a bottleneck. A later write on the same connection
-        # simply re-acquires.
-        try:
-            return self._conn.commit()
-        finally:
-            self._release()
-
-    def rollback(self):
-        try:
-            return self._conn.rollback()
-        finally:
-            self._release()
-
-    def close(self):
-        try:
-            return self._conn.close()
-        finally:
-            self._release()
-
-    def __enter__(self):
-        return self._conn.__enter__()
-
-    def __exit__(self, *exc):
-        return self._conn.__exit__(*exc)
-
-    def __getattr__(self, name):        # commit/rollback/cursor/... -> real conn
-        return getattr(object.__getattribute__(self, "_conn"), name)
-
-    def __setattr__(self, name, value):  # e.g. row_factory -> real conn
-        setattr(object.__getattribute__(self, "_conn"), name, value)
-
-
 class Store:
     # Soft-claim TTL: a reviewer who opens a file holds it (hidden from
     # other reviewers' queues) for this long. Generous vs. the ~40s
@@ -164,10 +72,16 @@ class Store:
         # checkpoint-triggering write that cost ~7x the rest of connect+close
         # for zero benefit. foreign_keys is per-connection and MUST stay here.
         conn.execute("PRAGMA foreign_keys=ON")
-        # Wrap so writes auto-serialize on _WRITE_LOCK (reads stay lock-free).
-        # This is what routes ALL ~60 write methods through the lock without
-        # touching each one -- see _WriteSerializingConnection.
-        return _WriteSerializingConnection(conn, self._WRITE_LOCK)
+        # NOTE: writes are serialized at the TARGETED level -- transaction()
+        # (all multi-statement writes) and upsert_channel_impedance_batch (the
+        # impedance storm) explicitly take _WRITE_LOCK. A blanket
+        # per-connection wrapper was tried and REVERTED: tying the lock to a
+        # connection's whole lifetime made every write funnel through one choke
+        # point AND risked a hard deadlock if any of the ~60 write methods
+        # leaked a connection after writing (lock never released). The targeted
+        # locks + WAL + BEGIN IMMEDIATE + busy_timeout + boot throttling cover
+        # the real contention without that global bottleneck.
+        return conn
 
     @contextmanager
     def transaction(self):
