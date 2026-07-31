@@ -2559,10 +2559,11 @@ def register_callbacks(app, store, config):
         State("pex-win-from", "value"),
         State("pex-win-to", "value"),
         State("pex-win-guard", "value"),
+        State("pex-embed2-job", "data"),
         prevent_initial_call=True,
     )
     def _embed2_build_or_poll(_n, _iv, animal, protocol, window_h, method,
-                              winmode, wf, wt, wg):
+                              winmode, wf, wt, wg, cur):
         """Build the passive AND evoked embeddings for the current scope; publish
         {passive: jid, evoked: jid} ONLY when both are cached. Two _kick()s into
         the shared _CACHE (distinct _job_id keys) run concurrently and reuse any
@@ -2622,7 +2623,13 @@ def register_callbacks(app, store, config):
             return s == "✓" or s.startswith("error")
         done = _settled(s_pass) and _settled(s_evk)
         status = f"passive: {s_pass} · evoked: {s_evk}"
-        return ("" if done else "⏳ ") + status, done, pub
+        # Only write the job store when a column's cached-state actually CHANGES,
+        # never every poll -- otherwise Dash re-fires _embed2_render each tick and
+        # rebuilds the ~10k-point evoked scatter (2-7 s) over and over, saturating
+        # the render threads and starving the slow passive build. Status still
+        # updates every tick (cheap text) so progress stays live.
+        job_out = pub if pub != (cur or {}) else no_update
+        return ("" if done else "⏳ ") + status, done, job_out
 
     @app.callback(
         Output("pex-graph-passive", "figure"),
