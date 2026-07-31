@@ -42,6 +42,12 @@ _DEFAULT_TAB = "Summary"
 _ANALYZED_STATUSES = {"no_events", "has_events", "needs_scoring",
                       "pending_pi_review", "pi_approved", "pi_flagged"}
 
+# Recordings are hourly chunks (median duration_sec is exactly 3600s; 97% are
+# within +/-100s), but only ~66% of files have duration_sec computed. Estimate
+# the missing ones at one nominal chunk so "total recording time" reflects ALL
+# recorded chunks, not just the ones that happened to get a duration written.
+_NOMINAL_CHUNK_SEC = 3600.0
+
 # Summary-tab header -> the value key we compute. Columns not listed here
 # (MouseID, Comments/Notes) are left untouched.
 _DERIVED_COLUMNS = {
@@ -78,24 +84,46 @@ def _parse_chunk_dt(ts: str | None) -> datetime | None:
     return None
 
 
+def _animals_on_file(channel_names_json: str) -> set:
+    """Real animal ids recorded on a file, parsed straight from channel_names
+    (e.g. 'BCH040slm' -> 'BCH040'). Independent of session_config.eeg_channels,
+    which is NULL for many (esp. older) sessions -- Store._animal_ids_for_config
+    needs it and silently returned [] for those, so an animal's early recordings
+    were dropped (BCH040's first date read a year late). Filters non-animal
+    channels (stimCopy/saline) and label-only 'NULL' (no digit)."""
+    from src.utils.animal import is_animal_channel, split_animal_electrode
+    try:
+        names = json.loads(channel_names_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    out: set = set()
+    for ch in (names if isinstance(names, list) else []):
+        if not is_animal_channel(ch):
+            continue
+        animal, _ = split_animal_electrode(ch)
+        if animal and any(c.isdigit() for c in animal):   # real id has a number
+            out.add(animal)
+    return out
+
+
 def _recording_stats_per_animal(store) -> dict:
     """{animal: {'total_sec', 'analyzed_sec', 'first_dt' (datetime|None)}}.
 
     A file's duration counts toward EVERY animal recorded on it (channels are
     per-animal); 'analyzed' additionally requires a reviewed status for that
-    (file, animal). Mirrors the file->animal scoping used elsewhere via
-    Store._animal_ids_for_config.
+    (file, animal). First-recording date considers ALL files (even those whose
+    duration wasn't computed); total/analyzed time only sums non-null durations.
     """
     latest = store._sql_latest_row_correlated("rs.file_id")
     conn = store._connect()
     try:
         files = conn.execute(
             """SELECT pf.id, pf.duration_sec, pf.chunk_datetime,
-                      sc.channel_names, sc.eeg_channels
+                      sc.channel_names
                FROM processed_files pf
                JOIN session_config sc ON sc.session_dir = pf.session_dir
-               WHERE pf.duration_sec IS NOT NULL
-                 AND sc.channel_names IS NOT NULL""").fetchall()
+               WHERE sc.channel_names IS NOT NULL
+                 AND pf.chunk_datetime IS NOT NULL""").fetchall()
         rev = conn.execute(
             f"""SELECT rs.file_id, rs.animal_id, rs.status
                 FROM review_state rs
@@ -109,9 +137,9 @@ def _recording_stats_per_animal(store) -> dict:
             reviewed.add((int(r["file_id"]), r["animal_id"]))
     out: dict = {}
     for f in files:
-        animals = store._animal_ids_for_config(
-            f["channel_names"], f["eeg_channels"])
-        dur = float(f["duration_sec"] or 0.0)
+        animals = _animals_on_file(f["channel_names"])
+        dur = (float(f["duration_sec"]) if f["duration_sec"] is not None
+               else _NOMINAL_CHUNK_SEC)   # estimate missing durations at 1 chunk
         dt = _parse_chunk_dt(f["chunk_datetime"])
         for a in animals:
             slot = out.setdefault(
