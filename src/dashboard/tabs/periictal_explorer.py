@@ -2588,22 +2588,31 @@ def register_callbacks(app, store, config):
                 _kick(store, evoked_dir, jid, animal, protocol or "", kind,
                       window_h, method, cap, sv, fcfg)
 
-        def _prog(kind):
+        def _status_of(kind):
+            """(human status, published-jid-or-None) for one column."""
             jid = jids[kind]
             with _LOCK:
-                if jid in _CACHE:
-                    return "✓"
+                cached = jid in _CACHE
                 st = dict(_JOBS.get(jid) or {})
+            if cached:
+                return "✓", jid
             if st.get("status") == "error":
-                return f"error: {st.get('progress', '')}"
-            return st.get("progress", "starting…")
+                return f"error: {st.get('progress', '')}", None
+            return st.get("progress", "starting…"), None
 
-        p_pass, p_evk = _prog("passive"), _prog("evoked")
-        if p_pass == "✓" and p_evk == "✓":
-            return "passive: ✓ · evoked: ✓", True, jids
-        if p_pass.startswith("error") or p_evk.startswith("error"):
-            return f"passive: {p_pass} · evoked: {p_evk}", True, no_update
-        return f"⏳ passive: {p_pass} · evoked: {p_evk}", False, no_update
+        s_pass, pub_pass = _status_of("passive")
+        s_evk, pub_evk = _status_of("evoked")
+        # Publish per column: that column's jid once IT caches, else None. The
+        # dict changes as each column completes, so _embed2_render re-fires and
+        # draws the fast (evoked) column before the slow passive re-windowing
+        # lands -- progressive, not all-or-nothing.
+        pub = {"passive": pub_pass, "evoked": pub_evk}
+
+        def _settled(s):
+            return s == "✓" or s.startswith("error")
+        done = _settled(s_pass) and _settled(s_evk)
+        status = f"passive: {s_pass} · evoked: {s_evk}"
+        return ("" if done else "⏳ ") + status, done, pub
 
     @app.callback(
         Output("pex-graph-passive", "figure"),
