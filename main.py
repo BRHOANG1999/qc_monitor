@@ -202,6 +202,15 @@ def main():
     except Exception:
         logger.exception("sidecar warm worker start failed")
 
+    # Nightly auto-population of the KA-cohort 'Summary' sheet tab (per-animal
+    # KA metadata + seizure/recording stats). Best-effort; off if disabled in
+    # config. Writes only derived columns, matched by MouseID.
+    try:
+        from src.utils import summary_sheet as _summary_sheet
+        _summary_sheet.start_worker(store, config)
+    except Exception:
+        logger.exception("summary sheet worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
