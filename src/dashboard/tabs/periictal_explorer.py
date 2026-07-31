@@ -2443,19 +2443,21 @@ def register_callbacks(app, store, config):
         Output("pex-variant", "value", allow_duplicate=True),
         Output("pex-window-h", "value", allow_duplicate=True),
         Output("pex-method", "value", allow_duplicate=True),
+        Output("pex-embed2-job", "data", allow_duplicate=True),
         Input("pex-import-up", "contents"),
         prevent_initial_call=True,
     )
     def _import_embedding(contents):
         if not contents:
-            return (no_update,) * 7
+            return (no_update,) * 8
         try:
             _hdr, _, b64 = contents.partition(",")
             selection, result = _eio.loads(base64.b64decode(b64))
         except Exception as e:                            # noqa: BLE001
             logger.warning("embedding import failed: %s", e)
             return (no_update, f"Import failed: {e}",
-                    no_update, no_update, no_update, no_update, no_update)
+                    no_update, no_update, no_update, no_update, no_update,
+                    no_update)
         jid = _selection_jid(selection)
         with _LOCK:
             _CACHE[jid] = result
@@ -2468,12 +2470,15 @@ def register_callbacks(app, store, config):
         msg = (f"✓ Loaded {selection.get('animal') or ''} · "
                f"{selection.get('protocol') or 'all'} · {str(method).upper()}"
                + (f" · n = {n} seizures" if n else "") + " (imported).")
-        # Setting pex-job pulses every lens to redraw from the restored cache;
-        # the dropdowns are set best-effort for a matching UI (the figures do
-        # NOT depend on them, so a cascade reset of protocol is only cosmetic).
+        # pex-job pulses the Trend / Waveform / slow lenses; the Embedding lens
+        # now renders from pex-embed2-job, so publish the imported jid under its
+        # variant's column key ({variant: jid}) too, or the two-column scatter
+        # stays on its placeholder. The other column is absent (an import carries
+        # one variant), so it simply keeps its current figure.
+        embed2 = {(selection.get("variant") or "evoked"): jid}
         return (jid, msg, selection.get("animal"),
                 selection.get("protocol") or "", selection.get("variant"),
-                selection.get("window_h"), method)
+                selection.get("window_h"), method, embed2)
 
     # ---- Live feature-warmer status (alive vs frozen) ---- #
     @app.callback(
@@ -2572,9 +2577,14 @@ def register_callbacks(app, store, config):
         except ValueError as e:
             return f"⚠ Evoked feature window: {e}", True, no_update
         # Passive ALWAYS uses the canonical -200..-1 ms pre-stim window -- never
-        # the shared win-from/to, which may currently hold an evoked window.
-        pa_sv, pa_cfg = _resolve_window("passive", "custom",
-                                        *_cfg.DEFAULT_PASSIVE_WINDOW_MS, wg)
+        # the shared win-from/to, which may currently hold an evoked window. Wrap
+        # like the evoked resolve: a cleared guard reaches validation HERE (the
+        # evoked 'full' path skips the guard), so an unwrapped call would 500.
+        try:
+            pa_sv, pa_cfg = _resolve_window("passive", "custom",
+                                            *_cfg.DEFAULT_PASSIVE_WINDOW_MS, wg)
+        except ValueError as e:
+            return f"⚠ Passive feature window: {e}", True, no_update
         jids = {}
         for kind, sv, fcfg in (("passive", pa_sv, pa_cfg),
                                ("evoked", ev_sv, ev_cfg)):
