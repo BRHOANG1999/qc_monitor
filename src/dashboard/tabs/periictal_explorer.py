@@ -321,41 +321,61 @@ def _save_load_row() -> html.Div:
               "flexWrap": "wrap", "marginTop": SPACE_2})
 
 
+def _embed_column(kind: str, title: str) -> object:
+    """One embedding column (*kind* = 'passive' | 'evoked'): the scatter, its
+    reading strip, the PC loadings, and a lasso-details pane -- every id suffixed
+    by *kind* so the two columns never collide. Dark tokens throughout."""
+    return card(
+        section_header(title),
+        dcc.Loading(
+            custom_spinner=loading_icon(f"Building {kind}…"),
+            overlay_style={"visibility": "visible", "opacity": 0.4},
+            children=dcc.Graph(
+                id=f"pex-graph-{kind}", clear_on_unhover=True,
+                config={"displaylogo": False},
+                figure=empty_fig("Press ▶ Build passive + evoked"))),
+        html.Div(id=f"pex-reading-{kind}", style={"marginTop": SPACE_2}),
+        section_header("Feature space — what defines the axes"),
+        dcc.Graph(id=f"pex-loadings-{kind}", config={"displaylogo": False},
+                  figure=empty_fig("Build to see the PC loadings (PCA only)")),
+        section_header("Selected points — details on demand"),
+        html.Div(id=f"pex-details-{kind}", children=_details_view(None)),
+    )
+
+
 def layout_embedding(store):
-    """Embedding lens: the PCA/UMAP scatter (+ confound strip), the feature-space
-    loadings, the feature reference, and lasso details."""
+    """Embedding lens: PASSIVE (left) and EVOKED (right) embeddings side by side,
+    one shared colour-by. A dedicated build runs BOTH windows concurrently (two
+    _kick()s into the shared cache); the passive column re-windows features from
+    the raw pre-stim trace, so it is the slower of the two to appear."""
     return html.Div([
         scope_bar(store),
-        card(_embed_colorby_ctl(),
-             dcc.Loading(
-                 custom_spinner=loading_icon("Building…"),
-                 overlay_style={"visibility": "visible", "opacity": 0.4},
-                 children=dcc.Graph(
-                     id="pex-graph", clear_on_unhover=True,
-                     config={"displaylogo": False},
-                     figure=empty_fig("Press ▶ Build to embed the lead-up stimuli",
-                                      hint="Pick an animal and protocol above."))),
-             _explainer(),
-             html.Div(id="pex-reading", style={"marginTop": SPACE_3}),
-             style={"marginTop": SPACE_4}),
-        card(section_header("Feature space — what defines the axes"),
-             html.Div("Each axis is a weighted mix of the standardized features. "
-                      "The bars are the PCA loadings: how much each feature pushes "
-                      "PC1 and PC2 — i.e. the directions of the feature vector "
-                      "space the scatter is a projection of. (PCA only; UMAP is "
-                      "non-linear and has no loadings.)",
-                      style={"color": COLOR_TEXT_SECONDARY,
-                             "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch",
-                             "marginBottom": SPACE_2}),
-             dcc.Graph(id="pex-loadings", config={"displaylogo": False},
-                       figure=empty_fig("Build to see which features define the "
-                                        "axes")),
-             style={"marginTop": SPACE_4}),
+        card(
+            _embed_colorby_ctl(),
+            html.Div([
+                button("▶ Build passive + evoked", "pex-embed2-build"),
+                html.Div(id="pex-embed2-status",
+                         style={"color": COLOR_TEXT_SECONDARY,
+                                "fontSize": FONT_SIZE_CAPTION,
+                                "fontFamily": "monospace", "minHeight": "16px"}),
+            ], style={"display": "flex", "gap": SPACE_3, "alignItems": "center",
+                      "flexWrap": "wrap", "margin": f"{SPACE_2} 0"}),
+            _explainer(),
+            # Responsive grid: passive first (DOM order = left on wide screens,
+            # top when it collapses to one column on narrow ones). No horizontal
+            # body scroll -- each column min-widths at 380px then wraps.
+            html.Div([
+                _embed_column("passive", "Passive · pre-stim LFP (−200→−1 ms)"),
+                _embed_column("evoked",
+                              "Evoked · post-stim response ([1–200 ms] or custom)"),
+            ], style={"display": "grid",
+                      "gridTemplateColumns": "repeat(auto-fit, minmax(380px, 1fr))",
+                      "gap": SPACE_4, "marginTop": SPACE_3}),
+            dcc.Interval(id="pex-embed2-poll", interval=1200, disabled=True),
+            dcc.Store(id="pex-embed2-job", storage_type="session"),
+            style={"marginTop": SPACE_4}),
         card(section_header("Features fed to the embedding"),
              _feature_reference(),
-             style={"marginTop": SPACE_4}),
-        card(section_header("Selected points — details on demand"),
-             html.Div(id="pex-details", children=_details_view(None)),
              style={"marginTop": SPACE_4}),
     ], style={"padding": SPACE_4})
 
@@ -1403,7 +1423,14 @@ def _cap_seconds(cap_val, cap_unit) -> float:
 def _figure(emb, sub, color_by, method, meta, cap_sec=None) -> go.Figure:
     if emb is None or emb.shape[0] == 0:
         return empty_fig("No lead-up stimuli for this selection")
-    n_unique = int(sub[color_by].nunique()) if color_by in sub else 0
+    if color_by not in sub:
+        # A shared evoked-superset colour-by (e.g. early_area) selected while
+        # drawing the PASSIVE column -- that frame has no such feature. Degrade
+        # gracefully instead of KeyError-ing inside _continuous_fig.
+        return _finish_fig(
+            empty_fig(f"‘{color_by}’ is evoked-only — not defined for the "
+                      "passive pre-stim window"), method, meta)
+    n_unique = int(sub[color_by].nunique())
     fig = (_categorical_fig(emb, sub, color_by)
            if _pal.is_categorical(color_by, n_unique)
            else _continuous_fig(emb, sub, color_by, cap_sec))
@@ -2266,14 +2293,16 @@ def register_callbacks(app, store, config):
         Output("pex-colorby", "options"),
         Output("pex-colorby", "value"),
         Input("pex-animal", "value"),
-        Input("pex-variant", "value"),
         State("pex-colorby", "value"),
         prevent_initial_call=False,
     )
-    def _embed_colorby_opts(_animal, variant, cur):
-        """Populate the Embedding lens's colour-by dropdown (on mount + on
-        animal/variant change)."""
-        copts = _colorby_options(variant or "evoked")
+    def _embed_colorby_opts(_animal, cur):
+        """Populate the Embedding lens's shared colour-by dropdown. It drives BOTH
+        the passive and evoked columns, so it offers the EVOKED SUPERSET (every
+        metric stays reachable for the evoked column); an evoked-only metric
+        degrades gracefully on the passive column via the _figure guard. No longer
+        keyed on pex-variant (that only scopes the other lenses)."""
+        copts = _colorby_options("evoked")
         cvals = {o["value"] for o in copts}
         return copts, (cur if cur in cvals else "time_to_onset_sec")
 
@@ -2510,43 +2539,125 @@ def register_callbacks(app, store, config):
             store.set_seizure_excluded(animal, s.file_id, s.eo_sec, False)
         return _keep_status(len(szs) - len(want_excl), len(want_excl), len(szs))
 
+    # ---- Two-column embedding: build BOTH passive + evoked, render side by side #
     @app.callback(
-        Output("pex-graph", "figure"),
-        Output("pex-reading", "children"),
-        Output("pex-loadings", "figure"),
-        Input("pex-job", "data"),
+        Output("pex-embed2-status", "children"),
+        Output("pex-embed2-poll", "disabled"),
+        Output("pex-embed2-job", "data"),
+        Input("pex-embed2-build", "n_clicks"),
+        Input("pex-embed2-poll", "n_intervals"),
+        State("pex-animal", "value"),
+        State("pex-protocol", "value"),
+        State("pex-window-h", "value"),
+        State("pex-method", "value"),
+        State("pex-winmode", "value"),
+        State("pex-win-from", "value"),
+        State("pex-win-to", "value"),
+        State("pex-win-guard", "value"),
+        prevent_initial_call=True,
+    )
+    def _embed2_build_or_poll(_n, _iv, animal, protocol, window_h, method,
+                              winmode, wf, wt, wg):
+        """Build the passive AND evoked embeddings for the current scope; publish
+        {passive: jid, evoked: jid} ONLY when both are cached. Two _kick()s into
+        the shared _CACHE (distinct _job_id keys) run concurrently and reuse any
+        single-variant build already done. Ignores pex-variant by design -- it
+        builds both. Local button+poll => cannot mis-fire on the other lenses."""
+        if not animal:
+            return "Pick an animal.", True, no_update
+        window_h = float(window_h or 6.0)
+        cap = _cfg.INTERACTIVE_POINT_CAP
+        try:
+            ev_sv, ev_cfg = _resolve_window("evoked", winmode or "full", wf, wt, wg)
+        except ValueError as e:
+            return f"⚠ Evoked feature window: {e}", True, no_update
+        # Passive ALWAYS uses the canonical -200..-1 ms pre-stim window -- never
+        # the shared win-from/to, which may currently hold an evoked window.
+        pa_sv, pa_cfg = _resolve_window("passive", "custom",
+                                        *_cfg.DEFAULT_PASSIVE_WINDOW_MS, wg)
+        jids = {}
+        for kind, sv, fcfg in (("passive", pa_sv, pa_cfg),
+                               ("evoked", ev_sv, ev_cfg)):
+            jid = _job_id(animal, protocol or "", kind, window_h, method, cap,
+                          _win_token(sv, fcfg))
+            jids[kind] = jid
+            with _LOCK:
+                have = jid in _CACHE
+                st = dict(_JOBS.get(jid) or {})
+            if not have and st.get("status") != "error":
+                _kick(store, evoked_dir, jid, animal, protocol or "", kind,
+                      window_h, method, cap, sv, fcfg)
+
+        def _prog(kind):
+            jid = jids[kind]
+            with _LOCK:
+                if jid in _CACHE:
+                    return "✓"
+                st = dict(_JOBS.get(jid) or {})
+            if st.get("status") == "error":
+                return f"error: {st.get('progress', '')}"
+            return st.get("progress", "starting…")
+
+        p_pass, p_evk = _prog("passive"), _prog("evoked")
+        if p_pass == "✓" and p_evk == "✓":
+            return "passive: ✓ · evoked: ✓", True, jids
+        if p_pass.startswith("error") or p_evk.startswith("error"):
+            return f"passive: {p_pass} · evoked: {p_evk}", True, no_update
+        return f"⏳ passive: {p_pass} · evoked: {p_evk}", False, no_update
+
+    @app.callback(
+        Output("pex-graph-passive", "figure"),
+        Output("pex-reading-passive", "children"),
+        Output("pex-loadings-passive", "figure"),
+        Output("pex-graph-evoked", "figure"),
+        Output("pex-reading-evoked", "children"),
+        Output("pex-loadings-evoked", "figure"),
+        Input("pex-embed2-job", "data"),
         State("pex-colorby", "value"),
         State("pex-color-cap", "value"),
         State("pex-color-cap-unit", "value"),
         prevent_initial_call=False,
     )
-    def _embed_render(jid, color_by, cap_val, cap_unit):
-        """Draw the Embedding lens from cache when the job pulse arrives (or on
-        mount, from the persisted job): the scatter, the reading strip, and the
-        feature-space loadings."""
-        cached = _CACHE.get(jid) if jid else None
-        if cached is None:
-            return no_update, no_update, no_update
-        fig, reading = _embed_fig_reading(
-            cached, color_by or "time_to_onset_sec",
-            _cap_seconds(cap_val, cap_unit))
-        return fig, reading, _loadings_fig(cached)
+    def _embed2_render(jobs, color_by, cap_val, cap_unit):
+        """Draw both columns from cache on the pair-job pulse (or on remount from
+        the persisted store). no_update per column whose job isn't cached yet, so
+        the faster (evoked) column can appear before the slower passive one."""
+        jobs = jobs or {}
+        cap = _cap_seconds(cap_val, cap_unit)
+        cb = color_by or "time_to_onset_sec"
+        out = []
+        for kind in ("passive", "evoked"):
+            cached = _CACHE.get(jobs.get(kind)) if jobs.get(kind) else None
+            if cached is None:
+                out += [no_update, no_update, no_update]
+                continue
+            fig, reading = _embed_fig_reading(cached, cb, cap)
+            out += [fig, reading, _loadings_fig(cached)]
+        return tuple(out)
 
     @app.callback(
-        Output("pex-graph", "figure", allow_duplicate=True),
+        Output("pex-graph-passive", "figure", allow_duplicate=True),
+        Output("pex-graph-evoked", "figure", allow_duplicate=True),
         Input("pex-colorby", "value"),
         Input("pex-color-cap", "value"),
         Input("pex-color-cap-unit", "value"),
-        State("pex-job", "data"),
+        State("pex-embed2-job", "data"),
         prevent_initial_call=True,
     )
-    def _recolor(color_by, cap_val, cap_unit, jid):
-        cached = _CACHE.get(jid) if jid else None
-        if not cached or cached.get("empty"):
-            return no_update
-        return _figure(cached["emb"], cached["sub"], color_by,
-                       cached.get("method", "pca"), cached.get("meta"),
-                       _cap_seconds(cap_val, cap_unit))
+    def _embed2_recolor(color_by, cap_val, cap_unit, jobs):
+        """Instant recolour of BOTH columns from cache (the second writer of the
+        two graph figures; allow_duplicate lives ONLY here)."""
+        jobs = jobs or {}
+        cap = _cap_seconds(cap_val, cap_unit)
+        out = []
+        for kind in ("passive", "evoked"):
+            cached = _CACHE.get(jobs.get(kind)) if jobs.get(kind) else None
+            if not cached or cached.get("empty"):
+                out.append(no_update)
+                continue
+            out.append(_figure(cached["emb"], cached["sub"], color_by,
+                               cached.get("method", "pca"), cached.get("meta"), cap))
+        return tuple(out)
 
     @app.callback(
         Output("pex-traj", "figure"),
@@ -2651,18 +2762,23 @@ def register_callbacks(app, store, config):
         return (_roc_fig(res), _phaseauc_fig(res), _coef_fig(res),
                 _forecast_verdict(res, n_sz))
 
-    @app.callback(
-        Output("pex-details", "children"),
-        Input("pex-graph", "selectedData"),
-        State("pex-job", "data"),
-        prevent_initial_call=True,
-    )
-    def _select(selected, jid):
-        cached = _CACHE.get(jid) if jid else None
-        if not cached or cached.get("empty"):
-            return _details_view(None)
-        idx = _selected_indices(selected)
-        return _details_view(summarize_selection(cached["sub"], idx))
+    def _make_select_cb(kind):
+        @app.callback(
+            Output(f"pex-details-{kind}", "children"),
+            Input(f"pex-graph-{kind}", "selectedData"),
+            State("pex-embed2-job", "data"),
+            prevent_initial_call=True,
+        )
+        def _select(selected, jobs, _kind=kind):
+            cached = _CACHE.get((jobs or {}).get(_kind))
+            if not cached or cached.get("empty"):
+                return _details_view(None)
+            return _details_view(
+                summarize_selection(cached["sub"], _selected_indices(selected)))
+        return _select
+
+    _select_passive = _make_select_cb("passive")   # noqa: F841 (registers cb)
+    _select_evoked = _make_select_cb("evoked")      # noqa: F841
 
     # --- ERP-image callbacks --- #
 

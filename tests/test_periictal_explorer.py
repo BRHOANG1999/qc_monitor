@@ -202,8 +202,11 @@ def test_three_sub_tab_layouts_build_with_scope_and_lens_ids(tmp_path):
     scope = {"pex-animal", "pex-protocol", "pex-variant", "pex-window-h",
              "pex-method", "pex-build", "pex-job", "pex-poll", "pex-preview",
              "pex-status"}
-    lens = {"layout_embedding": {"pex-graph", "pex-reading", "pex-colorby",
-                                 "pex-details"},
+    lens = {"layout_embedding": {"pex-graph-passive", "pex-graph-evoked",
+                                 "pex-reading-passive", "pex-reading-evoked",
+                                 "pex-colorby", "pex-details-passive",
+                                 "pex-details-evoked", "pex-embed2-job",
+                                 "pex-embed2-build"},
             "layout_trend": {"pex-traj", "pex-traj-y", "pex-trend-forest",
                              "pex-trend-verdict", "pex-trend-table"},
             "layout_pdfcdf": {"pex-pc-feature", "pex-pc-pdf", "pex-pc-cdf",
