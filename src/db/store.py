@@ -2040,18 +2040,20 @@ class Store:
         with a computed Z_ss. ``{(animal, channel): slow_ss_kohm}``."""
         conn = self._connect()
         try:
+            # Newest slow_ss per (animal, channel) via a window function -- was a
+            # per-row correlated MAX() subquery (~150ms full re-scan per row);
+            # ROW_NUMBER partition is ~2ms and returns identical results.
             rows = conn.execute(
-                """SELECT ci.animal_id, ci.channel_name, ci.slow_ss_kohm
-                   FROM channel_impedance ci
-                   JOIN processed_files pf ON pf.id = ci.file_id
-                   WHERE ci.slow_ss_kohm IS NOT NULL
-                     AND pf.chunk_datetime = (
-                       SELECT MAX(pf2.chunk_datetime)
-                       FROM channel_impedance ci2
-                       JOIN processed_files pf2 ON pf2.id = ci2.file_id
-                       WHERE ci2.animal_id = ci.animal_id
-                         AND ci2.channel_name = ci.channel_name
-                         AND ci2.slow_ss_kohm IS NOT NULL)"""
+                """SELECT animal_id, channel_name, slow_ss_kohm FROM (
+                     SELECT ci.animal_id, ci.channel_name, ci.slow_ss_kohm,
+                            ROW_NUMBER() OVER (
+                              PARTITION BY ci.animal_id, ci.channel_name
+                              ORDER BY pf.chunk_datetime DESC, ci.file_id DESC
+                            ) AS rn
+                     FROM channel_impedance ci
+                     JOIN processed_files pf ON pf.id = ci.file_id
+                     WHERE ci.slow_ss_kohm IS NOT NULL)
+                   WHERE rn = 1"""
             ).fetchall()
             return {(r["animal_id"] or "", r["channel_name"] or ""):
                     r["slow_ss_kohm"] for r in rows}
@@ -2064,21 +2066,22 @@ class Store:
         newest recording that has both. ``{(animal, channel): fidelity_pct}``."""
         conn = self._connect()
         try:
+            # Window-function form (was a per-row correlated MAX() subquery ~
+            # 200ms); newest reversal+offset pair per (animal, channel).
             rows = conn.execute(
-                """SELECT ci.animal_id, ci.channel_name,
-                          ci.access_r_reversal_kohm, ci.access_r_offset_kohm
-                   FROM channel_impedance ci
-                   JOIN processed_files pf ON pf.id = ci.file_id
-                   WHERE ci.access_r_reversal_kohm IS NOT NULL
-                     AND ci.access_r_offset_kohm IS NOT NULL
-                     AND pf.chunk_datetime = (
-                       SELECT MAX(pf2.chunk_datetime)
-                       FROM channel_impedance ci2
-                       JOIN processed_files pf2 ON pf2.id = ci2.file_id
-                       WHERE ci2.animal_id = ci.animal_id
-                         AND ci2.channel_name = ci.channel_name
-                         AND ci2.access_r_reversal_kohm IS NOT NULL
-                         AND ci2.access_r_offset_kohm IS NOT NULL)"""
+                """SELECT animal_id, channel_name,
+                          access_r_reversal_kohm, access_r_offset_kohm FROM (
+                     SELECT ci.animal_id, ci.channel_name,
+                            ci.access_r_reversal_kohm, ci.access_r_offset_kohm,
+                            ROW_NUMBER() OVER (
+                              PARTITION BY ci.animal_id, ci.channel_name
+                              ORDER BY pf.chunk_datetime DESC, ci.file_id DESC
+                            ) AS rn
+                     FROM channel_impedance ci
+                     JOIN processed_files pf ON pf.id = ci.file_id
+                     WHERE ci.access_r_reversal_kohm IS NOT NULL
+                       AND ci.access_r_offset_kohm IS NOT NULL)
+                   WHERE rn = 1"""
             ).fetchall()
             out = {}
             for r in rows:

@@ -203,6 +203,12 @@ CREATE TABLE IF NOT EXISTS seizure_events (
     severity TEXT,
     version_id INTEGER REFERENCES settings_versions(id)
 );
+-- seizure_events had ZERO indexes; every lookup by file/channel is a full scan.
+-- Harmless at 0 rows today but a landmine once the detector populates it.
+CREATE INDEX IF NOT EXISTS idx_seizure_events_file
+    ON seizure_events(file_id);
+CREATE INDEX IF NOT EXISTS idx_seizure_events_chan
+    ON seizure_events(channel_name);
 
 -- MATLAB pipeline results (status tracking)
 CREATE TABLE IF NOT EXISTS matlab_results (
@@ -417,6 +423,9 @@ CREATE TABLE IF NOT EXISTS video_qc (
 );
 CREATE INDEX IF NOT EXISTS idx_video_qc_file ON video_qc(file_id);
 CREATE INDEX IF NOT EXISTS idx_video_qc_status ON video_qc(status);
+-- get_recent_video_qc (Overview card, every refresh) filters/orders by
+-- analyzed_at -> was a full SCAN + temp-b-tree sort without this.
+CREATE INDEX IF NOT EXISTS idx_video_qc_analyzed ON video_qc(analyzed_at);
 
 -- ----------------------------------------------------------------------
 -- Reviewer queue: per-(file, user) review state + append-only audit log.

@@ -543,7 +543,17 @@ def create_app(config: dict, store: Store) -> Dash:
                    "minHeight": "36px"},
         ),
 
-        html.Div(id="tab-content",
+        html.Div(
+                 # Initial placeholder so the first cold-boot paint isn't a
+                 # scary BLANK while render_tab is still being served (on a cold
+                 # 10GB DB + boot workers the first tab render can queue a few
+                 # seconds behind them for a server thread). render_tab replaces
+                 # this the moment it returns; the status pill tracks progress.
+                 html.Div("⏳ Loading Overview…",
+                          style={"color": COLOR_TEXT_TERTIARY,
+                                 "fontSize": FONT_SIZE_BODY,
+                                 "padding": "24px 6px"}),
+                 id="tab-content",
                  style={"padding": f"{SPACE_6} {SPACE_5}",
                         "backgroundColor": COLOR_SURFACE_0,
                         "minHeight": "80vh"}),

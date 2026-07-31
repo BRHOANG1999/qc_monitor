@@ -126,6 +126,12 @@ _BSZ_CACHE = _CachedBuilder(45.0)
 _HOME_GRID_CACHE = _CachedBuilder(120.0)
 _KM_LOG_CACHE = _CachedBuilder(120.0)
 
+# Single-flight for the heavy (mean/sem/overlay) evoked-thumbnail build so
+# concurrent ticks (on load / when the newest-recording signature changes)
+# don't stack .mat reads + figure builds. The hist24 path is a cheap poll over
+# a background worker and is intentionally NOT gated.
+_THUMB_LOCK = threading.Lock()
+
 
 def _pending_placeholder(label: str = "Loading…"):
     """Lightweight stand-in for a not-yet-built Overview card. The tab shell
@@ -925,6 +931,9 @@ def _latest_evoked_from_output(config: dict | None) -> tuple[list[dict], str]:
 _HIST24_N = 24               # default; overridable via UI + config
 _HIST24_MAX = 500            # hard cap (NASA Rule 2 loop bound)
 _HIST24_LOCK = threading.Lock()
+# Overlay thumbnail: newest N historical files drawn under the mean (each
+# decimated) so "overlay" mode doesn't serialize hundreds of raw traces.
+_OVERLAY_MAX_FILES = 30
 
 
 def _hist24_default_n(config: dict | None) -> int:
@@ -1326,13 +1335,21 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         # Overlay mode: draw every file's mean_trace under this
         # channel's latest mean. Cheap stylized backdrop, no legend.
         if trace_mode == "overlay":
-            for prev in history_by_ch[ch]:
+            # Cap the overlaid history: was EVERY historical file at full
+            # resolution across 2 panels -> ~420k points, a huge figure JSON
+            # payload. Draw only the newest _OVERLAY_MAX_FILES, each decimated.
+            _hist = sorted(history_by_ch[ch],
+                           key=lambda w: (w.get("chunk_datetime") or ""),
+                           reverse=True)[:_OVERLAY_MAX_FILES]
+            for prev in _hist:
                 if prev is wf:
                     continue
                 pt = prev.get("time_axis_ms")
                 pm = prev.get("mean_trace")
                 if not pt or not pm or len(pt) != len(pm):
                     continue
+                _step = max(1, len(pt) // 800)   # cap each trace to ~800 pts
+                pt, pm = pt[::_step], pm[::_step]
                 # Left + right panels both get the overlay so the
                 # stim-window context matches the evoked window.
                 for col_idx in (1, 2):
@@ -4578,10 +4595,18 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             sig = None
         if sig is not None and sig == last_sig:
             return no_update, True, no_update
-        sessions = store.get_sessions()
-        session_dir = sessions[0]["session_dir"] if sessions else ""
-        return (_build_overview_thumbnail(store, config, session_dir, mode),
-                True, sig)
+        # Single-flight the heavy build (below the cheap sig check) so
+        # overlapping ticks don't stack .mat reads + figure builds.
+        if not _THUMB_LOCK.acquire(blocking=False):
+            return no_update, no_update, no_update
+        try:
+            sessions = store.get_sessions()
+            session_dir = sessions[0]["session_dir"] if sessions else ""
+            return (_build_overview_thumbnail(
+                        store, config, session_dir, mode),
+                    True, sig)
+        finally:
+            _THUMB_LOCK.release()
 
     @app.callback(
         Output("snapshot-expanded", "data"),
