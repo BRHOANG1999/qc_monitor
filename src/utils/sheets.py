@@ -159,7 +159,21 @@ def _sheets_api(service_account_file: str):
     creds = Credentials.from_service_account_file(
         service_account_file, scopes=_SHEETS_API_SCOPES,
     )
-    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    # Build the client over an http transport WITH A SOCKET TIMEOUT. Without
+    # this, googleapiclient/httplib2 default to NO timeout, so a flaky share /
+    # VPN makes `.execute()` hang INDEFINITELY -- the Overview home-grid + KM-log
+    # cards (which read Sheets) were observed blocking 11-34 min per refresh on
+    # a cache miss (the 2-attempt retry doubles a single hang). With the timeout
+    # a stuck read fails in ~_FETCH_TIMEOUT_SEC and falls back to the stale TTL
+    # cache. Fall back to the untimed build only if the http libs are missing.
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+        authed = AuthorizedHttp(
+            creds, http=httplib2.Http(timeout=_FETCH_TIMEOUT_SEC))
+        svc = build("sheets", "v4", http=authed, cache_discovery=False)
+    except Exception:  # noqa: BLE001 -- a working client beats none
+        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
     cache[service_account_file] = svc
     return svc
 

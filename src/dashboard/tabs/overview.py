@@ -68,6 +68,65 @@ logger = logging.getLogger("qc_monitor.dashboard.overview")
 _REFRESH_LOCK = threading.Lock()
 
 
+class _CachedBuilder:
+    """Single-flight + stale-while-revalidate cache for an expensive card build.
+
+    Fixes the Overview pile-up: a slow builder (the behavioral-seizure card;
+    the Google-Sheets home grid / KM log) fires on every ~10s refresh tick, and
+    with no guard the calls STACK concurrently, thrashing disk / GIL / the Sheets
+    network so each one balloons from ~seconds to tens of minutes and the queue
+    never drains. Here only ONE thread ever rebuilds; every other caller serves
+    the last good result (or no_update if nothing built yet). Results are also
+    reused for *ttl* seconds so a fresh tick doesn't recompute at all. The cache
+    is a process global (shared across users/threads) -- correct, the card is the
+    same for everyone.
+    """
+
+    __slots__ = ("_ttl", "_lock", "_t", "_val")
+
+    def __init__(self, ttl_sec: float):
+        self._ttl = ttl_sec
+        self._lock = threading.Lock()
+        self._t = 0.0
+        self._val = None
+
+    def get(self, build, *, label: str | None = None):
+        now = time.time()
+        val = self._val
+        if val is not None and (now - self._t) < self._ttl:
+            return val                       # fresh -> serve cached, no rebuild
+        if not self._lock.acquire(blocking=False):
+            # A rebuild is already in flight -> don't pile on; serve stale.
+            return val if val is not None else no_update
+        try:
+            if self._val is not None and (time.time() - self._t) < self._ttl:
+                return self._val             # re-check under the lock
+            if label:
+                with _perf.Timer(label):
+                    built = build()
+            else:
+                built = build()
+            self._val = built
+            self._t = time.time()
+            return built
+        finally:
+            self._lock.release()
+
+
+# Behavioral-seizure status card: computed from ~3k files + ~7k review rows and
+# fired every 10s -> single-flight + 45s cache so it can't pile up (was ~36 min
+# per call under the pile-up; a single build is ~1-3s).
+_BSZ_CACHE = _CachedBuilder(45.0)
+
+# Home grid + KM-log cards read GOOGLE SHEETS (surgery / maintenance / schedule /
+# data-log). Even with the new Sheets API socket timeout, a cache-miss costs
+# ~10-20s; these cards otherwise rebuilt on EVERY 10s tick. A 120s single-flight
+# cache keeps the (rare, bounded) Sheets miss off the critical path of the fast
+# DB cards. Sheets data changes on the order of hours, so 120s is plenty fresh.
+_HOME_GRID_CACHE = _CachedBuilder(120.0)
+_KM_LOG_CACHE = _CachedBuilder(120.0)
+
+
 def _pending_placeholder(label: str = "Loading…"):
     """Lightweight stand-in for a not-yet-built Overview card. The tab shell
     renders these INSTANTLY; the fill callbacks (mount + refresh-trigger)
@@ -4348,11 +4407,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
                 from datetime import date as _date
+                # Home grid + KM log hit Google Sheets -> cached (120s) so a
+                # Sheets miss doesn't run every tick or block the DB cards below.
+                home_grid = _HOME_GRID_CACHE.get(
+                    lambda: _build_home_grid_children(
+                        store, config, _date.today()),
+                    label="cb:overview-home-grid")
+                km_log = _KM_LOG_CACHE.get(
+                    lambda: _build_km_log_section(config),
+                    label="cb:overview-km-log")
                 return (
                     _build_overview_cards(store),
                     _build_overview_queue(store),
-                    _build_home_grid_children(store, config, _date.today()),
-                    _build_km_log_section(config),
+                    home_grid,
+                    km_log,
                     _build_impedance_trend_card(store, config),
                     _build_zss_consistency_card(store, config),
                     _build_current_fidelity_card(store, config),
@@ -4374,8 +4442,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _fill_bsz_status(_n, _mount, current_tab):
         if current_tab != "overview":
             return no_update
-        with _perf.Timer("cb:overview-bsz-status"):
-            return _build_behavioral_seizure_status_card(store, config)
+        # Single-flight + 45s cache (see _BSZ_CACHE): stops the every-10s pile-up
+        # that turned a ~2s build into a ~36 min stall.
+        return _BSZ_CACHE.get(
+            lambda: _build_behavioral_seizure_status_card(store, config),
+            label="cb:overview-bsz-status")
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
     # user clicks, and lives outside the refreshed card so it persists.
