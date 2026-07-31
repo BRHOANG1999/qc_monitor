@@ -180,11 +180,18 @@ def _fmt_hours(sec: float) -> float:
 def compute_rows(store, config: dict) -> list[dict]:
     """One dict per animal that has any recording, with the derived summary
     values (plus the raw pieces, for the dry-run preview)."""
+    # Same exclusion the Overview seizure card uses (default ['Randles'] --
+    # a non-experimental subject); case-insensitive substring match.
+    excl = [e.lower() for e in
+            ((config.get("overview", {}) or {}).get("exclude_animals")
+             or ["Randles"]) if e]
     rec = _recording_stats_per_animal(store)
     surg = _surgery_meta(config)
     szd = store.seizure_days_per_animal()      # {animal: {'YYYY-MM-DD': n}}
     rows: list[dict] = []
     for animal in sorted(rec.keys()):
+        if any(e in animal.lower() for e in excl):
+            continue                            # skip excluded subjects
         r = rec[animal]
         total_h = _fmt_hours(r["total_sec"])
         analyzed_h = _fmt_hours(r["analyzed_sec"])
@@ -259,11 +266,13 @@ def write_summary(store, config: dict, *, dry_run: bool = True) -> dict:
     # column index -> derived-value key, for the columns we OWN
     owned = {_col(name): key for name, key in _DERIVED_COLUMNS.items()
              if _col(name) >= 0}
-    batch = []              # {'range': A1, 'values': [merged_row]}
-    matched, n_cells = [], 0
+    batch = []              # {'range': A1, 'values': [merged_row]}  (updates)
+    matched, present, n_cells = [], set(), 0
     for r_i, existing in enumerate(body):
         raw_id = existing[id_idx] if 0 <= id_idx < len(existing) else ""
         animal = _norm_animal(raw_id)
+        if animal:
+            present.add(animal)
         r = by_animal.get(animal)
         if not r:
             continue
@@ -278,16 +287,37 @@ def write_summary(store, config: dict, *, dry_run: bool = True) -> dict:
             else:
                 merged.append(existing[ci] if ci < len(existing) else "")
         batch.append({"range": SW._a1_row(tab, r_i + 2), "values": [merged]})
-    result = {"rows": rows, "matched": matched, "n_updates": n_cells,
+    # APPEND a fresh row for every recorded animal NOT already in the sheet, so
+    # the tab covers all animals recorded (past + present). New rows carry the
+    # canonical 'BCHxxx' MouseID + our derived columns; other cells blank.
+    appends: list[list] = []
+    for animal in sorted(by_animal):
+        if animal in present:
+            continue
+        new_row = [""] * len(header)
+        if id_idx >= 0:
+            new_row[id_idx] = animal
+        for ci, key in owned.items():
+            new_row[ci] = str(by_animal[animal][key])
+        appends.append(new_row)
+    result = {"rows": rows, "matched": matched, "appended": [r[id_idx] for r
+              in appends] if id_idx >= 0 else [], "n_updates": n_cells,
               "dry_run": dry_run, "sheet_id": sheet_id, "tab": tab}
-    if dry_run or not batch:
+    if dry_run:
         return result
-    svc.spreadsheets().values().batchUpdate(
-        spreadsheetId=sheet_id,
-        body={"valueInputOption": "USER_ENTERED", "data": batch},
-    ).execute()
-    logger.info("summary_sheet: wrote %d cells across %d rows (%s)",
-                n_cells, len(batch), matched)
+    if batch:
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": batch},
+        ).execute()
+    if appends:
+        svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id, range=f"{tab}!A1",
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": appends},
+        ).execute()
+    logger.info("summary_sheet: updated %d rows (%s), appended %d (%s)",
+                len(batch), matched, len(appends), result["appended"])
     return result
 
 
@@ -343,12 +373,14 @@ def _main(argv=None) -> int:
     res = write_summary(store, config, dry_run=not a.apply)
     print(f"\nSummary tab: {res['sheet_id']} / {res['tab']}")
     _print_preview(res["rows"])
-    print(f"\nmatched sheet rows: {res['matched']}")
+    print(f"\nupdated existing rows: {res['matched']}")
+    print(f"append new rows for:  {res['appended']}")
     if res["dry_run"]:
-        print(f"DRY-RUN: would write {res['n_updates']} cells. "
-              "Re-run with --apply to write.")
+        print(f"DRY-RUN: would update {res['n_updates']} cells + append "
+              f"{len(res['appended'])} rows. Re-run with --apply.")
     else:
-        print(f"WROTE {res['n_updates']} cells.")
+        print(f"WROTE {res['n_updates']} cells + appended "
+              f"{len(res['appended'])} rows.")
     return 0
 
 
