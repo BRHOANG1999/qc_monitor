@@ -319,6 +319,21 @@ def create_app(config: dict, store: Store) -> Dash:
     # clock (daemon thread). Idempotent; no-op when disabled in config.
     from src.utils import operator_log as _operator_log
     _operator_log.start_warmer(config, store)
+    # Persist the performance ledger across restarts so the "which Overview
+    # processes are slow" history accumulates instead of resetting every boot.
+    # A JSON file next to the DB (NOT in the DB -- perf writes must not add to
+    # SQLite write-lock contention). Flushes on a daemon timer; loads on boot.
+    try:
+        _db_path = config.get("database", {}).get("path", "data/monitor.db")
+        _perf_path = (config.get("dashboard", {}).get("perf_ledger_path")
+                      or os.path.join(os.path.dirname(_db_path) or ".",
+                                      "perf_ledger.json"))
+        _perf_flush = float(config.get("dashboard", {})
+                            .get("perf_flush_sec", 60))
+        _perf.start_persistence(_perf_path, _perf_flush)
+    except Exception as _e:  # noqa: BLE001 -- observability must never block boot
+        log.warning("perf ledger persistence disabled: %s", _e)
+
     # Spawn the PI verification event-clip extractor worker.
     # Daemon thread that drains event_clip_job 'pending' rows
     # via ffmpeg. Idempotent across reloads.

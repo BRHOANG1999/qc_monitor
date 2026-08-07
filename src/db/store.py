@@ -1821,8 +1821,24 @@ class Store:
             conn.close()
 
     def get_evoked_waveforms_for_session(self, session_dir: str,
-                                         version_id: int | None = None) -> list[dict]:
-        """Return all evoked waveforms for a session, with parsed JSON arrays."""
+                                         version_id: int | None = None,
+                                         latest_only: bool = False,
+                                         limit_files: int | None = None
+                                         ) -> list[dict]:
+        """Return evoked waveforms for a session, with parsed JSON arrays.
+
+        By default returns EVERY file's waveforms -- but each row carries three
+        ~150-200 KB JSON trace arrays, so a long session (65 files x 5 channels =
+        325 rows here) is ~150 MB to fetch + json.loads, ~4 s. Most callers only
+        need the newest recording:
+
+        - ``latest_only=True``  -> only the single most-recent file's rows (the
+          Overview thumbnail's mean/SEM view -- 325 rows -> 5, ~4 s -> ~40 ms).
+        - ``limit_files=N``     -> only the newest N distinct files by
+          chunk_datetime (the overlay view, which caps history anyway).
+
+        ``latest_only`` wins if both are set. Ordered oldest->newest so callers
+        that build a history keep the existing order."""
         conn = self._connect()
         try:
             conditions = ["pf.session_dir = ?"]
@@ -1831,6 +1847,26 @@ class Store:
             if version_id is not None:
                 conditions.append("ew.version_id = ?")
                 params.append(version_id)
+
+            # Scope to the newest file(s) so we don't fetch + parse the whole
+            # session's traces when the caller only renders the latest. The
+            # sub-select mirrors the outer session_dir (+ version) filter so the
+            # "newest" is computed within the same slice.
+            if latest_only:
+                conditions.append(
+                    "pf.chunk_datetime = ("
+                    " SELECT MAX(p2.chunk_datetime) FROM processed_files p2"
+                    " JOIN evoked_waveforms e2 ON e2.file_id = p2.id"
+                    " WHERE p2.session_dir = ?)")
+                params.append(session_dir)
+            elif limit_files is not None and limit_files > 0:
+                conditions.append(
+                    "pf.chunk_datetime IN ("
+                    " SELECT DISTINCT p2.chunk_datetime FROM processed_files p2"
+                    " JOIN evoked_waveforms e2 ON e2.file_id = p2.id"
+                    " WHERE p2.session_dir = ?"
+                    " ORDER BY p2.chunk_datetime DESC LIMIT ?)")
+                params.extend([session_dir, int(limit_files)])
 
             where = " AND ".join(conditions)
             sql = f"""

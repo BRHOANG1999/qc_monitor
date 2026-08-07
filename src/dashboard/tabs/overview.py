@@ -1485,7 +1485,18 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
     waveforms = []
     if session_dir:
         try:
-            waveforms = store.get_evoked_waveforms_for_session(session_dir)
+            # Only the overlay view draws prior files; mean/SEM render the newest
+            # recording alone. Fetching the whole session's traces for mean/SEM
+            # was ~150 MB / ~4 s of JSON thrown away -- scope the read to match.
+            # Labelled by mode so the ledger separates the cheap latest-only read
+            # from the heavier overlay history read.
+            with _perf.Timer(f"overview:thumb-fetch-db:{trace_mode}"):
+                if trace_mode == "overlay":
+                    waveforms = store.get_evoked_waveforms_for_session(
+                        session_dir, limit_files=_OVERLAY_MAX_FILES)
+                else:
+                    waveforms = store.get_evoked_waveforms_for_session(
+                        session_dir, latest_only=True)
         except Exception as e:
             logger.debug("Could not load waveform thumbnail: %s", e)
             waveforms = []
@@ -1495,9 +1506,10 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         # holds the processed traces, so fall back to the latest file there.
         # That fallback scans a network share + h5py-reads a ~100s-of-MB .mat;
         # bound it so a hung share can't wedge this build (and _THUMB_LOCK).
-        res = call_with_deadline(
-            lambda: _latest_evoked_from_output(config),
-            _THUMB_READ_TIMEOUT, default=None)
+        with _perf.Timer("overview:thumb-fetch-share-fallback"):
+            res = call_with_deadline(
+                lambda: _latest_evoked_from_output(config),
+                _THUMB_READ_TIMEOUT, default=None)
         if res is None:                      # timed out reading the share
             logger.warning("Latest-evoked fallback read timed out (%.0fs)",
                            _THUMB_READ_TIMEOUT)
@@ -4712,18 +4724,24 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             return nout
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
-                # Freshness stamp under the status pills so "is it live or
-                # frozen?" is answerable at a glance -- the user's core complaint.
-                pills = html.Div([_build_overview_cards(store),
-                                  _freshness_footer(time.time())])
-                return (
-                    pills,
-                    _build_overview_queue(store),
-                    _build_impedance_trend_card(store, config),
-                    _build_zss_consistency_card(store, config),
-                    _build_current_fidelity_card(store, config),
-                    _build_region_drift_card(store, config),
-                )
+                # Time EACH card separately (not the 6 as one blurry label) so
+                # the Performance tab / persisted ledger names the exact slow
+                # builder instead of "the refresh is slow". Freshness stamp under
+                # the pills answers "is it live or frozen?" at a glance.
+                with _perf.Timer("overview:cards"):
+                    pills = html.Div([_build_overview_cards(store),
+                                      _freshness_footer(time.time())])
+                with _perf.Timer("overview:queue"):
+                    queue = _build_overview_queue(store)
+                with _perf.Timer("overview:impedance"):
+                    imp = _build_impedance_trend_card(store, config)
+                with _perf.Timer("overview:zss"):
+                    zss = _build_zss_consistency_card(store, config)
+                with _perf.Timer("overview:fidelity"):
+                    fid = _build_current_fidelity_card(store, config)
+                with _perf.Timer("overview:region"):
+                    region = _build_region_drift_card(store, config)
+                return (pills, queue, imp, zss, fid, region)
         finally:
             _REFRESH_LOCK.end()
 
