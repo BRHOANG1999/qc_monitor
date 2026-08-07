@@ -405,6 +405,18 @@ overview:
   # Default count for the "Recent recordings" evoked overlay (the N input
   # on the card overrides it live). Default 24 if absent.
   hist_recordings: 24
+  # Last-good card snapshots (stale-while-revalidate). The expensive Overview
+  # cards (behavioral-seizure status, Google-Sheets home grid + KM log) pickle
+  # their last render to the DB and repaint it INSTANTLY on the first open after
+  # a daemon restart, then revalidate in the background -- so a restart no longer
+  # drops everyone back to a cold rebuild. Pure cache; safe to disable.
+  snapshot_enabled: true
+  # Don't paint a restored card older than this on boot (the background warmer
+  # replaces it within seconds regardless). Default 1440 min (24 h).
+  snapshot_max_age_min: 1440
+  # Rebuild every expensive card in a background thread at daemon start so the
+  # first user never pays the cold build. Default true.
+  warm_on_boot: true
 chronic_evoked:
   evoked_output_dir: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/daqSignalGenerator/evokedOutput
   # Compute the heavy per-epoch features (recovery tau/slope, template

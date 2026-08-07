@@ -924,4 +924,21 @@ CREATE TABLE IF NOT EXISTS job_heartbeat (
     last_success_at TEXT,
     note TEXT
 );
+
+-- ui_snapshot: last-good rendered state of an expensive dashboard card, so the
+-- Overview tab can paint the previous result INSTANTLY on the first request
+-- after a daemon restart (stale-while-revalidate) instead of everyone racing a
+-- cold rebuild. `blob` is a pickled Dash component tree; `version` guards
+-- against restoring a tree whose component shape changed across a deploy (a
+-- mismatch is ignored, forcing a fresh build). `built_at` is the epoch-seconds
+-- the underlying data was computed (drives the "updated N ago" footer), which
+-- is distinct from `updated_at` (when this row was written). Pure cache: safe
+-- to DELETE at any time -- the warmer/refresh callbacks rebuild it.
+CREATE TABLE IF NOT EXISTS ui_snapshot (
+    key        TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,
+    built_at   REAL NOT NULL,
+    blob       BLOB NOT NULL,
+    updated_at REAL NOT NULL
+);
 """

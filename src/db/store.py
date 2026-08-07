@@ -6193,3 +6193,48 @@ class Store:
         payload["at"] = row["at"]
         payload["user_email"] = row["user_email"]
         return payload
+
+    # ---------------------------------------------------------------- #
+    #  UI snapshots -- last-good rendered state of an expensive card, so
+    #  the Overview tab can paint the previous result instantly on the
+    #  first request after a restart (stale-while-revalidate). Pure cache:
+    #  a miss / stale row just means a fresh build. See ui_snapshot table.
+    # ---------------------------------------------------------------- #
+    def get_ui_snapshot(self, key: str) -> dict | None:
+        """The persisted snapshot for *key*, or ``None`` if absent.
+
+        Returns ``{"version": int, "built_at": float, "blob": bytes}``.
+        The caller is responsible for version-matching and unpickling --
+        Store stays oblivious to the blob's meaning (it's a cache row)."""
+        assert key, "snapshot key required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT version, built_at, blob FROM ui_snapshot WHERE key=?",
+                (str(key),)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {"version": int(row["version"]),
+                "built_at": float(row["built_at"]),
+                "blob": bytes(row["blob"])}
+
+    def set_ui_snapshot(self, key: str, version: int, built_at: float,
+                        blob: bytes) -> None:
+        """Upsert the last-good snapshot blob for *key*. ``built_at`` is when
+        the underlying data was computed (drives the freshness footer);
+        ``updated_at`` is stamped here. Never raises on a caller mistake at the
+        boundary -- but SQLite errors propagate so a wedged DB is visible."""
+        assert key, "snapshot key required"
+        assert isinstance(blob, (bytes, bytearray)), "blob must be bytes"
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO ui_snapshot (key, version, built_at, blob,
+                                            updated_at)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     version=excluded.version, built_at=excluded.built_at,
+                     blob=excluded.blob, updated_at=excluded.updated_at""",
+                (str(key), int(version), float(built_at),
+                 sqlite3.Binary(bytes(blob)), time.time()))

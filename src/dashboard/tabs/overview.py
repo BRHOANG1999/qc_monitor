@@ -92,13 +92,18 @@ class _CachedBuilder:
     (see ``_guarded_card``) rather than an eternal spinner.
     """
 
-    __slots__ = ("_ttl", "_sf", "_t", "_val")
+    __slots__ = ("_ttl", "_sf", "_t", "_val", "_persist_key")
 
-    def __init__(self, ttl_sec: float, label: str = "cached-build"):
+    def __init__(self, ttl_sec: float, label: str = "cached-build",
+                 persist_key: str | None = None):
         self._ttl = ttl_sec
         self._sf = SingleFlight(label)
         self._t = 0.0                        # time.time() of last SUCCESSFUL build
         self._val = None
+        # When set, the last-good value is pickled to the ui_snapshot table on
+        # every successful build and restored on boot (stale-while-revalidate
+        # across restarts). None -> in-memory only. See _persist / restore.
+        self._persist_key = persist_key
 
     def built_at(self) -> float | None:
         """Epoch seconds of the last successful build, or None if never built."""
@@ -132,24 +137,118 @@ class _CachedBuilder:
                 built = build()
             self._val = built
             self._t = time.time()
+            self._persist()
             return built
         finally:
             self._sf.end()
 
+    def _persist(self) -> None:
+        """Pickle the last-good value to SQLite off the request thread. Best
+        effort: any failure (unpicklable tree, DB busy) is swallowed -- the
+        snapshot is a pure optimization, never load-bearing. Fire-and-forget so
+        the callback return is never delayed by disk I/O / the write lock."""
+        store = _SNAPSHOT_STORE
+        key = self._persist_key
+        if store is None or not key:
+            return
+        val, built_at = self._val, self._t
+        if val is None:
+            return
+
+        def _write():
+            try:
+                import pickle
+                blob = pickle.dumps(val, protocol=pickle.HIGHEST_PROTOCOL)
+                store.set_ui_snapshot(key, _SNAPSHOT_VERSION, built_at, blob)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("snapshot persist failed (%s): %s", key, e)
+
+        threading.Thread(target=_write, daemon=True, name=f"snap-{key}").start()
+
+    def restore(self) -> bool:
+        """Load the persisted last-good value into the in-memory cache so the
+        first request after a restart paints it immediately. No-op (False) if
+        snapshots are off, nothing is stored, the version mismatches, it's older
+        than the max age, or it fails to unpickle. Called once at boot, before
+        any request can hit the cache."""
+        store = _SNAPSHOT_STORE
+        key = self._persist_key
+        if store is None or not key or self._val is not None:
+            return False
+        try:
+            snap = store.get_ui_snapshot(key)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot load failed (%s): %s", key, e)
+            return False
+        if not snap or snap["version"] != _SNAPSHOT_VERSION:
+            return False
+        age = time.time() - snap["built_at"]
+        if age < 0 or age > _SNAPSHOT_MAX_AGE_SEC:
+            return False                      # too stale to paint; rebuild cold
+        try:
+            import pickle
+            val = pickle.loads(snap["blob"])
+        except Exception as e:  # noqa: BLE001 -- a shape change across a deploy
+            logger.debug("snapshot unpickle failed (%s): %s", key, e)
+            return False
+        self._val, self._t = val, snap["built_at"]
+        logger.info("overview snapshot restored: %s (age %.0f min)",
+                    key, age / 60.0)
+        return True
+
+
+# ------------------------------------------------------------------ #
+#  Persistent last-good snapshots (stale-while-revalidate across restarts).
+#  A _CachedBuilder with a persist_key pickles its last-good card into the
+#  ui_snapshot table on every successful build and restores it on boot, so the
+#  FIRST request after a daemon restart paints the previous result INSTANTLY
+#  instead of everyone racing a cold rebuild. Pure cache: any miss / version
+#  mismatch / over-age row just falls back to a fresh build.
+# ------------------------------------------------------------------ #
+# Bump when a persisted card's component SHAPE changes incompatibly (e.g. a
+# rename that would make an old pickle deserialize into a wrong/legacy tree). A
+# version mismatch is ignored on restore, forcing a fresh build -- so an old
+# schema can never render.
+_SNAPSHOT_VERSION = 1
+_SNAPSHOT_STORE = None                # bound once in register_callbacks
+_SNAPSHOT_MAX_AGE_SEC = 24 * 3600     # don't paint a card older than this on boot
+_SNAPSHOT_ENABLED = True
+
+
+def _bind_snapshot_store(store, config) -> None:
+    """Wire the Store used for snapshot persistence + apply config overrides
+    (overview.snapshot_enabled / snapshot_max_age_min). Called once at boot,
+    when a Store first exists."""
+    global _SNAPSHOT_STORE, _SNAPSHOT_MAX_AGE_SEC, _SNAPSHOT_ENABLED
+    ov = (config or {}).get("overview", {}) or {}
+    _SNAPSHOT_ENABLED = bool(ov.get("snapshot_enabled", True))
+    try:
+        _SNAPSHOT_MAX_AGE_SEC = max(
+            60.0, float(ov.get("snapshot_max_age_min", 24 * 60)) * 60.0)
+    except (TypeError, ValueError):
+        _SNAPSHOT_MAX_AGE_SEC = 24 * 3600
+    _SNAPSHOT_STORE = store if _SNAPSHOT_ENABLED else None
+
 
 # Behavioral-seizure status card: computed from ~3k files + ~7k review rows and
 # fired every 10s -> single-flight + 45s cache so it can't pile up (was ~36 min
-# per call under the pile-up; a single build is ~1-3s).
-_BSZ_CACHE = _CachedBuilder(45.0, "overview-bsz-status")
+# per call under the pile-up; a single build is ~1-3s). Persisted so a restart
+# doesn't drop the user back to a cold ~seconds rebuild.
+_BSZ_CACHE = _CachedBuilder(45.0, "overview-bsz-status",
+                            persist_key="overview:bsz-status")
 
 # Home grid + KM-log cards read GOOGLE SHEETS (surgery / maintenance / schedule /
 # data-log). These live in their OWN callbacks (see _fill_home_grid/_fill_km_log)
 # so a slow/unreachable Sheets read can't block the DB cards. Each build still
 # costs ~10-20s per unreachable sheet (socket timeout), so a 300s single-flight
 # cache keeps that stall to at most once / 5 min. Sheets data changes on the
-# order of hours, so 5 min is plenty fresh.
-_HOME_GRID_CACHE = _CachedBuilder(300.0, "overview-home-grid")
-_KM_LOG_CACHE = _CachedBuilder(300.0, "overview-km-log")
+# order of hours, so 5 min is plenty fresh. Persisted: the Sheets round-trip is
+# the single worst cold-open cost, so painting yesterday's grid instantly (then
+# revalidating) is the biggest win of the snapshot layer.
+_HOME_GRID_CACHE = _CachedBuilder(300.0, "overview-home-grid",
+                                  persist_key="overview:home-grid")
+_KM_LOG_CACHE = _CachedBuilder(300.0, "overview-km-log",
+                               persist_key="overview:km-log")
 
 # Single-flight for the heavy (mean/sem/overlay) evoked-thumbnail build so
 # concurrent ticks (on load / when the newest-recording signature changes)
@@ -4462,9 +4561,62 @@ def layout(store: Store, config: dict | None = None):
 #  Callbacks
 # ===================================================================== #
 
+def start_overview_warmer(store: Store, config: dict) -> None:
+    """Bind snapshot persistence, restore each expensive Overview card from
+    SQLite, then rebuild them all in a daemon thread so the FIRST user after a
+    daemon restart never pays the cold build.
+
+    Restore runs SYNCHRONOUSLY (three small SQLite reads + unpickles) so even a
+    request that lands before the warm thread finishes still serves the last-good
+    card. The warm thread then revalidates every cache (and kicks the recent-
+    recordings overlay) in the background. Idempotent enough to call once at boot.
+    Guarded end-to-end: a warm failure only means the old cold-start behavior."""
+    _bind_snapshot_store(store, config)
+    for cache in (_BSZ_CACHE, _HOME_GRID_CACHE, _KM_LOG_CACHE):
+        try:
+            cache.restore()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("overview snapshot restore failed: %s", e)
+    ov = (config or {}).get("overview", {}) or {}
+    if not ov.get("warm_on_boot", True):
+        return
+
+    def _warm():
+        from datetime import date as _date
+        builds = (
+            (_HOME_GRID_CACHE,
+             lambda: _build_home_grid_children(store, config, _date.today()),
+             "warm:home-grid"),
+            (_KM_LOG_CACHE, lambda: _build_km_log_section(config),
+             "warm:km-log"),
+            (_BSZ_CACHE,
+             lambda: _build_behavioral_seizure_status_card(store, config),
+             "warm:bsz-status"),
+        )
+        for cache, build, label in builds:
+            try:
+                cache.get(build, label=label)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("overview warm failed (%s): %s", label, e)
+        # Warm the recent-recordings overlay too (own background worker).
+        try:
+            sig, files = _hist24_file_set(config)
+            if sig and files:
+                _kick_hist24(sig, files)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("overview hist24 warm-kick failed: %s", e)
+        logger.info("overview caches warmed")
+
+    threading.Thread(target=_warm, daemon=True, name="overview-warmer").start()
+
+
 def register_callbacks(app, store: Store, config: dict) -> None:
     """Wire the Overview tab's six callbacks (fine-grained refresh,
     thumbnail, snapshot size + src, home-grid Open buttons)."""
+
+    # Bind snapshot persistence + warm/restore the expensive caches at boot so
+    # the first open after a restart paints the last-good cards instantly.
+    start_overview_warmer(store, config)
 
     # "Retry all" on the failed-MATLAB card: flip matlab_error rows back to
     # pending so the daemon reprocesses them (after the cause is fixed).
