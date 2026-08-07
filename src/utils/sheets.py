@@ -44,6 +44,8 @@ from threading import RLock
 import pandas as pd
 import requests
 
+from src.utils.deadline import call_with_deadline
+
 logger = logging.getLogger("qc_monitor.utils.sheets")
 
 # google-api-python-client + google-auth are optional installs, imported
@@ -216,9 +218,19 @@ def _load_sheet_via_api(sheet_id: str, tab_name: str,
     for attempt in range(2):
         try:
             svc = _sheets_api(service_account_file)
-            resp = svc.spreadsheets().values().get(
-                spreadsheetId=sheet_id, range=tab_name,
-            ).execute()
+            # Hard wall-clock bound on .execute() regardless of transport. The
+            # httplib2 client already carries a _FETCH_TIMEOUT_SEC socket
+            # timeout, but the import-failure fallback (build with credentials=)
+            # has NONE, so a flaky share could hang .execute() forever there.
+            # call_with_deadline caps BOTH paths and frees this thread.
+            resp = call_with_deadline(
+                lambda: svc.spreadsheets().values().get(
+                    spreadsheetId=sheet_id, range=tab_name,
+                ).execute(),
+                _FETCH_TIMEOUT_SEC + 5.0, default=None)
+            if resp is None:
+                raise TimeoutError(
+                    f"Sheets fetch exceeded {_FETCH_TIMEOUT_SEC + 5.0:.0f}s")
             break
         except Exception as e:  # noqa: BLE001 - fall back to stale cache
             last_err = e

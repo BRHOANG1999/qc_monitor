@@ -404,6 +404,10 @@ disk-saturated file.
   `Store._WRITE_LOCK` only.
 - ❌ **Don't serialize huge figures to the browser.** Cap and decimate; offload
   the expensive variants to a worker + poll.
+- ❌ **Don't leave a file/network read unbounded, especially under a lock.** A
+  read with no timeout, guarded by single-flight, is the worst case: one hang
+  wedges the lock forever and every later tick silently returns `no_update`.
+  Deadline-bound it (`call_with_deadline`) — see §11.
 - ❌ **Don't "fix slow" by optimizing the query first.** Confirm on the
   Performance tab whether it's cost or contention — it's almost always
   contention.
@@ -418,7 +422,9 @@ disk-saturated file.
 3. Can it overlap itself? Add a non-blocking single-flight guard, or wrap the
    build in a `_CachedBuilder` (§3.3–3.4).
 4. Does it read the network (Sheets) or a file (`.mat`)? Isolate it, give it a
-   hard timeout + TTL, and consider a background worker + poll (§3.5–3.6).
+   **hard deadline** (`call_with_deadline`, §11) + TTL, and consider a background
+   worker + poll (§3.5–3.6). A read behind a single-flight lock **must** be
+   bounded, or one hang freezes the card forever.
 5. Does it write? Fire-and-forget off the request thread (§3.8).
 6. Is the payload bounded? Cap/decimate points (§3.6).
 7. Verify on **System → Performance** that its `cb:` label is sub-second under a
@@ -445,7 +451,73 @@ disk-saturated file.
 | Overview fills | `overview.py` · `refresh_overview_dynamic` (4415), `_fill_home_grid` (4444), `_fill_km_log` (4460), `_fill_bsz_status` (4477), `refresh_overview_thumbnail` (4598) |
 | Fire-and-forget write | `src/dashboard/activity.py` · `track` (22) |
 | Sheets fast-fail timeout | `src/utils/sheets.py` |
+| Deadline helper | `src/utils/deadline.py` · `call_with_deadline` |
+| Watchdog guard | `src/dashboard/single_flight.py` · `SingleFlight`, `STALL_SEC` |
+| Card freshness / stalled surfacing | `overview.py` · `_freshness_footer`, `_guarded_card`, `_stalled_banner`, `_thumb_unavailable` |
 | Measured diagnosis | `~/.claude/plans/resilient-baking-hanrahan.md` |
 
 *Line numbers drift as the files change; treat them as starting points and
 confirm the symbol.*
+
+---
+
+## 11. Single-flight needs a watchdog (2026-08 hardening)
+
+Single-flight (§3.3) has a failure mode that took a live incident to surface:
+**Overview cards spun on `⏳` for an hour with zero errors anywhere.** Root cause
+— the evoked-thumbnail's fallback read a session `.mat` off a network share with
+**no timeout, under `_THUMB_LOCK`**. When the share hung, the lock was never
+released, so every later refresh tick did `try_begin()` → fail → `no_update`,
+forever. The guard worked exactly as designed; that was the problem — a wedged
+build is *supposed* to make others back off, but with no bound and no signal it
+made them back off permanently and silently.
+
+Three properties every single-flight-guarded build now must have:
+
+1. **Bounded** — any file/network read that can hang is wrapped in
+   `call_with_deadline(fn, timeout, default)` (`src/utils/deadline.py`). It runs
+   `fn` on a throwaway daemon thread and returns `default` if it doesn't finish
+   in time; the request thread is never blocked past the deadline. This is the
+   portable bound: Windows has no `SIGALRM`, and a blocked C-level read
+   (`os.stat`, `h5py.File`) can't be interrupted in-thread anyway. The thumbnail
+   `.mat` fallback (8 s), the hist24 worker reads, and the Sheets `.execute()`
+   (a backstop over the httplib2 socket timeout) are all bounded now. A hung
+   read self-clears instead of wedging the lock.
+2. **Observable + audible** — the bare `threading.Lock()` guards were replaced by
+   `SingleFlight` (`src/dashboard/single_flight.py`), which records when the
+   current build started. A later caller that finds the guard held past
+   `STALL_SEC` (90 s — well past the 30 s DB / 10 s Sheets ceilings) calls
+   `warn_if_stalled()`, which logs one loud `ERROR` per minute naming the wedged
+   card. `_CachedBuilder` composes a `SingleFlight` and exposes `built_at()` /
+   `age()` / `inflight_for()` so callbacks can render freshness/stall state.
+3. **Honest in the UI** — `_guarded_card` wraps the cached fill callbacks: a
+   built card carries a **`_freshness_footer`** ("updated 14:03:22 · 3 min ago",
+   green/amber/red by age — the same `_fmt_age` bands as the KM-log stamp), and a
+   rebuild wedged past `STALL_SEC` renders a **`_stalled_banner`** ("⚠ … hasn't
+   updated in N min … click Refresh to retry") instead of the mute `⏳`. The
+   thumbnail shows `_thumb_unavailable` ("source slow or unreachable") on a
+   deadline miss. Stale data can no longer masquerade as live, and a stall is
+   visible, not silent. (Retry reuses the global Refresh button rather than a
+   per-card button, which would collide on `id` if two cards stalled at once.)
+
+**Lesson:** single-flight without a deadline and a watchdog converts a transient
+infra stall into a permanent, invisible freeze — the worst possible property for
+a welfare/QC dashboard. Bound the read; time the guard; surface the state.
+
+## 12. Accepted debt — why one process, and when to split
+
+The nine mechanisms in §3 all exist because the dashboard shares **one process,
+one `Store`, one SQLite file** with the daemon and its ~6 writer threads (§2).
+That is a deliberate trade-off, not an accident: for a single-rig lab tool with a
+handful of concurrent viewers, in-process means zero deployment/IPC overhead, a
+warm shared cache, and one thing to run — and SQLite in WAL mode comfortably
+serves many readers alongside one writer. The cost is that every heavy read
+competes for the same file and thread pool, which is precisely what §3 manages.
+
+The trigger to split the dashboard into its **own read-mostly process** (talking
+to Postgres, or to a read replica / WAL-copy of the SQLite file) is when any of
+these becomes true: more than a handful of simultaneous users; the daemon's write
+volume saturates the disk badly enough that read latency stays high *after* the
+§3 mitigations; or a second rig/DB is added. Until then, in-process is the right
+call — but a future maintainer should make the split knowingly, not cargo-cult a
+tenth mechanism onto a design that has outgrown its assumptions.

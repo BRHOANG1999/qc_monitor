@@ -52,20 +52,24 @@ from src.dashboard.data_helpers import (
     session_dropdown_options as _session_dropdown_options,
 )
 from src.dashboard.design import (
-    COLOR_ACCENT, COLOR_DIVIDER, COLOR_SUCCESS, COLOR_SURFACE_1,
-    COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY,
-    COLOR_WARNING, FONT_SIZE_BODY, FONT_SIZE_CAPTION,
+    COLOR_ACCENT, COLOR_DANGER, COLOR_DIVIDER, COLOR_SUCCESS, COLOR_SURFACE_1,
+    COLOR_SURFACE_2, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
+    COLOR_TEXT_TERTIARY, COLOR_WARNING, FONT_SIZE_BODY, FONT_SIZE_CAPTION,
     RADIUS_MD, RADIUS_SM, ROLE_COLORS, SPACE_1, SPACE_2, SPACE_3,
     SPACE_5,
 )
 from src.db.store import Store, _current_fidelity_pct
 from src.dashboard import perf as _perf
+from src.dashboard.single_flight import SingleFlight, STALL_SEC
+from src.utils.deadline import call_with_deadline
 
 logger = logging.getLogger("qc_monitor.dashboard.overview")
 
 # Guards the auto-refresh callback so a slow refresh tick can't overlap itself
-# and pile heavy builds onto a fixed server thread pool. Non-blocking acquire.
-_REFRESH_LOCK = threading.Lock()
+# and pile heavy builds onto a fixed server thread pool. SingleFlight = the same
+# non-blocking acquire, plus a start-time + a loud log if it's ever held too long
+# (so a wedged build is visible instead of silently skipping every later tick).
+_REFRESH_LOCK = SingleFlight("overview-cards")
 
 
 class _CachedBuilder:
@@ -80,23 +84,43 @@ class _CachedBuilder:
     reused for *ttl* seconds so a fresh tick doesn't recompute at all. The cache
     is a process global (shared across users/threads) -- correct, the card is the
     same for everyone.
+
+    The single-flight guard is a ``SingleFlight`` so a wedged rebuild is
+    observable: ``built_at`` / ``age`` expose freshness (so a card can show
+    "updated 3 min ago" instead of pretending stale data is live), and a rebuild
+    held past ``STALL_SEC`` logs loudly and can be surfaced as a "stalled" state
+    (see ``_guarded_card``) rather than an eternal spinner.
     """
 
-    __slots__ = ("_ttl", "_lock", "_t", "_val")
+    __slots__ = ("_ttl", "_sf", "_t", "_val")
 
-    def __init__(self, ttl_sec: float):
+    def __init__(self, ttl_sec: float, label: str = "cached-build"):
         self._ttl = ttl_sec
-        self._lock = threading.Lock()
-        self._t = 0.0
+        self._sf = SingleFlight(label)
+        self._t = 0.0                        # time.time() of last SUCCESSFUL build
         self._val = None
+
+    def built_at(self) -> float | None:
+        """Epoch seconds of the last successful build, or None if never built."""
+        return self._t or None
+
+    def age(self) -> float | None:
+        """Seconds since the last successful build, or None if never built."""
+        return (time.time() - self._t) if self._t else None
+
+    def inflight_for(self) -> float:
+        """Seconds the current rebuild has been running (0.0 if none)."""
+        return self._sf.held_for()
 
     def get(self, build, *, label: str | None = None):
         now = time.time()
         val = self._val
         if val is not None and (now - self._t) < self._ttl:
             return val                       # fresh -> serve cached, no rebuild
-        if not self._lock.acquire(blocking=False):
-            # A rebuild is already in flight -> don't pile on; serve stale.
+        if not self._sf.try_begin():
+            # A rebuild is already in flight -> don't pile on; serve stale. If it
+            # has been wedged too long, say so loudly in the log.
+            self._sf.warn_if_stalled()
             return val if val is not None else no_update
         try:
             if self._val is not None and (time.time() - self._t) < self._ttl:
@@ -110,13 +134,13 @@ class _CachedBuilder:
             self._t = time.time()
             return built
         finally:
-            self._lock.release()
+            self._sf.end()
 
 
 # Behavioral-seizure status card: computed from ~3k files + ~7k review rows and
 # fired every 10s -> single-flight + 45s cache so it can't pile up (was ~36 min
 # per call under the pile-up; a single build is ~1-3s).
-_BSZ_CACHE = _CachedBuilder(45.0)
+_BSZ_CACHE = _CachedBuilder(45.0, "overview-bsz-status")
 
 # Home grid + KM-log cards read GOOGLE SHEETS (surgery / maintenance / schedule /
 # data-log). These live in their OWN callbacks (see _fill_home_grid/_fill_km_log)
@@ -124,14 +148,20 @@ _BSZ_CACHE = _CachedBuilder(45.0)
 # costs ~10-20s per unreachable sheet (socket timeout), so a 300s single-flight
 # cache keeps that stall to at most once / 5 min. Sheets data changes on the
 # order of hours, so 5 min is plenty fresh.
-_HOME_GRID_CACHE = _CachedBuilder(300.0)
-_KM_LOG_CACHE = _CachedBuilder(300.0)
+_HOME_GRID_CACHE = _CachedBuilder(300.0, "overview-home-grid")
+_KM_LOG_CACHE = _CachedBuilder(300.0, "overview-km-log")
 
 # Single-flight for the heavy (mean/sem/overlay) evoked-thumbnail build so
 # concurrent ticks (on load / when the newest-recording signature changes)
 # don't stack .mat reads + figure builds. The hist24 path is a cheap poll over
-# a background worker and is intentionally NOT gated.
-_THUMB_LOCK = threading.Lock()
+# a background worker and is intentionally NOT gated. SingleFlight adds the
+# stall watchdog (the thumbnail's .mat fallback read is the historical wedge).
+_THUMB_LOCK = SingleFlight("overview-thumbnail")
+
+# Wall-clock ceiling on any single evokedOutput .mat/share read on a REQUEST or
+# worker thread. A healthy share returns a ~100s-of-MB file in a few seconds; a
+# hung share used to block forever under _THUMB_LOCK and freeze the whole page.
+_THUMB_READ_TIMEOUT = 8.0
 
 
 def _pending_placeholder(label: str = "Loading…"):
@@ -145,6 +175,71 @@ def _pending_placeholder(label: str = "Loading…"):
         style={"color": "#6c6c80", "fontSize": "12px",
                "padding": "14px 6px", "letterSpacing": "0.2px"},
     )
+
+
+def _freshness_footer(built_at_epoch: float | None):
+    """Small themed 'updated HH:MM:SS · N ago' row for a cached card, so stale
+    data can never masquerade as live. Green when fresh (<90 min), amber (<24 h),
+    red older -- same bands as the KM-log stamp (_fmt_age). Hidden if never
+    built."""
+    if not built_at_epoch:
+        return html.Div()
+    age_min = max(0.0, (time.time() - built_at_epoch) / 60.0)
+    text, color = _fmt_age(age_min)
+    hhmm = datetime.fromtimestamp(built_at_epoch).strftime("%H:%M:%S")
+    return html.Div(
+        f"updated {hhmm} · {text}",
+        style={"color": color, "fontSize": FONT_SIZE_CAPTION,
+               "textAlign": "right", "padding": f"{SPACE_1} {SPACE_2} 0",
+               "opacity": "0.85"},
+    )
+
+
+def _stalled_banner(title: str, seconds: float, *, compact: bool = False):
+    """Themed 'this card's background build looks wedged' banner -- replaces the
+    silent, eternal ⏳ so a hang is honest and actionable. Points at the existing
+    global Refresh control to retry (a per-card button would collide on id if two
+    cards stalled at once)."""
+    mins = seconds / 60.0
+    msg = (f"⚠ {title} hasn't updated in {mins:.0f} min — the background build "
+           f"looks stalled. Click Refresh (top bar) to retry; if it persists the "
+           f"daemon may need attention.")
+    return html.Div(
+        msg,
+        style={"color": COLOR_DANGER, "fontSize": FONT_SIZE_CAPTION,
+               "background": COLOR_SURFACE_2,
+               "border": f"1px solid {COLOR_DANGER}",
+               "borderRadius": RADIUS_SM,
+               "padding": f"{SPACE_2} {SPACE_3}",
+               "marginBottom": (SPACE_1 if compact else SPACE_2)},
+    )
+
+
+def _guarded_card(cache: "_CachedBuilder", build, *, label: str, title: str):
+    """Render a _CachedBuilder-backed card with a freshness footer, or a themed
+    'stalled' banner when the background build has wedged -- never a silent
+    no_update-forever behind an eternal spinner.
+
+    - fresh / just built -> card + 'updated …' footer
+    - rebuild in flight, not yet stalled -> last-good card + footer (or the ⏳
+      placeholder via no_update if nothing has ever built)
+    - rebuild wedged past STALL_SEC -> stalled banner (prepended to any stale
+      card so the user still sees the last-good data, clearly marked)
+    """
+    inflight = cache.inflight_for()          # measure BEFORE get() may build here
+    children = cache.get(build, label=label)
+    stalled = inflight > STALL_SEC
+    if children is no_update:
+        # Nothing cached yet AND a rebuild is in flight elsewhere.
+        if stalled:
+            return _stalled_banner(title, inflight)
+        return no_update                      # keep the ⏳ placeholder
+    footer = _freshness_footer(cache.built_at())
+    if stalled:
+        return html.Div([_stalled_banner(title, inflight, compact=True),
+                         children, footer])
+    return html.Div([children, footer])
+
 
 # Shared row style for the "today at the lab" home-grid block rows.
 _HOME_ROW_STYLE = {
@@ -986,7 +1081,14 @@ def _hist24_file_set(config: dict | None, n: int | None = None):
         logger.debug("hist24 import failed: %s", e)
         return None, []
     evoked_dir = ce.get("evoked_output_dir") or DEFAULT_EVOKED_DIR
-    dated = [(parse_recording_dt(f), f) for f in list_evoked_files(evoked_dir)]
+    # This runs on the callback (request) thread, so bound the share glob: a hung
+    # evokedOutput mount would otherwise block a Dash worker here.
+    listed = call_with_deadline(
+        lambda: list_evoked_files(evoked_dir), _THUMB_READ_TIMEOUT, default=None)
+    if listed is None:
+        logger.warning("hist24 file listing timed out (evoked_dir=%s)", evoked_dir)
+        return None, []
+    dated = [(parse_recording_dt(f), f) for f in listed]
     dated = [(d, f) for d, f in dated if d is not None]
     if not dated:
         return None, []
@@ -1014,7 +1116,16 @@ def _hist24_file_waveforms(path: str, dt) -> list:
         return cached
     try:
         from src.utils.evoked_output import read_file_evoked
-        wfs = _evoked_channels_to_waveforms(read_file_evoked(path), dt)
+        # Bound the h5py decode: a hung share read on the worker thread would
+        # otherwise block hist24 forever (and _kick_hist24 gates re-kicks on
+        # is_alive(), so one wedged read stalls ALL future overlays).
+        chans = call_with_deadline(
+            lambda: read_file_evoked(path), _THUMB_READ_TIMEOUT, default=None)
+        if chans is None:
+            logger.warning("hist24 read timed out: %s", path)
+            wfs = []
+        else:
+            wfs = _evoked_channels_to_waveforms(chans, dt)
     except Exception as e:  # noqa: BLE001 -- skip a bad file, keep going
         logger.debug("hist24 read failed %s: %s", path, e)
         wfs = []
@@ -1248,6 +1359,19 @@ def _hist24_render(config: dict | None, n: int | None = None):
     return [_hist24_placeholder(_hist24_progress())], False
 
 
+def _thumb_unavailable(msg: str) -> list:
+    """Themed 'the evoked source is slow/unreachable' node for the thumbnail --
+    shown instead of a bare, eternal spinner when the .mat fallback read times
+    out, so the user knows it's an infra stall, not a frozen app."""
+    return [html.Div(
+        f"⚠ {msg}",
+        style={"color": COLOR_WARNING, "fontSize": FONT_SIZE_CAPTION,
+               "background": COLOR_SURFACE_2,
+               "border": f"1px solid {COLOR_DIVIDER}",
+               "borderRadius": RADIUS_SM, "padding": f"{SPACE_3}"},
+    )]
+
+
 def _build_overview_thumbnail(store: Store, config: dict | None,
                                 session_dir: str, trace_mode: str
                                 ) -> list:
@@ -1270,7 +1394,17 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         # The newest session may not yet have QC dispatcher-populated
         # evoked_waveforms rows; the toolkit's evokedOutput folder already
         # holds the processed traces, so fall back to the latest file there.
-        waveforms, _ = _latest_evoked_from_output(config)
+        # That fallback scans a network share + h5py-reads a ~100s-of-MB .mat;
+        # bound it so a hung share can't wedge this build (and _THUMB_LOCK).
+        res = call_with_deadline(
+            lambda: _latest_evoked_from_output(config),
+            _THUMB_READ_TIMEOUT, default=None)
+        if res is None:                      # timed out reading the share
+            logger.warning("Latest-evoked fallback read timed out (%.0fs)",
+                           _THUMB_READ_TIMEOUT)
+            return _thumb_unavailable(
+                "Latest-evoked source is slow or unreachable")
+        waveforms, _ = res
     if not waveforms:
         return [html.Div()]
 
@@ -1630,15 +1764,17 @@ def _km_log_summary(config: dict | None) -> dict:
 
 
 def _fmt_age(minutes: float | None) -> tuple[str, str]:
-    """(label, color) for an age in minutes. Green <90 min, orange
-    <24 h, red older. Used for both 'recorded' and 'submitted'."""
+    """(label, color) for an age in minutes. Green <90 min, amber <24 h, red
+    older. On-palette design tokens so the KM-log stamp and the per-card
+    freshness footer (_freshness_footer) share one scale. Used for 'recorded',
+    'submitted', and card build-age."""
     if minutes is None:
-        return "unknown", "#888"
+        return "unknown", COLOR_TEXT_TERTIARY
     if minutes < 90:
-        return f"{minutes:.0f} min ago", "#00CC96"
+        return f"{minutes:.0f} min ago", COLOR_SUCCESS
     if minutes < 24 * 60:
-        return f"{minutes / 60:.1f} h ago", "#FFA15A"
-    return f"{minutes / (24 * 60):.1f} d ago", "#EF553B"
+        return f"{minutes / 60:.1f} h ago", COLOR_WARNING
+    return f"{minutes / (24 * 60):.1f} d ago", COLOR_DANGER
 
 
 def _build_km_log_section(config: dict | None) -> html.Div:
@@ -4416,13 +4552,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         nout = (no_update,) * 6
         if current_tab != "overview":
             return nout
-        # Single-flight: don't let a slow tick overlap itself.
-        if not _REFRESH_LOCK.acquire(blocking=False):
+        # Single-flight: don't let a slow tick overlap itself. These cards are
+        # all bounded DB reads (busy_timeout 30s) so a stall self-clears; the
+        # watchdog just logs loudly if one ever wedges.
+        if not _REFRESH_LOCK.try_begin():
+            _REFRESH_LOCK.warn_if_stalled()
             return nout
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
+                # Freshness stamp under the status pills so "is it live or
+                # frozen?" is answerable at a glance -- the user's core complaint.
+                pills = html.Div([_build_overview_cards(store),
+                                  _freshness_footer(time.time())])
                 return (
-                    _build_overview_cards(store),
+                    pills,
                     _build_overview_queue(store),
                     _build_impedance_trend_card(store, config),
                     _build_zss_consistency_card(store, config),
@@ -4430,7 +4573,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     _build_region_drift_card(store, config),
                 )
         finally:
-            _REFRESH_LOCK.release()
+            _REFRESH_LOCK.end()
 
     # Home grid (Google Sheets) -- own callback + 120s single-flight cache so a
     # slow/unreachable Sheets read never blocks the DB cards above.
@@ -4445,9 +4588,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if current_tab != "overview":
             return no_update
         from datetime import date as _date
-        return _HOME_GRID_CACHE.get(
+        return _guarded_card(
+            _HOME_GRID_CACHE,
             lambda: _build_home_grid_children(store, config, _date.today()),
-            label="cb:overview-home-grid")
+            label="cb:overview-home-grid", title="Lab home grid")
 
     # KM-log summary (Google Sheets) -- own callback + 120s cache, same reason.
     @app.callback(
@@ -4460,9 +4604,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     def _fill_km_log(_n, _mount, current_tab):
         if current_tab != "overview":
             return no_update
-        return _KM_LOG_CACHE.get(
+        return _guarded_card(
+            _KM_LOG_CACHE,
             lambda: _build_km_log_section(config),
-            label="cb:overview-km-log")
+            label="cb:overview-km-log", title="KM-recorder log")
 
     # Behavioral-seizure status card: its own fill callback so it loads in
     # PARALLEL with the 8-card refresh above (own thread) instead of adding to
@@ -4478,10 +4623,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if current_tab != "overview":
             return no_update
         # Single-flight + 45s cache (see _BSZ_CACHE): stops the every-10s pile-up
-        # that turned a ~2s build into a ~36 min stall.
-        return _BSZ_CACHE.get(
+        # that turned a ~2s build into a ~36 min stall. _guarded_card adds a
+        # freshness stamp + a "stalled" state if it ever wedges again.
+        return _guarded_card(
+            _BSZ_CACHE,
             lambda: _build_behavioral_seizure_status_card(store, config),
-            label="cb:overview-bsz-status")
+            label="cb:overview-bsz-status", title="Behavioral-seizure status")
 
     # Lazy stim-artifact overlay: only loads (heavy trace reads) when the
     # user clicks, and lives outside the refreshed card so it persists.
@@ -4614,8 +4761,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if sig is not None and sig == last_sig:
             return no_update, True, no_update
         # Single-flight the heavy build (below the cheap sig check) so
-        # overlapping ticks don't stack .mat reads + figure builds.
-        if not _THUMB_LOCK.acquire(blocking=False):
+        # overlapping ticks don't stack .mat reads + figure builds. The .mat
+        # fallback read inside is now deadline-bounded, so this can't wedge; the
+        # watchdog just logs loudly if it ever runs long.
+        if not _THUMB_LOCK.try_begin():
+            _THUMB_LOCK.warn_if_stalled()
             return no_update, no_update, no_update
         try:
             sessions = store.get_sessions()
@@ -4624,7 +4774,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         store, config, session_dir, mode),
                     True, sig)
         finally:
-            _THUMB_LOCK.release()
+            _THUMB_LOCK.end()
 
     @app.callback(
         Output("snapshot-expanded", "data"),
