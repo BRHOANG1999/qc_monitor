@@ -38,29 +38,51 @@ def stimulated_indices(eeg_channels, stim_copy_channels) -> set:
     return {int(i) for i in (eeg_channels or []) if (int(i) - 1) in sc}
 
 
-def _session_stim_indices(store, session_dir: str) -> tuple[bool, set]:
-    """``(config_present, stimulated_index_set)`` for a session.
+def _session_stim_info(store, session_dir: str) -> tuple[bool, set, list]:
+    """``(config_present, stimulated_index_set, stim_channel_names)`` for a
+    session, from ONE cheap session_config read (no waveform blob).
 
     ``config_present`` separates "session_config row exists but the session is
     non-stim" (safe to mark done forever via impedance_skip) from "no
     session_config discovered yet" (may become stim later -- must NOT be
-    skipped). The index set is empty for both non-stim and not-yet-known."""
+    skipped). ``stim_channel_names`` lets the caller pre-resolve gain before
+    deciding whether the expensive blob read is worth it."""
     if not session_dir:
-        return False, set()
+        return False, set(), []
     with store.connection() as conn:
         row = conn.execute(
-            """SELECT eeg_channels, stim_copy_channels
+            """SELECT eeg_channels, stim_copy_channels, channel_names
                FROM session_config WHERE session_dir = ?""",
             (session_dir,),
         ).fetchone()
     if not row:
-        return False, set()
+        return False, set(), []
     try:
         eeg = json.loads(row["eeg_channels"] or "[]")
         sc = json.loads(row["stim_copy_channels"] or "[]")
+        names = json.loads(row["channel_names"] or "[]")
     except (json.JSONDecodeError, TypeError):
-        return True, set()
-    return True, stimulated_indices(eeg, sc)
+        return True, set(), []
+    idx = stimulated_indices(eeg, sc)
+    stim_names = [names[i] for i in sorted(idx) if 0 <= int(i) < len(names)]
+    return True, idx, stim_names
+
+
+def _any_gain_resolvable(gains, session_name: str, file_base: str,
+                         stim_names: list) -> bool:
+    """True if ANY stimulated channel of this file resolves an amplifier gain.
+    Pure in-memory lookups against the loaded gains -- no DB / blob read. Used to
+    skip the costly waveform read on an access-r RETRY whose gain still won't
+    resolve (the recompute would only produce another NULL)."""
+    for ch_name in stim_names:
+        if not is_animal_channel(ch_name):
+            continue
+        animal, elec = split_animal_electrode(ch_name)
+        gain = resolve_gain(gains, session_name, file_base, ch_name,
+                            animal or "", elec or "")
+        if gain not in (None, ""):
+            return True
+    return False
 
 
 def _stim_params(store, file_id: int, session_dir: str) -> dict:
@@ -100,11 +122,20 @@ def _file_meta(store, file_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def _process_one_file(store, file_id: int, gains) -> int:
+def _process_one_file(store, file_id: int, gains, *,
+                      is_retry: bool = False) -> int:
     """Compute + upsert impedance for every animal channel of one file.
 
     Returns the number of channel rows written (0 if the file has no
     animal channels or waveforms).
+
+    *is_retry*: this file already HAS impedance rows and is only being revisited
+    to fill a missing access_r (gain-was-unknown). For those we resolve gain
+    from the cheap session_config read FIRST and bail BEFORE the multi-MB blob
+    read when it still won't resolve -- the recompute would only produce another
+    NULL, and re-reading ~937 such blobs every sweep is what starved the
+    dashboard. New files (no rows yet) always process fully so they leave the
+    missing list.
     """
     meta = _file_meta(store, file_id)
     if meta is None:
@@ -116,7 +147,7 @@ def _process_one_file(store, file_id: int, gains) -> int:
     # multi-MB evoked_waveform blobs = GBs of disk reads that saturated the disk
     # and made the dashboard's Overview builds collide/oscillate (1s <-> minutes).
     session_dir = meta.get("session_dir") or ""
-    present, stim_idx = _session_stim_indices(store, session_dir)
+    present, stim_idx, stim_names = _session_stim_info(store, session_dir)
     if not stim_idx:
         # No stimulated channel -> nothing to compute. If the session config is
         # KNOWN (present) and structurally non-stim, mark the file done so the
@@ -129,6 +160,12 @@ def _process_one_file(store, file_id: int, gains) -> int:
             except Exception:  # noqa: BLE001 -- marker is best-effort
                 logger.exception("mark_impedance_skip failed for file_id=%s",
                                  file_id)
+        return 0
+    # Access-r retry whose gain STILL won't resolve -> skip the blob read; the
+    # recompute can only re-produce NULL. (New files skip this and process fully.)
+    if is_retry and not _any_gain_resolvable(
+            gains, meta.get("session_name") or "",
+            os.path.basename(meta.get("file_path") or ""), stim_names):
         return 0
     waveforms = store.get_evoked_waveform_by_file(file_id)
     if not waveforms:
@@ -195,7 +232,8 @@ def _as_float(x):
 
 
 def refresh_impedance(store, config: dict, *, limit: int | None = None,
-                      log_every: int = 200, throttle_sec: float = 0.0) -> int:
+                      log_every: int = 200, throttle_sec: float = 0.0,
+                      retry_after_hours: float = 24.0) -> int:
     """Backfill/refresh channel_impedance. Returns channel rows written.
 
     Processes files with no impedance yet plus gain-was-missing retries,
@@ -205,25 +243,38 @@ def refresh_impedance(store, config: dict, *, limit: int | None = None,
     YIELDS the disk + WAL write lock to the dashboard instead of starving it
     (the sweep read large per-channel waveform arrays flat-out). 0 = no throttle
     (interactive callers that want it fast).
+
+    *retry_after_hours*: access-resistance RETRY backoff. A stim file whose
+    access_r won't compute (gain unresolvable) otherwise re-enters the retry set
+    EVERY sweep and its multi-MB blobs are re-read for a recompute-to-NULL --
+    ~937 files every 30 min, the dashboard-starving storm. With the backoff such
+    a file is retried at most once per window. Pass 0 to force a full retry
+    (e.g. just after a File_Records gain edit).
     """
     assert store is not None, "store required"
     gains = load_amplifier_gains(config or {})
-    todo = list(store.files_missing_impedance(limit=limit))
-    seen = set(todo)
-    for fid in store.files_needing_access_r(limit=limit):
-        if fid not in seen:
-            todo.append(fid)
-            seen.add(fid)
+    missing = list(store.files_missing_impedance(limit=limit))
+    seen = set(missing)
+    # Access-r retries are rate-limited so a perpetually-unresolvable file
+    # (missing gain) can't be re-read every cycle. These get an attempt stamp
+    # after the pass so the backoff window applies next time.
+    access_r_ids = [fid for fid in store.files_needing_access_r(
+                        limit=limit, retry_after_hours=retry_after_hours)
+                    if fid not in seen]
+    todo = missing + access_r_ids
+    retry_set = set(access_r_ids)
     total = len(todo)
     if total == 0:
         return 0
-    logger.info("Impedance refresh: %d file(s) to compute", total)
+    logger.info("Impedance refresh: %d file(s) to compute (%d new, %d access-r "
+                "retry)", total, len(missing), len(access_r_ids))
     rows = 0
     max_iter = total + 1
     for idx, fid in enumerate(todo):
         assert idx < max_iter, "impedance refresh runaway"
         try:
-            rows += _process_one_file(store, fid, gains)
+            rows += _process_one_file(store, fid, gains,
+                                      is_retry=(fid in retry_set))
         except Exception:
             logger.exception("impedance compute failed for file_id=%s", fid)
         if (idx + 1) % log_every == 0:
@@ -231,6 +282,13 @@ def refresh_impedance(store, config: dict, *, limit: int | None = None,
                         idx + 1, total, rows)
         if throttle_sec:
             time.sleep(throttle_sec)
+    # Stamp the retry attempts (whether or not they resolved -- the ones that DID
+    # compute access_r drop out of files_needing_access_r on their own; the ones
+    # that didn't are now backed off so they stop starving the next sweep).
+    try:
+        store.record_access_r_attempts(access_r_ids)
+    except Exception:
+        logger.exception("recording access-r attempts failed")
     logger.info("Impedance refresh done: %d file(s), %d channel rows",
                 total, rows)
     return rows

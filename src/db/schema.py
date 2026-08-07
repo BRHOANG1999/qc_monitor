@@ -955,4 +955,18 @@ CREATE TABLE IF NOT EXISTS impedance_skip (
     reason    TEXT,
     marked_at TEXT NOT NULL
 );
+
+-- impedance_access_r_attempt: backoff clock for the access-resistance RETRY.
+-- A stim file whose access_r couldn't be computed (usually gain not resolvable
+-- from File_Records) re-enters files_needing_access_r forever; without a clock
+-- the 30-min sweep re-read all ~940 of their multi-MB waveform blobs every cycle
+-- (a pointless recompute-to-NULL) and starved the dashboard. We stamp each
+-- attempt and skip files attempted within the backoff window, so a gain-missing
+-- file is retried at most ~daily (a later File_Records edit still gets picked up,
+-- just not every half hour). Cleared implicitly: once access_r computes, the
+-- file leaves files_needing_access_r regardless of this row.
+CREATE TABLE IF NOT EXISTS impedance_access_r_attempt (
+    file_id      INTEGER PRIMARY KEY,
+    attempted_at TEXT NOT NULL
+);
 """

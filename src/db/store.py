@@ -2038,20 +2038,38 @@ class Store:
         finally:
             conn.close()
 
-    def files_needing_access_r(self, limit: int | None = None
+    def files_needing_access_r(self, limit: int | None = None,
+                               retry_after_hours: float = 24.0
                                ) -> list[int]:
         """Stim files whose channel_impedance rows have no access resistance
         yet (``access_r_kohm IS NULL``) -- the legacy peak/mean rows that
         predate the metric, plus rows that were skipped because the gain was
         unknown (re-tried when a File_Records edit adds it). Non-stim rows
-        (charge NULL/0) are excluded -- they have no stim pulse to measure."""
+        (charge NULL/0) are excluded -- they have no stim pulse to measure.
+
+        Files attempted within *retry_after_hours* are EXCLUDED (see
+        impedance_access_r_attempt): without that backoff the ~937 files whose
+        gain never resolves re-entered this list every 30-min sweep and their
+        multi-MB waveform blobs were re-read each time -- a recompute-to-NULL
+        storm that starved the dashboard. ``retry_after_hours=0`` disables the
+        backoff (a full retry -- e.g. right after a File_Records edit)."""
         conn = self._connect()
         try:
-            sql = ("""SELECT DISTINCT ci.file_id
+            backoff = ""
+            if retry_after_hours and retry_after_hours > 0:
+                # Skip files whose last attempt is newer than the window. NULL
+                # (never attempted) always passes.
+                backoff = (
+                    " AND (aa.attempted_at IS NULL"
+                    f" OR aa.attempted_at < datetime('now','-{float(retry_after_hours)} hours'))")
+            sql = (f"""SELECT DISTINCT ci.file_id
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
+                      LEFT JOIN impedance_access_r_attempt aa
+                             ON aa.file_id = ci.file_id
                       WHERE ci.access_r_kohm IS NULL
                         AND ci.charge_nc IS NOT NULL AND ci.charge_nc > 0
+                        {backoff}
                       ORDER BY pf.chunk_datetime DESC""")
             if limit is not None:
                 sql += f" LIMIT {int(limit)}"
@@ -2059,6 +2077,22 @@ class Store:
             return [int(r["file_id"]) for r in rows]
         finally:
             conn.close()
+
+    def record_access_r_attempts(self, file_ids) -> None:
+        """Stamp ``now`` as the last access-resistance attempt for each file id,
+        so files_needing_access_r's backoff can skip them until the window
+        elapses. Batched in ONE transaction (the whole point is to avoid per-file
+        write churn). No-op on an empty list."""
+        ids = [int(f) for f in (file_ids or [])]
+        if not ids:
+            return
+        now = datetime.now().isoformat()
+        with self.transaction() as conn:
+            conn.executemany(
+                "INSERT INTO impedance_access_r_attempt (file_id, attempted_at)"
+                " VALUES (?,?)"
+                " ON CONFLICT(file_id) DO UPDATE SET attempted_at=excluded.attempted_at",
+                [(fid, now) for fid in ids])
 
     def active_impedance_channel_keys(self) -> set:
         """The ``(animal_id, channel_name)`` set stimulated in the MOST-RECENT
