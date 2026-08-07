@@ -38,11 +38,15 @@ def stimulated_indices(eeg_channels, stim_copy_channels) -> set:
     return {int(i) for i in (eeg_channels or []) if (int(i) - 1) in sc}
 
 
-def _session_stim_indices(store, session_dir: str) -> set:
-    """Stimulated channel index set for a session (empty if unknown /
-    non-stim)."""
+def _session_stim_indices(store, session_dir: str) -> tuple[bool, set]:
+    """``(config_present, stimulated_index_set)`` for a session.
+
+    ``config_present`` separates "session_config row exists but the session is
+    non-stim" (safe to mark done forever via impedance_skip) from "no
+    session_config discovered yet" (may become stim later -- must NOT be
+    skipped). The index set is empty for both non-stim and not-yet-known."""
     if not session_dir:
-        return set()
+        return False, set()
     with store.connection() as conn:
         row = conn.execute(
             """SELECT eeg_channels, stim_copy_channels
@@ -50,13 +54,13 @@ def _session_stim_indices(store, session_dir: str) -> set:
             (session_dir,),
         ).fetchone()
     if not row:
-        return set()
+        return False, set()
     try:
         eeg = json.loads(row["eeg_channels"] or "[]")
         sc = json.loads(row["stim_copy_channels"] or "[]")
     except (json.JSONDecodeError, TypeError):
-        return set()
-    return stimulated_indices(eeg, sc)
+        return True, set()
+    return True, stimulated_indices(eeg, sc)
 
 
 def _stim_params(store, file_id: int, session_dir: str) -> dict:
@@ -112,9 +116,20 @@ def _process_one_file(store, file_id: int, gains) -> int:
     # multi-MB evoked_waveform blobs = GBs of disk reads that saturated the disk
     # and made the dashboard's Overview builds collide/oscillate (1s <-> minutes).
     session_dir = meta.get("session_dir") or ""
-    stim_idx = _session_stim_indices(store, session_dir)
+    present, stim_idx = _session_stim_indices(store, session_dir)
     if not stim_idx:
-        return 0                       # no stimulated channel -> nothing to do
+        # No stimulated channel -> nothing to compute. If the session config is
+        # KNOWN (present) and structurally non-stim, mark the file done so the
+        # sweep never re-scans it -- this is what collapses the perpetual
+        # ~940-file list. If the config isn't discovered yet, leave it: it may
+        # become stim later and should be retried then.
+        if present:
+            try:
+                store.mark_impedance_skip(file_id, "no_stim")
+            except Exception:  # noqa: BLE001 -- marker is best-effort
+                logger.exception("mark_impedance_skip failed for file_id=%s",
+                                 file_id)
+        return 0
     waveforms = store.get_evoked_waveform_by_file(file_id)
     if not waveforms:
         return 0

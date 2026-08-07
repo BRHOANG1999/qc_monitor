@@ -1961,14 +1961,21 @@ class Store:
 
     def files_missing_impedance(self, limit: int | None = None) -> list[int]:
         """File ids that have evoked_waveforms but no channel_impedance row
-        yet, newest recording first (LIFO backfill)."""
+        yet, newest recording first (LIFO backfill).
+
+        Excludes files marked in ``impedance_skip`` (structurally non-stim
+        recordings that can never get an impedance row) -- without that filter
+        the same ~940 non-stim files were returned on EVERY sweep forever,
+        starving the dashboard. See mark_impedance_skip / the impedance_skip
+        table."""
         conn = self._connect()
         try:
             sql = ("""SELECT DISTINCT ew.file_id
                       FROM evoked_waveforms ew
                       JOIN processed_files pf ON pf.id = ew.file_id
                       LEFT JOIN channel_impedance ci ON ci.file_id = ew.file_id
-                      WHERE ci.file_id IS NULL
+                      LEFT JOIN impedance_skip sk ON sk.file_id = ew.file_id
+                      WHERE ci.file_id IS NULL AND sk.file_id IS NULL
                       ORDER BY pf.chunk_datetime DESC""")
             if limit is not None:
                 sql += f" LIMIT {int(limit)}"
@@ -1976,6 +1983,19 @@ class Store:
             return [int(r["file_id"]) for r in rows]
         finally:
             conn.close()
+
+    def mark_impedance_skip(self, file_id: int, reason: str = "no_stim") -> None:
+        """Permanently exclude *file_id* from the impedance backfill sweep.
+
+        Called once the sweep confirms a file's session is structurally
+        non-stimulated (session_config present, no stimCopy-preceded animal
+        channel), so it stops being re-scanned every cycle. Idempotent."""
+        assert file_id is not None, "file_id required"
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO impedance_skip (file_id, reason, marked_at)"
+                " VALUES (?,?,?)",
+                (int(file_id), str(reason), datetime.now().isoformat()))
 
     def purge_nonstimulated_impedance(self) -> int:
         """Delete channel_impedance rows for channels that were only RECORDED,

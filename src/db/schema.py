@@ -941,4 +941,18 @@ CREATE TABLE IF NOT EXISTS ui_snapshot (
     blob       BLOB NOT NULL,
     updated_at REAL NOT NULL
 );
+
+-- impedance_skip: done-marker for files the impedance backfill should NEVER
+-- retry -- structurally non-stimulated recordings (no stimCopy-preceded animal
+-- channel), which by definition never get a channel_impedance row. Without this
+-- marker they stayed in files_missing_impedance FOREVER, so every 30-min sweep
+-- re-iterated all ~940 of them (per-file session_config reads + blob reads for
+-- the genuine stim files), GIL/disk-starving the dashboard for minutes. Marked
+-- once, on the first pass that sees the session_config exists with no stim
+-- channel -- so the sweep list collapses to only genuinely-new files.
+CREATE TABLE IF NOT EXISTS impedance_skip (
+    file_id   INTEGER PRIMARY KEY,
+    reason    TEXT,
+    marked_at TEXT NOT NULL
+);
 """

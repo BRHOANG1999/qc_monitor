@@ -359,7 +359,11 @@ def main():
             # then drift check, on a slower cadence than the health tick.
             if (loop_start - last_impedance_time) > impedance_interval:
                 try:
-                    refresh_impedance(store, config)
+                    # throttle_sec: yield the disk/GIL between files so the
+                    # periodic sweep can't starve the dashboard (the boot sweep
+                    # already throttles; this one used to run flat-out and wedged
+                    # every Overview build for minutes every 30 min).
+                    refresh_impedance(store, config, throttle_sec=0.03)
                     alert_engine.check_impedance_shift()
                     alert_engine.check_current_sag()
                 except Exception as e:
