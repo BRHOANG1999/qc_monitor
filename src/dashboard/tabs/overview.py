@@ -1561,6 +1561,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         return f"rgba({r},{g},{b},{alpha})"
 
+    import numpy as np
     for ri, ch in enumerate(sorted_chs, 1):
         wf = latest_by_ch[ch]
         nm = chan_label[ch]
@@ -1568,6 +1569,13 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         time_ms = wf["time_axis_ms"]
         mean_tr = wf["mean_trace"]
         sem_tr = wf.get("sem_trace")
+        # Hand plotly NUMPY arrays (not Python lists) so Dash figure
+        # serialization takes plotly's fast ndarray branch (one C call) instead
+        # of the per-element list recursion that pins the GIL on the waitress
+        # request thread for seconds. Kept SEPARATE from the list vars above so
+        # every `if not x`/`len()` guard below stays correct.
+        _t = np.asarray(time_ms, dtype=float)
+        _m = np.asarray(mean_tr, dtype=float)
         color = colors_list[(ri - 1) % len(colors_list)]
         band_color = _hex_to_rgba(color, 0.18)
         overlay_color = _hex_to_rgba(color, 0.12)
@@ -1607,17 +1615,18 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
 
         # SEM band: filled ribbon mean±sem, mean drawn on top.
         if trace_mode == "sem" and sem_tr and len(sem_tr) == len(mean_tr):
-            upper = [m + s for m, s in zip(mean_tr, sem_tr)]
-            lower = [m - s for m, s in zip(mean_tr, sem_tr)]
+            _s = np.asarray(sem_tr, dtype=float)
+            upper = _m + _s
+            lower = _m - _s
             for col_idx in (1, 2):
                 thumb_fig.add_trace(go.Scatter(
-                    x=time_ms, y=upper, mode="lines",
+                    x=_t, y=upper, mode="lines",
                     line=dict(color="rgba(0,0,0,0)"),
                     hoverinfo="skip", showlegend=False,
                     legendgroup=lg,
                 ), row=ri, col=col_idx)
                 thumb_fig.add_trace(go.Scatter(
-                    x=time_ms, y=lower, mode="lines",
+                    x=_t, y=lower, mode="lines",
                     fill="tonexty", fillcolor=band_color,
                     line=dict(color="rgba(0,0,0,0)"),
                     hoverinfo="skip", showlegend=False,
@@ -1626,7 +1635,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
 
         # Left panel: LFP mean, zoomed to ±1 ms around stim.
         thumb_fig.add_trace(go.Scatter(
-            x=time_ms, y=mean_tr, mode="lines",
+            x=_t, y=_m, mode="lines",
             name=f"{nm} stim",
             line=dict(color=color, width=1.5),
             showlegend=False, legendgroup=lg,
@@ -1646,7 +1655,7 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
         # carries the channel group so clicking it hides the whole
         # row across both columns.
         thumb_fig.add_trace(go.Scatter(
-            x=time_ms, y=mean_tr, mode="lines",
+            x=_t, y=_m, mode="lines",
             name=f"{nm} (n={n_ep})",
             line=dict(color=color, width=1.5),
             legendgroup=lg,
