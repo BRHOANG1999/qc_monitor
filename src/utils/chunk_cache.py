@@ -10,6 +10,7 @@ with the dashboard.
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from threading import BoundedSemaphore, RLock
 
@@ -105,7 +106,17 @@ def get_chunk(file_path: str, *, transient: bool = False) -> ChunkData:
                 if transient:
                     _od.move_to_end(file_path, last=False)
                 return hit
-        chunk = load_mat(file_path)
+        # In the DASHBOARD process, read the multi-GB .mat in a CHILD process so
+        # the slow SMB read never holds this process's GIL (which would freeze
+        # Overview + every other request while an LFP/Video read is in flight).
+        # The daemon (mass_analyze transient sweeps, QC_DASHBOARD_ROLE unset)
+        # keeps the plain in-process read -- it has no UI to starve. Off-proc
+        # degrades to in-process on any pool failure (see chunk_reader).
+        if os.environ.get("QC_DASHBOARD_ROLE"):
+            from src.utils.chunk_reader import read_chunk_offproc
+            chunk = read_chunk_offproc(file_path)
+        else:
+            chunk = load_mat(file_path)
     assert chunk.signal.ndim == 2, "signal must be 2-D"
 
     with _lock:
