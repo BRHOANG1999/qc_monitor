@@ -1,10 +1,10 @@
 @echo off
 :: ============================================================
-:: QC Monitor — Windows Service Uninstaller (requires Admin)
+:: QC Monitor - Windows Service Uninstaller (requires Admin)
+:: Removes both split services (and the legacy single service).
 :: ============================================================
 setlocal
 
-set SERVICE_NAME=QCMonitor
 set NSSM_EXE=D:\code\qc_monitor\tools\nssm\nssm.exe
 
 net session >nul 2>&1
@@ -20,15 +20,21 @@ if not exist "%NSSM_EXE%" (
     exit /b 1
 )
 
-echo Stopping %SERVICE_NAME%...
-"%NSSM_EXE%" stop %SERVICE_NAME% >nul 2>&1
+call :remove_svc QCMonitorDashboard
+call :remove_svc QCMonitorDaemon
+call :remove_svc QCMonitor
 
-echo Removing %SERVICE_NAME%...
-"%NSSM_EXE%" remove %SERVICE_NAME% confirm
-if %errorlevel% equ 0 (
-    echo Service removed successfully.
-) else (
-    echo Failed to remove service (may not be installed).
-)
-
+echo Done.
 pause
+exit /b 0
+
+:remove_svc
+"%NSSM_EXE%" status %~1 >nul 2>&1
+if %errorlevel% equ 0 (
+    echo Stopping and removing %~1...
+    "%NSSM_EXE%" stop %~1 >nul 2>&1
+    "%NSSM_EXE%" remove %~1 confirm
+) else (
+    echo %~1 not installed - skipping.
+)
+exit /b 0

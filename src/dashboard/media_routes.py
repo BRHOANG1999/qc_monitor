@@ -15,18 +15,74 @@ from flask import abort, g, jsonify, send_file
 
 from src.utils import event_clip as _event_clip
 from src.utils import avi_transcode as _avi
+from src.utils.deadline import call_with_deadline
 from src.utils.video import (video_path_for_mat, companion_video_paths,
                               companion_videos)
 
 logger = logging.getLogger("qc_monitor.dashboard.media")
 
-# Last-frame snapshot cache: (jpeg_bytes, captured_at_ts). The route
-# returns the cached bytes if they're younger than _SNAPSHOT_TTL_SEC
-# so the dashboard's 10-s refresh-trigger doesn't hammer the SMB
-# share + OpenCV pipeline on every tick.
-_SNAPSHOT_TTL_SEC = 8.0
+# Last-frame snapshot cache: (jpeg_bytes, captured_at_ts). A BACKGROUND thread
+# (started in register_media_routes) rebuilds this every _SNAPSHOT_TTL_SEC; the
+# /media/latest-snapshot.jpg route only ever serves the cached bytes and NEVER
+# decodes on the request thread. This matters because the route is on the
+# Overview 10-s auto-refresh path -- decoding a video off the SMB share (cv2,
+# GIL-holding C) on a request thread, under _snapshot_lock, used to stall every
+# dashboard thread each time the cache went cold.
+_SNAPSHOT_TTL_SEC = 8.0               # background rebuild cadence
+_SNAPSHOT_READ_TIMEOUT = 20.0         # bound one decode so a hung share can't wedge the refresher
 _snapshot_cache: dict[str, tuple[bytes, float]] = {}
 _snapshot_lock = threading.Lock()
+_snapshot_refresher_started = False
+_snapshot_start_lock = threading.Lock()
+
+
+def _build_snapshot_jpeg(store):
+    """Decode the newest companion video's last frame into a collage JPEG.
+
+    Returns bytes or None. Does NOT touch _snapshot_lock -- the background
+    refresher stores the result -- so a slow SMB decode never serializes the
+    request threads. This is the heavy work (glob + cv2.VideoCapture off SMB)."""
+    mat_path = _latest_mat_with_video(store)
+    if mat_path is None:
+        return None
+    # Glob every companion _vN.mp4 so multi-camera sessions render side-by-side.
+    video_paths = companion_video_paths(mat_path)
+    if not video_paths:
+        # Fallback to the legacy single-video path so old sessions still resolve.
+        legacy = video_path_for_mat(mat_path)
+        if legacy is None or not os.path.exists(legacy):
+            return None
+        video_paths = [legacy]
+    return _frames_to_collage_jpeg(video_paths)
+
+
+def _refresh_snapshot_loop(store):
+    """Daemon loop: rebuild the snapshot cache every _SNAPSHOT_TTL_SEC, off the
+    request threads, each decode bounded by a deadline so a hung share can't
+    wedge the refresher forever (it just serves the last-good frame)."""
+    it = 0
+    while it < 10_000_000:                 # NASA rule 2: explicit loop bound
+        it += 1
+        try:
+            jpeg = call_with_deadline(lambda: _build_snapshot_jpeg(store),
+                                      _SNAPSHOT_READ_TIMEOUT, default=None)
+            if jpeg is not None:
+                with _snapshot_lock:
+                    _snapshot_cache["latest"] = (jpeg, time.time())
+        except Exception:                  # noqa: BLE001 -- never kill the daemon
+            logger.debug("snapshot refresh failed", exc_info=True)
+        time.sleep(_SNAPSHOT_TTL_SEC)
+
+
+def _start_snapshot_refresher(store):
+    """Start the background snapshot refresher once per process (idempotent)."""
+    global _snapshot_refresher_started
+    with _snapshot_start_lock:
+        if _snapshot_refresher_started:
+            return
+        _snapshot_refresher_started = True
+    threading.Thread(target=_refresh_snapshot_loop, args=(store,),
+                     daemon=True, name="snapshot-refresher").start()
 
 
 def _lookup_mat_path(store, file_id: int) -> str | None:
@@ -135,6 +191,11 @@ def register_media_routes(server, store, config: dict) -> None:
     the whole file. Returns 404 if the file_id is unknown or the video
     doesn't exist on disk.
     """
+    # Rebuild the Overview snapshot JPEG off the request threads (see
+    # _refresh_snapshot_loop) so the 10-s auto-refresh route serves cached bytes
+    # only. Idempotent per process.
+    _start_snapshot_refresher(store)
+
     @server.route("/media/video/<int:file_id>")
     def serve_video(file_id: int):  # pragma: no cover — exercised by browser
         if not getattr(g, "user", None):
@@ -251,42 +312,24 @@ def register_media_routes(server, store, config: dict) -> None:
 
     @server.route("/media/latest-snapshot.jpg")
     def serve_latest_snapshot():  # pragma: no cover -- exercised by browser
-        """Return a JPEG of the most-recently-recorded video's last
-        frame. Cached for _SNAPSHOT_TTL_SEC so the dashboard's
-        per-tick refresh doesn't pummel the SMB share."""
+        """Serve the most recent cached last-frame JPEG. The decode happens in
+        the background refresher (_refresh_snapshot_loop); this handler NEVER
+        touches the SMB share or OpenCV, so a slow decode can't stall the
+        request pool even though this route is on the 10-s auto-refresh path."""
         if not getattr(g, "user", None):
             abort(403)
         with _snapshot_lock:
             cached = _snapshot_cache.get("latest")
-            now = time.time()
-            if cached and (now - cached[1]) < _SNAPSHOT_TTL_SEC:
-                jpeg, captured_at = cached
-            else:
-                mat_path = _latest_mat_with_video(store)
-                if mat_path is None:
-                    abort(404,
-                            description="No recorded videos available")
-                # Glob every companion _vN.mp4 so multi-camera
-                # sessions render side-by-side instead of dropping
-                # all but the first camera.
-                video_paths = companion_video_paths(mat_path)
-                if not video_paths:
-                    # Fallback to legacy single-video path so old
-                    # sessions still resolve cleanly.
-                    legacy = video_path_for_mat(mat_path)
-                    if legacy is None or not os.path.exists(legacy):
-                        abort(404,
-                                description="Companion video not on disk")
-                    video_paths = [legacy]
-                jpeg = _frames_to_collage_jpeg(video_paths)
-                if jpeg is None:
-                    abort(500,
-                            description="Could not decode any video frame")
-                captured_at = now
-                _snapshot_cache["latest"] = (jpeg, captured_at)
+        if not cached:
+            # Cold: the refresher hasn't produced a frame yet (fresh boot) or
+            # there's no companion video. Do NOT decode here -- just say so; the
+            # <img> shows its broken/placeholder state and recovers on the next
+            # tick once the background thread lands a frame.
+            abort(404, description="Snapshot not ready")
+        jpeg, _captured_at = cached
         resp = send_file(io.BytesIO(jpeg), mimetype="image/jpeg",
                          conditional=False)
-        # Tell the browser this is cheap to re-fetch -- cache buster
-        # is the ?t=… query string the dashboard appends each tick.
+        # Cheap to re-fetch -- the cache buster is the ?t=… the dashboard
+        # appends each tick.
         resp.headers["Cache-Control"] = "no-store, must-revalidate"
         return resp

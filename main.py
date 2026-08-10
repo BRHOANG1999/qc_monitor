@@ -173,6 +173,17 @@ def main():
     except Exception:
         logger.exception("mass_analyze worker start failed")
 
+    # Event-clip extractor (ffmpeg) worker. Historically started ONLY from
+    # create_app (the dashboard), so a headless daemon (--no-dashboard, i.e. the
+    # split topology) never drained event_clip_job. Start it here so the DAEMON
+    # owns it; start_worker is idempotent (a no-op if already started in this
+    # process), so single-process mode is unaffected.
+    try:
+        from src.utils import event_clip as _event_clip
+        _event_clip.start_worker(store, config)
+    except Exception:
+        logger.exception("event_clip worker start failed")
+
     # Pre-ictal CWT sweep worker (thesis subsystem). Idempotent; a no-op when
     # preictal is disabled in config. Heavy CWT compute runs off the main loop.
     try:

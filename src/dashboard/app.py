@@ -319,28 +319,48 @@ def create_app(config: dict, store: Store) -> Dash:
     # clock (daemon thread). Idempotent; no-op when disabled in config.
     from src.utils import operator_log as _operator_log
     _operator_log.start_warmer(config, store)
+    # Process role. When this IS the standalone dashboard process
+    # (dashboard_main.py sets QC_DASHBOARD_ROLE before create_app), the DAEMON
+    # process owns the sustained writers -- the dashboard must NOT also start
+    # them or they double-drain their job queues. In the single-process topology
+    # (flag unset) behaviour is byte-for-byte unchanged: the dashboard starts
+    # them and main.py's start is the idempotent no-op it has always been.
+    _is_dashboard_role = bool(os.environ.get("QC_DASHBOARD_ROLE"))
+
     # Persist the performance ledger across restarts so the "which Overview
     # processes are slow" history accumulates instead of resetting every boot.
     # A JSON file next to the DB (NOT in the DB -- perf writes must not add to
     # SQLite write-lock contention). Flushes on a daemon timer; loads on boot.
     try:
         _db_path = config.get("database", {}).get("path", "data/monitor.db")
+        # Two processes must not fight one ledger file: the split dashboard gets
+        # its own default name so the daemon's ledger stays separate.
+        _ledger_name = ("perf_ledger_dashboard.json" if _is_dashboard_role
+                        else "perf_ledger.json")
         _perf_path = (config.get("dashboard", {}).get("perf_ledger_path")
                       or os.path.join(os.path.dirname(_db_path) or ".",
-                                      "perf_ledger.json"))
+                                      _ledger_name))
         _perf_flush = float(config.get("dashboard", {})
                             .get("perf_flush_sec", 60))
         _perf.start_persistence(_perf_path, _perf_flush)
     except Exception as _e:  # noqa: BLE001 -- observability must never block boot
         log.warning("perf ledger persistence disabled: %s", _e)
 
-    # Spawn the PI verification event-clip extractor worker.
-    # Daemon thread that drains event_clip_job 'pending' rows
-    # via ffmpeg. Idempotent across reloads.
-    _event_clip.start_worker(store, config)
-    # Mass Analyze (PI bulk pre-screen) worker. Drains
-    # mass_analyze_job rows; same idempotent pattern.
-    _mass_analyze.start_worker(store, config)
+    # Sustained-writer workers (ffmpeg clip extraction + PI mass-analyze). These
+    # drain job queues and write continuously, so exactly ONE process must own
+    # them. In the split topology the daemon owns them (see main.py); the
+    # dashboard process skips them. In single-process mode we start them here as
+    # always.
+    if _is_dashboard_role:
+        log.info("dashboard role: daemon owns event_clip + mass_analyze; "
+                 "not starting them in the dashboard process")
+    else:
+        # Daemon thread that drains event_clip_job 'pending' rows via ffmpeg.
+        _event_clip.start_worker(store, config)
+        # Mass Analyze (PI bulk pre-screen) worker; drains mass_analyze_job rows.
+        _mass_analyze.start_worker(store, config)
+        log.info("single-process mode: event_clip + mass_analyze workers "
+                 "started in-process")
 
     assets_dir = os.path.join(os.path.dirname(__file__), "assets")
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
