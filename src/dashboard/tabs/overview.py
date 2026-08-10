@@ -367,7 +367,8 @@ _HOME_ROW_STYLE = {
 def _collapsible(title: str, content, *, open_default: bool = True,
                   badge: str | None = None,
                   badge_color: str | None = None,
-                  full_width: bool = False):
+                  full_width: bool = False,
+                  title_color: str = "#ddd"):
     """Section wrapped in a native <details> element so the user can
     collapse anything they don't want to see.
 
@@ -379,7 +380,7 @@ def _collapsible(title: str, content, *, open_default: bool = True,
     """
     summary_children = [
         html.Span(title, style={
-            "color": "#ddd", "fontSize": "12px", "fontWeight": "600",
+            "color": title_color, "fontSize": "12px", "fontWeight": "600",
             "letterSpacing": "0.2px",
         }),
     ]
@@ -2952,12 +2953,7 @@ def _build_gain_blocked_card(store):
     total = sum(int(b["files"]) for b in blocked)
     who = ", ".join(f"{b['animal_id']} ({b['files']})" for b in blocked[:8])
     extra = (f"  (+{len(blocked) - 8} more animal(s))" if len(blocked) > 8 else "")
-    return html.Div([
-        html.Div(
-            f"⚠ {total} recording(s) have no impedance — amplifier gain missing "
-            f"from File_Records",
-            style={"color": "#ffd60a", "fontWeight": "700", "fontSize": "13px",
-                   "marginBottom": "4px"}),
+    body = html.Div([
         html.Div(f"Blocked animals: {who}{extra}",
                  style={"color": "#f0f0f5", "fontSize": "12px",
                         "marginBottom": "4px"}),
@@ -2965,10 +2961,18 @@ def _build_gain_blocked_card(store):
                  "recomputes access resistance on the next impedance sweep — no "
                  "restart needed.",
                  style={"color": "#a0a0b0", "fontSize": "11px"}),
-    ], style={"marginBottom": "12px", "padding": "10px 14px",
-              "background": "rgba(255,214,10,0.08)",
-              "border": "1px solid rgba(255,214,10,0.35)",
-              "borderRadius": "8px"})
+    ])
+    # Collapsed by default -- it's a standing data-entry advisory, not an alert
+    # that needs to occupy the fold every load. The ⚠ + amber title + count badge
+    # keep it noticeable in the collapsed summary.
+    return _collapsible(
+        f"⚠ {total} recording(s) have no impedance — amplifier gain missing "
+        f"from File_Records",
+        body,
+        open_default=False,
+        badge=str(total),
+        badge_color="rgba(255,214,10,0.85)",
+        title_color="#ffd60a")
 
 
 def _build_behavioral_seizure_status_card(store, config=None):
@@ -4798,14 +4802,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
                 with _perf.Timer("overview:cards"):
-                    # SPREAD the pills list -- _build_overview_cards returns a
-                    # LIST, and html.Div([list, footer]) nests a list inside
-                    # children, which Dash 4.1.0's renderer does not recurse into
-                    # (the inner components arrive as raw {type,namespace,props}
-                    # dicts -> React error #31 -> the whole strip renders blank).
-                    # A flat [pill, pill, ..., footer] renders correctly.
-                    pills = html.Div([*_build_overview_cards(store),
-                                      _freshness_footer(time.time())])
+                    # overview-cards is itself the flex/wrap ROW, so return the
+                    # pills as a FLAT list straight into it -- an extra html.Div
+                    # wrapper would be a single block child and stack the pills
+                    # vertically. The footer is wrapped as a full-width flex item
+                    # (flexBasis:100%) so it drops onto its own line below the
+                    # row. (Flat list, not a nested [list, footer]: nesting a list
+                    # in children triggers React #31 in Dash 4.1.0 -> blank strip.)
+                    pills = [*_build_overview_cards(store),
+                             html.Div(_freshness_footer(time.time()),
+                                      style={"flexBasis": "100%"})]
                 with _perf.Timer("overview:queue"):
                     queue = _build_overview_queue(store)
                 return (pills, queue)
