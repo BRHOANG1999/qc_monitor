@@ -58,6 +58,12 @@ _NOMINAL_CHUNK_SEC = 3600.0
 
 # Summary-tab header -> the value key we compute. Columns not listed here
 # (MouseID, Comments/Notes) are left untouched.
+# The recording electrodes in this cohort (the lab records each animal on the
+# SR and/or SLM electrode). Each gets its OWN gap columns because an animal is
+# often recorded on one electrode while the other pair is idle, so a per-
+# electrode timeline has different gaps than the cumulative animal timeline.
+_GAP_ELECTRODES = ("SLM", "SR")
+
 _DERIVED_COLUMNS = {
     "KA location": "ka_location",
     "Surgeon": "surgeon",
@@ -71,16 +77,26 @@ _DERIVED_COLUMNS = {
     "Electrode(s) recorded": "electrodes",
     "Earliest recording": "earliest_date",
     "Latest recording": "latest_date",
-    "Recording coverage %": "coverage_pct",
-    "# recording gaps (>2h)": "gap_count",
-    "Total gap time (h)": "gap_total_h",
-    "Largest gap (h)": "gap_max_h",
-    "Smallest gap (h)": "gap_min_h",
+    # Cumulative animal timeline: a recording counts once regardless of how many
+    # electrodes it carried.
+    "Animal coverage %": "coverage_pct",
+    "Animal # gaps (>2h)": "gap_count",
+    "Animal total gap (h)": "gap_total_h",
+    "Animal largest gap (h)": "gap_max_h",
+    "Animal smallest gap (h)": "gap_min_h",
+}
+# Per-electrode gap columns (core 3: coverage %, # gaps, total gap) for each
+# electrode, built here so the set stays DRY and extensible.
+for _e in _GAP_ELECTRODES:
+    _DERIVED_COLUMNS[f"{_e} coverage %"] = f"{_e.lower()}_coverage_pct"
+    _DERIVED_COLUMNS[f"{_e} # gaps (>2h)"] = f"{_e.lower()}_gap_count"
+    _DERIVED_COLUMNS[f"{_e} total gap (h)"] = f"{_e.lower()}_gap_total_h"
+_DERIVED_COLUMNS.update({
     "Earliest file": "earliest_file",
     "Latest file": "latest_file",
     "Last updated": "last_updated",
     "QC Monitor version": "qc_version",
-}
+})
 
 
 def _norm_animal(raw: str) -> str:
@@ -186,24 +202,27 @@ def _update_extrema(slot: dict, dt: datetime, basename: str) -> None:
         slot["last_file"] = basename
 
 
-def _recording_gaps(dts: list, first_dt, last_dt) -> dict:
-    """Gap stats for one animal's recording timeline. A gap = a break between
-    consecutive recording starts longer than _GAP_THRESHOLD_H; its size is the
-    elapsed time minus one nominal chunk (so a contiguous hourly run yields ~0).
+def _recording_gaps(dts: list) -> dict:
+    """Gap stats for a recording timeline (animal-cumulative or per-electrode).
+    A gap = a break between consecutive recording starts longer than
+    _GAP_THRESHOLD_H; its size is the elapsed time minus one nominal chunk (so a
+    contiguous hourly run yields ~0). Bounds (first/last) are the min/max of
+    *dts* -- pass the full list for the animal, or one electrode's subset.
 
     Returns {gap_count, gap_total_h, gap_max_h, gap_min_h, coverage_pct}; the
-    numeric gap fields are '' when there are no gaps. Coverage = recorded span
+    numeric gap fields are '' when there are no gaps and coverage_pct is '' when
+    the timeline is empty (electrode never recorded). Coverage = recorded span
     minus total gap time, over the full span, clamped to [0, 100]%.
     """
     assert isinstance(dts, list), "dts must be a list"
     empty = {"gap_count": 0, "gap_total_h": "", "gap_max_h": "",
              "gap_min_h": "", "coverage_pct": ""}
-    if first_dt is None or last_dt is None or len(dts) < 2:
-        # A single (or zero) parseable file: nothing spans, so 100% by fiat.
-        if first_dt is not None and last_dt is not None:
-            empty["coverage_pct"] = "100%"
+    if len(dts) < 2:
+        # 0 files -> '' coverage (not recorded); 1 file -> spans nothing -> 100%.
+        empty["coverage_pct"] = "100%" if len(dts) == 1 else ""
         return empty
     ordered = sorted(dts)
+    first_dt, last_dt = ordered[0], ordered[-1]
     gaps: list = []
     nominal_h = _NOMINAL_CHUNK_SEC / 3600.0
     for i in range(len(ordered) - 1):
@@ -225,10 +244,11 @@ def _recording_gaps(dts: list, first_dt, last_dt) -> dict:
 
 def _new_stat_slot() -> dict:
     """A per-animal accumulator: recording time plus earliest/latest file, the
-    electrode set, and every parsed recording datetime (for gap detection)."""
+    electrode set, every parsed recording datetime (cumulative, for animal-level
+    gaps), and per-electrode datetime lists (for per-electrode gaps)."""
     return {"total_sec": 0.0, "analyzed_sec": 0.0, "first_dt": None,
             "first_file": "", "last_dt": None, "last_file": "",
-            "electrodes": set(), "dts": []}
+            "electrodes": set(), "dts": [], "dts_by_elec": {}}
 
 
 def _recording_stats_per_animal(store) -> dict:
@@ -277,7 +297,9 @@ def _recording_stats_per_animal(store) -> dict:
                 slot["analyzed_sec"] += dur
             slot["electrodes"].update(electrodes)
             if dt:
-                slot["dts"].append(dt)
+                slot["dts"].append(dt)          # cumulative animal timeline
+                for e in electrodes:            # per-electrode timelines
+                    slot["dts_by_elec"].setdefault(e, []).append(dt)
                 _update_extrema(slot, dt, basename)
     return out
 
@@ -337,12 +359,13 @@ def _fmt_hours(sec: float) -> float:
 
 def _validation_cols(r: dict, last_updated: str, qc_version: str) -> dict:
     """The per-animal validation / provenance columns (electrodes, earliest &
-    latest date + file, gap stats, run stamp + version) from a stat slot *r*."""
+    latest date + file, cumulative + per-electrode gap stats, run stamp +
+    version) from a stat slot *r*."""
     assert isinstance(r, dict), "stat slot required"
     assert last_updated, "last_updated required"
     first_dt, last_dt = r["first_dt"], r["last_dt"]
-    gaps = _recording_gaps(r["dts"], first_dt, last_dt)
-    return {
+    gaps = _recording_gaps(r["dts"])            # cumulative animal timeline
+    cols = {
         "electrodes": ", ".join(sorted(r["electrodes"])),
         "earliest_date": first_dt.strftime("%Y-%m-%d %H:%M") if first_dt else "",
         "latest_date": last_dt.strftime("%Y-%m-%d %H:%M") if last_dt else "",
@@ -356,6 +379,15 @@ def _validation_cols(r: dict, last_updated: str, qc_version: str) -> dict:
         "last_updated": last_updated,
         "qc_version": qc_version,
     }
+    # Per-electrode gaps: a blank row means the animal was never recorded on
+    # that electrode (its pair was used instead).
+    for e in _GAP_ELECTRODES:
+        eg = _recording_gaps(r["dts_by_elec"].get(e, []))
+        key = e.lower()
+        cols[f"{key}_coverage_pct"] = eg["coverage_pct"]
+        cols[f"{key}_gap_count"] = eg["gap_count"] if eg["coverage_pct"] else ""
+        cols[f"{key}_gap_total_h"] = eg["gap_total_h"]
+    return cols
 
 
 def compute_rows(store, config: dict) -> list[dict]:
@@ -415,10 +447,10 @@ def compute_rows(store, config: dict) -> list[dict]:
 
 
 def _print_preview(rows: list[dict]) -> None:
-    hdr = ("animal", "ka_location", "surgeon", "_ka_date", "_first_dt",
-           "time_from_ka", "bh_sz_2wk", "recording_time", "bh_sz_total",
-           "bh_sz_rate", "electrodes", "earliest_date", "latest_date",
-           "coverage_pct", "gap_count", "gap_total_h", "qc_version")
+    hdr = ("animal", "electrodes", "earliest_date", "latest_date",
+           "coverage_pct", "gap_count", "gap_total_h",
+           "slm_coverage_pct", "slm_gap_count", "sr_coverage_pct",
+           "sr_gap_count", "qc_version")
     print("  ".join(f"{h:>14}" for h in hdr))
     for r in rows:
         print("  ".join(f"{str(r.get(h,'')):>14}" for h in hdr))
