@@ -2854,6 +2854,16 @@ def _overview_tab(store: Store, config: dict | None = None):
         dcc.Interval(id="overview-mount-thumb", interval=900, max_intervals=1),
         dcc.Interval(id="overview-mount-mid", interval=1400, max_intervals=1),
         dcc.Interval(id="overview-mount-stim", interval=2400, max_intervals=1),
+        # SLOW refresh (90s) for the heavy, low-priority cards. The 10s
+        # refresh-trigger drives ONLY the cheap pills + queue; the expensive
+        # builds (stim/electrode umbrella 12-38s, Google-Sheets home-grid + KM
+        # log 6-38s, behavioral-seizure status 17s) were re-firing on every 10s
+        # tick and, being slower than the interval, saturated the dashboard's
+        # single GIL and starved the pills + left column. Those cards move here
+        # so they still auto-refresh, just at a cadence that leaves the GIL free
+        # for the high-priority cards. Each still paints immediately via its
+        # overview-mount-* one-shot on tab open.
+        dcc.Interval(id="overview-slow-refresh", interval=90_000),
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         gain_blocked,   # ⚠ impedance blocked on missing File_Records gain (or empty)
@@ -4800,7 +4810,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("overview-zss", "children"),
         Output("overview-current-fidelity", "children"),
         Output("overview-region-drift", "children"),
-        Input("refresh-trigger", "data"),
+        Input("overview-slow-refresh", "n_intervals"),  # 90s, not the 10s trigger
         Input("overview-mount-stim", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
@@ -4830,12 +4840,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # slow/unreachable Sheets read never blocks the DB cards above.
     @app.callback(
         Output("overview-home-grid", "children"),
-        Input("refresh-trigger", "data"),
+        Input("overview-slow-refresh", "n_intervals"),  # 90s, not the 10s trigger
         Input("overview-mount-mid", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def _fill_home_grid(_n, _mount, current_tab):
+    def _fill_home_grid(_slow, _mount, current_tab):
         if current_tab != "overview":
             return no_update
         from datetime import date as _date
@@ -4847,12 +4857,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # KM-log summary (Google Sheets) -- own callback + 120s cache, same reason.
     @app.callback(
         Output("overview-km-log", "children"),
-        Input("refresh-trigger", "data"),
+        Input("overview-slow-refresh", "n_intervals"),  # 90s, not the 10s trigger
         Input("overview-mount-mid", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def _fill_km_log(_n, _mount, current_tab):
+    def _fill_km_log(_slow, _mount, current_tab):
         if current_tab != "overview":
             return no_update
         return _guarded_card(
@@ -4865,12 +4875,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     # that callback's sequential build. Mount + refresh-trigger, tab-gated.
     @app.callback(
         Output("overview-bsz-status", "children"),
-        Input("refresh-trigger", "data"),
+        Input("overview-slow-refresh", "n_intervals"),  # 90s, not the 10s trigger
         Input("overview-mount-bsz", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
-    def _fill_bsz_status(_n, _mount, current_tab):
+    def _fill_bsz_status(_slow, _mount, current_tab):
         if current_tab != "overview":
             return no_update
         # Single-flight + 45s cache (see _BSZ_CACHE): stops the every-10s pile-up
