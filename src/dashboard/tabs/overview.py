@@ -2561,6 +2561,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         ]),
         open_default=False)
     matlab_failed = _build_matlab_failed_card(store)
+    gain_blocked = _build_gain_blocked_card(store)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
@@ -2855,6 +2856,7 @@ def _overview_tab(store: Store, config: dict | None = None):
         dcc.Interval(id="overview-mount-stim", interval=2400, max_intervals=1),
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
+        gain_blocked,   # ⚠ impedance blocked on missing File_Records gain (or empty)
         bsz_status,    # per-animal seizure analysis status
         top_section,   # sidebar | (Evoked + Channel Map) | (Today + KM + Snapshot + Alerts)
         stim_health,   # collapsed umbrella of all stim/electrode diagnostics
@@ -2917,6 +2919,39 @@ def _build_matlab_failed_card(store):
     ], style={"marginBottom": "12px", "padding": "10px 14px",
               "background": "rgba(255,69,58,0.08)",
               "border": "1px solid rgba(255,69,58,0.35)",
+              "borderRadius": "8px"})
+
+
+def _build_gain_blocked_card(store):
+    """Amber banner naming animals whose impedance can't be computed because their
+    amplifier GAIN is missing from the File_Records sheet -- a silent data-entry
+    gap that otherwise just looks like 'no impedance yet' forever (BCH040's 663
+    files were invisibly stuck this way). Empty Div when nothing is blocked."""
+    try:
+        blocked = store.files_blocked_on_missing_gain()
+    except Exception:  # noqa: BLE001
+        blocked = []
+    if not blocked:
+        return html.Div()
+    total = sum(int(b["files"]) for b in blocked)
+    who = ", ".join(f"{b['animal_id']} ({b['files']})" for b in blocked[:8])
+    extra = (f"  (+{len(blocked) - 8} more animal(s))" if len(blocked) > 8 else "")
+    return html.Div([
+        html.Div(
+            f"⚠ {total} recording(s) have no impedance — amplifier gain missing "
+            f"from File_Records",
+            style={"color": "#ffd60a", "fontWeight": "700", "fontSize": "13px",
+                   "marginBottom": "4px"}),
+        html.Div(f"Blocked animals: {who}{extra}",
+                 style={"color": "#f0f0f5", "fontSize": "12px",
+                        "marginBottom": "4px"}),
+        html.Div("Add each animal's gain to the File_Records sheet; the daemon "
+                 "recomputes access resistance on the next impedance sweep — no "
+                 "restart needed.",
+                 style={"color": "#a0a0b0", "fontSize": "11px"}),
+    ], style={"marginBottom": "12px", "padding": "10px 14px",
+              "background": "rgba(255,214,10,0.08)",
+              "border": "1px solid rgba(255,214,10,0.35)",
               "borderRadius": "8px"})
 
 

@@ -61,7 +61,10 @@ def main() -> None:
     # dev server automatically if waitress isn't installed (_serve_waitress).
     dash_cfg = config.setdefault("dashboard", {})
     dash_cfg["use_waitress"] = True
-    dash_cfg.setdefault("waitress_threads", 16)
+    # 16, not the shared-process default of 8: this process no longer competes
+    # with the daemon for the GIL, and 8 threads convoyed (observed waitress
+    # queue depth 16). Override rather than setdefault so config's 8 doesn't win.
+    dash_cfg["waitress_threads"] = 16
 
     # run_dashboard builds create_app(config, store) and serves it via waitress
     # (or the threaded dev server) exactly as the in-process dashboard did.

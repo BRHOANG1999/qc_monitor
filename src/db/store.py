@@ -2094,6 +2094,25 @@ class Store:
                 " ON CONFLICT(file_id) DO UPDATE SET attempted_at=excluded.attempted_at",
                 [(fid, now) for fid in ids])
 
+    def files_blocked_on_missing_gain(self) -> list[dict]:
+        """Animals whose recordings can't get an access-resistance (impedance)
+        value because their amplifier GAIN is missing from the File_Records
+        sheet -- gain NULL leaves access_r NULL forever. Returns
+        ``[{animal_id, files}]`` (distinct files) ordered by count desc. Surfaced
+        on Overview so this silent data-entry gap stops being invisible."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT animal_id, COUNT(DISTINCT file_id) AS files "
+                "FROM channel_impedance "
+                "WHERE gain IS NULL AND access_r_kohm IS NULL "
+                "  AND animal_id IS NOT NULL AND animal_id != '' "
+                "GROUP BY animal_id ORDER BY files DESC").fetchall()
+            return [{"animal_id": r["animal_id"], "files": int(r["files"])}
+                    for r in rows]
+        finally:
+            conn.close()
+
     def active_impedance_channel_keys(self) -> set:
         """The ``(animal_id, channel_name)`` set stimulated in the MOST-RECENT
         stim recording session -- i.e. the animals currently on the rig.
