@@ -1501,23 +1501,17 @@ def _build_overview_thumbnail(store: Store, config: dict | None,
             logger.debug("Could not load waveform thumbnail: %s", e)
             waveforms = []
     if not waveforms:
-        # The newest session may not yet have QC dispatcher-populated
-        # evoked_waveforms rows; the toolkit's evokedOutput folder already
-        # holds the processed traces, so fall back to the latest file there.
-        # That fallback scans a network share + h5py-reads a ~100s-of-MB .mat;
-        # bound it so a hung share can't wedge this build (and _THUMB_LOCK).
-        with _perf.Timer("overview:thumb-fetch-share-fallback"):
-            res = call_with_deadline(
-                lambda: _latest_evoked_from_output(config),
-                _THUMB_READ_TIMEOUT, default=None)
-        if res is None:                      # timed out reading the share
-            logger.warning("Latest-evoked fallback read timed out (%.0fs)",
-                           _THUMB_READ_TIMEOUT)
-            return _thumb_unavailable(
-                "Latest-evoked source is slow or unreachable")
-        waveforms, _ = res
-    if not waveforms:
-        return [html.Div()]
+        # No DB evoked_waveforms for the newest session yet (the daemon is still
+        # processing it). We used to fall back to h5py-reading the latest .mat off
+        # the SMB share here -- but that read HOLDS THIS (dashboard) process's GIL
+        # for seconds, and it fired on EVERY refresh (the newest session is
+        # perpetually unprocessed while recording), starving the Overview DB
+        # cards behind it. So skip the share read on the refresh path and show a
+        # placeholder; the thumbnail fills once the daemon writes the waveforms.
+        # (The "Recent recordings" overlay mode still reads the share, but only on
+        # explicit user selection and off a background worker.)
+        return _thumb_unavailable("Latest recording still processing "
+                                  "(no evoked data in the DB yet)")
 
     fa_cfg = (config or {}).get("feature_analysis", {}) or {}
     evoked_x0 = float(fa_cfg.get("analysis_start_ms", 2.0))
@@ -4610,13 +4604,11 @@ def start_overview_warmer(store: Store, config: dict) -> None:
                 cache.get(build, label=label)
             except Exception as e:  # noqa: BLE001
                 logger.warning("overview warm failed (%s): %s", label, e)
-        # Warm the recent-recordings overlay too (own background worker).
-        try:
-            sig, files = _hist24_file_set(config)
-            if sig and files:
-                _kick_hist24(sig, files)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("overview hist24 warm-kick failed: %s", e)
+        # NOTE: intentionally NOT pre-warming the hist24 "recent recordings"
+        # overlay here -- it h5py-reads ~24 .mat files off the SMB share, which
+        # holds this process's GIL and stalled the Overview cards on boot (and it
+        # was returning 0 channels anyway). It builds on demand when the user
+        # selects "Recent recordings".
         logger.info("overview caches warmed")
 
     threading.Thread(target=_warm, daemon=True, name="overview-warmer").start()
