@@ -28,7 +28,11 @@ logger = logging.getLogger("qc_monitor.dashboard.media")
 # Overview 10-s auto-refresh path -- decoding a video off the SMB share (cv2,
 # GIL-holding C) on a request thread, under _snapshot_lock, used to stall every
 # dashboard thread each time the cache went cold.
-_SNAPSHOT_TTL_SEC = 8.0               # background rebuild cadence
+_SNAPSHOT_TTL_SEC = 30.0              # background rebuild cadence (was 8s: the cv2
+                                     # decode holds the GIL ~2-3s each pass, so a
+                                     # tight loop occupied ~30% of the dashboard's
+                                     # GIL and starved the Overview cards. A live
+                                     # cage snapshot every 30s is plenty.)
 _SNAPSHOT_READ_TIMEOUT = 20.0         # bound one decode so a hung share can't wedge the refresher
 _snapshot_cache: dict[str, tuple[bytes, float]] = {}
 _snapshot_lock = threading.Lock()
