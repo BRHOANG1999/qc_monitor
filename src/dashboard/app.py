@@ -900,24 +900,43 @@ def create_app(config: dict, store: Store) -> Dash:
             function green(op){return style('#30d158','1px solid rgba(48,209,88,0.35)',op);}
             var now = Date.now();
             var ctx = dc.callback_context;
-            var trig = (ctx && ctx.triggered && ctx.triggered.length)
-                ? ctx.triggered[0].prop_id : '';
+            var triggered = (ctx && ctx.triggered) ? ctx.triggered : [];
+            // Scan ALL triggered inputs, not just [0]: when the tab body
+            // (tab-content) lands in the same ~200ms update round as a
+            // nav-load-tick, the tick could be triggered[0] and STEAL the
+            // trigger, so the "Ready" branch never ran and -- since tab-content
+            // only changes once per tab switch -- the pill stuck on "Loading"
+            // forever. Checking membership fixes that permanently.
+            var hasContent = false, hasTab = false, hasTick = false;
+            for (var i = 0; i < triggered.length; i++) {
+                var pid = triggered[i].prop_id || '';
+                if (pid.indexOf('tab-content') === 0) hasContent = true;
+                else if (pid.indexOf('tabs.value') === 0) hasTab = true;
+                else if (pid.indexOf('nav-load-tick') === 0) hasTick = true;
+            }
+            // Server delivered the current tab's body -> flash "Ready" (checked
+            // FIRST so it always wins the round).
+            if (hasContent) {
+                return ['\\u25cf Ready', green(1), {loading: 0, readyAt: now}];
+            }
             // Tab clicked -> start the loading clock for the tab being viewed
             // (fires instantly, before the server has built anything).
-            if (trig.indexOf('tabs.value') === 0 && tabValue) {
+            if (hasTab && tabValue) {
                 var label = (labelMap && labelMap[tabValue])
                     ? labelMap[tabValue] : tabValue;
                 return ['\\u23f3 Loading ' + label + '\\u2026 0.0s', amber(),
                         {loading: 1, label: label, t0: now}];
             }
-            // Server delivered the current tab's body -> flash "Ready".
-            if (trig.indexOf('tab-content') === 0) {
-                return ['\\u25cf Ready', green(1), {loading: 0, readyAt: now}];
-            }
             // Timer tick.
-            if (trig.indexOf('nav-load-tick') === 0) {
+            if (hasTick) {
                 if (st && st.loading && st.t0) {   // still loading: tick elapsed
                     var secs = (now - st.t0) / 1000;
+                    if (secs > 120) {              // hard cap: never count forever
+                        var capped = {};
+                        for (var ck in (st || {})) capped[ck] = st[ck];
+                        capped.loading = 0; capped.hidden = 1;
+                        return [nu, green(0), capped];
+                    }
                     var txt = '\\u23f3 Loading ' + (st.label || '')
                         + '\\u2026 ' + secs.toFixed(1) + 's';
                     if (secs >= 8) {
