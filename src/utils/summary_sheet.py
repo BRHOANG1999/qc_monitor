@@ -103,7 +103,15 @@ _DERIVED_COLUMNS.update({
     "Latest file": "latest_file",
     "Last updated": "last_updated",
     "QC Monitor version": "qc_version",
+    # Plain-language finalize-readiness verdict for the advisor (see
+    # _reliability_flag): 'OK', or 'Check: <reasons>'.
+    "Reliability": "reliability",
 })
+
+# Thresholds that make a row "Check" (not finalize-ready). Kept as named
+# constants so the verdict logic is auditable and easy to tune.
+_MIN_ANALYZED_FRAC = 0.50      # <50% reviewed -> lean on unverified data
+_MIN_COVERAGE_PCT = 80.0       # <80% coverage -> gappy recording
 
 
 def _norm_animal(raw: str) -> str:
@@ -364,6 +372,36 @@ def _fmt_hours(sec: float) -> float:
     return round(sec / 3600.0, 1)
 
 
+def _reliability_flag(r: dict, coverage_pct: str) -> str:
+    """Finalize-readiness verdict for one animal: 'OK', or 'Check: <reasons>'.
+
+    Flags the two data-quality signals that make the auto Sz/rate numbers
+    untrustworthy: too little of the recording actually reviewed in Video Review
+    (analyzed fraction) and a gappy recording (low coverage). Electrode count is
+    NOT a reason -- a single-electrode implant can still be reliable and is
+    already visible in the Electrode(s) column.
+    """
+    assert isinstance(r, dict), "stat slot required"
+    tot = r["total_sec"]
+    if tot <= 0:
+        return "Check: no recording"
+    reasons: list = []
+    frac = r["analyzed_sec"] / tot
+    if frac <= 0:
+        reasons.append("not analyzed (imported)")
+    elif frac < _MIN_ANALYZED_FRAC:
+        reasons.append(f"{frac * 100:.0f}% analyzed")
+    cov = None
+    if coverage_pct and coverage_pct.endswith("%"):
+        try:
+            cov = float(coverage_pct[:-1])
+        except ValueError:
+            cov = None
+    if cov is not None and cov < _MIN_COVERAGE_PCT:
+        reasons.append(f"{coverage_pct} coverage")
+    return "OK" if not reasons else "Check: " + "; ".join(reasons)
+
+
 def _validation_cols(r: dict, last_updated: str, qc_version: str) -> dict:
     """The per-animal validation / provenance columns (electrodes, earliest &
     latest date + file, cumulative + per-electrode gap stats, run stamp +
@@ -385,6 +423,7 @@ def _validation_cols(r: dict, last_updated: str, qc_version: str) -> dict:
         "latest_file": r["last_file"],
         "last_updated": last_updated,
         "qc_version": qc_version,
+        "reliability": _reliability_flag(r, gaps["coverage_pct"]),
     }
     # Per-electrode gaps: a blank row means the animal was never recorded on
     # that electrode (its pair was used instead).
