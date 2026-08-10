@@ -218,15 +218,14 @@ def _protocol_options(store, animal):
 
 
 def _default_protocol(store, animal) -> str:
-    """Default to the animal's chronicStim group when it exists (the intended
-    zero-click view), else all protocols. Must return a value that is an actual
-    option -- the folder token is parameterized (chronicStim-5nC-2nC), so a bare
-    'chronicStim' would be an invalid selection that Dash silently blanks."""
-    if not animal:
-        return ""
-    toks = sorted(_sm.session_dir_by_token(store, animal).keys())
-    chronic = [t for t in toks if "chronicstim" in t.lower()]
-    return chronic[0] if chronic else ""
+    """Default to ALL protocols ('') so the explorer organizes by SEIZURE across
+    every experimental context, not by one protocol folder. Two differently-named
+    protocols with equivalent stim are merged downstream by stim FINGERPRINT (the
+    seizure label + marker symbol), so scoping to a single folder would wrongly
+    hide equivalent seizures. The protocol dropdown stays available as an OPTIONAL
+    narrowing filter. (store/animal kept for signature compatibility with callers.)"""
+    _ = (store, animal)
+    return ""
 
 
 def _animals_a0(store):
@@ -1234,11 +1233,18 @@ def _render_trajectory(tr, ylabel, cap) -> go.Figure:
 # --------------------------------------------------------------------- #
 
 def _seizure_labels(full) -> dict:
-    """{seizure_idx: 'R{racine} · MM-DD HH:MM'} from the matrix, for the forest
-    row labels."""
+    """{seizure_idx: 'R{racine} · MM-DD HH:MM · <stim group>'} from the matrix.
+
+    The stim group is the hardware stim FINGERPRINT (charge/pulse-width/freq/gain),
+    NOT the protocol folder name, so two differently-named protocols with
+    equivalent stim carry the SAME group label -- the point of organizing by
+    seizure with a stim-group label rather than by protocol folder."""
     out: dict = {}
-    g = full.groupby("seizure_idx")[["seizure_onset_epoch",
-                                     "seizure_racine"]].first()
+    cols = ["seizure_onset_epoch", "seizure_racine"]
+    has_stim = "stim_key" in full.columns
+    if has_stim:
+        cols.append("stim_key")
+    g = full.groupby("seizure_idx")[cols].first()
     for sid, row in g.iterrows():
         try:
             when = datetime.fromtimestamp(
@@ -1247,7 +1253,12 @@ def _seizure_labels(full) -> dict:
             when = "?"
         rac = row["seizure_racine"]
         rac = int(rac) if np.isfinite(rac) else "?"
-        out[int(sid)] = f"R{rac} · {when}"
+        label = f"R{rac} · {when}"
+        if has_stim:
+            sk = row["stim_key"]
+            if isinstance(sk, str) and sk:
+                label += f" · {sk}"
+        out[int(sid)] = label
     return out
 
 
@@ -1420,6 +1431,34 @@ def _cap_seconds(cap_val, cap_unit) -> float:
     return sec if sec > 0 else _pal.DEFAULT_TIME_CAP_SEC
 
 
+# Distinct marker symbols for the stim-group (fingerprint) dimension. Chosen to
+# stay visually separable at size 4 and to render on Scattergl.
+_STIM_SYMBOLS = ("circle", "triangle-up", "square", "diamond", "cross",
+                 "star", "triangle-down", "x", "pentagon", "hexagon")
+
+
+def _stim_symbol_map(stim_vals) -> dict:
+    """Map each stim group (fingerprint) to a distinct marker symbol, in
+    first-seen order. {group_str: plotly_symbol}."""
+    seen: list = []
+    for v in stim_vals:
+        s = str(v)
+        if s not in seen:
+            seen.append(s)
+    return {g: _STIM_SYMBOLS[i % len(_STIM_SYMBOLS)]
+            for i, g in enumerate(seen)}
+
+
+def _symbol_legend_traces(sym_map) -> list:
+    """Legend-only (off-canvas) traces so the marker SYMBOL -> stim-group mapping
+    is readable next to the seizure colour. Neutral grey = 'shape means group'."""
+    return [go.Scattergl(
+        x=[None], y=[None], mode="markers", name=g, showlegend=True,
+        legendgroup="stimgroup", hoverinfo="skip",
+        marker=dict(size=8, symbol=sym, color="#c8c8d4", line=dict(width=0)))
+        for g, sym in sym_map.items()]
+
+
 def _figure(emb, sub, color_by, method, meta, cap_sec=None) -> go.Figure:
     if emb is None or emb.shape[0] == 0:
         return empty_fig("No lead-up stimuli for this selection")
@@ -1430,14 +1469,23 @@ def _figure(emb, sub, color_by, method, meta, cap_sec=None) -> go.Figure:
         return _finish_fig(
             empty_fig(f"‘{color_by}’ is evoked-only — not defined for the "
                       "passive pre-stim window"), method, meta)
+    # Encode the stim GROUP (fingerprint) as marker SYMBOL whenever we're not
+    # already colouring by it -- so seizure colour + stim-group shape read at
+    # once. Only when there's more than one group (else a symbol adds no info).
+    sym = None
+    if "stim_key" in sub and color_by != "stim_key":
+        svals = sub["stim_key"].astype(str).to_numpy()
+        smap = _stim_symbol_map(svals)
+        if len(smap) > 1:
+            sym = {"vals": svals, "map": smap}
     n_unique = int(sub[color_by].nunique())
-    fig = (_categorical_fig(emb, sub, color_by)
+    fig = (_categorical_fig(emb, sub, color_by, sym)
            if _pal.is_categorical(color_by, n_unique)
-           else _continuous_fig(emb, sub, color_by, cap_sec))
+           else _continuous_fig(emb, sub, color_by, cap_sec, sym))
     return _finish_fig(fig, method, meta)
 
 
-def _continuous_fig(emb, sub, color_by, cap_sec=None) -> go.Figure:
+def _continuous_fig(emb, sub, color_by, cap_sec=None, sym=None) -> go.Figure:
     spec = _pal.continuous_spec(color_by, sub[color_by].to_numpy(dtype=float),
                                 cap_sec)
     cbar = dict(title=dict(text=spec["label"], font=dict(size=9)),
@@ -1449,6 +1497,8 @@ def _continuous_fig(emb, sub, color_by, cap_sec=None) -> go.Figure:
                   reversescale=spec["reverse"], showscale=True, colorbar=cbar)
     if spec["cmin"] is not None:
         marker["cmin"], marker["cmax"] = spec["cmin"], spec["cmax"]
+    if sym is not None:                      # stim group -> marker symbol
+        marker["symbol"] = [sym["map"][s] for s in sym["vals"]]
     kw = dict(x=emb[:, 0], y=emb[:, 1], mode="markers", marker=marker,
               customdata=np.arange(emb.shape[0]))
     if color_by == "time_to_onset_sec":
@@ -1458,7 +1508,17 @@ def _continuous_fig(emb, sub, color_by, cap_sec=None) -> go.Figure:
         kw["hovertemplate"] = "time to onset: %{text}<extra></extra>"
     else:
         kw["hovertemplate"] = f"{spec['label']}: %{{marker.color:.2f}}<extra></extra>"
-    return go.Figure(go.Scattergl(**kw))
+    fig = go.Figure(go.Scattergl(**kw))
+    if sym is not None:
+        # Colour rides a COLORBAR here, so the legend is free for the symbol->group
+        # key -- one clean legend for stim group, colorbar for seizure.
+        for t in _symbol_legend_traces(sym["map"]):
+            fig.add_trace(t)
+        fig.update_layout(showlegend=True,
+                          legend=dict(title="stim group (marker)", orientation="h",
+                                      y=1.02, yanchor="bottom", font=dict(size=9),
+                                      itemsizing="constant"))
+    return fig
 
 
 def _fmt_dur(s) -> str:
@@ -1472,7 +1532,7 @@ def _fmt_dur(s) -> str:
     return f"{s / 3600:.1f} h"
 
 
-def _categorical_fig(emb, sub, color_by) -> go.Figure:
+def _categorical_fig(emb, sub, color_by, sym=None) -> go.Figure:
     raw = sub[color_by].astype(str).to_numpy()
     order, disp = _pal.fold_categories(raw)
     shown = np.array([disp[x] for x in raw])
@@ -1480,11 +1540,17 @@ def _categorical_fig(emb, sub, color_by) -> go.Figure:
     fig = go.Figure()
     for k, name in enumerate(order):
         m = shown == name
+        marker = dict(size=4, opacity=0.65, color=_pal.hue_for(name, k))
+        if sym is not None:                  # stim group -> marker symbol
+            marker["symbol"] = [sym["map"][s] for s in sym["vals"][m]]
         fig.add_trace(go.Scattergl(
             x=emb[m, 0], y=emb[m, 1], mode="markers", name=name, showlegend=True,
-            marker=dict(size=4, opacity=0.65, color=_pal.hue_for(name, k)),
+            legendgroup="color", marker=marker,
             customdata=row_idx[m],
             hovertemplate=f"{_pretty(color_by)}: {name}<extra></extra>"))
+    if sym is not None:                      # symbol->group key alongside the colours
+        for t in _symbol_legend_traces(sym["map"]):
+            fig.add_trace(t)
     # Force the legend even for a single category (Plotly hides a 1-trace legend
     # by default) so a single-valued colour-by reads as "one value here", not as
     # a broken control.
@@ -2304,7 +2370,10 @@ def register_callbacks(app, store, config):
         keyed on pex-variant (that only scopes the other lenses)."""
         copts = _colorby_options("evoked")
         cvals = {o["value"] for o in copts}
-        return copts, (cur if cur in cvals else "time_to_onset_sec")
+        # Default to SEIZURE so the embedding organizes by seizure out of the box
+        # (stim group rides along as the marker symbol); keep the user's choice
+        # if they've already picked one.
+        return copts, (cur if cur in cvals else "seizure_idx")
 
     @app.callback(
         Output("pex-traj-y", "options"),
