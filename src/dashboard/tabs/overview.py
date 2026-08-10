@@ -1070,6 +1070,11 @@ def _evoked_channels_to_waveforms(chans: dict, latest_dt) -> list[dict]:
 # *_evoked.mat every few seconds. Invalidates when the file changes.
 _EVOKED_FALLBACK_CACHE: dict = {"key": None, "value": ([], "")}
 
+# Memoize the snapshot caption's camera count by file_path -- companion_video_
+# paths globs the SMB share (GIL-holding), and the caption callback fires every
+# refresh tick. Keyed by the newest-video file_path (changes ~hourly).
+_SNAP_CAM_CACHE: dict = {}
+
 
 def _latest_evoked_from_output(config: dict | None) -> tuple[list[dict], str]:
     """Per-channel mean traces from the most recent ``*_evoked.mat`` in
@@ -5005,11 +5010,21 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             ).fetchone()
         if not row or not row["chunk_datetime"]:
             return src, "No videos available"
-        from src.utils.video import companion_video_paths
-        try:
-            n_cams = len(companion_video_paths(row["file_path"] or ""))
-        except Exception:
-            n_cams = 0
+        # Camera count for the caption. companion_video_paths GLOBS the SMB
+        # share -- a GIL-holding read that used to fire every 10s tick here and
+        # stall the Overview builds. Memoize by file_path: the newest recording
+        # changes ~hourly, so the glob now runs at most once per new file.
+        fp = row["file_path"] or ""
+        n_cams = _SNAP_CAM_CACHE.get(fp)
+        if n_cams is None:
+            from src.utils.video import companion_video_paths
+            try:
+                n_cams = len(companion_video_paths(fp))
+            except Exception:  # noqa: BLE001
+                n_cams = 0
+            _SNAP_CAM_CACHE[fp] = n_cams
+            while len(_SNAP_CAM_CACHE) > 64:      # bound the memo
+                _SNAP_CAM_CACHE.pop(next(iter(_SNAP_CAM_CACHE)))
         cam_tag = (f" · {n_cams} cameras" if n_cams > 1
                     else "")
         start_dt = _parse_chunk_dt(row["chunk_datetime"])
