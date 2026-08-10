@@ -46,6 +46,8 @@ def _worker(path: str, tmp_dir: str) -> dict:
     """CHILD process: load the .mat, dump ONLY the signal to a local .npy, and
     return small metadata + that path. The big array never crosses the pipe."""
     sys.path.insert(0, _REPO_ROOT)                 # child import safety
+    from src.utils.offproc_guard import mark_worker
+    mark_worker()                                  # this IS an allowed off-proc reader
     from src.utils.mat_loader import load_mat
     import numpy as _np
     cd = load_mat(path)

@@ -101,82 +101,11 @@ def _latest_mat_with_video(store) -> str | None:
         return row["file_path"] if row else None
 
 
-def _read_last_frame(video_path: str):
-    """Open *video_path* with OpenCV, seek as close to the end as the
-    container allows, return the decoded frame (BGR ndarray) or None.
-    """
-    try:
-        import cv2  # noqa: WPS433
-    except Exception as e:
-        logger.warning("OpenCV not available: %s", e)
-        return None
-    cap = cv2.VideoCapture(video_path)
-    try:
-        if not cap.isOpened():
-            logger.debug("VideoCapture refused %s", video_path)
-            return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total > 1:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total - 2))
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            return None
-        return frame
-    finally:
-        cap.release()
-
-
-def _frames_to_collage_jpeg(video_paths: list[str],
-                              max_width: int = 720) -> bytes | None:
-    """Stitch each video's last frame side-by-side (cv2.hconcat) and
-    encode the collage as a single JPEG. Frames are first resized to
-    the shortest input height to avoid upscaling. Skips videos that
-    fail to decode; returns None if every video fails.
-
-    Multi-camera sessions (cage A + cage B etc.) drop multiple
-    ``_vN.mp4`` next to one .mat; this lets the dashboard show all
-    of them in a single thumbnail without juggling separate <img>
-    elements + Flask round-trips.
-    """
-    try:
-        import cv2  # noqa: WPS433
-    except Exception as e:
-        logger.warning("OpenCV not available: %s", e)
-        return None
-    frames = []
-    for vp in video_paths:
-        f = _read_last_frame(vp)
-        if f is not None:
-            frames.append(f)
-    if not frames:
-        return None
-    # Normalise heights so hconcat doesn't fail. Use the shortest
-    # input as the target so we never up-scale (preserves detail).
-    target_h = min(f.shape[0] for f in frames)
-    norm = []
-    for f in frames:
-        h, w = f.shape[:2]
-        if h == target_h:
-            norm.append(f)
-            continue
-        scale = target_h / float(h)
-        new_w = max(1, int(round(w * scale)))
-        norm.append(cv2.resize(f, (new_w, target_h),
-                                interpolation=cv2.INTER_AREA))
-    collage = cv2.hconcat(norm)
-    # Downscale collage if it exceeds max_width so we don't ship a
-    # 3 K pixel-wide JPEG to the dashboard.
-    h, w = collage.shape[:2]
-    if w > max_width:
-        scale = max_width / float(w)
-        new_size = (max_width, max(1, int(round(h * scale))))
-        collage = cv2.resize(collage, new_size,
-                              interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", collage,
-                             [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    if not ok:
-        return None
-    return bytes(buf.tobytes())
+# NOTE: the cv2 last-frame decode (_read_last_frame / _frames_to_collage_jpeg)
+# moved to src/utils/snapshot_reader.py and runs in an OFF-PROCESS worker -- the
+# invariant is that the dashboard package never decodes video on a thread it
+# owns (see offproc_guard + tests/test_dashboard_offproc_invariant.py). The
+# snapshot route here serves only cached bytes produced by that worker.
 
 
 def register_media_routes(server, store, config: dict) -> None:

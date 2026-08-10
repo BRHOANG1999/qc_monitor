@@ -33,6 +33,8 @@ _pool_lock = threading.Lock()
 def _read_last_frame(video_path: str):
     """Open *video_path* with OpenCV, seek near the end, return the decoded
     frame (BGR ndarray) or None. Runs in the CHILD process."""
+    from src.utils.offproc_guard import require_offproc
+    require_offproc("cv2 video decode")   # invariant: never on a dashboard thread
     try:
         import cv2
     except Exception as e:  # noqa: BLE001
@@ -88,6 +90,8 @@ def _worker(mat_path: str):
     """CHILD process: resolve the companion videos for *mat_path* (share glob) and
     decode their last-frame collage to JPEG bytes. Returns bytes or None."""
     sys.path.insert(0, _REPO_ROOT)
+    from src.utils.offproc_guard import mark_worker
+    mark_worker()                         # allowed off-proc reader
     import os as _os
     from src.utils.video import companion_video_paths, video_path_for_mat
     video_paths = companion_video_paths(mat_path)

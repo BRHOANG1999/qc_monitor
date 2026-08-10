@@ -20,6 +20,12 @@ class ChunkData:
 
 def load_mat(path: str) -> ChunkData:
     """Load a KMrecorder .mat file. Handles both v5 and v7.3 formats."""
+    from src.utils.offproc_guard import require_offproc
+    # INVARIANT: in the dashboard process, .mat reads must run in an off-proc
+    # worker, never on a thread the dashboard owns (else the slow share read
+    # freezes the UI). Raises loudly here instead of silently freezing. No-op in
+    # the daemon and inside the off-proc reader workers. See offproc_guard.
+    require_offproc("load_mat")
     from src.utils.mirror import local_first
     # Read from the fast local rolling mirror when this file is mirrored; falls
     # back to the SMB share for anything outside the window. No-op when the
