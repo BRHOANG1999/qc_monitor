@@ -71,6 +71,13 @@ logger = logging.getLogger("qc_monitor.dashboard.overview")
 # (so a wedged build is visible instead of silently skipping every later tick).
 _REFRESH_LOCK = SingleFlight("overview-cards")
 
+# Separate guard for the 4 stim/electrode cards. They were bundled into
+# refresh_overview_dynamic with the status pills + review queue, so a slow
+# impedance build (the heaviest Overview card) held the pills on the placeholder
+# for its whole duration. Splitting them onto their own callback + lock lets the
+# high-priority pills paint immediately.
+_STIM_LOCK = SingleFlight("overview-stim-cards")
+
 
 class _CachedBuilder:
     """Single-flight + stale-while-revalidate cache for an expensive card build.
@@ -2830,9 +2837,22 @@ def _overview_tab(store: Store, config: dict | None = None):
         badge_color=stim_badge_color)
 
     return html.Div([
-        # Fires once, ~120ms after the shell mounts, to kick the card-fill
-        # callbacks (they also listen to refresh-trigger for periodic updates).
+        # PRIORITY LOAD ORDER. Each card-fill callback is kicked by one of these
+        # staggered one-shot intervals so the page fills top-to-bottom by
+        # importance instead of all ~10 callbacks firing at once (which convoyed
+        # the 8-thread pool and left the high-value pills waiting). Highest first:
+        #   120ms  status pills + review queue   (overview-mount)
+        #   450ms  behavioral-seizure status     (overview-mount-bsz)
+        #   900ms  Latest-Evoked thumbnail       (overview-mount-thumb)
+        #   1400ms lab home grid + KM log        (overview-mount-mid)
+        #   2400ms stim/electrode umbrella (bottom, lowest) (overview-mount-stim)
+        # All fills ALSO listen to refresh-trigger, so this only orders the
+        # INITIAL paint; periodic refresh keeps everything fresh thereafter.
         dcc.Interval(id="overview-mount", interval=120, max_intervals=1),
+        dcc.Interval(id="overview-mount-bsz", interval=450, max_intervals=1),
+        dcc.Interval(id="overview-mount-thumb", interval=900, max_intervals=1),
+        dcc.Interval(id="overview-mount-mid", interval=1400, max_intervals=1),
+        dcc.Interval(id="overview-mount-stim", interval=2400, max_intervals=1),
         cards,         # pills strip, full width
         matlab_failed,  # ⚠ recordings that failed MATLAB processing (or empty)
         bsz_status,    # per-animal seizure analysis status
@@ -4709,36 +4729,56 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("overview-cards", "children"),
         Output("overview-queue", "children"),
-        Output("overview-impedance", "children"),
-        Output("overview-zss", "children"),
-        Output("overview-current-fidelity", "children"),
-        Output("overview-region-drift", "children"),
         Input("refresh-trigger", "data"),
         Input("overview-mount", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
     def refresh_overview_dynamic(_n, _mount, current_tab):
-        nout = (no_update,) * 6
+        # HIGHEST-PRIORITY cards: status pills + review queue only. The 4 heavy
+        # stim cards were split into _fill_stim_cards (own lock) so the pills no
+        # longer wait behind the slow impedance build.
+        nout = (no_update, no_update)
         if current_tab != "overview":
             return nout
-        # Single-flight: don't let a slow tick overlap itself. These cards are
-        # all bounded DB reads (busy_timeout 30s) so a stall self-clears; the
-        # watchdog just logs loudly if one ever wedges.
         if not _REFRESH_LOCK.try_begin():
             _REFRESH_LOCK.warn_if_stalled()
             return nout
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
-                # Time EACH card separately (not the 6 as one blurry label) so
-                # the Performance tab / persisted ledger names the exact slow
-                # builder instead of "the refresh is slow". Freshness stamp under
-                # the pills answers "is it live or frozen?" at a glance.
                 with _perf.Timer("overview:cards"):
                     pills = html.Div([_build_overview_cards(store),
                                       _freshness_footer(time.time())])
                 with _perf.Timer("overview:queue"):
                     queue = _build_overview_queue(store)
+                return (pills, queue)
+        finally:
+            _REFRESH_LOCK.end()
+
+    # Stim/electrode cards (impedance / Zss / current-fidelity / region drift):
+    # OWN callback + lock. They live in the collapsed "Electrode & stimulation
+    # health" umbrella and are the heaviest Overview builds; bundling them with
+    # the pills made the pills wait for them. Now they fill independently and
+    # never block the high-priority pills/queue.
+    @app.callback(
+        Output("overview-impedance", "children"),
+        Output("overview-zss", "children"),
+        Output("overview-current-fidelity", "children"),
+        Output("overview-region-drift", "children"),
+        Input("refresh-trigger", "data"),
+        Input("overview-mount-stim", "n_intervals"),
+        State("tabs", "value"),
+        prevent_initial_call=True,
+    )
+    def _fill_stim_cards(_n, _mount, current_tab):
+        nout = (no_update,) * 4
+        if current_tab != "overview":
+            return nout
+        if not _STIM_LOCK.try_begin():
+            _STIM_LOCK.warn_if_stalled()
+            return nout
+        try:
+            with _perf.Timer("cb:overview-stim-cards"):
                 with _perf.Timer("overview:impedance"):
                     imp = _build_impedance_trend_card(store, config)
                 with _perf.Timer("overview:zss"):
@@ -4747,16 +4787,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     fid = _build_current_fidelity_card(store, config)
                 with _perf.Timer("overview:region"):
                     region = _build_region_drift_card(store, config)
-                return (pills, queue, imp, zss, fid, region)
+                return (imp, zss, fid, region)
         finally:
-            _REFRESH_LOCK.end()
+            _STIM_LOCK.end()
 
     # Home grid (Google Sheets) -- own callback + 120s single-flight cache so a
     # slow/unreachable Sheets read never blocks the DB cards above.
     @app.callback(
         Output("overview-home-grid", "children"),
         Input("refresh-trigger", "data"),
-        Input("overview-mount", "n_intervals"),
+        Input("overview-mount-mid", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
@@ -4773,7 +4813,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("overview-km-log", "children"),
         Input("refresh-trigger", "data"),
-        Input("overview-mount", "n_intervals"),
+        Input("overview-mount-mid", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
@@ -4791,7 +4831,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     @app.callback(
         Output("overview-bsz-status", "children"),
         Input("refresh-trigger", "data"),
-        Input("overview-mount", "n_intervals"),
+        Input("overview-mount-bsz", "n_intervals"),
         State("tabs", "value"),
         prevent_initial_call=True,
     )
@@ -4914,7 +4954,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("refresh-trigger", "data"),
         Input("overview-hist24-poll", "n_intervals"),
         Input("overview-hist24-n", "value"),
-        Input("overview-mount", "n_intervals"),
+        Input("overview-mount-thumb", "n_intervals"),
         State("overview-thumb-sig", "data"),
         State("tabs", "value"),
     )
