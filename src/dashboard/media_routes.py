@@ -15,7 +15,7 @@ from flask import abort, g, jsonify, send_file
 
 from src.utils import event_clip as _event_clip
 from src.utils import avi_transcode as _avi
-from src.utils.deadline import call_with_deadline
+from src.utils.snapshot_reader import decode_snapshot_offproc
 from src.utils.video import (video_path_for_mat, companion_video_paths,
                               companion_videos)
 
@@ -41,35 +41,27 @@ _snapshot_start_lock = threading.Lock()
 
 
 def _build_snapshot_jpeg(store):
-    """Decode the newest companion video's last frame into a collage JPEG.
-
-    Returns bytes or None. Does NOT touch _snapshot_lock -- the background
-    refresher stores the result -- so a slow SMB decode never serializes the
-    request threads. This is the heavy work (glob + cv2.VideoCapture off SMB)."""
+    """Resolve the newest companion video (DB, fast) then decode its last-frame
+    collage in a CHILD process (snapshot_reader.decode_snapshot_offproc), so the
+    slow SMB glob + cv2 decode never hold THIS process's GIL -- that decode was
+    the last in-dashboard share reader starving the Overview card builds (found
+    via py-spy). Returns JPEG bytes or None."""
     mat_path = _latest_mat_with_video(store)
     if mat_path is None:
         return None
-    # Glob every companion _vN.mp4 so multi-camera sessions render side-by-side.
-    video_paths = companion_video_paths(mat_path)
-    if not video_paths:
-        # Fallback to the legacy single-video path so old sessions still resolve.
-        legacy = video_path_for_mat(mat_path)
-        if legacy is None or not os.path.exists(legacy):
-            return None
-        video_paths = [legacy]
-    return _frames_to_collage_jpeg(video_paths)
+    return decode_snapshot_offproc(mat_path)
 
 
 def _refresh_snapshot_loop(store):
-    """Daemon loop: rebuild the snapshot cache every _SNAPSHOT_TTL_SEC, off the
-    request threads, each decode bounded by a deadline so a hung share can't
-    wedge the refresher forever (it just serves the last-good frame)."""
+    """Daemon loop: rebuild the snapshot cache every _SNAPSHOT_TTL_SEC. The heavy
+    glob + cv2 decode run OFF-PROCESS (decode_snapshot_offproc), which waits with
+    the GIL released and is itself deadline-bounded, so a slow/hung share can
+    neither wedge the refresher nor freeze the dashboard."""
     it = 0
     while it < 10_000_000:                 # NASA rule 2: explicit loop bound
         it += 1
         try:
-            jpeg = call_with_deadline(lambda: _build_snapshot_jpeg(store),
-                                      _SNAPSHOT_READ_TIMEOUT, default=None)
+            jpeg = _build_snapshot_jpeg(store)
             if jpeg is not None:
                 with _snapshot_lock:
                     _snapshot_cache["latest"] = (jpeg, time.time())
