@@ -341,10 +341,16 @@ def _guarded_card(cache: "_CachedBuilder", build, *, label: str, title: str):
             return _stalled_banner(title, inflight)
         return no_update                      # keep the ⏳ placeholder
     footer = _freshness_footer(cache.built_at())
+    # A builder may return a LIST (home-grid, KM-log tiles) or a single
+    # component (bsz card). html.Div([list, footer]) nests a list inside
+    # children, which Dash 4.1.0 fails to render (raw component dicts reach
+    # React -> error #31 -> blank card). Spread lists so children is always a
+    # FLAT sequence of components.
+    kids = children if isinstance(children, list) else [children]
     if stalled:
         return html.Div([_stalled_banner(title, inflight, compact=True),
-                         children, footer])
-    return html.Div([children, footer])
+                         *kids, footer])
+    return html.Div([*kids, footer])
 
 
 # Shared row style for the "today at the lab" home-grid block rows.
@@ -4792,7 +4798,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         try:
             with _perf.Timer("cb:overview-auto-refresh"):
                 with _perf.Timer("overview:cards"):
-                    pills = html.Div([_build_overview_cards(store),
+                    # SPREAD the pills list -- _build_overview_cards returns a
+                    # LIST, and html.Div([list, footer]) nests a list inside
+                    # children, which Dash 4.1.0's renderer does not recurse into
+                    # (the inner components arrive as raw {type,namespace,props}
+                    # dicts -> React error #31 -> the whole strip renders blank).
+                    # A flat [pill, pill, ..., footer] renders correctly.
+                    pills = html.Div([*_build_overview_cards(store),
                                       _freshness_footer(time.time())])
                 with _perf.Timer("overview:queue"):
                     queue = _build_overview_queue(store)
