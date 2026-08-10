@@ -344,7 +344,7 @@ def create_app(config: dict, store: Store) -> Dash:
                             .get("perf_flush_sec", 60))
         _perf.start_persistence(_perf_path, _perf_flush)
     except Exception as _e:  # noqa: BLE001 -- observability must never block boot
-        log.warning("perf ledger persistence disabled: %s", _e)
+        logger.warning("perf ledger persistence disabled: %s", _e)
 
     # Sustained-writer workers (ffmpeg clip extraction + PI mass-analyze). These
     # drain job queues and write continuously, so exactly ONE process must own
@@ -352,15 +352,15 @@ def create_app(config: dict, store: Store) -> Dash:
     # dashboard process skips them. In single-process mode we start them here as
     # always.
     if _is_dashboard_role:
-        log.info("dashboard role: daemon owns event_clip + mass_analyze; "
-                 "not starting them in the dashboard process")
+        logger.info("dashboard role: daemon owns event_clip + mass_analyze; "
+                    "not starting them in the dashboard process")
     else:
         # Daemon thread that drains event_clip_job 'pending' rows via ffmpeg.
         _event_clip.start_worker(store, config)
         # Mass Analyze (PI bulk pre-screen) worker; drains mass_analyze_job rows.
         _mass_analyze.start_worker(store, config)
-        log.info("single-process mode: event_clip + mass_analyze workers "
-                 "started in-process")
+        logger.info("single-process mode: event_clip + mass_analyze workers "
+                    "started in-process")
 
     assets_dir = os.path.join(os.path.dirname(__file__), "assets")
     app = Dash(__name__, title="QC Monitor", suppress_callback_exceptions=True,
