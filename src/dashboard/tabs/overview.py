@@ -4805,13 +4805,15 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     # overview-cards is itself the flex/wrap ROW, so return the
                     # pills as a FLAT list straight into it -- an extra html.Div
                     # wrapper would be a single block child and stack the pills
-                    # vertically. The footer is wrapped as a full-width flex item
-                    # (flexBasis:100%) so it drops onto its own line below the
-                    # row. (Flat list, not a nested [list, footer]: nesting a list
-                    # in children triggers React #31 in Dash 4.1.0 -> blank strip.)
+                    # vertically. The freshness stamp sits at the RIGHT END of the
+                    # SAME row (marginLeft:auto pushes it there; alignSelf centers
+                    # it against the pills). (Flat list, not a nested [list,
+                    # footer]: nesting a list in children triggers React #31 in
+                    # Dash 4.1.0 -> blank strip.)
                     pills = [*_build_overview_cards(store),
                              html.Div(_freshness_footer(time.time()),
-                                      style={"flexBasis": "100%"})]
+                                      style={"marginLeft": "auto",
+                                             "alignSelf": "center"})]
                 with _perf.Timer("overview:queue"):
                     queue = _build_overview_queue(store)
                 return (pills, queue)
