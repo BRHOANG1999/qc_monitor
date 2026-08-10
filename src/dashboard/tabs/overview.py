@@ -957,7 +957,8 @@ def _build_overview_cards(store: Store):
     net_ok = latest.get("network_share_accessible")
     cpu = latest.get("cpu_pct", 0)
     mem = latest.get("memory_pct", 0)
-    disk = latest.get("disk_free_gb", 0)
+    disk_pc = latest.get("disk_free_gb", 0)       # analysis PC's own drive
+    disk_data = latest.get("data_disk_free_gb")   # recording share (where data lands)
     fph = latest.get("files_processed_last_hour", 0)
     # Video QC: 24-hour status mix. Color reflects worst severity in
     # the window (critical > warning > ok). Empty window stays gray.
@@ -972,20 +973,33 @@ def _build_overview_cards(store: Store):
         vid_label = f"{n_ok}/{n_warn}/{n_crit}"
     else:
         vid_label = "—"
+    # Muted palette: a healthy value should read as CALM, not shout. Only
+    # attention states (warning amber / critical red) get a loud color; "good"
+    # is a quiet slate-gray close to the surface so the strip stops reading as a
+    # wall of green noise.
+    calm = "#8890a4"
     vid_color = ("#EF553B" if n_crit
                   else "#FFA15A" if n_warn
-                  else "#00CC96" if n_ok
+                  else calm if n_ok
                   else "#666")
+
+    def _disk_color(gb):
+        # Low free space is the only disk state worth a loud color.
+        return "#EF553B" if (gb is not None and gb <= 50) else calm
+
     return [
         _status_pill("Network", "OK" if net_ok else "DOWN",
-                     "#00CC96" if net_ok else "#EF553B"),
+                     calm if net_ok else "#EF553B"),
         _status_pill("CPU", f"{cpu:.0f}%",
-                     "#00CC96" if cpu < 80 else "#FFA15A"),
+                     calm if cpu < 80 else "#FFA15A"),
         _status_pill("Memory", f"{mem:.0f}%",
-                     "#00CC96" if mem < 85 else "#FFA15A"),
-        _status_pill("Disk Free", _fmt_disk_space(disk),
-                     "#00CC96" if disk > 50 else "#EF553B"),
-        _status_pill("Files/Hour", str(fph), "#636EFA"),
+                     calm if mem < 85 else "#FFA15A"),
+        # Two disks, delineated: where recordings actually land vs this PC.
+        _status_pill("Data Free",
+                     _fmt_disk_space(disk_data) if disk_data is not None else "—",
+                     _disk_color(disk_data)),
+        _status_pill("PC Free", _fmt_disk_space(disk_pc), _disk_color(disk_pc)),
+        _status_pill("Files/Hour", str(fph), calm),
         _status_pill("Videos (24h)", vid_label, vid_color),
     ]
 

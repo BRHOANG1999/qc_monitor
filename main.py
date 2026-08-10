@@ -48,10 +48,23 @@ def health_snapshot(watcher: FileWatcher, store: Store, queue_depth: int,
     # snapshot survives a move off D:\ (e.g., a non-Windows host running
     # tests, or a future deployment on a different drive letter).
     disk = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path)) or ".")
+    # Also report free space on the PRIMARY DATA DRIVE -- the recording share
+    # where chunks are actually written (watch.paths[0]) -- since that, not the
+    # analysis PC's drive, is what fills up and stops acquisition. This is an SMB
+    # round-trip, so it runs ONLY here in the daemon's periodic health loop, never
+    # on a dashboard request thread; a share hiccup degrades to None, not a hang.
+    data_free_gb = None
+    watch_paths = getattr(watcher, "watch_paths", None) or []
+    if watch_paths:
+        try:
+            data_free_gb = shutil.disk_usage(watch_paths[0]).free / (1024 ** 3)
+        except Exception:  # noqa: BLE001 -- share down/slow: report unknown, don't crash
+            data_free_gb = None
     return {
         "cpu_pct": psutil.cpu_percent(interval=0.5),
         "memory_pct": psutil.virtual_memory().percent,
         "disk_free_gb": disk.free / (1024 ** 3),
+        "data_disk_free_gb": data_free_gb,
         "network_share_accessible": int(watcher.check_network_accessible()),
         "queue_depth": queue_depth,
         "files_processed_last_hour": store.get_files_processed_last_hour(),

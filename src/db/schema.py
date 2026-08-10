@@ -364,6 +364,7 @@ CREATE TABLE IF NOT EXISTS system_health (
     cpu_pct REAL,
     memory_pct REAL,
     disk_free_gb REAL,
+    data_disk_free_gb REAL,
     network_share_accessible INTEGER,
     queue_depth INTEGER,
     files_processed_last_hour INTEGER

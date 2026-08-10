@@ -156,6 +156,15 @@ class Store:
         # Externally-synced notes (operator log): stable de-dup key.
         if "source_key" not in existing_ann_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN source_key TEXT")
+        # Free space on the primary DATA drive (the recording share), separate
+        # from disk_free_gb (the analysis PC's drive). Added so the Overview
+        # 'Disk Free' pill can show where recordings actually land.
+        existing_health_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(system_health)")
+        }
+        if "data_disk_free_gb" not in existing_health_cols:
+            conn.execute(
+                "ALTER TABLE system_health ADD COLUMN data_disk_free_gb REAL")
         # Create the UNIQUE index unconditionally here (NOT in SCHEMA_SQL):
         # SCHEMA_SQL runs before this migration, so on an existing DB the
         # column may not exist yet when executescript runs. Doing it here,
@@ -1468,13 +1477,15 @@ class Store:
             conn.execute(
                 """INSERT INTO system_health
                    (timestamp, cpu_pct, memory_pct, disk_free_gb,
-                    network_share_accessible, queue_depth, files_processed_last_hour)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    data_disk_free_gb, network_share_accessible, queue_depth,
+                    files_processed_last_hour)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     datetime.now().isoformat(),
                     metrics.get("cpu_pct"),
                     metrics.get("memory_pct"),
                     metrics.get("disk_free_gb"),
+                    metrics.get("data_disk_free_gb"),
                     metrics.get("network_share_accessible"),
                     metrics.get("queue_depth"),
                     metrics.get("files_processed_last_hour"),
