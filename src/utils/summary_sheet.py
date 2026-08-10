@@ -25,11 +25,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
 
+from src.utils.version import qc_monitor_version
+
 logger = logging.getLogger("qc_monitor.utils.summary_sheet")
+
+# A "gap" in an animal's recording timeline is a break between consecutive
+# recording starts longer than this. Chunks are normally back-to-back hourly,
+# so >2h means at least one missing chunk.
+_GAP_THRESHOLD_H = 2.0
 
 # The target spreadsheet + tab (the same workbook QC Monitor writes the BHZ
 # Daily/Events tabs to). Overridable via config['summary_sheet'].
@@ -58,6 +66,20 @@ _DERIVED_COLUMNS = {
     "Total recording (and analyzed) time": "recording_time",
     "Total overt bh sz during that time": "bh_sz_total",
     "Overall Bh SZ rate": "bh_sz_rate",
+    # Validation / provenance columns (each its own cell, ordered easiest to
+    # digest first) so a reviewer can independently verify the numbers above.
+    "Electrode(s) recorded": "electrodes",
+    "Earliest recording": "earliest_date",
+    "Latest recording": "latest_date",
+    "Recording coverage %": "coverage_pct",
+    "# recording gaps (>2h)": "gap_count",
+    "Total gap time (h)": "gap_total_h",
+    "Largest gap (h)": "gap_max_h",
+    "Smallest gap (h)": "gap_min_h",
+    "Earliest file": "earliest_file",
+    "Latest file": "latest_file",
+    "Last updated": "last_updated",
+    "QC Monitor version": "qc_version",
 }
 
 
@@ -106,19 +128,125 @@ def _animals_on_file(channel_names_json: str) -> set:
     return out
 
 
+def _canon_electrode(electrode: str | None) -> str:
+    """Canonical RECORDING location for a channel-name suffix.
+
+    Lab labels vary: 'SLM', 'RecSLM', and 'stimSRRecSLM' all denote a recording
+    on SLM (the token after 'Rec'; any 'stim<X>' prefix marks where stim was
+    applied, not where we recorded). Normalize to the recording site so the
+    Summary column reads a clean 'SLM, SR' instead of the raw variants. When
+    there's no 'Rec' marker the whole suffix IS the recording location.
+    """
+    if not electrode:
+        return ""
+    up = str(electrode).upper()
+    idx = up.rfind("REC")
+    if idx >= 0 and idx + 3 < len(up):
+        return up[idx + 3:]
+    return up
+
+
+def _animal_electrodes_on_file(channel_names_json: str) -> dict:
+    """{animal_id: set(recording_location)} parsed from a file's channel_names.
+
+    Same parse as _animals_on_file, but keeps the electrode suffix instead of
+    discarding it (e.g. 'BCH062SLM' -> {'BCH062': {'SLM'}}), canonicalized to the
+    recording location via _canon_electrode, so the caller learns both which
+    animals were recorded AND on which electrode(s). Non-animal channels
+    (stimCopy/saline) and label-only ids (no digit) are filtered out.
+    """
+    from src.utils.animal import is_animal_channel, split_animal_electrode
+    try:
+        names = json.loads(channel_names_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    out: dict = {}
+    for ch in (names if isinstance(names, list) else []):
+        if not is_animal_channel(ch):
+            continue
+        animal, electrode = split_animal_electrode(ch)
+        if not (animal and any(c.isdigit() for c in animal)):
+            continue
+        slot = out.setdefault(animal, set())
+        loc = _canon_electrode(electrode)
+        if loc:
+            slot.add(loc)
+    return out
+
+
+def _update_extrema(slot: dict, dt: datetime, basename: str) -> None:
+    """Track earliest/latest (dt, filename) for an animal, in place."""
+    assert slot is not None, "slot required"
+    assert dt is not None, "dt required"
+    if slot["first_dt"] is None or dt < slot["first_dt"]:
+        slot["first_dt"] = dt
+        slot["first_file"] = basename
+    if slot["last_dt"] is None or dt > slot["last_dt"]:
+        slot["last_dt"] = dt
+        slot["last_file"] = basename
+
+
+def _recording_gaps(dts: list, first_dt, last_dt) -> dict:
+    """Gap stats for one animal's recording timeline. A gap = a break between
+    consecutive recording starts longer than _GAP_THRESHOLD_H; its size is the
+    elapsed time minus one nominal chunk (so a contiguous hourly run yields ~0).
+
+    Returns {gap_count, gap_total_h, gap_max_h, gap_min_h, coverage_pct}; the
+    numeric gap fields are '' when there are no gaps. Coverage = recorded span
+    minus total gap time, over the full span, clamped to [0, 100]%.
+    """
+    assert isinstance(dts, list), "dts must be a list"
+    empty = {"gap_count": 0, "gap_total_h": "", "gap_max_h": "",
+             "gap_min_h": "", "coverage_pct": ""}
+    if first_dt is None or last_dt is None or len(dts) < 2:
+        # A single (or zero) parseable file: nothing spans, so 100% by fiat.
+        if first_dt is not None and last_dt is not None:
+            empty["coverage_pct"] = "100%"
+        return empty
+    ordered = sorted(dts)
+    gaps: list = []
+    nominal_h = _NOMINAL_CHUNK_SEC / 3600.0
+    for i in range(len(ordered) - 1):
+        delta_h = (ordered[i + 1] - ordered[i]).total_seconds() / 3600.0
+        if delta_h > _GAP_THRESHOLD_H:
+            gaps.append(max(0.0, delta_h - nominal_h))
+    span_h = (last_dt - first_dt).total_seconds() / 3600.0
+    total = sum(gaps)
+    cov = 100.0 * (span_h - total) / span_h if span_h > 0 else 100.0
+    cov = max(0.0, min(100.0, cov))
+    return {
+        "gap_count": len(gaps),
+        "gap_total_h": round(total, 1) if gaps else "",
+        "gap_max_h": round(max(gaps), 1) if gaps else "",
+        "gap_min_h": round(min(gaps), 1) if gaps else "",
+        "coverage_pct": f"{cov:.0f}%",
+    }
+
+
+def _new_stat_slot() -> dict:
+    """A per-animal accumulator: recording time plus earliest/latest file, the
+    electrode set, and every parsed recording datetime (for gap detection)."""
+    return {"total_sec": 0.0, "analyzed_sec": 0.0, "first_dt": None,
+            "first_file": "", "last_dt": None, "last_file": "",
+            "electrodes": set(), "dts": []}
+
+
 def _recording_stats_per_animal(store) -> dict:
-    """{animal: {'total_sec', 'analyzed_sec', 'first_dt' (datetime|None)}}.
+    """{animal: stat-slot} (see _new_stat_slot). Earliest/latest file + all
+    recording datetimes + electrode set are tracked alongside recording time.
 
     A file's duration counts toward EVERY animal recorded on it (channels are
     per-animal); 'analyzed' additionally requires a reviewed status for that
-    (file, animal). First-recording date considers ALL files (even those whose
+    (file, animal). Earliest/latest consider ALL files (even those whose
     duration wasn't computed); total/analyzed time only sums non-null durations.
     """
+    assert store is not None, "store required"
     latest = store._sql_latest_row_correlated("rs.file_id")
+    assert latest, "latest-row SQL fragment must be non-empty"
     conn = store._connect()
     try:
         files = conn.execute(
-            """SELECT pf.id, pf.duration_sec, pf.chunk_datetime,
+            """SELECT pf.id, pf.duration_sec, pf.chunk_datetime, pf.file_path,
                       sc.channel_names
                FROM processed_files pf
                JOIN session_config sc ON sc.session_dir = pf.session_dir
@@ -137,18 +265,20 @@ def _recording_stats_per_animal(store) -> dict:
             reviewed.add((int(r["file_id"]), r["animal_id"]))
     out: dict = {}
     for f in files:
-        animals = _animals_on_file(f["channel_names"])
+        elecs = _animal_electrodes_on_file(f["channel_names"])
         dur = (float(f["duration_sec"]) if f["duration_sec"] is not None
                else _NOMINAL_CHUNK_SEC)   # estimate missing durations at 1 chunk
         dt = _parse_chunk_dt(f["chunk_datetime"])
-        for a in animals:
-            slot = out.setdefault(
-                a, {"total_sec": 0.0, "analyzed_sec": 0.0, "first_dt": None})
+        basename = os.path.basename(f["file_path"] or "")
+        for a, electrodes in elecs.items():
+            slot = out.setdefault(a, _new_stat_slot())
             slot["total_sec"] += dur
             if (int(f["id"]), a) in reviewed:
                 slot["analyzed_sec"] += dur
-            if dt and (slot["first_dt"] is None or dt < slot["first_dt"]):
-                slot["first_dt"] = dt
+            slot["electrodes"].update(electrodes)
+            if dt:
+                slot["dts"].append(dt)
+                _update_extrema(slot, dt, basename)
     return out
 
 
@@ -205,6 +335,29 @@ def _fmt_hours(sec: float) -> float:
     return round(sec / 3600.0, 1)
 
 
+def _validation_cols(r: dict, last_updated: str, qc_version: str) -> dict:
+    """The per-animal validation / provenance columns (electrodes, earliest &
+    latest date + file, gap stats, run stamp + version) from a stat slot *r*."""
+    assert isinstance(r, dict), "stat slot required"
+    assert last_updated, "last_updated required"
+    first_dt, last_dt = r["first_dt"], r["last_dt"]
+    gaps = _recording_gaps(r["dts"], first_dt, last_dt)
+    return {
+        "electrodes": ", ".join(sorted(r["electrodes"])),
+        "earliest_date": first_dt.strftime("%Y-%m-%d %H:%M") if first_dt else "",
+        "latest_date": last_dt.strftime("%Y-%m-%d %H:%M") if last_dt else "",
+        "coverage_pct": gaps["coverage_pct"],
+        "gap_count": gaps["gap_count"],
+        "gap_total_h": gaps["gap_total_h"],
+        "gap_max_h": gaps["gap_max_h"],
+        "gap_min_h": gaps["gap_min_h"],
+        "earliest_file": r["first_file"],
+        "latest_file": r["last_file"],
+        "last_updated": last_updated,
+        "qc_version": qc_version,
+    }
+
+
 def compute_rows(store, config: dict) -> list[dict]:
     """One dict per animal that has any recording, with the derived summary
     values (plus the raw pieces, for the dry-run preview)."""
@@ -216,6 +369,9 @@ def compute_rows(store, config: dict) -> list[dict]:
     rec = _recording_stats_per_animal(store)
     surg = _surgery_meta(config)
     szd = store.seizure_days_per_animal()      # {animal: {'YYYY-MM-DD': n}}
+    # Run-level provenance -- identical on every row written this run.
+    last_updated = datetime.now().isoformat(timespec="seconds")
+    qc_version = qc_monitor_version()
     rows: list[dict] = []
     for animal in sorted(rec.keys()):
         if any(e in animal.lower() for e in excl):
@@ -240,7 +396,7 @@ def compute_rows(store, config: dict) -> list[dict]:
         # rate = seizures per recording-day
         rec_days = r["total_sec"] / 86400.0
         rate = f"{(bh_total / rec_days):.2f} /day" if rec_days > 0 else ""
-        rows.append({
+        row = {
             "animal": animal,
             "ka_location": meta.get("ka_location", ""),
             "surgeon": meta.get("surgeon", ""),
@@ -252,22 +408,79 @@ def compute_rows(store, config: dict) -> list[dict]:
             # extras for preview
             "_first_dt": first_dt.date().isoformat() if first_dt else "",
             "_ka_date": ka_date.date().isoformat() if ka_date else "",
-        })
+        }
+        row.update(_validation_cols(r, last_updated, qc_version))
+        rows.append(row)
     return rows
 
 
 def _print_preview(rows: list[dict]) -> None:
     hdr = ("animal", "ka_location", "surgeon", "_ka_date", "_first_dt",
            "time_from_ka", "bh_sz_2wk", "recording_time", "bh_sz_total",
-           "bh_sz_rate")
+           "bh_sz_rate", "electrodes", "earliest_date", "latest_date",
+           "coverage_pct", "gap_count", "gap_total_h", "qc_version")
     print("  ".join(f"{h:>14}" for h in hdr))
     for r in rows:
         print("  ".join(f"{str(r.get(h,'')):>14}" for h in hdr))
 
 
+def _owned_columns(header: list) -> tuple:
+    """Return (id_idx, {col_index: value_key}) for the columns we own, matching
+    _DERIVED_COLUMNS headers case-insensitively. *header* must already contain
+    every owned column (self-provisioned by the caller)."""
+    def _col(name):
+        for i, h in enumerate(header):
+            if str(h).strip().lower() == name.lower():
+                return i
+        return -1
+    id_idx = _col("MouseID")
+    owned = {_col(name): key for name, key in _DERIVED_COLUMNS.items()
+             if _col(name) >= 0}
+    return id_idx, owned
+
+
+def _build_row_writes(header, body, by_animal, id_idx, owned, tab) -> tuple:
+    """Build the (batch, matched, present, appends, n_cells) write payload:
+    a MERGE update for every existing sheet row whose MouseID matches (owned
+    columns overwritten, all other cells preserved), plus an appended row for
+    every recorded animal not yet present. Pure -- issues no API calls."""
+    import src.utils.sheets_write as SW
+    batch: list = []                     # {'range': A1, 'values': [merged_row]}
+    matched, present, n_cells = [], set(), 0
+    for r_i, existing in enumerate(body):
+        raw_id = existing[id_idx] if 0 <= id_idx < len(existing) else ""
+        animal = _norm_animal(raw_id)
+        if animal:
+            present.add(animal)
+        r = by_animal.get(animal)
+        if not r:
+            continue
+        matched.append(animal)
+        merged = []
+        for ci in range(len(header)):
+            if ci in owned:
+                merged.append(str(r[owned[ci]]))
+                n_cells += 1
+            else:
+                merged.append(existing[ci] if ci < len(existing) else "")
+        batch.append({"range": SW._a1_row(tab, r_i + 2), "values": [merged]})
+    appends: list = []
+    for animal in sorted(by_animal):
+        if animal in present:
+            continue
+        new_row = [""] * len(header)
+        if id_idx >= 0:
+            new_row[id_idx] = animal
+        for ci, key in owned.items():
+            new_row[ci] = str(by_animal[animal][key])
+        appends.append(new_row)
+    return batch, matched, present, appends, n_cells
+
+
 def write_summary(store, config: dict, *, dry_run: bool = True) -> dict:
     """Compute + (unless dry_run) write the derived columns to the Summary tab,
-    matched by MouseID. Only animals already present as rows are updated."""
+    matched by MouseID. Only animals already present as rows are updated;
+    recorded animals not yet present are appended."""
     rows = compute_rows(store, config)
     by_animal = {r["animal"]: r for r in rows}
     cfg = config.get("summary_sheet", {}) or {}
@@ -283,56 +496,30 @@ def write_summary(store, config: dict, *, dry_run: bool = True) -> dict:
     if not grid:
         raise ValueError(f"Summary tab {tab!r} is empty (no header row)")
     header = grid[0]
-    body = grid[1:]
-
-    def _col(name):
-        for i, h in enumerate(header):
-            if str(h).strip().lower() == name.lower():
-                return i
-        return -1
-    id_idx = _col("MouseID")
-    # column index -> derived-value key, for the columns we OWN
-    owned = {_col(name): key for name, key in _DERIVED_COLUMNS.items()
-             if _col(name) >= 0}
-    batch = []              # {'range': A1, 'values': [merged_row]}  (updates)
-    matched, present, n_cells = [], set(), 0
-    for r_i, existing in enumerate(body):
-        raw_id = existing[id_idx] if 0 <= id_idx < len(existing) else ""
-        animal = _norm_animal(raw_id)
-        if animal:
-            present.add(animal)
-        r = by_animal.get(animal)
-        if not r:
-            continue
-        matched.append(animal)
-        # MERGE: our columns get the computed value; every other cell keeps its
-        # existing content (Comments/Notes + MouseID are never touched).
-        merged = []
-        for ci in range(len(header)):
-            if ci in owned:
-                merged.append(str(r[owned[ci]]))
-                n_cells += 1
-            else:
-                merged.append(existing[ci] if ci < len(existing) else "")
-        batch.append({"range": SW._a1_row(tab, r_i + 2), "values": [merged]})
-    # APPEND a fresh row for every recorded animal NOT already in the sheet, so
-    # the tab covers all animals recorded (past + present). New rows carry the
-    # canonical 'BCHxxx' MouseID + our derived columns; other cells blank.
-    appends: list[list] = []
-    for animal in sorted(by_animal):
-        if animal in present:
-            continue
-        new_row = [""] * len(header)
-        if id_idx >= 0:
-            new_row[id_idx] = animal
-        for ci, key in owned.items():
-            new_row[ci] = str(by_animal[animal][key])
-        appends.append(new_row)
+    assert isinstance(header, list), "header must be a list"
+    # Self-provision any owned column whose header doesn't exist yet: extend the
+    # in-memory header (in place) so the row merge/append size correctly and
+    # every owned column resolves; the live sheet's row 1 gets the same new
+    # cells written below (skipped in dry-run). Idempotent across runs.
+    lower_hdr = {str(h).strip().lower() for h in header}
+    missing_headers = [name for name in _DERIVED_COLUMNS
+                       if name.lower() not in lower_hdr]
+    header.extend(missing_headers)
+    id_idx, owned = _owned_columns(header)
+    batch, matched, present, appends, n_cells = _build_row_writes(
+        header, grid[1:], by_animal, id_idx, owned, tab)
     result = {"rows": rows, "matched": matched, "appended": [r[id_idx] for r
               in appends] if id_idx >= 0 else [], "n_updates": n_cells,
               "dry_run": dry_run, "sheet_id": sheet_id, "tab": tab}
     if dry_run:
         return result
+    # Write the new header cells to the live sheet before the body so the owned
+    # columns exist when the rows land. Idempotent (appends only truly-missing
+    # columns) and never disturbs existing columns / hand-entered cells.
+    if missing_headers:
+        SW._ensure_header_columns(
+            svc, sheet_id, tab, list(_DERIVED_COLUMNS.keys()),
+            value_input_option="USER_ENTERED")
     if batch:
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
