@@ -72,6 +72,13 @@ _DERIVED_COLUMNS = {
     "Total recording (and analyzed) time": "recording_time",
     "Total overt bh sz during that time": "bh_sz_total",
     "Overall Bh SZ rate": "bh_sz_rate",
+    # Atomic split of the "(and analyzed)" figure -- separate cells + a
+    # reliability %: how much of the recording has actually been reviewed in
+    # Video Review. A low Analyzed % means the Sz/rate numbers lean on imported
+    # historical data, not verified scoring (informs the advisor's Finalized).
+    "Total recording (h)": "recording_total_h",
+    "Analyzed (h)": "recording_analyzed_h",
+    "Analyzed %": "analyzed_pct",
     # Validation / provenance columns (each its own cell, ordered easiest to
     # digest first) so a reviewer can independently verify the numbers above.
     "Electrode(s) recorded": "electrodes",
@@ -428,6 +435,9 @@ def compute_rows(store, config: dict) -> list[dict]:
         # rate = seizures per recording-day
         rec_days = r["total_sec"] / 86400.0
         rate = f"{(bh_total / rec_days):.2f} /day" if rec_days > 0 else ""
+        # analyzed fraction = reviewed portion of the recording (reliability)
+        analyzed_pct = (f"{100 * r['analyzed_sec'] / r['total_sec']:.0f}%"
+                        if r["total_sec"] > 0 else "")
         row = {
             "animal": animal,
             "ka_location": meta.get("ka_location", ""),
@@ -435,6 +445,9 @@ def compute_rows(store, config: dict) -> list[dict]:
             "time_from_ka": time_from_ka,
             "bh_sz_2wk": bh_2wk,
             "recording_time": f"{total_h} h ({analyzed_h} h)",
+            "recording_total_h": total_h,
+            "recording_analyzed_h": analyzed_h,
+            "analyzed_pct": analyzed_pct,
             "bh_sz_total": bh_total,
             "bh_sz_rate": rate,
             # extras for preview
