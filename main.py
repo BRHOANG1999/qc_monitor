@@ -128,6 +128,11 @@ def main():
     if args.no_matlab:
         config.pop("matlab_exe", None)
 
+    # Stamp the local-mirror env (if mirror.enabled) so load_mat reads recordings
+    # from the fast local rolling mirror instead of the slow Tailscale share.
+    from src.utils import mirror as _mirror
+    _mirror.configure(config)
+
     # Setup logging
     log_cfg = config.get("logging", {})
     logger = setup_logging(

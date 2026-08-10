@@ -304,6 +304,11 @@ from src.dashboard.data_helpers import (  # noqa: E402,F401
 def create_app(config: dict, store: Store) -> Dash:
     refresh_sec = config.get("dashboard", {}).get("refresh_interval_sec", 10)
 
+    # Local-mirror env (if mirror.enabled): the dashboard's off-proc .mat readers
+    # then read from the fast local rolling mirror; spawn children inherit the env.
+    from src.utils import mirror as _mirror
+    _mirror.configure(config)
+
     # Opt-in memory-leak tracer (debug.memtrace / env QC_MEMTRACE). No-op unless
     # enabled; when on, logs the top memory-GROWTH sites every interval so an
     # unbounded process names its own leaking file:line. Start first so it sees

@@ -20,7 +20,11 @@ class ChunkData:
 
 def load_mat(path: str) -> ChunkData:
     """Load a KMrecorder .mat file. Handles both v5 and v7.3 formats."""
-    path = str(path)
+    from src.utils.mirror import local_first
+    # Read from the fast local rolling mirror when this file is mirrored; falls
+    # back to the SMB share for anything outside the window. No-op when the
+    # mirror is disabled. Works in spawned child readers (env-driven).
+    path = local_first(str(path))
 
     try:
         import scipy.io
