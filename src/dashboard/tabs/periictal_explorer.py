@@ -291,6 +291,7 @@ def scope_bar(store):
         # from the module cache on remount using the retained job id.
         dcc.Store(id="pex-job", storage_type="session"),
         dcc.Download(id="pex-export-dl"),
+        dcc.Download(id="pex-nb-dl"),
     ])
 
 
@@ -338,6 +339,10 @@ def _save_load_row() -> html.Div:
                            "re-import later."}),
         dcc.Upload(id="pex-import-up", multiple=False,
                    children="⬆ Import embedding", style=up_style),
+        button("⬇ Export notebook", "pex-nb-btn", variant="secondary",
+               **{"title": "Download a self-contained Jupyter notebook + frozen "
+                           "data that reproduces THIS lens offline (no DB/share). "
+                           "Build first."}),
         html.Span(id="pex-io-status",
                   style={"color": COLOR_TEXT_SECONDARY,
                          "fontSize": FONT_SIZE_CAPTION, "marginLeft": SPACE_3}),
@@ -2929,6 +2934,60 @@ def register_callbacks(app, store, config):
         name = _eio.suggested_name(selection)
         return (dcc.send_bytes(lambda buf: buf.write(blob), name),
                 f"Exported {name} ({len(blob) // 1024} KB).")
+
+    @app.callback(
+        Output("pex-nb-dl", "data"),
+        Output("pex-io-status", "children", allow_duplicate=True),
+        Input("pex-nb-btn", "n_clicks"),
+        State("tabs", "value"),
+        State("pex-job", "data"),
+        State("pex-animal", "value"), State("pex-protocol", "value"),
+        State("pex-variant", "value"), State("pex-window-h", "value"),
+        State("pex-winmode", "value"), State("pex-win-from", "value"),
+        State("pex-win-to", "value"), State("pex-win-guard", "value"),
+        State("pex-swauc-nwin", "value"), State("pex-swauc-bandlo", "value"),
+        State("pex-swauc-bandhi", "value"), State("pex-pc-nphases", "value"),
+        State("pex-traj-y", "value"), State("pex-method", "value"),
+        prevent_initial_call=True,
+    )
+    def _export_notebook(_n, tab, jid, animal, protocol, variant, window_h,
+                         winmode, wf, wt, wg, nwin, blo, bhi, nphases, trend_feat,
+                         method):
+        """Export the CURRENT lens as a self-contained reproducible notebook +
+        frozen matrix (tab-aware; only the matrix-based lenses)."""
+        from src.periictal import notebook_export as _nx
+        if not _nx.supported(tab or ""):
+            return no_update, "Notebook export isn't available for this lens."
+        cached = _CACHE.get(jid) if jid else None
+        if not cached or cached.get("empty") or "full" not in cached:
+            return no_update, "Build first (scope bar), then export the notebook."
+        variant = variant or "evoked"
+        try:
+            sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
+            wlabel = _window_label(sv, cfg)
+        except Exception:                                 # noqa: BLE001
+            wlabel = ""
+        meta = {"animal": animal or "", "protocol": protocol or "all protocols",
+                "variant": variant, "feature_window": wlabel, "lead_up_h": window_h,
+                "n_seizures": int(cached.get("n_seizures", 0)),
+                "exported_at": datetime.now().isoformat(timespec="seconds")}
+        if tab == "periictal_slidingauc":
+            params = {"variant": variant, "n_windows": int(nwin or 12),
+                      "band_lo": float(blo or 1) * 3600.0,
+                      "band_hi": float(bhi or 6) * 3600.0}
+        elif tab == "periictal_pdfcdf":
+            params = {"variant": variant, "nphases": int(nphases or 6)}
+        elif tab == "periictal_trend":
+            params = {"variant": variant, "feature": trend_feat or "peak_to_trough"}
+        else:                                             # periictal_embedding
+            params = {"variant": variant, "method": method or "pca"}
+        try:
+            blob, fname = _nx.build_export(tab, cached["full"], meta, params)
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("notebook export failed: %s", e)
+            return no_update, f"Notebook export failed: {e}"
+        return (dcc.send_bytes(lambda buf: buf.write(blob), fname),
+                f"Exported {fname} ({len(blob) // 1024} KB) — unzip & Run All.")
 
     @app.callback(
         Output("pex-job", "data", allow_duplicate=True),
