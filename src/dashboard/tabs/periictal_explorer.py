@@ -2541,93 +2541,67 @@ def _swauc_render(result, sel, feature):
             _swauc_best_bar(result), pdf, cdf, _swauc_notes(result))
 
 
-def _hex_to_rgba(color: str, alpha: float) -> str:
-    """A semi-transparent rgba() from a #rrggbb hue (or pass-through)."""
-    c = str(color)
-    if c.startswith("#") and len(c) == 7:
-        r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
-        return f"rgba({r},{g},{b},{alpha})"
-    return c
-
-
-def _swauc_dist_values(result, sid) -> np.ndarray:
-    """The auc_norm scores for one seizure across the GROUP top-5 features x all
-    valid interictal windows (finite only) -- the per-seizure spread the sliding
-    windows produce."""
+def _swauc_dist_fig(result, clicked_sid, feature) -> go.Figure:
+    """Window-AUC trajectory: x = interictal-window lead time before onset,
+    y = that window's rank AUC for *feature*. One colour-coded line per seizure
+    (the clicked one foregrounded) + a bold GROUP median with an IQR band, so you
+    can read WHERE in the pre-onset run each seizure -- and the cohort -- separates
+    best. Windows dropped by the post-ictal guard leave gaps."""
     feats = result.get("features", [])
-    top_idx = [feats.index(f) for f in result.get("group_top5", []) if f in feats]
-    ps = result.get("per_seizure", {}).get(int(sid))
-    if not ps:
-        return np.empty(0)
-    auc = np.asarray(ps["auc"])
-    vals = auc[top_idx, :].ravel() if top_idx else auc.ravel()
-    return vals[np.isfinite(vals)]
-
-
-def _kde_curve(vals, grid):
-    """Gaussian-KDE density over *grid*, or None when there's too little spread
-    (n<3 or ~zero variance) to smooth honestly."""
-    v = np.asarray(vals, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size < 3 or float(np.ptp(v)) < 1e-9:
-        return None
-    try:
-        from scipy.stats import gaussian_kde
-        return gaussian_kde(v)(grid)
-    except Exception:                       # noqa: BLE001
-        return None
-
-
-def _swauc_dist_fig(result, clicked_sid) -> go.Figure:
-    """Distribution of AUC scores across windows: a colour-coded rug of every
-    seizure's raw scores + a shaded per-seizure density (the clicked seizure
-    foregrounded) + a bold shaded GROUP density. Answers 'is the peak a fluke or
-    is this seizure consistently separable across windows?'."""
+    if feature not in feats:
+        feature = (result.get("group_top5") or feats or [None])[0]
+    if feature is None:
+        return empty_fig("No feature to plot")
+    fi = feats.index(feature)
+    offsets = np.asarray(result["offsets"], dtype=float)
+    x_h = offsets / 3600.0
     sids = sorted(result.get("per_seizure", {}))
-    series = {s: _swauc_dist_values(result, s) for s in sids}
-    allv = [v for v in series.values() if v.size]
-    if not allv:
-        return empty_fig("No AUC scores to distribute yet")
-    allvals = np.concatenate(allv)
-    lo, hi = float(np.min(allvals)), float(np.max(allvals))
-    pad = max(0.02, (hi - lo) * 0.12)
-    grid = np.linspace(max(0.5, lo - pad), min(1.0, hi + pad), 220)
+    if not sids:
+        return empty_fig("No seizures scored yet")
     labels = result.get("sz_labels", {})
     fig = go.Figure()
+    rows = []
     for k, s in enumerate(sids):
-        v = series[s]
-        if v.size == 0:
+        row = np.asarray(result["per_seizure"][s]["auc"])[fi]
+        rows.append(row)
+        if not np.isfinite(row).any():
             continue
         col = _pal.hue_for(labels.get(s, str(s)), k)
         clicked = clicked_sid is not None and int(s) == int(clicked_sid)
-        kde = _kde_curve(v, grid)
-        if kde is not None:
-            fig.add_trace(go.Scatter(
-                x=grid, y=kde, mode="lines", name=labels.get(s, f"sz {s}"),
-                legendgroup=str(s),
-                line=dict(color=col, width=2.8 if clicked else 1.1),
-                opacity=0.98 if clicked else 0.45,
-                fill="tozeroy" if clicked else None,
-                fillcolor=_hex_to_rgba(col, 0.22) if clicked else None))
-        fig.add_trace(go.Scatter(              # colour-coded rug of the raw scores
-            x=v, y=np.full(v.size, 0.0), mode="markers", showlegend=False,
-            legendgroup=str(s),
-            marker=dict(symbol="line-ns-open", color=col,
-                        size=9 if clicked else 6,
-                        line=dict(width=1.8 if clicked else 0.8, color=col)),
-            hovertemplate=(labels.get(s, f"sz {s}") +
-                           " · AUC %{x:.3f}<extra></extra>")))
-    gk = _kde_curve(allvals, grid)
-    if gk is not None:
         fig.add_trace(go.Scatter(
-            x=grid, y=gk, mode="lines", name="group (all seizures)",
-            line=dict(color="#d8d8e0", width=3),
-            fill="tozeroy", fillcolor="rgba(216,216,224,0.10)"))
-    fig.add_vline(x=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+            x=x_h, y=row, mode="lines+markers", name=labels.get(s, f"sz {s}"),
+            connectgaps=False, opacity=1.0 if clicked else 0.4,
+            line=dict(color=col, width=2.8 if clicked else 1.0),
+            marker=dict(color=col, size=8 if clicked else 4),
+            hovertemplate="%{x:.1f} h before onset · AUC %{y:.3f}<extra>"
+                          + labels.get(s, f"sz {s}") + "</extra>"))
+    # Group median + IQR band across seizures at each window.
+    M = np.vstack(rows) if rows else np.empty((0, offsets.size))
+    if M.size:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN cols
+            med = np.nanmedian(M, axis=0)
+            q1 = np.nanpercentile(M, 25, axis=0)
+            q3 = np.nanpercentile(M, 75, axis=0)
+        ok = np.isfinite(med)
+        if ok.any():
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([x_h[ok], x_h[ok][::-1]]),
+                y=np.concatenate([q3[ok], q1[ok][::-1]]),
+                fill="toself", mode="lines", line=dict(width=0),
+                fillcolor="rgba(216,216,224,0.13)", hoverinfo="skip",
+                name="group IQR", showlegend=False))
+            fig.add_trace(go.Scatter(
+                x=x_h[ok], y=med[ok], mode="lines+markers", name="group median",
+                line=dict(color="#e2e2ea", width=3), marker=dict(size=6),
+                hovertemplate="%{x:.1f} h · median AUC %{y:.3f}<extra>group</extra>"))
+    fig.add_hline(y=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
     fig.update_layout(
-        **_pc_layout("AUC across windows — per seizure & group (top-5 features)",
-                     "AUC (auc_norm)", height=460),
-        yaxis_title="density")
+        **_pc_layout(f"Window AUC vs lead time · {feature}",
+                     "time before onset (h)", height=460),
+        yaxis_title="AUC (auc_norm)", yaxis_range=[0.45, 1.0],
+        xaxis_autorange="reversed")            # onset-approaching to the right
     return fig
 
 
@@ -2742,11 +2716,12 @@ def layout_slidingauc(store):
                                        "fontSize": FONT_SIZE_BODY}),
                 ], style={"display": "flex", "alignItems": "center",
                           "gap": SPACE_3, "marginBottom": SPACE_2}),
-                html.Div("Each seizure's AUC scores across the sampled interictal "
-                         "windows (group top-5 features): the coloured rug is the "
-                         "raw scores, the shaded curve the clicked seizure's "
-                         "density, faint curves the other seizures, and the bold "
-                         "grey curve the group.",
+                html.Div("Window AUC vs lead time (for the selected Feature): "
+                         "x = how long before onset the interictal window sits, "
+                         "y = that window's rank AUC. Each coloured line is a "
+                         "seizure (the clicked one bold, the others faint); the "
+                         "bold grey line is the group median with an IQR band. "
+                         "Change the Feature dropdown to re-plot.",
                          style={"color": COLOR_TEXT_TERTIARY,
                                 "fontSize": FONT_SIZE_CAPTION,
                                 "marginBottom": SPACE_2, "maxWidth": "90ch"}),
@@ -3396,9 +3371,10 @@ def register_callbacks(app, store, config):
         Input("pex-swauc-bestbar", "clickData"),
         Input("pex-swauc-modal-close", "n_clicks"),
         State("pex-swauc-job", "data"),
+        State("pex-swauc-feature", "value"),
         prevent_initial_call=True,
     )
-    def _swauc_open_dist(click, _close, key):
+    def _swauc_open_dist(click, _close, key, feature):
         # Close button (or no click payload) -> hide the modal + clear the click.
         if callback_context.triggered_id == "pex-swauc-modal-close" or not click:
             return {"display": "none"}, no_update, no_update, None
@@ -3414,8 +3390,9 @@ def register_callbacks(app, store, config):
             return no_update, no_update, no_update, no_update
         sid = best[idx]["seizure_idx"]
         label = result.get("sz_labels", {}).get(sid, f"seizure {sid}")
-        return (_SWAUC_MODAL_SHOWN, _swauc_dist_fig(result, sid),
-                f"Window AUC distribution · {label}", no_update)
+        feat = _swauc_feat(result, feature)
+        return (_SWAUC_MODAL_SHOWN, _swauc_dist_fig(result, sid, feat),
+                f"Window AUC vs lead time · {label}", no_update)
 
     def _make_select_cb(kind):
         @app.callback(
