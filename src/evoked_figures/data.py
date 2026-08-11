@@ -63,7 +63,7 @@ def parse_iso(s):
 
 
 def iter_animal_sidecars(animal: str, evoked_dir: str, *,
-                         compute_missing: bool = False):
+                         compute_missing: bool = False, file_filter=None):
     """Yield (mat_path, sidecar_path, rows) for each sidecar of *animal*,
     oldest recording first.
 
@@ -71,10 +71,16 @@ def iter_animal_sidecars(animal: str, evoked_dir: str, *,
     figure-export path wants only what's ready). With *compute_missing* they
     are recomputed + written on the fly (``read_or_compute_sidecar``), so a
     feature-schema/version bump self-heals for callers that opt in (build_matrix
-    via ``warm_missing``). One file's rows at a time."""
+    via ``warm_missing``). One file's rows at a time.
+
+    *file_filter* (optional ``fp -> bool``) prunes the file list BEFORE any read
+    -- used by build_matrix's near-seizure prefilter to skip files that can't
+    contribute a row. Applied to both the read-only and compute paths."""
     assert animal, "animal required"
     files = [fp for fp in list_evoked_files(evoked_dir)
              if animal in animals_in_filename(fp)]
+    if file_filter is not None:
+        files = [fp for fp in files if file_filter(fp)]
     assert len(files) < 1_000_000, "evoked file scan runaway"
     if compute_missing:
         # Recompute path is CPU-heavy (reads the raw .mat) and rare -- keep it

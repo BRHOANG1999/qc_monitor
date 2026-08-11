@@ -71,6 +71,19 @@ SLIDING_WIDTH_SEC = 1800.0         # 30-min windows, matching the preictal width
 SLIDING_POSTICTAL_GUARD_SEC = 3600.0   # keep windows >= 1 h after the prev seizure
 SLIDING_MIN_N = 20                 # min finite stimuli per class to score a window
 
+# --- Matrix-build speedup: near-seizure file prefilter ---------------------
+# A cold matrix build reads EVERY one of an animal's evoked sidecars off the
+# share, but only files whose recording could contain a stimulus within
+# window_sec of a seizure onset can contribute a kept row (see matrix.build_
+# matrix: pre rows within a per-seizure ceiling <= window_sec, post rows within
+# window_sec). Filtering by filename time BEFORE reading is a PROVABLE superset
+# of contributing files, so the matrix is unchanged -- it just skips files whose
+# every stimulus is dropped anyway (BCH111: ~127 of 351). SLACK guards the file
+# that STARTS before the window but CONTAINS its start (a recording is a short
+# chunk; matches erpimage._candidate_files' validated 2 h guard).
+PERIICTAL_PREFILTER_NEAR_SEIZURE = True
+PERIICTAL_PREFILTER_SLACK_SEC = 7200.0
+
 # The paper's five best perturbed features (Fig 3 / Table 1), in our column
 # names: SumPower[1-64], SumPower[256-1024], exp-fit initial factor a,
 # 1st-moment[64-256], 1st-moment[1-64].

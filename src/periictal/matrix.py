@@ -32,25 +32,50 @@ from src.periictal import passive as _passive
 from src.periictal import stim_map as _sm
 from src.preictal.isi import (included_seizures, leadtime_bins,
                               lookback_ceilings)
+from src.utils.evoked_output import parse_recording_dt
 
 _MAX_FILES = 2_000_000        # NASA Rule 2: explicit scan bound.
 
 
+def _near_seizure_file_filter(onsets, window_sec, slack):
+    """Filename-time predicate: keep a recording only if its start could contain
+    a stimulus within *window_sec* of some onset (+ *slack* for the chunk's own
+    length). A PROVABLE SUPERSET of files that yield a kept row -- every kept
+    stimulus lies within +/- window_sec of its onset (pre ceiling <= window_sec;
+    post window == window_sec) and a file starts no later than its stimuli -- so
+    the matrix is identical, only files whose every stimulus is dropped anyway
+    are skipped. Unparseable filenames are KEPT (never drop on uncertainty)."""
+    lo = np.asarray(onsets, dtype=np.float64) - float(window_sec) - float(slack)
+    hi = np.asarray(onsets, dtype=np.float64) + float(window_sec) + float(slack)
+
+    def _keep(fp) -> bool:
+        dt = parse_recording_dt(fp)
+        if dt is None:
+            return True
+        ts = dt.timestamp()
+        return bool(np.any((ts >= lo) & (ts <= hi)))
+    return _keep
+
+
 def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cfg,
-                  warm_missing: bool = False):
+                  warm_missing: bool = False, file_filter=None):
     """The (mat, sidecar, rows) generator for a sidecar variant. The shared
     default 'evoked' sidecar (full trace, no window) is read directly; any other
     variant ('passive', 'evokedw', …) is a config-signed windowed sidecar and
     needs its FeatureConfig to read the right file. *warm_missing* recomputes a
     stale/missing default sidecar on the fly (self-heals a version bump)."""
     if sidecar_variant in (None, "evoked"):
-        return iter_animal_sidecars(animal, evoked_dir, compute_missing=warm_missing)
+        return iter_animal_sidecars(animal, evoked_dir, compute_missing=warm_missing,
+                                    file_filter=file_filter)
     cfg = feature_cfg or _passive.passive_config()
+    # The windowed variants (passive/evokedw) don't take the prefilter yet -- the
+    # common evoked path above does; passive builds are correct, just unfiltered.
     return _passive.iter_variant_sidecars(animal, evoked_dir, sidecar_variant, cfg)
 
 
 def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
-                   sidecar_variant: str, feature_cfg, warm_missing: bool = False):
+                   sidecar_variant: str, feature_cfg, warm_missing: bool = False,
+                   file_filter=None):
     """One pass over *animal*'s fresh sidecars -> parallel arrays:
     (t_epoch[N], metric_arrays{m: f32[N]}, channel[N] obj, session[N] obj).
     Session/channel are kept per row so the protocol filter + fingerprint can
@@ -60,7 +85,7 @@ def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
     m_parts: dict = {m: [] for m in metrics}
     for i, (_fp, _sp, rows) in enumerate(
             _sidecar_iter(animal, evoked_dir, sidecar_variant, feature_cfg,
-                          warm_missing)):
+                          warm_missing, file_filter=file_filter)):
         assert i < _MAX_FILES, "sidecar scan runaway"
         if not rows:
             continue
@@ -171,9 +196,18 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
          for c in lookback_ceilings(seizures, post_ictal_buffer_sec, window_sec)],
         dtype=np.float64)
 
+    # Near-seizure prefilter: skip files that can't contribute a kept row (only
+    # the evoked path; a provable superset -> matrix unchanged). Big win on a
+    # cold build (BCH111: ~127 of 351 files read instead of all).
+    file_filter = None
+    if (_cfg.PERIICTAL_PREFILTER_NEAR_SEIZURE
+            and sidecar_variant in (None, "evoked")):
+        file_filter = _near_seizure_file_filter(
+            onsets, window_sec, _cfg.PERIICTAL_PREFILTER_SLACK_SEC)
+
     t, mcols, chan, sess, rec = _epoch_columns(animal, evoked_dir, metrics,
                                                sidecar_variant, feature_cfg,
-                                               warm_missing)
+                                               warm_missing, file_filter=file_filter)
     if t.size == 0:
         return _empty_frame(metrics)
     idx_pre, tto_pre, keep_pre = _assign_next_onset(t, onsets, ceilings)
