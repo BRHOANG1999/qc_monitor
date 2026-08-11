@@ -83,10 +83,15 @@ def test_figure_continuous_single_trace_categorical_folded():
     sub = _sub()
     emb = np.random.default_rng(1).random((len(sub), 2))
     cont = pex._figure(emb, sub, "time_to_onset_sec", "pca", {"explained_var": [0.3, 0.2]})
-    assert len(cont.data) == 1                       # one Scattergl + colourbar
-    assert cont.data[0].customdata is not None       # row indices for selection
+    # One REAL scatter (colourbar + row indices for selection); any extra traces
+    # are legend-only symbol keys for the stim-group dimension (x=[None]).
+    real = [t for t in cont.data if getattr(t, "customdata", None) is not None]
+    assert len(real) == 1
+    assert real[0].customdata is not None            # row indices for selection
     cat = pex._figure(emb, sub, "stim_key", "umap", None)
-    assert len(cat.data) == 2                         # one trace per fingerprint
+    # colour == stim_key -> no symbol dimension; one trace per fingerprint.
+    assert len([t for t in cat.data
+                if getattr(t, "customdata", None) is not None]) == 2
 
 
 def test_axis_titles_report_variance_and_flag_umap():
@@ -123,7 +128,8 @@ def test_render_cached_empty_and_ready_paths():
                       "explained_var": [0.3, 0.2]}, "method": "pca", "n_seizures": 3}
     fig, reading, status, disabled, jid, traj = pex._render_cached(
         ready, "time_to_onset_sec", "j2", "line_length")
-    assert disabled is True and len(fig.data) == 1 and traj is not None
+    real = [t for t in fig.data if getattr(t, "customdata", None) is not None]
+    assert disabled is True and len(real) == 1 and traj is not None
 
 
 def test_trajectory_fig_from_cache():
@@ -233,13 +239,30 @@ def test_job_store_persists_across_sub_tab_swaps(tmp_path):
     assert job is not None and job.storage_type == "session"
 
 
+def test_excl_tok_changes_cache_key_on_exclusion(tmp_path):
+    # Excluding a seizure must change the in-memory matrix cache key so Build
+    # recomputes instead of serving the stale (pre-exclusion) matrix.
+    store = Store(str(tmp_path / "m.db"))
+    t0 = pex._excl_tok(store, "BCH111")
+    assert t0 == "|x0"                                   # empty set -> stable const
+    store.set_seizure_excluded("BCH111", 123, 45.6, True)
+    t1 = pex._excl_tok(store, "BCH111")
+    assert t1 != t0 and t1.startswith("|x")              # token changed
+    # ... and it flows into the job id (so _swauc_key, which derives from jid, changes)
+    j0 = pex._job_id("BCH111", "", "evoked", 6.0, "pca", 50000, "w" + t0)
+    j1 = pex._job_id("BCH111", "", "evoked", 6.0, "pca", 50000, "w" + t1)
+    assert j0 != j1
+    store.set_seizure_excluded("BCH111", 123, 45.6, False)
+    assert pex._excl_tok(store, "BCH111") == t0          # re-include restores it
+
+
 def test_nav_group_promoted_to_top_level():
     from src.dashboard import app as _app
     grp = next((g for g in _app.NAV_GROUPS if g["id"] == "periictal"), None)
     assert grp is not None
     assert [s["id"] for s in grp["subs"]] == [
         "periictal_embedding", "periictal_trend", "periictal_pdfcdf",
-        "periictal_waveform", "periictal_slow"]
+        "periictal_slidingauc", "periictal_waveform", "periictal_slow"]
     # the old single sub-tab is gone from every group
     assert all(s["id"] != "periictal_explorer"
                for g in _app.NAV_GROUPS for s in g["subs"])

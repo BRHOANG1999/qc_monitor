@@ -23,6 +23,7 @@ embedding and is instant.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import threading
@@ -59,6 +60,7 @@ from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
 from src.periictal.selection import summarize_selection
 from src.periictal import trendtest as _tt
 from src.periictal import slow_report as _slow
+from src.periictal import sliding_auc as _swa
 from src.periictal.trial_series import build_trial_series
 from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
@@ -86,6 +88,24 @@ _RADIO_INPUT = {"marginRight": "4px"}
 
 def _job_id(animal, protocol, variant, window_h, method, cap, wintok="") -> str:
     return f"{animal}|{protocol}|{variant}|{window_h}|{method}|{cap}|{wintok}"
+
+
+def _excl_tok(store, animal) -> str:
+    """Short signature of the EXCLUDED-seizure set for *animal*, folded into the
+    in-memory cache key (via wintok). Without it, the in-process ``_CACHE``
+    short-circuits ``_build_or_poll`` before the disk layer, so toggling a
+    seizure's inclusion + Build silently re-serves the STALE matrix that still
+    contains the excluded seizure (the disk cache already honours exclusion via
+    persist._seizure_sig, but is never consulted on an in-memory hit). Empty set
+    -> stable constant, so unchanged exclusions never force a spurious rebuild."""
+    try:
+        keys = store.excluded_seizure_keys(animal) if animal else set()
+    except Exception:                       # noqa: BLE001 -- never break the build
+        keys = set()
+    if not keys:
+        return "|x0"
+    digest = hashlib.sha1("|".join(sorted(map(str, keys))).encode()).hexdigest()
+    return "|x" + digest[:8]
 
 
 def _tok(session_dir: str) -> str:
@@ -2323,6 +2343,283 @@ def layout_slow_dynamics(store):
     ], style={"padding": SPACE_4})
 
 
+# --------------------------------------------------------------------- #
+#  Sliding-window ROC-AUC lens (src.periictal.sliding_auc)
+# --------------------------------------------------------------------- #
+_SWAUC_JOBS: dict = {}
+_SWAUC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_SWAUC_CACHE_MAX = 4
+
+
+def _swauc_key(jid, nwin, band_lo_h, band_hi_h) -> str:
+    return f"{jid}|swauc|{nwin}|{band_lo_h}|{band_hi_h}"
+
+
+def _swauc_set(key, **kw):
+    with _LOCK:
+        _SWAUC_JOBS.setdefault(key, {}).update(kw)
+        _prune_jobs(_SWAUC_JOBS)
+
+
+def _swauc_finish(key, result):
+    with _LOCK:
+        _SWAUC_CACHE[key] = result
+        while len(_SWAUC_CACHE) > _SWAUC_CACHE_MAX:
+            _SWAUC_CACHE.popitem(last=False)
+        _SWAUC_JOBS[key] = {"status": "done", "progress": "done"}
+        _prune_jobs(_SWAUC_JOBS)
+
+
+def _swauc_kick(store, key, jid, nwin, band_lo_sec, band_hi_sec):
+    with _LOCK:
+        if key in _SWAUC_CACHE:
+            return
+        st = _SWAUC_JOBS.get(key)
+        if st and st.get("status") == "running":
+            return
+        _SWAUC_JOBS[key] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_SWAUC_JOBS)
+    threading.Thread(
+        target=_swauc_worker, name=f"swauc-{key}", daemon=True,
+        args=(key, jid, nwin, band_lo_sec, band_hi_sec)).start()
+
+
+def _swauc_group_matrix(result) -> np.ndarray:
+    """Mean-across-seizures AUC matrix (feature x window); NaN where no seizure
+    scored a cell."""
+    import warnings
+    mats = [ps["auc"] for ps in result["per_seizure"].values()]
+    n_feat, n_win = len(result["features"]), result["offsets"].size
+    if not mats:
+        return np.full((n_feat, n_win), np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN slices
+        return np.nanmean(np.stack(mats), axis=0)
+
+
+def _swauc_worker(key, jid, nwin, band_lo_sec, band_hi_sec):
+    """Score the sliding-window AUC off the request thread. Never raises."""
+    try:
+        with _LOCK:
+            cached = _CACHE.get(jid)
+        if cached is None or cached.get("empty"):
+            _swauc_finish(key, {"empty": True,
+                                "reason": "Build the matrix first (scope bar)."})
+            return
+        full = cached["full"]
+        feats = list(cached.get("metrics") or [])
+        _swauc_set(key, progress="scoring windows…")
+        result = _swa.sliding_window_auc(
+            full, feats, n_windows=int(nwin),
+            band_lo=float(band_lo_sec), band_hi=float(band_hi_sec))
+        result["group_auc"] = _swauc_group_matrix(result)
+        _swauc_set(key, progress="building distributions…")
+        cls = _swa.sliding_class_column(full, n_windows=int(nwin),
+                                        band_lo=float(band_lo_sec),
+                                        band_hi=float(band_hi_sec))
+        lab = full.assign(**{"class": cls})
+        result["pc_by_feature"] = {f: _fc.pdf_cdf(lab, f)
+                                   for f in result["features"]}
+        result["sz_labels"] = _seizure_labels(full)
+        result["empty"] = result["n_seizures_used"] == 0
+        _swauc_finish(key, result)
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("sliding-AUC build failed (key=%s): %s", key, e)
+        _swauc_set(key, status="error", progress=f"error: {e}")
+
+
+def _swauc_feat(result, feature):
+    """Selected PDF/CDF feature, defaulting to the group's #1 feature."""
+    if feature in result.get("features", []):
+        return feature
+    top = result.get("group_top5") or result.get("features") or [None]
+    return top[0]
+
+
+def _swauc_seizure_opts(result) -> list:
+    opts = [{"label": "All seizures (group)", "value": "group"}]
+    labels = result.get("sz_labels", {})
+    for s in sorted(result.get("per_seizure", {})):
+        opts.append({"label": labels.get(s, f"seizure {s}"), "value": str(s)})
+    return opts
+
+
+def _swauc_notes(result) -> object:
+    n = result.get("n_seizures_used", 0)
+    notes = result.get("notes", [])
+    colour = COLOR_SUCCESS if n else COLOR_WARNING
+    head = (f"{n} seizure(s) scored · group top-5: "
+            f"{', '.join(result.get('group_top5', [])) or '—'}")
+    body = [html.Div(head, style={"color": COLOR_TEXT_PRIMARY,
+                                  "fontSize": FONT_SIZE_CAPTION})]
+    for nt in notes[:8]:
+        body.append(html.Div("· " + nt, style={"color": COLOR_TEXT_TERTIARY,
+                                               "fontSize": FONT_SIZE_CAPTION}))
+    return html.Div(body, style={"borderLeft": f"3px solid {colour}",
+                                 "padding": f"6px {SPACE_3}",
+                                 "background": COLOR_SURFACE_2,
+                                 "borderRadius": RADIUS_SM})
+
+
+def _swauc_bar(result, sel) -> go.Figure:
+    """Ranked mean-AUC horizontal bar: group (mean across seizures) or one
+    seizure; group top-5 highlighted."""
+    if sel == "group":
+        score, ranked, top = (result["group"], result["group_ranked"],
+                              set(result["group_top5"]))
+        title = "Mean AUC across seizures"
+    else:
+        ps = result["per_seizure"].get(int(sel))
+        if not ps:
+            return empty_fig("No scorable windows for this seizure")
+        score, ranked, top = ps["mean_auc"], ps["ranked"], set(ps["top5"])
+        title = f"Mean AUC · seizure {sel}"
+    show = [f for f in ranked if np.isfinite(score[f])][:12][::-1]
+    colours = [COLOR_ACCENT if f in top else COLOR_DIVIDER for f in show]
+    fig = go.Figure(go.Bar(
+        x=[score[f] for f in show], y=show, orientation="h", marker_color=colours,
+        hovertemplate="%{y}: AUC %{x:.3f}<extra></extra>"))
+    fig.add_vline(x=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+    fig.update_layout(**_pc_layout(title, "mean AUC (≥.5)", height=390),
+                      xaxis_range=[0.5, 1.0], yaxis_title="")
+    return fig
+
+
+def _swauc_heatmap(result, sel) -> go.Figure:
+    feats, ranked, labels = (result["features"], result["group_ranked"],
+                             result["win_labels"])
+    if sel == "group":
+        M, title = result["group_auc"], "AUC by feature × window (group mean)"
+    else:
+        ps = result["per_seizure"].get(int(sel))
+        if not ps:
+            return empty_fig("No scorable windows for this seizure")
+        M, title = ps["auc"], f"AUC by feature × window · seizure {sel}"
+    order = [feats.index(f) for f in ranked][::-1]        # best feature at top
+    z = np.asarray(M)[order]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=labels, y=[ranked[::-1][i] for i in range(len(order))],
+        colorscale="Viridis", zmin=0.5, zmax=1.0,
+        colorbar=dict(title=dict(text="AUC", font=dict(size=9)), thickness=10,
+                      len=0.85, x=1.005),
+        hovertemplate="%{y} · %{x} before onset · AUC %{z:.3f}<extra></extra>"))
+    fig.update_layout(**_pc_layout(title, "interictal window (before onset)",
+                                   height=530), yaxis_title="")
+    return fig
+
+
+def _swauc_best_bar(result) -> go.Figure:
+    best, labels = result["best_per_seizure"], result.get("sz_labels", {})
+    xs = [labels.get(b["seizure_idx"], f"sz {b['seizure_idx']}") for b in best]
+    ys = [b["best_auc"] for b in best]
+    txt = [b["best_feature"] or "" for b in best]
+    fig = go.Figure(go.Bar(
+        x=xs, y=ys, text=txt, textposition="outside", marker_color=COLOR_ACCENT,
+        hovertemplate="%{x}<br>best AUC %{y:.3f} (%{text})<extra></extra>"))
+    fig.add_hline(y=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+    fig.update_layout(**_pc_layout("Best AUC per seizure (group top-5 features)",
+                                   "seizure", height=390),
+                      yaxis_title="best AUC", yaxis_range=[0.4, 1.0])
+    return fig
+
+
+def _swauc_render(result, sel, feature):
+    pc = result.get("pc_by_feature", {}).get(feature)
+    pdf = _pdf_fig(pc, feature) if pc else empty_fig("No distribution")
+    cdf = _cdf_fig(pc, feature) if pc else empty_fig("No distribution")
+    return (_swauc_bar(result, sel), _swauc_heatmap(result, sel),
+            _swauc_best_bar(result), pdf, cdf, _swauc_notes(result))
+
+
+def layout_slidingauc(store):
+    """Sliding-window ROC-AUC lens: the fixed 30-min preictal window vs N sampled
+    30-min interictal windows across a 1-6 h band, scored per feature per seizure
+    then aggregated -- surfacing per-seizure and consensus top features."""
+    inp = {**DROPDOWN_STYLE, "width": "90px"}
+    return html.Div([
+        scope_bar(store),
+        card(section_header("Sliding-window ROC-AUC — preictal vs sampled interictal"),
+             html.Div([
+                 html.Div("The preictal 30-min window (positive) is held fixed; the "
+                          "interictal reference is sampled as N evenly-spaced 30-min "
+                          "windows across a 1-6 h lookback band before onset (windows "
+                          "within 1 h of the previous seizure are dropped). Each "
+                          "feature's preictal-vs-window rank AUC is scored per seizure, "
+                          "then averaged across seizures (the seizure is the unit). "
+                          "Build the matrix in the scope bar first, then Run.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 html.Div([
+                     _ctl("Windows / seizure", dcc.Input(
+                         id="pex-swauc-nwin", type="number",
+                         value=_cfg.SLIDING_N_WINDOWS, min=2, max=40, step=1,
+                         debounce=True, style=inp),
+                         "How many interictal windows to sample per seizure."),
+                     _ctl("Band from (h)", dcc.Input(
+                         id="pex-swauc-bandlo", type="number", value=1, min=0.5,
+                         max=12, step=0.5, debounce=True, style=inp),
+                         "Closest the windows get to onset."),
+                     _ctl("Band to (h)", dcc.Input(
+                         id="pex-swauc-bandhi", type="number", value=6, min=1,
+                         max=24, step=0.5, debounce=True, style=inp),
+                         "Furthest before onset the windows reach."),
+                     _ctl("Seizure", dcc.Dropdown(
+                         id="pex-swauc-seizure",
+                         options=[{"label": "All seizures (group)",
+                                   "value": "group"}], value="group",
+                         clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "230px"}),
+                         "Group aggregate, or drill into one seizure."),
+                     _ctl("Feature (PDF/CDF)", dcc.Dropdown(
+                         id="pex-swauc-feature", clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "200px"}),
+                         "Which feature's distribution to show at the bottom."),
+                     html.Div(button("▶ Run sliding-window AUC", "pex-swauc-build",
+                                     icon_name="play"),
+                              style={"alignSelf": "flex-end"}),
+                 ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+                           "alignItems": "flex-start", "marginTop": SPACE_3}),
+                 html.Div(id="pex-swauc-status",
+                          style={"marginTop": SPACE_2, "color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION}),
+                 html.Div(id="pex-swauc-notes", style={"marginTop": SPACE_2}),
+             ], style={"display": "flex", "flexDirection": "column",
+                       "gap": SPACE_2, "marginTop": SPACE_2}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Top features & AUC across windows"),
+             html.Div([
+                 dcc.Graph(id="pex-swauc-groupbar", config={"displaylogo": False},
+                           figure=empty_fig("Run to see ranked features"),
+                           style={"flex": "1 1 380px", "minWidth": "0",
+                                  "height": "400px"}),
+                 dcc.Graph(id="pex-swauc-heatmap", config={"displaylogo": False},
+                           figure=empty_fig("Run to see AUC by window"),
+                           style={"flex": "1 1 460px", "minWidth": "0",
+                                  "height": "540px"}),
+             ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Best AUC per seizure (using the group top-5 features)"),
+             dcc.Graph(id="pex-swauc-bestbar", config={"displaylogo": False},
+                       figure=empty_fig("Run to see per-seizure best AUC")),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Distribution of the selected feature "
+                            "(preictal vs pooled interictal windows)"),
+             html.Div([
+                 dcc.Graph(id="pex-swauc-pdf", config={"displaylogo": False},
+                           figure=empty_fig("Run to see the PDF"),
+                           style={"flex": "1 1 380px", "minWidth": "0",
+                                  "height": "375px"}),
+                 dcc.Graph(id="pex-swauc-cdf", config={"displaylogo": False},
+                           figure=empty_fig("Run to see the CDF"),
+                           style={"flex": "1 1 380px", "minWidth": "0",
+                                  "height": "375px"}),
+             ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+        dcc.Interval(id="pex-swauc-poll", interval=1200, disabled=True),
+        dcc.Store(id="pex-swauc-job"),
+    ], style={"padding": SPACE_4})
+
+
 def register_callbacks(app, store, config):
     global _CACHE_DIR
     _CACHE_DIR = _default_cache_dir()
@@ -2444,7 +2741,7 @@ def register_callbacks(app, store, config):
         window_h = float(window_h or 6.0)
         cap = _cfg.INTERACTIVE_POINT_CAP
         jid = _job_id(animal, protocol or "", variant, window_h, method, cap,
-                      _win_token(sv, cfg))
+                      _win_token(sv, cfg) + _excl_tok(store, animal))
         with _LOCK:
             cached = _CACHE.get(jid)
             state = dict(_JOBS.get(jid) or {})
@@ -2472,7 +2769,7 @@ def register_callbacks(app, store, config):
         return _job_id(sel.get("animal"), sel.get("protocol") or "", variant,
                        float(sel.get("window_h") or 6.0),
                        sel.get("method", "pca"), _cfg.INTERACTIVE_POINT_CAP,
-                       _win_token(sv, cfg))
+                       _win_token(sv, cfg) + _excl_tok(store, sel.get("animal")))
 
     @app.callback(
         Output("pex-export-dl", "data"),
@@ -2659,7 +2956,7 @@ def register_callbacks(app, store, config):
         for kind, sv, fcfg in (("passive", pa_sv, pa_cfg),
                                ("evoked", ev_sv, ev_cfg)):
             jid = _job_id(animal, protocol or "", kind, window_h, method, cap,
-                          _win_token(sv, fcfg))
+                          _win_token(sv, fcfg) + _excl_tok(store, animal))
             jids[kind] = jid
             with _LOCK:
                 have = jid in _CACHE
@@ -2856,6 +3153,92 @@ def register_callbacks(app, store, config):
         n_sz = int(cached.get("n_seizures", 0))
         return (_roc_fig(res), _phaseauc_fig(res), _coef_fig(res),
                 _forecast_verdict(res, n_sz))
+
+    # --- Sliding-window ROC-AUC callbacks --- #
+
+    @app.callback(
+        Output("pex-swauc-feature", "options"),
+        Output("pex-swauc-feature", "value"),
+        Input("pex-variant", "value"),
+        State("pex-swauc-feature", "value"),
+        prevent_initial_call=False,
+    )
+    def _swauc_feature_opts(variant, cur):
+        opts = [{"label": m, "value": m}
+                for m in _cfg.metrics_for_variant(variant or "evoked")]
+        vals = {o["value"] for o in opts}
+        return opts, (cur if cur in vals else (opts[0]["value"] if opts else None))
+
+    @app.callback(
+        Output("pex-swauc-groupbar", "figure"),
+        Output("pex-swauc-heatmap", "figure"),
+        Output("pex-swauc-bestbar", "figure"),
+        Output("pex-swauc-pdf", "figure"),
+        Output("pex-swauc-cdf", "figure"),
+        Output("pex-swauc-status", "children"),
+        Output("pex-swauc-poll", "disabled"),
+        Output("pex-swauc-job", "data"),
+        Output("pex-swauc-notes", "children"),
+        Output("pex-swauc-seizure", "options"),
+        Input("pex-swauc-build", "n_clicks"),
+        Input("pex-swauc-poll", "n_intervals"),
+        State("pex-job", "data"),
+        State("pex-swauc-nwin", "value"),
+        State("pex-swauc-bandlo", "value"),
+        State("pex-swauc-bandhi", "value"),
+        State("pex-swauc-seizure", "value"),
+        State("pex-swauc-feature", "value"),
+        prevent_initial_call=True,
+    )
+    def _swauc_build_or_poll(_n, _iv, jid, nwin, blo, bhi, sel, feature):
+        grp_opt = [{"label": "All seizures (group)", "value": "group"}]
+        if not jid or _CACHE.get(jid) is None:
+            msg = "Build the matrix in the scope bar above first, then Run."
+            return (no_update,) * 5 + (msg, True, no_update, "", no_update)
+        nwin = int(nwin or _cfg.SLIDING_N_WINDOWS)
+        blo, bhi = float(blo or 1.0), float(bhi or 6.0)
+        key = _swauc_key(jid, nwin, blo, bhi)
+        with _LOCK:
+            result = _SWAUC_CACHE.get(key)
+            state = dict(_SWAUC_JOBS.get(key) or {})
+        if result is not None:
+            if result.get("empty"):
+                ef = empty_fig("No seizure had both a clean preictal window and a "
+                               "sampled interictal window")
+                return (ef, ef, ef, ef, ef, result.get("reason", "no data"),
+                        True, key, _swauc_notes(result), grp_opt)
+            feat = _swauc_feat(result, feature)
+            g, h, b, pdf, cdf, notes = _swauc_render(result, sel or "group", feat)
+            return (g, h, b, pdf, cdf,
+                    f"✓ {result['n_seizures_used']} seizure(s) scored", True, key,
+                    notes, _swauc_seizure_opts(result))
+        if state.get("status") == "error":
+            ef = empty_fig("Run failed", hint=state.get("progress", ""))
+            return (ef, ef, ef, ef, ef, state.get("progress", "error"),
+                    True, no_update, "", no_update)
+        _swauc_kick(store, key, jid, nwin, blo * 3600.0, bhi * 3600.0)
+        prog = (_SWAUC_JOBS.get(key) or {}).get("progress", "starting…")
+        return (no_update,) * 5 + (f"⏳ {prog}", False, no_update, no_update,
+                                   no_update)
+
+    @app.callback(
+        Output("pex-swauc-groupbar", "figure", allow_duplicate=True),
+        Output("pex-swauc-heatmap", "figure", allow_duplicate=True),
+        Output("pex-swauc-bestbar", "figure", allow_duplicate=True),
+        Output("pex-swauc-pdf", "figure", allow_duplicate=True),
+        Output("pex-swauc-cdf", "figure", allow_duplicate=True),
+        Input("pex-swauc-seizure", "value"),
+        Input("pex-swauc-feature", "value"),
+        State("pex-swauc-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _swauc_rerender(sel, feature, key):
+        result = _SWAUC_CACHE.get(key) if key else None
+        if not result or result.get("empty"):
+            return (no_update,) * 5
+        feat = _swauc_feat(result, feature)
+        g, h, b, pdf, cdf, _notes = _swauc_render(result, sel or "group", feat)
+        return g, h, b, pdf, cdf
 
     def _make_select_cb(kind):
         @app.callback(

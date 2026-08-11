@@ -58,6 +58,19 @@ INTERICTAL_HI_SEC = 5400.0
 MIN_PREICTAL_SEC = 1800.0
 DEFAULT_N_PHASES = 10            # epileptogenesis phases for the forecaster
 
+# --- Sliding-window ROC-AUC test ------------------------------------------
+# The preictal (positive) window stays fixed at (0, PREICTAL_MAX_SEC]. The
+# interictal reference is no longer a single fixed window: N evenly-spaced
+# WIDTH-wide windows are sampled from a fixed lookback BAND before onset, and
+# any window whose far edge falls within POSTICTAL_GUARD of the PREVIOUS seizure
+# is dropped (o <= isi - WIDTH - GUARD). Geometry tunable here.
+SLIDING_N_WINDOWS = 12
+SLIDING_BAND_LO_SEC = 3600.0       # windows start no closer than 1 h to onset
+SLIDING_BAND_HI_SEC = 21600.0      # ... and no further than 6 h before onset
+SLIDING_WIDTH_SEC = 1800.0         # 30-min windows, matching the preictal width
+SLIDING_POSTICTAL_GUARD_SEC = 3600.0   # keep windows >= 1 h after the prev seizure
+SLIDING_MIN_N = 20                 # min finite stimuli per class to score a window
+
 # The paper's five best perturbed features (Fig 3 / Table 1), in our column
 # names: SumPower[1-64], SumPower[256-1024], exp-fit initial factor a,
 # 1st-moment[64-256], 1st-moment[1-64].
