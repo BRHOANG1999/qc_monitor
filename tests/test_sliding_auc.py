@@ -86,6 +86,7 @@ def test_best_per_seizure_from_group_top5():
         assert b["best_feature"] in res["group_top5"]
         assert b["best_feature"] == "signal"     # signal dominates
         assert b["best_auc"] > 0.9
+        assert b["best_window"] in res["win_labels"]   # a concrete window, not a mean
 
 
 def test_short_isi_seizure_dropped():

@@ -2512,14 +2512,24 @@ def _swauc_best_bar(result) -> go.Figure:
     best, labels = result["best_per_seizure"], result.get("sz_labels", {})
     xs = [labels.get(b["seizure_idx"], f"sz {b['seizure_idx']}") for b in best]
     ys = [b["best_auc"] for b in best]
-    txt = [b["best_feature"] or "" for b in best]
+    # The PEAK is a concrete (feature, window) pair -- show BOTH the feature and
+    # which interictal window (lead time before onset) it was, so "best AUC" is
+    # never an unattributed average over windows.
+    txt = [f"{(b['best_feature'] or '—')}<br>@{b.get('best_window') or '?'}"
+           for b in best]
+    cd = [[b.get("best_window") or "?", b["best_feature"] or "—"] for b in best]
     fig = go.Figure(go.Bar(
-        x=xs, y=ys, text=txt, textposition="outside", marker_color=COLOR_ACCENT,
-        hovertemplate="%{x}<br>best AUC %{y:.3f} (%{text})<extra></extra>"))
+        x=xs, y=ys, text=txt, textposition="outside", customdata=cd,
+        textfont=dict(size=9), marker_color=COLOR_ACCENT,
+        hovertemplate="%{x}<br>peak AUC %{y:.3f}<br>%{customdata[1]} @ "
+                      "%{customdata[0]} before onset<br><i>click to see the "
+                      "window distribution</i><extra></extra>"))
     fig.add_hline(y=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
-    fig.update_layout(**_pc_layout("Best AUC per seizure (group top-5 features)",
-                                   "seizure", height=390),
-                      yaxis_title="best AUC", yaxis_range=[0.4, 1.0])
+    fig.update_layout(
+        **_pc_layout("Peak AUC per seizure — best group top-5 feature @ its window",
+                     "seizure (click a bar for its window distribution)",
+                     height=390),
+        yaxis_title="peak AUC", yaxis_range=[0.4, 1.0])
     return fig
 
 
@@ -2529,6 +2539,104 @@ def _swauc_render(result, sel, feature):
     cdf = _cdf_fig(pc, feature) if pc else empty_fig("No distribution")
     return (_swauc_bar(result, sel), _swauc_heatmap(result, sel),
             _swauc_best_bar(result), pdf, cdf, _swauc_notes(result))
+
+
+def _hex_to_rgba(color: str, alpha: float) -> str:
+    """A semi-transparent rgba() from a #rrggbb hue (or pass-through)."""
+    c = str(color)
+    if c.startswith("#") and len(c) == 7:
+        r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return c
+
+
+def _swauc_dist_values(result, sid) -> np.ndarray:
+    """The auc_norm scores for one seizure across the GROUP top-5 features x all
+    valid interictal windows (finite only) -- the per-seizure spread the sliding
+    windows produce."""
+    feats = result.get("features", [])
+    top_idx = [feats.index(f) for f in result.get("group_top5", []) if f in feats]
+    ps = result.get("per_seizure", {}).get(int(sid))
+    if not ps:
+        return np.empty(0)
+    auc = np.asarray(ps["auc"])
+    vals = auc[top_idx, :].ravel() if top_idx else auc.ravel()
+    return vals[np.isfinite(vals)]
+
+
+def _kde_curve(vals, grid):
+    """Gaussian-KDE density over *grid*, or None when there's too little spread
+    (n<3 or ~zero variance) to smooth honestly."""
+    v = np.asarray(vals, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 3 or float(np.ptp(v)) < 1e-9:
+        return None
+    try:
+        from scipy.stats import gaussian_kde
+        return gaussian_kde(v)(grid)
+    except Exception:                       # noqa: BLE001
+        return None
+
+
+def _swauc_dist_fig(result, clicked_sid) -> go.Figure:
+    """Distribution of AUC scores across windows: a colour-coded rug of every
+    seizure's raw scores + a shaded per-seizure density (the clicked seizure
+    foregrounded) + a bold shaded GROUP density. Answers 'is the peak a fluke or
+    is this seizure consistently separable across windows?'."""
+    sids = sorted(result.get("per_seizure", {}))
+    series = {s: _swauc_dist_values(result, s) for s in sids}
+    allv = [v for v in series.values() if v.size]
+    if not allv:
+        return empty_fig("No AUC scores to distribute yet")
+    allvals = np.concatenate(allv)
+    lo, hi = float(np.min(allvals)), float(np.max(allvals))
+    pad = max(0.02, (hi - lo) * 0.12)
+    grid = np.linspace(max(0.5, lo - pad), min(1.0, hi + pad), 220)
+    labels = result.get("sz_labels", {})
+    fig = go.Figure()
+    for k, s in enumerate(sids):
+        v = series[s]
+        if v.size == 0:
+            continue
+        col = _pal.hue_for(labels.get(s, str(s)), k)
+        clicked = clicked_sid is not None and int(s) == int(clicked_sid)
+        kde = _kde_curve(v, grid)
+        if kde is not None:
+            fig.add_trace(go.Scatter(
+                x=grid, y=kde, mode="lines", name=labels.get(s, f"sz {s}"),
+                legendgroup=str(s),
+                line=dict(color=col, width=2.8 if clicked else 1.1),
+                opacity=0.98 if clicked else 0.45,
+                fill="tozeroy" if clicked else None,
+                fillcolor=_hex_to_rgba(col, 0.22) if clicked else None))
+        fig.add_trace(go.Scatter(              # colour-coded rug of the raw scores
+            x=v, y=np.full(v.size, 0.0), mode="markers", showlegend=False,
+            legendgroup=str(s),
+            marker=dict(symbol="line-ns-open", color=col,
+                        size=9 if clicked else 6,
+                        line=dict(width=1.8 if clicked else 0.8, color=col)),
+            hovertemplate=(labels.get(s, f"sz {s}") +
+                           " · AUC %{x:.3f}<extra></extra>")))
+    gk = _kde_curve(allvals, grid)
+    if gk is not None:
+        fig.add_trace(go.Scatter(
+            x=grid, y=gk, mode="lines", name="group (all seizures)",
+            line=dict(color="#d8d8e0", width=3),
+            fill="tozeroy", fillcolor="rgba(216,216,224,0.10)"))
+    fig.add_vline(x=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+    fig.update_layout(
+        **_pc_layout("AUC across windows — per seizure & group (top-5 features)",
+                     "AUC (auc_norm)", height=460),
+        yaxis_title="density")
+    return fig
+
+
+_SWAUC_MODAL_SHOWN = {
+    "display": "flex", "position": "fixed", "top": "0", "left": "0",
+    "right": "0", "bottom": "0", "background": "rgba(10,10,16,0.62)",
+    "alignItems": "center", "justifyContent": "center", "zIndex": "2000",
+    "padding": SPACE_4,
+}
 
 
 def layout_slidingauc(store):
@@ -2598,7 +2706,8 @@ def layout_slidingauc(store):
                                   "height": "540px"}),
              ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
              style={"marginTop": SPACE_4}),
-        card(section_header("Best AUC per seizure (using the group top-5 features)"),
+        card(section_header("Peak AUC per seizure — click a bar for its window "
+                            "distribution"),
              dcc.Graph(id="pex-swauc-bestbar", config={"displaylogo": False},
                        figure=empty_fig("Run to see per-seizure best AUC")),
              style={"marginTop": SPACE_4}),
@@ -2615,6 +2724,41 @@ def layout_slidingauc(store):
                                   "height": "375px"}),
              ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
              style={"marginTop": SPACE_4}),
+        # Click-to-expand modal: the AUC-across-windows distribution for a
+        # clicked seizure (+ all seizures + group). Hidden until a bar is clicked.
+        html.Div(id="pex-swauc-modal", style={"display": "none"}, children=[
+            html.Div([
+                html.Div([
+                    html.Span(id="pex-swauc-modal-title",
+                              style={"color": COLOR_TEXT_PRIMARY,
+                                     "fontSize": FONT_SIZE_TITLE,
+                                     "fontWeight": "600"}),
+                    html.Button("✕", id="pex-swauc-modal-close", n_clicks=0,
+                                style={"marginLeft": "auto", "cursor": "pointer",
+                                       "background": "#3a3a4a", "color": "#f0f0f5",
+                                       "border": f"1px solid {COLOR_DIVIDER}",
+                                       "borderRadius": RADIUS_SM,
+                                       "padding": "2px 10px",
+                                       "fontSize": FONT_SIZE_BODY}),
+                ], style={"display": "flex", "alignItems": "center",
+                          "gap": SPACE_3, "marginBottom": SPACE_2}),
+                html.Div("Each seizure's AUC scores across the sampled interictal "
+                         "windows (group top-5 features): the coloured rug is the "
+                         "raw scores, the shaded curve the clicked seizure's "
+                         "density, faint curves the other seizures, and the bold "
+                         "grey curve the group.",
+                         style={"color": COLOR_TEXT_TERTIARY,
+                                "fontSize": FONT_SIZE_CAPTION,
+                                "marginBottom": SPACE_2, "maxWidth": "90ch"}),
+                dcc.Graph(id="pex-swauc-modal-fig", config={"displaylogo": False},
+                          figure=empty_fig("Click a seizure bar"),
+                          style={"height": "470px"}),
+            ], style={"background": "#1e1e2f",
+                      "border": f"1px solid {COLOR_DIVIDER}",
+                      "borderRadius": RADIUS_SM, "padding": SPACE_4,
+                      "width": "92%", "maxWidth": "920px",
+                      "boxShadow": "0 8px 40px rgba(0,0,0,0.5)"}),
+        ]),
         dcc.Interval(id="pex-swauc-poll", interval=1200, disabled=True),
         dcc.Store(id="pex-swauc-job"),
     ], style={"padding": SPACE_4})
@@ -3239,6 +3383,39 @@ def register_callbacks(app, store, config):
         feat = _swauc_feat(result, feature)
         g, h, b, pdf, cdf, _notes = _swauc_render(result, sel or "group", feat)
         return g, h, b, pdf, cdf
+
+    @app.callback(
+        Output("pex-swauc-modal", "style"),
+        Output("pex-swauc-modal-fig", "figure"),
+        Output("pex-swauc-modal-title", "children"),
+        # Reset clickData on close so re-clicking the SAME bar is a value change
+        # and re-fires (Dash only fires on a changed Input value; a bar's clickData
+        # is deterministic, so without this the modal can't be reopened for a
+        # seizure just closed).
+        Output("pex-swauc-bestbar", "clickData", allow_duplicate=True),
+        Input("pex-swauc-bestbar", "clickData"),
+        Input("pex-swauc-modal-close", "n_clicks"),
+        State("pex-swauc-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _swauc_open_dist(click, _close, key):
+        # Close button (or no click payload) -> hide the modal + clear the click.
+        if callback_context.triggered_id == "pex-swauc-modal-close" or not click:
+            return {"display": "none"}, no_update, no_update, None
+        result = _SWAUC_CACHE.get(key) if key else None
+        if not result or result.get("empty"):
+            return {"display": "none"}, no_update, no_update, None
+        best = result.get("best_per_seizure", [])
+        try:
+            idx = int(click["points"][0].get("pointNumber", 0))
+        except (KeyError, IndexError, TypeError, ValueError):
+            idx = -1
+        if idx < 0 or idx >= len(best):
+            return no_update, no_update, no_update, no_update
+        sid = best[idx]["seizure_idx"]
+        label = result.get("sz_labels", {}).get(sid, f"seizure {sid}")
+        return (_SWAUC_MODAL_SHOWN, _swauc_dist_fig(result, sid),
+                f"Window AUC distribution · {label}", no_update)
 
     def _make_select_cb(kind):
         @app.callback(

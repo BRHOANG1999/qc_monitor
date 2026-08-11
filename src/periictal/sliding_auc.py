@@ -158,7 +158,7 @@ def sliding_window_auc(full, features, *,
 
     group = _group_from_per_seizure(per_seizure, feats)
     group_ranked, group_top5 = _rank_features(group, feats, k=top_k)
-    best = _best_per_seizure(per_seizure, group_top5)
+    best = _best_per_seizure(per_seizure, group_top5, feats, win_labels)
     return {"offsets": offsets, "win_labels": win_labels, "features": feats,
             "per_seizure": per_seizure, "group": group,
             "group_ranked": group_ranked, "group_top5": group_top5,
@@ -215,19 +215,26 @@ def sliding_class_column(full, *, n_windows=_cfg.SLIDING_N_WINDOWS,
     return cls
 
 
-def _best_per_seizure(per_seizure, group_top5) -> list:
-    """For each seizure, its best mean AUC among the GROUP top-5 features (the
-    seizure's best achievable discrimination using the consensus feature set)."""
+def _best_per_seizure(per_seizure, group_top5, feats, win_labels) -> list:
+    """For each seizure, the PEAK auc_norm over the GROUP top-5 features AND the
+    sampled interictal windows -- reporting WHICH feature and, crucially, WHICH
+    window achieved it, so the comparison is a concrete (feature, window) pair
+    rather than an average over windows. (Peak over windows is optimistic; it's
+    the seizure's best-case discrimination, surfaced alongside its lead time.)"""
+    top_idx = [feats.index(f) for f in group_top5 if f in feats]
     out = []
     for s, ps in per_seizure.items():
-        cand = [(ps["mean_auc"][f], f) for f in group_top5
-                if np.isfinite(ps["mean_auc"].get(f, float("nan")))]
-        if not cand:
-            out.append({"seizure_idx": int(s), "best_auc": float("nan"),
-                        "best_feature": None})
-            continue
-        best_auc, best_f = max(cand, key=lambda t: t[0])
-        out.append({"seizure_idx": int(s), "best_auc": float(best_auc),
-                    "best_feature": best_f})
+        auc = np.asarray(ps["auc"])
+        best_auc, best_f, best_w = float("nan"), None, None
+        for fi in top_idx:
+            row = auc[fi]
+            if not np.isfinite(row).any():
+                continue
+            wj = int(np.nanargmax(row))
+            if not np.isfinite(best_auc) or row[wj] > best_auc:
+                best_auc, best_f, best_w = (float(row[wj]), feats[fi],
+                                            win_labels[wj])
+        out.append({"seizure_idx": int(s), "best_auc": best_auc,
+                    "best_feature": best_f, "best_window": best_w})
     out.sort(key=lambda r: int(r["seizure_idx"]))
     return out
