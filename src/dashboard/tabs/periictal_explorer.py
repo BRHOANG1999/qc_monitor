@@ -1680,7 +1680,7 @@ def _loadings_fig(cached) -> go.Figure:
 # --------------------------------------------------------------------- #
 
 def _preview_panel(store, animal, protocol, variant, window_h,
-                   window_label="") -> html.Div:
+                   window_label="", tab="") -> html.Div:
     if not animal:
         return _callout("Pick an animal to begin.", COLOR_TEXT_SECONDARY)
     szs = [s for s in scored_seizures(store, animal)
@@ -1693,14 +1693,17 @@ def _preview_panel(store, animal, protocol, variant, window_h,
             f"define lead-up windows. Try another protocol or 'All protocols'.",
             COLOR_WARNING, "⚠")
     win = f" [{window_label}]" if window_label else ""
+    # "embed" is only accurate on the Embedding lens; every other lens just needs
+    # the shared matrix built (the embedding radio is irrelevant there).
+    action = ("embed their lead-up stimuli" if tab == "periictal_embedding"
+              else "prepare the matrix, then Run this lens")
     return html.Div([
         html.Span("Ready — ", style={"color": COLOR_SUCCESS, "fontWeight": "600",
                                      "fontSize": FONT_SIZE_BODY}),
         html.Span(f"{animal} · {proto} · {variant} features{win} · "
                   f"{window_h:g} h lead-up",
                   style={"color": COLOR_TEXT_PRIMARY, "fontSize": FONT_SIZE_BODY}),
-        html.Span(f"    Effective n = {n} seizures. Press ▶ Build to embed their "
-                  f"lead-up stimuli.",
+        html.Span(f"    Effective n = {n} seizures. Press ▶ Build to {action}.",
                   style={"color": COLOR_TEXT_SECONDARY,
                          "fontSize": FONT_SIZE_CAPTION}),
     ])
@@ -2821,8 +2824,9 @@ def register_callbacks(app, store, config):
         Input("pex-win-from", "value"),
         Input("pex-win-to", "value"),
         Input("pex-win-guard", "value"),
+        Input("tabs", "value"),
     )
-    def _preview(animal, protocol, variant, window_h, winmode, wf, wt, wg):
+    def _preview(animal, protocol, variant, window_h, winmode, wf, wt, wg, tab):
         variant = variant or "evoked"
         try:
             sv, cfg = _resolve_window(variant, winmode or "full", wf, wt, wg)
@@ -2830,7 +2834,8 @@ def register_callbacks(app, store, config):
             return _callout(f"Feature window: {e}.", COLOR_WARNING, "⚠")
         try:
             return _preview_panel(store, animal, protocol or "", variant,
-                                  float(window_h or 6.0), _window_label(sv, cfg))
+                                  float(window_h or 6.0), _window_label(sv, cfg),
+                                  tab=tab or "")
         except Exception:                                     # noqa: BLE001
             return no_update
 
