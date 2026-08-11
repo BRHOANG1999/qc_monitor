@@ -119,16 +119,21 @@ def build_variant_sidecar(mat_path: str, animal: str, variant: str,
 
 
 def warm_variant(animal: str, evoked_dir: str, variant: str, cfg: FeatureConfig,
-                 progress=None, protocol: str | None = None) -> tuple[int, int]:
+                 progress=None, protocol: str | None = None,
+                 file_filter=None) -> tuple[int, int]:
     """Build every fresh *variant* sidecar for *animal* (skips ones already fresh
     for this config). *protocol* restricts to recordings whose session token
     contains that substring (the windowed read re-parses the traces, ~15 s/file,
-    so scoping to one protocol matters). Returns (built, total)."""
+    so scoping to one protocol matters). *file_filter* (``fp -> bool``) prunes the
+    file list first -- the near-seizure prefilter, so a custom-window build only
+    recomputes files that can contribute a row. Returns (built, total)."""
     assert animal and evoked_dir and variant, "animal, evoked_dir, variant required"
     sig = config_sig(cfg)
     files = [f for f in eo.list_evoked_files(evoked_dir)
              if animal in eo.animals_in_filename(f)
              and (not protocol or protocol in eo.parse_session(f))]
+    if file_filter is not None:
+        files = [f for f in files if file_filter(f)]
     import gc
     built = 0
     for i, fp in enumerate(files):
@@ -147,15 +152,18 @@ def warm_variant(animal: str, evoked_dir: str, variant: str, cfg: FeatureConfig,
 
 
 def iter_variant_sidecars(animal: str, evoked_dir: str, variant: str,
-                          cfg: FeatureConfig):
+                          cfg: FeatureConfig, file_filter=None):
     """Yield (mat_path, sidecar_path, rows) for each FRESH *variant* sidecar of
     *animal* under the given config -- the readiness gate for the windowed
-    matrix. Mirrors evoked_figures.data.iter_animal_sidecars."""
+    matrix. Mirrors evoked_figures.data.iter_animal_sidecars. *file_filter*
+    (``fp -> bool``) prunes the file list first (near-seizure prefilter)."""
     assert animal and variant, "animal and variant required"
     sig = config_sig(cfg)
     for i, fp in enumerate(eo.list_evoked_files(evoked_dir)):
         assert i < _MAX_FILES, "variant sidecar scan runaway"
         if animal not in eo.animals_in_filename(fp):
+            continue
+        if file_filter is not None and not file_filter(fp):
             continue
         rows = eo.read_feature_sidecar(fp, animal, variant, sig)
         if rows:

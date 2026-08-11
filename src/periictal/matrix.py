@@ -57,6 +57,23 @@ def _near_seizure_file_filter(onsets, window_sec, slack):
     return _keep
 
 
+def near_seizure_filter(store, animal, window_sec, slack=None):
+    """Near-seizure file predicate for *animal* (None if the prefilter is off or
+    the animal has no scored seizures). Shared so the dashboard's WINDOWED
+    pre-warm (passive.warm_variant, ~15 s/file) skips exactly the same
+    far-from-seizure files build_matrix does -- otherwise a custom-window build
+    recomputes every file from raw traces for nothing."""
+    if not _cfg.PERIICTAL_PREFILTER_NEAR_SEIZURE:
+        return None
+    onsets = np.array([s.onset_epoch for s in included_seizures(store, animal)],
+                      dtype=np.float64)
+    if onsets.size < 1:
+        return None
+    return _near_seizure_file_filter(
+        onsets, window_sec,
+        _cfg.PERIICTAL_PREFILTER_SLACK_SEC if slack is None else slack)
+
+
 def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cfg,
                   warm_missing: bool = False, file_filter=None):
     """The (mat, sidecar, rows) generator for a sidecar variant. The shared
@@ -68,9 +85,8 @@ def _sidecar_iter(animal: str, evoked_dir: str, sidecar_variant: str, feature_cf
         return iter_animal_sidecars(animal, evoked_dir, compute_missing=warm_missing,
                                     file_filter=file_filter)
     cfg = feature_cfg or _passive.passive_config()
-    # The windowed variants (passive/evokedw) don't take the prefilter yet -- the
-    # common evoked path above does; passive builds are correct, just unfiltered.
-    return _passive.iter_variant_sidecars(animal, evoked_dir, sidecar_variant, cfg)
+    return _passive.iter_variant_sidecars(animal, evoked_dir, sidecar_variant, cfg,
+                                          file_filter=file_filter)
 
 
 def _epoch_columns(animal: str, evoked_dir: str, metrics: list[str],
@@ -196,12 +212,12 @@ def build_matrix(store, animal: str, evoked_dir: str, *,
          for c in lookback_ceilings(seizures, post_ictal_buffer_sec, window_sec)],
         dtype=np.float64)
 
-    # Near-seizure prefilter: skip files that can't contribute a kept row (only
-    # the evoked path; a provable superset -> matrix unchanged). Big win on a
-    # cold build (BCH111: ~127 of 351 files read instead of all).
+    # Near-seizure prefilter: skip files that can't contribute a kept row (a
+    # provable superset -> matrix unchanged). Applies to BOTH the evoked read and
+    # the windowed recompute, where it matters most (~15 s/file). Big win on a
+    # cold build (BCH111: ~127 of 351 files instead of all).
     file_filter = None
-    if (_cfg.PERIICTAL_PREFILTER_NEAR_SEIZURE
-            and sidecar_variant in (None, "evoked")):
+    if _cfg.PERIICTAL_PREFILTER_NEAR_SEIZURE:
         file_filter = _near_seizure_file_filter(
             onsets, window_sec, _cfg.PERIICTAL_PREFILTER_SLACK_SEC)
 

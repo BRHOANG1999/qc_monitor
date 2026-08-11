@@ -47,6 +47,7 @@ from src.dashboard.design import (COLOR_ACCENT, COLOR_DIVIDER, COLOR_SUCCESS,
                                   SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5)
 from src.periictal import config as _cfg
 from src.periictal import embed_io as _eio
+from src.periictal import matrix as _matrix
 from src.periictal import forecast as _fc
 from src.periictal import palette as _pal
 from src.periictal import passive as _passive
@@ -163,9 +164,13 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
         # the raw traces first; the shared default 'evoked' sidecar is pre-warm.
         if sidecar_variant not in (None, "evoked"):
             _set(job_id, progress="reading traces for the feature window…")
+            # Same near-seizure prefilter as the matrix read: a custom-window
+            # build recomputes features from raw traces (~15 s/file), so skipping
+            # files that can't contribute a row is the dominant speedup here.
+            near = _matrix.near_seizure_filter(store, animal, window_h * 3600.0)
             _passive.warm_variant(
                 animal, evoked_dir, sidecar_variant, feature_cfg,
-                protocol=protocol or None,
+                protocol=protocol or None, file_filter=near,
                 progress=lambda d, n, fp: _set(
                     job_id, progress=f"windowing traces… ({d}/{n})"))
         _set(job_id, progress="joining stimuli to seizures…")
