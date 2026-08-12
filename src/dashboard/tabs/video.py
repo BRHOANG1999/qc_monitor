@@ -65,10 +65,15 @@ from src.utils import wavelet as _wav
 
 logger = logging.getLogger("qc_monitor.dashboard.video")
 
-# Initial-render decimation target. The zoom callback re-decimates the
-# visible window dynamically, so this only governs the first paint and
-# the auto-reset view.
-INITIAL_TARGET_BINS = 60_000
+# Initial-render decimation target for the Video Review traces. min/max
+# decimation emits 2 points per bin, so this draws up to 2x this many points.
+# Lowered 60k -> 30k to roughly halve first-paint render + serialize on the LFP
+# and analysis figures (speed prioritized; peaks are preserved by min/max, so
+# only very fine wiggles at full zoom-out soften). The zoom callback re-decimates
+# the visible window to full detail, so zoomed-in fidelity is unchanged. Scoped
+# to Video Review (passed explicitly to choose_target_bins) so the shared
+# decimate._TARGET_BINS -- and the full-fidelity LFP Browser -- are untouched.
+INITIAL_TARGET_BINS = 30_000
 
 # Stim-blanked per-channel series cache. Re-blanking on every zoom is
 # wasteful when only the visible window changed; keyed by
@@ -76,6 +81,27 @@ INITIAL_TARGET_BINS = 60_000
 _BLANKED_MAX = 8
 _blanked_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
 _blanked_lock = RLock()
+
+# Memoize the expensive analytic ENVELOPES (full-recording FFT + filtfilt, and
+# for band power the FFT zero-mask) so a ma-cutoff / auc-window / line-length
+# keystroke -- which only move the threshold line + peakseek/windowed_auc, NOT
+# the envelope -- reuses the cached envelope instead of recomputing it, and
+# toggling Hilbert<->AUC (same 20-200 Hz envelope) is a cache hit. Keyed exactly
+# like _blanked_cache (the envelope is a pure function of the blanked series) plus
+# the transform's own (lo, hi, smooth). Envelopes are ~40 MB (float64) for a long
+# channel; cap small.
+_ENV_MAX = 6
+_env_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
+_env_lock = RLock()
+
+# Memoize the full-recording min/max DECIMATION for the initial LFP render, so an
+# Apply-filter click (filter is applied AFTER decimation, on the ~120k-point
+# display series) reuses the decimation instead of re-running envelope() over the
+# whole multi-million-sample channel. Keyed like _blanked_cache + target_bins.
+# Decimated arrays are ~1 MB each; cap small.
+_DECIM_MAX = 8
+_decim_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_decim_lock = RLock()
 
 # LABEL_STYLE / DROPDOWN_STYLE now come from src.dashboard.components
 # (the shared design system) -- imported above. The local copies used to
@@ -924,6 +950,35 @@ def _get_blanked_series(file_path: str, channel: int,
     return series, fs, n_blanked
 
 
+def _get_analytic_env(file_path: str, channel: int, series: np.ndarray, fs: float,
+                      blank_pre_ms: float, blank_post_ms: float,
+                      stim_times: np.ndarray | None, *,
+                      lo: float = 20.0, hi: float = 200.0,
+                      smooth: bool = True) -> tuple[np.ndarray, float]:
+    """Memoized analytic envelope of the blanked *series* -- ``hilbert_envelope_
+    20_200`` (smooth 20-200 Hz, used by the Hilbert + AUC traces) or the generic
+    ``band_envelope`` (used by continuous band power). Keyed like _blanked_cache
+    plus (lo, hi, smooth) -- so cutoff/AUC-window/line-length keystrokes (which
+    don't touch the envelope) are cache hits, and Hilbert<->AUC share one entry.
+    Returns (env, fs)."""
+    key = (file_path, int(channel), float(blank_pre_ms), float(blank_post_ms),
+           _stim_fingerprint(stim_times), float(lo), float(hi), bool(smooth))
+    with _env_lock:
+        hit = _env_cache.pop(key, None)
+        if hit is not None:
+            _env_cache[key] = hit            # LRU touch
+            return hit[0], hit[1]
+    if smooth and lo == 20.0 and hi == 200.0:
+        env = hilbert_envelope_20_200(series, fs)          # identical to today
+    else:
+        env = band_envelope(np.asarray(series, dtype=np.float64), fs, lo, hi)
+    with _env_lock:
+        _env_cache[key] = (env, float(fs))
+        while len(_env_cache) > _ENV_MAX:
+            _env_cache.popitem(last=False)
+    return env, float(fs)
+
+
 def _decimated_lfp(file_path: str, channel: int,
                    stim_times: np.ndarray | None = None,
                    blank_pre_ms: float = -5.0,
@@ -940,10 +995,24 @@ def _decimated_lfp(file_path: str, channel: int,
     series, fs, n_blanked = _get_blanked_series(
         file_path, channel, stim_times, blank_pre_ms, blank_post_ms,
     )
-    target_bins = choose_target_bins(len(series)) or INITIAL_TARGET_BINS
+    target_bins = (choose_target_bins(len(series),
+                                      target_bins=INITIAL_TARGET_BINS)
+                   or INITIAL_TARGET_BINS)
+    key = (file_path, int(channel), float(blank_pre_ms), float(blank_post_ms),
+           _stim_fingerprint(stim_times), int(target_bins))
+    with _decim_lock:
+        hit = _decim_cache.pop(key, None)
+        if hit is not None:
+            _decim_cache[key] = hit          # LRU touch
+            return hit
     t, display, _decim = envelope(series, fs, target_bins, t_start=0.0)
     duration = float(len(series) / fs)
-    return t, display, duration, n_blanked
+    result = (t, display, duration, n_blanked)
+    with _decim_lock:
+        _decim_cache[key] = result
+        while len(_decim_cache) > _DECIM_MAX:
+            _decim_cache.popitem(last=False)
+    return result
 
 
 def _mmss(sec) -> str:
@@ -1180,7 +1249,9 @@ def _render_hilbert_trace(store, file_id: int,
                         file_id, channel, e)
         return (_empty_lfp_fig(
             f"Couldn't load LFP for Hilbert: {e}"), "")
-    env = hilbert_envelope_20_200(series, fs)
+    env, fs = _get_analytic_env(
+        file_path, int(channel), series, fs, blank_pre_ms, blank_post_ms,
+        stim_times, lo=20.0, hi=200.0, smooth=True)
     # BHZ peak detection runs on the FULL-resolution envelope
     # before decimation; sample indices then translate to seconds
     # the same way the LFP cursor does.
@@ -1202,7 +1273,8 @@ def _render_hilbert_trace(store, file_id: int,
             dtype=bool)
         peak_times = peak_times[keep]
 
-    target_bins = choose_target_bins(len(env)) or 4000
+    target_bins = choose_target_bins(
+        len(env), target_bins=INITIAL_TARGET_BINS) or 4000
     t, display, _decim = envelope(env, fs, target_bins, t_start=0.0)
     fig = _build_lfp_figure(
         t, display,
@@ -1306,9 +1378,12 @@ def _render_band_power_trace(store, file_id: int, channel: int | None,
         logger.warning("Band-power load failed file=%s ch=%s: %s",
                         file_id, channel, e)
         return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
-    env = band_envelope(np.asarray(series, dtype=np.float64), fs, lo, hi)
+    env, fs = _get_analytic_env(
+        file_path, int(channel), series, fs, blank_pre_ms, blank_post_ms,
+        stim_times, lo=lo, hi=hi, smooth=False)
     power = env * env  # instantaneous band power
-    target_bins = choose_target_bins(len(power)) or 4000
+    target_bins = choose_target_bins(
+        len(power), target_bins=INITIAL_TARGET_BINS) or 4000
     t, display, _decim = envelope(power, fs, target_bins, t_start=0.0)
     fig = _build_lfp_figure(
         t, display, f"Slow gamma power ({lo:g}-{hi:g} Hz)",
@@ -1401,12 +1476,25 @@ def _render_wavelet_band_power(store, file_id: int, channel: int | None,
         logger.warning("Wavelet power load failed file=%s ch=%s: %s",
                         file_id, channel, e)
         return (_empty_lfp_fig(f"Couldn't load LFP: {e}"), "")
-    power, work_fs = _wav.wavelet_band_power(
-        np.asarray(series, dtype=np.float64), fs, lo, hi)
+    # Continuous wavelet power over the WHOLE recording: decimate to a modest
+    # working rate (500 Hz -- ample for slow gamma, whose band top is 50 Hz) so a
+    # long recording fits under the CWT sample cap and the transform stays fast.
+    # Guard anyway: an extremely long recording can still exceed the cap, and the
+    # old code let that AssertionError escape (crashing the feature).
+    try:
+        power, work_fs = _wav.wavelet_band_power(
+            np.asarray(series, dtype=np.float64), fs, lo, hi, target_fs=500.0)
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("Continuous wavelet power failed file=%s ch=%s: %s",
+                        file_id, channel, e)
+        return (_empty_lfp_fig(
+            "Recording too long for continuous wavelet power — use the Hilbert "
+            "or slow-gamma (analytic) feature, or per-stim wavelet."), "")
     if power.size == 0:
         return (_empty_lfp_fig("Window too short for a wavelet transform."),
                 "")
-    target_bins = choose_target_bins(len(power)) or 4000
+    target_bins = choose_target_bins(
+        len(power), target_bins=INITIAL_TARGET_BINS) or 4000
     t, display, _decim = envelope(power, work_fs, target_bins, t_start=0.0)
     fig = _build_lfp_figure(
         t, display, f"Wavelet power ({lo:g}-{hi:g} Hz)",
@@ -1834,7 +1922,9 @@ def _render_auc_trace(store, file_id: int, channel: int | None,
         logger.warning("AUC load failed file=%s ch=%s: %s",
                         file_id, channel, e)
         return (_empty_lfp_fig(f"Couldn't load LFP for AUC: {e}"), "")
-    env = hilbert_envelope_20_200(series, fs)
+    env, fs = _get_analytic_env(
+        file_path, int(channel), series, fs, blank_pre_ms, blank_post_ms,
+        stim_times, lo=20.0, hi=200.0, smooth=True)
     try:
         win = float(window_sec) if window_sec else 5.0
         if win <= 0:
@@ -1842,7 +1932,8 @@ def _render_auc_trace(store, file_id: int, channel: int | None,
     except (TypeError, ValueError):
         win = 5.0
     auc = windowed_auc(env, fs, win)
-    target_bins = choose_target_bins(len(auc)) or 4000
+    target_bins = choose_target_bins(
+        len(auc), target_bins=INITIAL_TARGET_BINS) or 4000
     t, display, _decim = envelope(auc, fs, target_bins, t_start=0.0)
     fig = _build_lfp_figure(
         t, display, f"Hilbert AUC ({win:g} s window)",
@@ -2473,6 +2564,12 @@ def layout(store: Store, bridge: dict | None = None):
                   className="video-load-pill",
                   style={"display": "none"}),
         dcc.Store(id="video-load-state", data={}),
+        # Single resolved (file, channel) key that drives the two heavy figure
+        # callbacks (_update_lfp / _update_analysis). _update_player writes it
+        # ONCE per file open AFTER resolving the channel, so the heavy callbacks
+        # no longer fire twice (once with the stale channel, once resolved). A
+        # manual channel change updates it via _sync_render_key_on_channel.
+        dcc.Store(id="video-render-key", data=None),
         # Per-leg "render completed" tokens. The LFP / Hilbert
         # status strings are a pure function of duration + point
         # count + stim/candidate count, so consecutive fixed-
@@ -6261,6 +6358,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-note-history", "children"),
         Output("video-channel-dropdown", "options"),
         Output("video-channel-dropdown", "value"),
+        Output("video-render-key", "data"),
         Input("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
         State("lfp-to-video-bridge", "data"),
@@ -6272,7 +6370,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 html.P("Pick a file to load the video.",
                        style={"color": "#a0a0b0"}),
                 "",
-                [], 0,
+                [], 0, None,
             )
 
         # Build channel options from the .mat itself (truth) +
@@ -6445,7 +6543,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 "gap": "8px",
             })
         history = _render_history(store, file_id)
-        return player, history, ch_options, ch_value
+        return (player, history, ch_options, ch_value,
+                {"file_id": file_id, "channel": ch_value})
+
+    @app.callback(
+        Output("video-render-key", "data", allow_duplicate=True),
+        Input("video-channel-dropdown", "value"),
+        State("video-file-dropdown", "value"),
+        State("video-render-key", "data"),
+        prevent_initial_call=True,
+    )
+    def _sync_render_key_on_channel(channel, file_id, cur):
+        """A MANUAL (or animal-retarget) channel change must drive the two heavy
+        figure callbacks, which now key on ``video-render-key``. ``_update_player``
+        already writes the key on a file open (with the resolved channel), so
+        dedup against the current key to avoid a second render on that path."""
+        if not file_id:
+            return no_update
+        if (isinstance(cur, dict) and cur.get("file_id") == file_id
+                and cur.get("channel") == channel):
+            return no_update
+        return {"file_id": file_id, "channel": channel}
 
     # ---- LFP trace ---- #
     @app.callback(
@@ -6454,8 +6572,11 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-filter-state", "data"),
         Output("video-lfp-duration", "data"),
         Output("video-lfp-loadtoken", "data"),
-        Input("video-file-dropdown", "value"),
-        Input("video-channel-dropdown", "value"),
+        # Single Input: the resolved (file, channel) key. Replaces the separate
+        # file + channel Inputs so a file open renders ONCE (after the channel is
+        # resolved by _update_player) instead of twice (stale channel, then
+        # resolved). See _update_player / _sync_render_key_on_channel.
+        Input("video-render-key", "data"),
         Input("video-apply-filter-btn", "n_clicks"),
         State("video-filter-hp", "value"),
         State("video-filter-lp", "value"),
@@ -6466,8 +6587,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-events-store", "data"),
         prevent_initial_call="initial_duplicate",
     )
-    def _update_lfp(file_id, channel, _n_apply,
+    def _update_lfp(render_key, _n_apply,
                      hp, lp, notch, smooth_ms, blank_raw, timebase, events):
+        file_id = (render_key or {}).get("file_id")
+        channel = (render_key or {}).get("channel")
         # Fresh token each fire so the load-pill done-watcher
         # triggers even when the human-readable status string is
         # identical to the previous recording (fixed-length rig).
@@ -6581,14 +6704,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Output("video-analysis-trace", "figure"),
         Output("video-analysis-status", "children"),
         Output("video-hilbert-loadtoken", "data"),
-        Input("video-file-dropdown", "value"),
+        # Single resolved (file, channel) Input -- see _update_lfp. Renders once
+        # per file open (after the channel resolves) instead of twice. The
+        # render-key changes whenever file or channel changes, so the old
+        # "channel must be a separate Input" cascade concern is subsumed.
+        Input("video-render-key", "data"),
         Input("video-analysis-feature", "value"),
         Input("video-analysis-apply-btn", "n_clicks"),
-        # Channel must be an Input -- the file→channel cascade
-        # sets channel AFTER _update_analysis first fires (with
-        # channel=None). State would leave the Hilbert envelope
-        # stuck on the empty 'Pick a brain channel' message.
-        Input("video-channel-dropdown", "value"),
         # Mass Analyze cutoff drives the dashed-line threshold +
         # the BHZ peak detection on this view. Listening as an
         # Input means typing in the MA cutoff (or click-to-set
@@ -6604,10 +6726,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-analysis-postproc", "value"),
         State("video-events-store", "data"),
     )
-    def _update_analysis(file_id, feature, _n_apply,
-                          channel, ma_cutoff, blank_raw, _rej_ver,
+    def _update_analysis(render_key, feature, _n_apply,
+                          ma_cutoff, blank_raw, _rej_ver,
                           auc_window, ll_start_ms, ll_end_ms,
                           smooth_sec, rollwin, postproc, events):
+        file_id = (render_key or {}).get("file_id")
+        channel = (render_key or {}).get("channel")
         # Thin wrapper: delegate, then stamp a fresh token so the
         # load-pill done-watcher fires even when the status string
         # repeats (0-candidate fixed-length recordings all render
@@ -6898,6 +7022,46 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         }
         """ % target_id)
 
+    # Playback cursor: move ONLY shapes[0] (the vertical cursor line) via a
+    # side-effect Plotly.relayout, exactly like _xsync_js. The old version
+    # returned a whole new figure ({data: fig.data, ...}) 10x/sec, which forced
+    # Plotly.react to re-diff every one of the ~120k Scattergl points on BOTH
+    # graphs ten times a second (and re-fired the dragmode enforcer each tick) --
+    # the dominant playback lag. Touching only shapes[0].x0/x1 leaves `data`
+    # untouched, doesn't rewrite the figure prop, and (being a shape, not an
+    # xaxis.range) never trips the xsync guard. shapes[0] is always the cursor
+    # (_build_lfp_figure / _compute_analysis); markers/threshold live at [1:].
+    def _cursor_js(target_id: str) -> str:
+        return ("""
+        function(currentTime, lfp_dur) {
+            if (currentTime === null || currentTime === undefined) {
+                return window.dash_clientside.no_update;
+            }
+            var host = document.getElementById('""" + target_id + """');
+            var gd = null;
+            if (host) {
+                gd = host.classList
+                      && host.classList.contains('js-plotly-plot')
+                     ? host : host.querySelector('.js-plotly-plot');
+            }
+            if (!gd || !window.Plotly) {
+                return window.dash_clientside.no_update;
+            }
+            if (!gd.layout || !gd.layout.shapes || !gd.layout.shapes.length) {
+                return window.dash_clientside.no_update;  // cursor not built yet
+            }
+            var t = currentTime;
+            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
+            if (v && isFinite(v.duration) && v.duration > 0
+                    && lfp_dur && lfp_dur > 0) {
+                t = currentTime * (lfp_dur / v.duration);
+            }
+            window.Plotly.relayout(gd,
+                {'shapes[0].x0': t, 'shapes[0].x1': t});
+            return window.dash_clientside.no_update;
+        }
+        """)
+
     app.clientside_callback(
         _xsync_js("video-analysis-trace"),
         Output("video-xsync-sink", "data", allow_duplicate=True),
@@ -6911,45 +7075,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
 
-    # 4. Mirror the orange cursor on the analysis trace too.
+    # 4. Mirror the orange cursor on the analysis trace too (side-effect
+    #    relayout of shapes[0] only -- see _cursor_js).
     app.clientside_callback(
-        """
-        function(currentTime, fig, lfp_dur) {
-            if (fig === undefined || fig === null) {
-                return window.dash_clientside.no_update;
-            }
-            if (currentTime === null || currentTime === undefined) {
-                return window.dash_clientside.no_update;
-            }
-            var t = currentTime;
-            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
-            if (v && isFinite(v.duration) && v.duration > 0
-                    && lfp_dur && lfp_dur > 0) {
-                t = currentTime * (lfp_dur / v.duration);
-            }
-            // Keep shapes[1:] (threshold line + landmark verticals);
-            // only shapes[0] (the cursor) moves. Replacing the whole
-            // array here used to wipe the markers 10x/sec.
-            var keep = ((fig.layout && fig.layout.shapes)
-                         || []).slice(1);
-            var cursor = {
-                type: 'line', xref: 'x', yref: 'paper',
-                x0: t, x1: t, y0: 0, y1: 1,
-                line: {color: '#ff9f0a', width: 2}
-            };
-            const newFig = {
-                data: fig.data,
-                layout: Object.assign({}, fig.layout, {
-                    shapes: [cursor].concat(keep)
-                })
-            };
-            return newFig;
-        }
-        """,
-        Output("video-analysis-trace", "figure",
-                allow_duplicate=True),
+        _cursor_js("video-analysis-trace"),
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-current-time", "data"),
-        State("video-analysis-trace", "figure"),
         State("video-lfp-duration", "data"),
         prevent_initial_call=True,
     )
@@ -7566,42 +7697,9 @@ def register_callbacks(app, store: Store, config: dict) -> None:
     #    accumulate drift. When either duration isn't known yet,
     #    fall back to the identity mapping (same as before).
     app.clientside_callback(
-        """
-        function(currentTime, fig, lfp_dur) {
-            if (fig === undefined || fig === null) {
-                return window.dash_clientside.no_update;
-            }
-            if (currentTime === null || currentTime === undefined) {
-                return window.dash_clientside.no_update;
-            }
-            var t = currentTime;
-            var v = document.getElementById('""" + VIDEO_DOM_ID + """');
-            if (v && isFinite(v.duration) && v.duration > 0
-                    && lfp_dur && lfp_dur > 0) {
-                t = currentTime * (lfp_dur / v.duration);
-            }
-            // Preserve shapes[1:] (landmark verticals) -- only the
-            // cursor (shapes[0]) moves. A full replace here wiped the
-            // markers _render_marker_shapes painted.
-            var keep = ((fig.layout && fig.layout.shapes)
-                         || []).slice(1);
-            var cursor = {
-                type: 'line', xref: 'x', yref: 'paper',
-                x0: t, x1: t, y0: 0, y1: 1,
-                line: {color: '#ff9f0a', width: 2}
-            };
-            const newFig = {
-                data: fig.data,
-                layout: Object.assign({}, fig.layout, {
-                    shapes: [cursor].concat(keep)
-                })
-            };
-            return newFig;
-        }
-        """,
-        Output("video-lfp-trace", "figure", allow_duplicate=True),
+        _cursor_js("video-lfp-trace"),
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-current-time", "data"),
-        State("video-lfp-trace", "figure"),
         State("video-lfp-duration", "data"),
         prevent_initial_call=True,
     )

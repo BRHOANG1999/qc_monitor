@@ -80,8 +80,13 @@ def scalogram(signal: np.ndarray, fs: float, fmin: float = 2.0,
     import pywt
     x = np.asarray(signal, dtype=np.float64).ravel()
     assert x.ndim == 1, "scalogram needs a 1-D segment"
-    assert x.size <= _MAX_CWT_SAMPLES, "segment too long; window/slice first"
     x, work_fs = _decimate_to(x, fs, target_fs)
+    # Guard the DECIMATED size. Asserting on the RAW size (before decimation)
+    # made continuous callers crash on any recording > ~250 s @ 20 kHz even
+    # though the decimated CWT was perfectly feasible; a bounded epoch stays
+    # tiny either way, so small-window callers are unaffected.
+    assert x.size <= _MAX_CWT_SAMPLES, \
+        "segment too long even after decimation; window/slice first"
     if x.size < 8:
         return np.array([]), np.array([]), np.zeros((0, 0))
     if not np.all(np.isfinite(x)):
