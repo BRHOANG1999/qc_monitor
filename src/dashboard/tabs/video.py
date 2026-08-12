@@ -5895,113 +5895,107 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return [header,
                 html.Div(rows, style={"marginTop": "4px", "width": "100%"})]
 
-    MAX_MARKER_SHAPES = 64  # NASA Rule 3 fixed bound
-
     # Per-field landmark colors -- the single source of truth lives in
     # video_events.py so the plot verticals and the on-screen color
-    # legend (events panel) can never drift apart.
+    # legend (events panel) can never drift apart. (The 64-marker NASA Rule 3
+    # cap now lives inline in the clientside painter JS below.)
     LANDMARK_COLORS: dict = _events.LANDMARK_COLORS
 
-    @app.callback(
-        Output("video-lfp-trace", "figure", allow_duplicate=True),
+    # Landmark verticals are painted CLIENTSIDE via Plotly.relayout(shapes), so an
+    # event edit no longer uploads the ENTIRE ~120k-point figure to the server as
+    # State on every video-events-store change -- that browser->server figure echo
+    # (LFP + Hilbert, on every landmark/racine/type edit) was the dominant "editing
+    # events is laggy" cost. Build-time _inject_landmarks still draws the landmarks
+    # on every figure rebuild, so re-renders are unaffected; this only handles LIVE
+    # edits. Reads gd.layout.shapes in the browser: shapes[0] is the cursor
+    # (preserved), the rest are markers/landmarks (rebuilt from the small stores).
+    _MARKER_COLORS_JS = json.dumps(LANDMARK_COLORS)
+    app.clientside_callback(
+        """
+        function(markers, events) {
+            var host = document.getElementById('video-lfp-trace');
+            if (!host) { return window.dash_clientside.no_update; }
+            var gd = host.classList && host.classList.contains('js-plotly-plot')
+                     ? host : host.querySelector('.js-plotly-plot');
+            if (!gd || !window.Plotly || !gd.layout || !gd.layout.shapes
+                    || !gd.layout.shapes.length) {
+                return window.dash_clientside.no_update;   // figure not built yet
+            }
+            var COLORS = """ + _MARKER_COLORS_JS + """;
+            var FIELDS = ["EO", "LAS", "BO", "PID", "BB"];
+            var shapes = [gd.layout.shapes[0]];            // keep the cursor
+            var caps = (markers || []).slice(0, 64);       // MAX_MARKER_SHAPES
+            for (var m = 0; m < caps.length; m++) {
+                var tm = parseFloat((caps[m] && caps[m].peak_time_sec) || 0);
+                if (!isFinite(tm)) { continue; }
+                shapes.push({type: 'line', xref: 'x', yref: 'paper',
+                    x0: tm, x1: tm, y0: 0, y1: 1,
+                    line: {color: '#ff453a', width: 1.5, dash: 'dot'},
+                    opacity: 0.85});
+            }
+            var evs = events || [];
+            for (var i = 0; i < evs.length && i < 16; i++) {
+                for (var f = 0; f < FIELDS.length; f++) {
+                    var fld = FIELDS[f];
+                    var ts = evs[i] ? evs[i][fld + '_sec'] : null;
+                    if (ts === null || ts === undefined) { continue; }
+                    var t = parseFloat(ts);
+                    if (!isFinite(t)) { continue; }
+                    shapes.push({type: 'line', xref: 'x', yref: 'paper',
+                        x0: t, x1: t, y0: 0, y1: 1,
+                        line: {color: COLORS[fld] || '#888', width: 2},
+                        opacity: 0.85});
+                }
+            }
+            window.Plotly.relayout(gd, {shapes: shapes});
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-review-marker-store", "data"),
         Input("video-events-store", "data"),
-        State("video-lfp-trace", "figure"),
         prevent_initial_call=True,
     )
-    def _render_marker_shapes(markers, events, fig):
-        """Paint colored landmark verticals on the LFP.
 
-        Two sources:
-        * ``video-review-marker-store`` -- legacy flat onset
-          markers (red dotted) from the pre-BHZ code path.
-        * ``video-events-store`` -- the BHZ structured events;
-          each filled EO/LAS/BO/PID/BB landmark renders as a
-          line in its semantic color. Up to 5 per event.
-
-        Preserves ``shapes[0]`` (the orange video cursor) by
-        reading it out of the current figure State and re-using
-        it untouched. Anything past index 0 is marker territory.
-        Capped at ``MAX_MARKER_SHAPES`` per NASA Rule 3.
+    # Same landmarks on the Hilbert/analysis trace, clientside (see above). It
+    # reserves shapes[0] (cursor) + shapes[1] (dashed detection threshold) and
+    # appends landmarks past them.
+    app.clientside_callback(
         """
-        if not fig:
-            return no_update
-        existing = (fig.get("layout") or {}).get("shapes") or []
-        cursor = existing[0] if existing else None
-        new_shapes: list[dict] = []
-        if cursor is not None:
-            new_shapes.append(cursor)
-        # Legacy flat markers (unchanged behavior).
-        capped = (markers or [])[:MAX_MARKER_SHAPES]
-        for m in capped:
-            t = float(m.get("peak_time_sec", 0))
-            new_shapes.append({
-                "type": "line",
-                "xref": "x", "yref": "paper",
-                "x0": t, "x1": t, "y0": 0, "y1": 1,
-                "line": {"color": "#ff453a", "width": 1.5,
-                          "dash": "dot"},
-                "opacity": 0.85,
-            })
-        # Structured BHZ landmarks. Per-field colors.
-        for i, e in enumerate(events or []):
-            if i >= 16:  # NASA Rule 3: bound events per file
-                break
-            for field, color in LANDMARK_COLORS.items():
-                t_sec = e.get(f"{field}_sec")
-                if t_sec is None:
-                    continue
-                try:
-                    t = float(t_sec)
-                except (TypeError, ValueError):
-                    continue
-                new_shapes.append({
-                    "type": "line",
-                    "xref": "x", "yref": "paper",
-                    "x0": t, "x1": t, "y0": 0, "y1": 1,
-                    "line": {"color": color, "width": 2},
-                    "opacity": 0.85,
-                })
-        patch = Patch()
-        patch["layout"]["shapes"] = new_shapes
-        return patch
-
-    @app.callback(
-        Output("video-analysis-trace", "figure",
-                allow_duplicate=True),
+        function(events) {
+            var host = document.getElementById('video-analysis-trace');
+            if (!host) { return window.dash_clientside.no_update; }
+            var gd = host.classList && host.classList.contains('js-plotly-plot')
+                     ? host : host.querySelector('.js-plotly-plot');
+            if (!gd || !window.Plotly || !gd.layout || !gd.layout.shapes
+                    || !gd.layout.shapes.length) {
+                return window.dash_clientside.no_update;
+            }
+            var COLORS = """ + _MARKER_COLORS_JS + """;
+            var FIELDS = ["EO", "LAS", "BO", "PID", "BB"];
+            var shapes = gd.layout.shapes.slice(0, 2);     // cursor + threshold
+            var evs = events || [];
+            for (var i = 0; i < evs.length && i < 16; i++) {
+                for (var f = 0; f < FIELDS.length; f++) {
+                    var fld = FIELDS[f];
+                    var ts = evs[i] ? evs[i][fld + '_sec'] : null;
+                    if (ts === null || ts === undefined) { continue; }
+                    var t = parseFloat(ts);
+                    if (!isFinite(t)) { continue; }
+                    shapes.push({type: 'line', xref: 'x', yref: 'paper',
+                        x0: t, x1: t, y0: 0, y1: 1,
+                        line: {color: COLORS[fld] || '#888', width: 2},
+                        opacity: 0.85});
+                }
+            }
+            window.Plotly.relayout(gd, {shapes: shapes});
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("video-xsync-sink", "data", allow_duplicate=True),
         Input("video-events-store", "data"),
-        State("video-analysis-trace", "figure"),
         prevent_initial_call=True,
     )
-    def _render_marker_shapes_hilbert(events, fig):
-        """Same landmark verticals on the Hilbert envelope. The
-        Hilbert keeps two reserved shapes -- shapes[0] cursor,
-        shapes[1] the dashed detection threshold -- so preserve both
-        and append landmarks past them."""
-        if not fig:
-            return no_update
-        existing = (fig.get("layout") or {}).get("shapes") or []
-        new_shapes: list[dict] = list(existing[:2])  # cursor+threshold
-        for i, e in enumerate(events or []):
-            if i >= 16:  # NASA Rule 3
-                break
-            for field, color in LANDMARK_COLORS.items():
-                t_sec = e.get(f"{field}_sec")
-                if t_sec is None:
-                    continue
-                try:
-                    t = float(t_sec)
-                except (TypeError, ValueError):
-                    continue
-                new_shapes.append({
-                    "type": "line", "xref": "x", "yref": "paper",
-                    "x0": t, "x1": t, "y0": 0, "y1": 1,
-                    "line": {"color": color, "width": 2},
-                    "opacity": 0.85,
-                })
-        patch = Patch()
-        patch["layout"]["shapes"] = new_shapes
-        return patch
 
     @app.callback(
         Output("video-review-marker-store", "data",
