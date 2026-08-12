@@ -61,6 +61,7 @@ from src.periictal.selection import summarize_selection
 from src.periictal import trendtest as _tt
 from src.periictal import slow_report as _slow
 from src.periictal import sliding_auc as _swa
+from src.periictal import dist_animation as _dan
 from src.periictal.trial_series import build_trial_series
 from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
@@ -2381,6 +2382,12 @@ _SWAUC_JOBS: dict = {}
 _SWAUC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _SWAUC_CACHE_MAX = 4
 
+# Distribution-animation (GIF) jobs. Result = {"mode","status","progress", and
+# on success "src" (data-URI for the inline preview) OR "zip" (bytes) + "name"}.
+_GIF_JOBS: dict = {}
+_GIF_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_GIF_CACHE_MAX = 6
+
 
 def _swauc_key(jid, nwin, band_lo_h, band_hi_h) -> str:
     return f"{jid}|swauc|{nwin}|{band_lo_h}|{band_hi_h}"
@@ -2458,6 +2465,90 @@ def _swauc_worker(key, jid, nwin, band_lo_sec, band_hi_sec):
     except Exception as e:                                    # noqa: BLE001
         logger.exception("sliding-AUC build failed (key=%s): %s", key, e)
         _swauc_set(key, status="error", progress=f"error: {e}")
+
+
+# --- Distribution-animation (GIF) jobs --------------------------------- #
+
+def _gif_key(jid, sel, feature, lookback_h, mode) -> str:
+    return f"{jid}|gif|{sel}|{feature}|{lookback_h}|{mode}"
+
+
+def _gif_set(key, **kw):
+    with _LOCK:
+        _GIF_JOBS.setdefault(key, {}).update(kw)
+        _prune_jobs(_GIF_JOBS)
+
+
+def _gif_finish(key, result):
+    with _LOCK:
+        _GIF_CACHE[key] = result
+        while len(_GIF_CACHE) > _GIF_CACHE_MAX:
+            _GIF_CACHE.popitem(last=False)
+        _GIF_JOBS[key] = {"status": "done", "progress": "done"}
+        _prune_jobs(_GIF_JOBS)
+
+
+def _gif_seizure_ids(full) -> list:
+    """Seizure indices with >= 1 pre-onset stimulus, oldest first (bounded)."""
+    pre = full[full["phase"].to_numpy() == "pre"]
+    return sorted({int(s) for s in pre["seizure_idx"].to_numpy().tolist()})[:500]
+
+
+def _gif_kick(jid, key, sel, feature, lookback_sec, mode):
+    with _LOCK:
+        if key in _GIF_CACHE:
+            return
+        st = _GIF_JOBS.get(key)
+        if st and st.get("status") == "running":
+            return
+        _GIF_JOBS[key] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_GIF_JOBS)
+    # Heavy matplotlib render (many frames x maybe many seizures) -> hold a
+    # process-wide compute slot, same gate as the matrix/ERP/AUC builds.
+    threading.Thread(
+        target=_run_admitted, name=f"gif-{key}", daemon=True,
+        args=(_gif_worker, _gif_set, key,
+              (jid, key, sel, feature, lookback_sec, mode))).start()
+
+
+def _gif_worker(jid, key, sel, feature, lookback_sec, mode):
+    """Render the distribution GIF(s) off the request thread. Never raises."""
+    try:
+        cached = _CACHE.get(jid)
+        if not cached or cached.get("empty") or "full" not in cached:
+            _gif_finish(key, {"empty": True,
+                              "reason": "Build the matrix first (scope bar)."})
+            return
+        if not feature:
+            _gif_finish(key, {"empty": True, "reason": "Pick a Feature first."})
+            return
+        full = cached["full"]
+        labels = _seizure_labels(full)
+        if mode == "zip":
+            sids = _gif_seizure_ids(full)
+            if not sids:
+                _gif_finish(key, {"empty": True, "reason": "No seizures to animate."})
+                return
+            blob = _dan.render_all_seizures_zip(
+                full, feature, sids, labels, lookback=lookback_sec,
+                progress=lambda i, n, lab: _gif_set(
+                    key, progress=f"rendering seizure {i + 1}/{n}: {lab}…"))
+            _gif_finish(key, {"empty": False, "mode": "zip", "zip": blob,
+                              "name": f"{_dan.safe_name(feature)}_dist_gifs.zip"})
+            return
+        sid = "group" if (sel in (None, "group", "")) else int(sel)
+        _gif_set(key, progress="rendering frames…")
+        gif = _dan.render_seizure_gif(full, sid, feature,
+                                      label=labels.get(sid, ""),
+                                      lookback=lookback_sec)
+        b64 = base64.b64encode(gif).decode("ascii")
+        _gif_finish(key, {"empty": False, "mode": "one",
+                          "src": f"data:image/gif;base64,{b64}"})
+    except ValueError as e:                                   # no usable stimuli
+        _gif_finish(key, {"empty": True, "reason": str(e)})
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("distribution-GIF build failed (key=%s): %s", key, e)
+        _gif_set(key, status="error", progress=f"error: {e}")
 
 
 def _swauc_feat(result, feature):
@@ -2730,6 +2821,36 @@ def layout_slidingauc(store):
                                   "height": "375px"}),
              ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
              style={"marginTop": SPACE_4}),
+        card(section_header("🎞 Animate the distribution over time to onset"),
+             html.Div([
+                 html.Div("For the Seizure + Feature selected above, animate that "
+                          "metric's distribution across a 30-min window sliding from "
+                          "the 'Band to (h)' lookback down to the window right up to "
+                          "the seizure. Each frame is one window's distribution "
+                          "(histogram + smoothed density + the individual stimuli as "
+                          "ticks); the faint grey shape is the far-from-onset "
+                          "baseline, so a drift toward onset is visible. 'All seizures "
+                          "(group)' pools every seizure by lead time; the ZIP writes "
+                          "one GIF per seizure.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 html.Div([
+                     button("🎞 Generate GIF (selected seizure)",
+                            "pex-swauc-gif-btn"),
+                     button("⬇ Download all seizures (.zip)", "pex-swauc-gifzip-btn",
+                            variant="secondary"),
+                 ], style={"display": "flex", "gap": SPACE_3, "flexWrap": "wrap",
+                           "marginTop": SPACE_3, "alignItems": "center"}),
+                 html.Div(id="pex-swauc-gif-status",
+                          style={"marginTop": SPACE_2, "color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION}),
+                 html.Img(id="pex-swauc-gif-img",
+                          style={"marginTop": SPACE_3, "maxWidth": "680px",
+                                 "width": "100%", "display": "none",
+                                 "border": f"1px solid {COLOR_DIVIDER}",
+                                 "borderRadius": RADIUS_SM}),
+             ], style={"display": "flex", "flexDirection": "column"}),
+             style={"marginTop": SPACE_4}),
         # Click-to-expand modal: the AUC-across-windows distribution for a
         # clicked seizure (+ all seizures + group). Hidden until a bar is clicked.
         html.Div(id="pex-swauc-modal", style={"display": "none"}, children=[
@@ -2768,6 +2889,9 @@ def layout_slidingauc(store):
         ]),
         dcc.Interval(id="pex-swauc-poll", interval=1200, disabled=True),
         dcc.Store(id="pex-swauc-job"),
+        dcc.Interval(id="pex-swauc-gif-poll", interval=1200, disabled=True),
+        dcc.Store(id="pex-swauc-gif-job"),
+        dcc.Download(id="pex-swauc-gif-dl"),
     ], style={"padding": SPACE_4})
 
 
@@ -3481,6 +3605,72 @@ def register_callbacks(app, store, config):
         feat = _swauc_feat(result, feature)
         return (_SWAUC_MODAL_SHOWN, _swauc_dist_fig(result, sid, feat),
                 f"Window AUC vs lead time · {label}", no_update)
+
+    _GIF_IMG_BASE = {"marginTop": SPACE_3, "maxWidth": "680px", "width": "100%",
+                     "border": f"1px solid {COLOR_DIVIDER}", "borderRadius": RADIUS_SM}
+    _GIF_IMG_HIDDEN = {**_GIF_IMG_BASE, "display": "none"}
+    _GIF_IMG_SHOWN = {**_GIF_IMG_BASE, "display": "block"}
+
+    @app.callback(
+        Output("pex-swauc-gif-img", "src"),
+        Output("pex-swauc-gif-img", "style"),
+        Output("pex-swauc-gif-status", "children"),
+        Output("pex-swauc-gif-dl", "data"),
+        Output("pex-swauc-gif-poll", "disabled"),
+        Output("pex-swauc-gif-job", "data"),
+        Input("pex-swauc-gif-btn", "n_clicks"),
+        Input("pex-swauc-gifzip-btn", "n_clicks"),
+        Input("pex-swauc-gif-poll", "n_intervals"),
+        State("pex-job", "data"),
+        State("pex-swauc-seizure", "value"),
+        State("pex-swauc-feature", "value"),
+        State("pex-swauc-bandhi", "value"),
+        State("pex-swauc-gif-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _swauc_gif_build_or_poll(_n1, _n2, _iv, jid, sel, feature, bandhi, cur_key):
+        trig = callback_context.triggered_id
+        lookback = float(bandhi or 6.0) * 3600.0
+        # A button press: validate the matrix + kick a fresh render job.
+        if trig in ("pex-swauc-gif-btn", "pex-swauc-gifzip-btn"):
+            cached = _CACHE.get(jid) if jid else None
+            if not cached or cached.get("empty"):
+                return (no_update, _GIF_IMG_HIDDEN,
+                        "Build the matrix in the scope bar first.", no_update,
+                        True, no_update)
+            if not feature:
+                return (no_update, _GIF_IMG_HIDDEN, "Pick a Feature first.",
+                        no_update, True, no_update)
+            mode = "one" if trig == "pex-swauc-gif-btn" else "zip"
+            key = _gif_key(jid, sel or "group", feature, round(lookback), mode)
+            _gif_kick(jid, key, sel, feature, lookback, mode)
+            busy = ("⏳ rendering the selected seizure…" if mode == "one"
+                    else "⏳ rendering one GIF per seizure…")
+            return no_update, _GIF_IMG_HIDDEN, busy, no_update, False, key
+        # Poll tick: surface progress, or deliver the finished result (once).
+        if not cur_key:
+            return no_update, no_update, no_update, no_update, True, no_update
+        with _LOCK:
+            result = _GIF_CACHE.get(cur_key)
+            state = dict(_GIF_JOBS.get(cur_key) or {})
+        if result is not None:
+            if result.get("empty"):
+                return (no_update, _GIF_IMG_HIDDEN,
+                        f"⚠ {result.get('reason', 'nothing to animate')}",
+                        no_update, True, no_update)
+            if result.get("mode") == "zip":
+                blob = result["zip"]
+                dl = dcc.send_bytes(lambda b: b.write(blob), result["name"])
+                return (no_update, _GIF_IMG_HIDDEN,
+                        f"✓ {result['name']} ({len(blob) // 1024} KB) downloaded.",
+                        dl, True, no_update)
+            return (result["src"], _GIF_IMG_SHOWN,
+                    "✓ done — the looping GIF is below.", no_update, True, no_update)
+        if state.get("status") == "error":
+            return (no_update, _GIF_IMG_HIDDEN, state.get("progress", "error"),
+                    no_update, True, no_update)
+        return (no_update, no_update, f"⏳ {state.get('progress', 'working…')}",
+                no_update, False, no_update)
 
     def _make_select_cb(kind):
         @app.callback(
