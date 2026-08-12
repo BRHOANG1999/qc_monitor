@@ -74,3 +74,21 @@ def test_require_offproc_raises_only_on_dashboard_owned_thread(monkeypatch):
     # Dashboard process, but inside an off-proc worker: allowed.
     g.mark_worker()
     g.require_offproc("load_mat")            # no raise
+
+
+def test_read_file_evoked_impl_is_guarded(monkeypatch):
+    """The evoked h5py read carries the runtime guard too: the raw
+    ``_read_file_evoked_impl`` must refuse to run on a dashboard-owned thread
+    (the public ``read_file_evoked`` router sends those reads off-process), and
+    must run once marked as an off-proc worker."""
+    from src.utils import evoked_output as eo
+
+    # Dashboard-owned thread: the raw h5py read is forbidden.
+    monkeypatch.setenv("QC_DASHBOARD_ROLE", "1")
+    monkeypatch.delenv("QC_OFFPROC_WORKER", raising=False)
+    with pytest.raises(RuntimeError):
+        eo._read_file_evoked_impl("does_not_exist_evoked.mat")
+
+    # Inside an off-proc worker: allowed -- a missing/unreadable file yields {}.
+    monkeypatch.setenv("QC_OFFPROC_WORKER", "1")
+    assert eo._read_file_evoked_impl("does_not_exist_evoked.mat") == {}

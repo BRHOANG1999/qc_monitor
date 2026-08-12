@@ -56,8 +56,7 @@ from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
 from src.periictal import erpimage as _erp
 from src.periictal import trajectory as _traj
-from src.periictal.erpimage import (decimate_rows, gather_leadup_trials,
-                                    sliding_trial_average)
+from src.periictal.erpimage import decimate_rows, sliding_trial_average
 from src.periictal.selection import summarize_selection
 from src.periictal import trendtest as _tt
 from src.periictal import slow_report as _slow
@@ -67,6 +66,8 @@ from src.preictal.isi import scored_seizures
 from src.utils import evoked_features as _ef
 from src.utils.evoked_features import FeatureConfig
 from src.utils.evoked_output import list_animals
+from src.utils import evoked_reader as _er
+from src.utils import heavy_admit as _ha
 from src.utils import sidecar_warm as _sw
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,16 @@ def _set(job_id: str, **kw) -> None:
         _prune_jobs(_JOBS)
 
 
+def _run_admitted(target, set_fn, tok, args) -> None:
+    """Thread body for every heavy peri-ictal build: hold a process-wide
+    heavy-compute slot (``heavy_admit``) for the whole build so N distinct
+    selections can't all run at once, surfacing a 'waiting…' status via *set_fn*
+    while parked, then run ``target(*args)``. The build workers swallow their own
+    exceptions, so the ``with`` always releases the slot."""
+    with _ha.admit(tok, progress=lambda m: set_fn(tok, progress=m)):
+        target(*args)
+
+
 def _kick(store, evoked_dir, job_id, animal, protocol, variant,
           window_h, method, cap, sidecar_variant, feature_cfg) -> None:
     """Start the build thread for *job_id* unless one is already running or the
@@ -149,9 +160,10 @@ def _kick(store, evoked_dir, job_id, animal, protocol, variant,
         _JOBS[job_id] = {"status": "running", "progress": "starting…"}
         _prune_jobs(_JOBS)
     th = threading.Thread(
-        target=_worker, name=f"periictal-{job_id}", daemon=True,
-        args=(store, evoked_dir, job_id, animal, protocol, variant,
-              window_h, method, cap, sidecar_variant, feature_cfg))
+        target=_run_admitted, name=f"periictal-{job_id}", daemon=True,
+        args=(_worker, _set, job_id,
+              (store, evoked_dir, job_id, animal, protocol, variant,
+               window_h, method, cap, sidecar_variant, feature_cfg)))
     th.start()
 
 
@@ -2019,8 +2031,9 @@ def _erp_kick(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to):
         _ERP_JOBS[key] = {"status": "running", "progress": "starting…"}
         _prune_jobs(_ERP_JOBS)
     threading.Thread(
-        target=_erp_worker, name=f"erp-{key}", daemon=True,
-        args=(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)
+        target=_run_admitted, name=f"erp-{key}", daemon=True,
+        args=(_erp_worker, _erp_set, key,
+              (store, evoked_dir, key, animal, protocol, sz, lookback, frm, to))
     ).start()
 
 
@@ -2039,10 +2052,14 @@ def _erp_worker(store, evoked_dir, key, animal, protocol, sz, lookback, frm, to)
         except Exception:                                     # noqa: BLE001
             pass
         cfg = FeatureConfig(window_start_ms=float(frm), window_end_ms=float(to))
-        res = gather_leadup_trials(
-            evoked_dir, animal, s.onset_epoch, float(lookback) * 60.0, cfg=cfg,
-            progress=lambda i, n, fp: _erp_set(
-                key, progress=f"reading traces… ({i + 1}/{n})"))
+        # The lead-up gather reads many ~600 MB evoked files (~15 s each) and is
+        # the ONLY peri-ictal view that reads raw traces -- run the WHOLE gather
+        # in a child process (off the dashboard GIL) so it can't freeze a second
+        # user. Only the final windowed trials return; per-file progress can't
+        # cross the process boundary, so surface one coarse status instead.
+        _erp_set(key, progress="reading lead-up traces…")
+        res = _er.gather_leadup_offproc(
+            evoked_dir, animal, s.onset_epoch, float(lookback) * 60.0, cfg=cfg)
         res["empty"] = int(res["trials"].shape[0]) == 0
         res["record_only"] = rec_only
         _erp_finish(key, res)
@@ -2207,8 +2224,9 @@ def _sd_kick(store, evoked_dir, key, animal, feature, win):
         _SD_JOBS[key] = {"status": "running", "progress": "starting…"}
         _prune_jobs(_SD_JOBS)
     threading.Thread(
-        target=_sd_worker, name=f"periictal-sd-{key}", daemon=True,
-        args=(store, evoked_dir, key, animal, feature, win)).start()
+        target=_run_admitted, name=f"periictal-sd-{key}", daemon=True,
+        args=(_sd_worker, _sd_set, key,
+              (store, evoked_dir, key, animal, feature, win))).start()
 
 
 def _sd_worker(store, evoked_dir, key, animal, feature, win):
@@ -2393,8 +2411,9 @@ def _swauc_kick(store, key, jid, nwin, band_lo_sec, band_hi_sec):
         _SWAUC_JOBS[key] = {"status": "running", "progress": "starting…"}
         _prune_jobs(_SWAUC_JOBS)
     threading.Thread(
-        target=_swauc_worker, name=f"swauc-{key}", daemon=True,
-        args=(key, jid, nwin, band_lo_sec, band_hi_sec)).start()
+        target=_run_admitted, name=f"swauc-{key}", daemon=True,
+        args=(_swauc_worker, _swauc_set, key,
+              (key, jid, nwin, band_lo_sec, band_hi_sec))).start()
 
 
 def _swauc_group_matrix(result) -> np.ndarray:

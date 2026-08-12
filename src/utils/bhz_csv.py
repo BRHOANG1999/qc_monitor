@@ -33,9 +33,12 @@ if a sample-index actually changes (caveat #3 in the plan).
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import hashlib
 import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -115,6 +118,87 @@ _COMPLETENESS_COLS: tuple[str, ...] = (
 # One lock serialises ALL day-CSV mutations (append + overwrite), since
 # both read-modify-rewrite the same per-(animal, day) files.
 _CSV_WRITE_LOCK = threading.Lock()
+
+# Same-host cross-PROCESS lock for the day CSVs. `_CSV_WRITE_LOCK` only serialises
+# threads within ONE process, but the split topology has TWO writers: the
+# dashboard (Video Review Submit / PI approve) and the daemon
+# (needs_scoring_flush timer) both read-modify-write the same {date}_{animal}.csv.
+# Without a cross-process lock a concurrent Submit + flush can lose one side's
+# appended rows (classic read-modify-write race). Both services run on the same
+# host as the same user, so a LOCAL advisory lock file (keyed by the CSV's
+# absolute path) coordinates them without depending on network-share lock
+# semantics. Best-effort: if the OS lock can't be taken it degrades to the thread
+# lock alone (today's behaviour) rather than blocking the write.
+_CSV_LOCK_DIR = os.path.join(tempfile.gettempdir(), "qc_bhz_csv_locks")
+_CSV_OS_LOCK_TRIES = 3          # NASA Rule 2: bounded. msvcrt LK_LOCK waits ~10 s
+                                # per try, so ~30 s max before it degrades.
+
+
+def _os_lock(fd: int) -> bool:
+    """Take an exclusive advisory lock on *fd* (blocking, bounded). True on
+    success, False if it could not be acquired within the retry budget."""
+    try:
+        import msvcrt
+    except ImportError:                              # non-Windows (e.g. CI Linux)
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    for _ in range(_CSV_OS_LOCK_TRIES):
+        try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _os_unlock(fd: int) -> None:
+    try:
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    except ImportError:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@contextlib.contextmanager
+def _cross_proc_csv_lock(path: Path):
+    """Serialise day-CSV read-modify-write ACROSS processes (dashboard vs daemon),
+    keyed on the CSV's absolute path. The slow cross-process wait happens here,
+    OUTSIDE ``_CSV_WRITE_LOCK``, so it never blocks writes to OTHER day files.
+    Degrades to a no-op (thread lock only) if the lock file / OS lock can't be
+    obtained -- it never blocks a write outright."""
+    fd = None
+    try:
+        os.makedirs(_CSV_LOCK_DIR, exist_ok=True)
+        key = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+        fd = os.open(os.path.join(_CSV_LOCK_DIR, key + ".lock"),
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        _os_lock(fd)
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        fd = None                       # degrade: proceed under the thread lock
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                _os_unlock(fd)
+            finally:
+                os.close(fd)
 
 
 def _to_sample_index(t_sec: float | None,
@@ -377,7 +461,7 @@ def write_event_rows(csv_path: str | Path,
     path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fname = str(file_meta.get("filename") or "")
-    with _CSV_WRITE_LOCK:
+    with _cross_proc_csv_lock(path), _CSV_WRITE_LOCK:
         # Upgrade a legacy/older-schema CSV to the current COLUMNS before we
         # append, so the new row's extra columns don't spill past the header.
         _ensure_header(path)
@@ -573,7 +657,7 @@ def overwrite_day_csv(csv_path: str | Path,
     assert isinstance(file_meta_by_filename, dict)
     assert isinstance(fs, (int, float)) and fs > 0, "fs > 0"
     path = Path(csv_path)
-    with _CSV_WRITE_LOCK:
+    with _cross_proc_csv_lock(path), _CSV_WRITE_LOCK:
         # Snapshot what's on disk.
         existing = existing_filenames_in_csv(path)
         existing_fns = set(existing.keys())

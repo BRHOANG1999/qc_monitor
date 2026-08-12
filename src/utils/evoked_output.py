@@ -46,6 +46,7 @@ import numpy as np
 
 from src.utils.animal import split_animal_electrode, is_animal_channel
 from src.utils import evoked_features as ef
+from src.utils.offproc_guard import in_dashboard_owned_thread, require_offproc
 
 logger = logging.getLogger("qc_monitor.utils.evoked_output")
 
@@ -386,8 +387,25 @@ def read_file_evoked(path: str,
     the file has no ``evokedData`` (scalars-only files still yield rows).
     Unreadable files -> ``{}``. h5py gives ``evokedData`` as ``[epochs x
     samples]`` already (HDF5 is transposed vs MATLAB), so no transpose.
+
+    ROUTING: on a dashboard-owned thread (``QC_DASHBOARD_ROLE`` set, split
+    topology) this GIL-holding h5py read is dispatched to a child process via
+    ``evoked_reader`` so it never freezes the page -- mirroring how
+    ``chunk_cache.get_chunk`` routes ``.mat`` reads. In the daemon / offline tool
+    / off-proc worker it reads in-process, unchanged.
     """
+    if in_dashboard_owned_thread():
+        from src.utils import evoked_reader
+        return evoked_reader.read_file_offproc(path, only_animals)
+    return _read_file_evoked_impl(path, only_animals)
+
+
+def _read_file_evoked_impl(path: str,
+                           only_animals: list | None = None) -> dict[str, dict]:
+    """Raw h5py read (see ``read_file_evoked``). Guarded so it can never run on a
+    dashboard-owned thread -- the router sends dashboard reads off-process."""
     assert isinstance(path, str) and path, "path required"
+    require_offproc("read_file_evoked (evoked *_evoked.mat h5py read)")
     import h5py  # lazy: keeps the dependency off non-chronic code paths.
     keep = set(only_animals) if only_animals else None
     out: dict[str, dict] = {}
@@ -445,6 +463,26 @@ def compute_feature_rows(path: str, animal: str, cfg=None,
                          expensive: bool = False,
                          include_wavelet: bool = True,
                          trial_avg: int | None = None) -> list:
+    """Per-epoch feature rows for one ``*_evoked.mat`` / *animal*.
+
+    ROUTING: on a dashboard-owned thread the whole read + Morlet-CWT compute is
+    dispatched to a child process (``evoked_reader.compute_rows_offproc``) so it
+    never holds the page's GIL; only the small row dicts return. In the daemon /
+    offline tool / off-proc worker it computes in-process. See
+    ``_compute_feature_rows_impl`` for the full contract.
+    """
+    if in_dashboard_owned_thread():
+        from src.utils import evoked_reader
+        return evoked_reader.compute_rows_offproc(
+            path, animal, cfg, expensive, include_wavelet, trial_avg)
+    return _compute_feature_rows_impl(
+        path, animal, cfg, expensive, include_wavelet, trial_avg)
+
+
+def _compute_feature_rows_impl(path: str, animal: str, cfg=None,
+                               expensive: bool = False,
+                               include_wavelet: bool = True,
+                               trial_avg: int | None = None) -> list:
     """Per-epoch feature rows for one ``*_evoked.mat`` / *animal* -- the
     canonical sidecar payload. Pure: reads the animal's traces, computes the
     full feature set (optionally with *cfg* window/filter/smoothing/baseline),
