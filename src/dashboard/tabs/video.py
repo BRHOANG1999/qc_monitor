@@ -2085,6 +2085,17 @@ _ELECTRODE_OPTIONS = [
 # for any real single-animal backlog.
 _QUEUE_LIST_MAX = 100000
 
+# ...but do NOT render a wildcard button for all of them. Every
+# {type:'video-queue-item'/'video-needs-item'} button is a pattern-matching
+# component that dash-renderer must re-match against ALL callbacks on EVERY
+# callback dispatch. On a chronic animal (weeks of hourly chunks) that's
+# thousands of them, and it turned the events-editor's re-fire wave (mounting an
+# event card's sub-tree on a type pick) into a ~400-round-trip, multi-second
+# stall. Render buttons only for the active day + the most-recent days up to this
+# cap; older days collapse to a count-only summary (reach them via the Pool
+# list). Bounds the wildcard population regardless of how old the animal is.
+_QUEUE_RENDER_CAP = 250
+
 
 _POOL_BTN_STYLE = {
     "flex": "1",
@@ -4423,8 +4434,22 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 style={"color": "#888", "fontSize": "11px",
                         "padding": "8px"})
         from datetime import datetime as _dt
+        # Bound the rendered wildcard-button population (see _QUEUE_RENDER_CAP):
+        # a chronic animal's pool can be thousands of files, and each button is a
+        # pattern component dash-renderer re-matches on every dispatch. Render at
+        # most the cap; always include the active file even if it's past it.
+        rows = list(rows)
+        total = len(rows)
+        shown = rows[:_QUEUE_RENDER_CAP]
+        if total > len(shown) and active_file_id is not None:
+            ids_shown = {int(r.get("id") or r.get("file_id")) for r in shown}
+            if int(active_file_id) not in ids_shown:
+                for r in rows[_QUEUE_RENDER_CAP:]:
+                    if int(r.get("id") or r.get("file_id")) == int(active_file_id):
+                        shown = shown + [r]
+                        break
         items = []
-        for r in rows:
+        for r in shown:
             fid = int(r.get("id") or r.get("file_id"))
             ts_raw = r.get("chunk_datetime") or ""
             try:
@@ -4474,6 +4499,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         "borderLeft": ("3px solid #f0b429" if is_active
                                         else "3px solid transparent"),
                         "textAlign": "left"}))
+        if total > len(shown):
+            items.append(html.Div(
+                f"+ {total - len(shown)} more in this pool — narrow the animal, "
+                "or use prev/next.",
+                style={"color": "#6f7080", "fontSize": "11px",
+                        "fontStyle": "italic", "padding": "8px 10px"}))
         return title, sub, items
 
     @app.callback(
@@ -4586,11 +4617,27 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             if is_active:
                 g["active"] = True
 
-        # One collapsible section per day; auto-open the day holding
-        # the loaded recording, collapse the rest.
+        # One collapsible section per day; auto-open the day holding the loaded
+        # recording, collapse the rest. Bound the rendered wildcard-button
+        # population (see _QUEUE_RENDER_CAP): keep the active day + the most-
+        # recent days up to the cap; older days render a count-only summary.
+        keep: set = set()
+        budget = _QUEUE_RENDER_CAP
+        for day_key, g in reversed(list(day_groups.items())):   # recent -> old
+            if g["active"] or budget > 0:
+                keep.add(day_key)
+                budget -= len(g["items"])
         out = []
         for day_key, g in day_groups.items():
             n_rec = len(g["items"])
+            if day_key in keep:
+                body = html.Div(g["items"])
+            else:
+                body = html.Div(
+                    f"{n_rec} recording{'' if n_rec == 1 else 's'} — open one "
+                    "from the Pool list above, or narrow the animal/date.",
+                    style={"color": "#6f7080", "fontSize": "11px",
+                            "fontStyle": "italic", "padding": "8px 10px"})
             out.append(html.Details([
                 html.Summary([
                     html.Span(day_key, style={
@@ -4602,7 +4649,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                         style={"color": "#888", "fontSize": "11px"}),
                 ], style={"cursor": "pointer", "padding": "6px 8px",
                            "userSelect": "none"}),
-                html.Div(g["items"]),
+                body,
             ], open=g["active"],
                style={"borderBottom":
                           "1px solid rgba(255,255,255,0.06)"}))
