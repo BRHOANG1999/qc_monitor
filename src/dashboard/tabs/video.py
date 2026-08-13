@@ -2581,6 +2581,13 @@ def layout(store: Store, bridge: dict | None = None):
         # no longer fire twice (once with the stale channel, once resolved). A
         # manual channel change updates it via _sync_render_key_on_channel.
         dcc.Store(id="video-render-key", data=None),
+        # Only REAL zoom/pan/reset relayouts reach the server re-decimate
+        # callback. The 10Hz playback cursor moves shapes[0] via Plotly.relayout,
+        # which emits a relayoutData event too; without this clientside filter the
+        # server _video_lfp_zoom fired ~10x/sec during playback (flashing the
+        # "Filtering & re-decimating…" overlay + wasting round-trips). The filter
+        # forwards only xaxis.range / autorange changes here.
+        dcc.Store(id="video-lfp-zoom-req", data=None),
         # Per-leg "render completed" tokens. The LFP / Hilbert
         # status strings are a pure function of duration + point
         # count + stim/candidate count, so consecutive fixed-
@@ -7206,15 +7213,40 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         prevent_initial_call=True,
     )
 
+    # Clientside filter: forward ONLY real zoom/pan/reset relayouts to the server
+    # re-decimate callback. A relayoutData event also fires for the 10Hz cursor's
+    # shapes[0] move and for autosize/marker relayouts -- those must NOT trigger a
+    # server round-trip (they flashed the "Filtering & re-decimating…" overlay
+    # during playback). Mirrors the xsync guard.
+    app.clientside_callback(
+        """
+        function(rel) {
+            if (!rel) { return window.dash_clientside.no_update; }
+            var hasRange = ('xaxis.range[0]' in rel && 'xaxis.range[1]' in rel)
+                           || ('xaxis.range' in rel);
+            var hasAuto = rel['xaxis.autorange'] === true;
+            if (!hasRange && !hasAuto) {
+                return window.dash_clientside.no_update;  // cursor/marker/autosize
+            }
+            return rel;   // real zoom/pan/reset -> server re-decimates
+        }
+        """,
+        Output("video-lfp-zoom-req", "data"),
+        Input("video-lfp-trace", "relayoutData"),
+        prevent_initial_call=True,
+    )
+
     # ---- Zoom-driven dynamic decimation ----
     # When the reviewer zooms in, re-decimate just the visible window so
     # narrow features (e.g. 150 us stim pulses) resolve to real samples.
     # The orange cursor lives in figure.layout.shapes[0] and the clientside
     # cursor callback writes layout only, so patching figure.data here is
-    # safe -- the cursor and zoom callbacks edit disjoint paths.
+    # safe -- the cursor and zoom callbacks edit disjoint paths. Triggered by the
+    # clientside-filtered zoom request (NOT raw relayoutData) so cursor moves
+    # during playback never fire it.
     @app.callback(
         Output("video-lfp-trace", "figure", allow_duplicate=True),
-        Input("video-lfp-trace", "relayoutData"),
+        Input("video-lfp-zoom-req", "data"),
         State("video-file-dropdown", "value"),
         State("video-channel-dropdown", "value"),
         State("video-filter-state", "data"),
