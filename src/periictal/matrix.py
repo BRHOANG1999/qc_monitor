@@ -350,3 +350,66 @@ def _attach_fingerprint(frame: pd.DataFrame, store, animal: str) -> None:
         stats.append(cache[tok][1])
     frame["stim_key"] = keys
     frame["stim_status"] = stats
+
+
+# --------------------------------------------------------------------- #
+#  Null-onset control (nonstationarity): score FAKE deep-interictal onsets with
+#  the SAME sliding-AUC machinery. Fake onsets come from null_onsets.py.
+# --------------------------------------------------------------------- #
+
+def epoch_columns_for(store, animal: str, evoked_dir: str, *,
+                      metrics: list[str], sidecar_variant: str, feature_cfg,
+                      extra_onsets=None,
+                      window_sec: float = _cfg.DEFAULT_WINDOW_SEC,
+                      warm_missing: bool = False):
+    """Read the per-stimulus epoch columns ONCE for a (variant, window), with the
+    near-seizure prefilter built from the UNION of real seizures and *extra_onsets*
+    (the fake null onsets). The union is still a provable superset for both, so the
+    real matrix and every null draw share this single read -- essential because the
+    real-only prefilter drops exactly the deep-interictal files the fakes live in.
+    Returns ``(t, mcols, chan, sess, rec)`` (same shape as ``_epoch_columns``)."""
+    assert animal and evoked_dir, "animal and evoked_dir required"
+    real = np.array([s.onset_epoch for s in included_seizures(store, animal)],
+                    dtype=np.float64)
+    onsets = real
+    if extra_onsets is not None and len(extra_onsets):
+        onsets = np.concatenate([real, np.asarray(extra_onsets, dtype=np.float64)])
+    file_filter = None
+    if _cfg.PERIICTAL_PREFILTER_NEAR_SEIZURE and onsets.size:
+        file_filter = _near_seizure_file_filter(
+            onsets, window_sec, _cfg.PERIICTAL_PREFILTER_SLACK_SEC)
+    return _epoch_columns(animal, evoked_dir, metrics, sidecar_variant,
+                          feature_cfg, warm_missing, file_filter=file_filter)
+
+
+def build_null_matrix(fake_onsets, epoch_cols, metrics: list[str], *,
+                      window_sec: float = _cfg.SLIDING_BAND_HI_SEC) -> pd.DataFrame:
+    """Assemble the pre-phase ``event x metric`` frame for FAKE onsets, scorable by
+    ``sliding_window_auc`` unchanged. Each fake is assembled INDEPENDENTLY with a
+    per-fake ceiling fixed at *window_sec* (single onset -> all lead-up rows in
+    ``(0, window_sec]`` kept), and given a UNIQUE ``seizure_idx`` -- so the
+    inter-fake spacing can never truncate a band at build time (the trap when a
+    fake set is joined like real seizures). ``epoch_cols`` is the shared
+    ``epoch_columns_for`` output for this variant. Only the columns
+    ``sliding_window_auc`` needs are produced (no post rows / lead_bin / stim
+    fingerprint)."""
+    from types import SimpleNamespace
+    t, mcols, chan, sess, rec = epoch_cols
+    if t.size == 0:
+        return _empty_frame(metrics)
+    ceil = np.array([float(window_sec)], dtype=np.float64)
+    frames = []
+    for k, a in enumerate(np.asarray(fake_onsets, dtype=np.float64)):
+        idx, tto, keep = _assign_next_onset(t, np.array([float(a)]), ceil)
+        sel = np.flatnonzero(keep)
+        if sel.size == 0:
+            continue
+        fake_sz = [SimpleNamespace(onset_epoch=float(a), racine=-1,
+                                   session_dir="")]
+        fp = _assemble(sel, t, tto, idx, mcols, chan, sess, rec,
+                       fake_sz, metrics, "pre")
+        fp["seizure_idx"] = np.int32(k)        # unique group per fake onset
+        frames.append(fp)
+    if not frames:
+        return _empty_frame(metrics)
+    return pd.concat(frames, ignore_index=True)

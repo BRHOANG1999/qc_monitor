@@ -204,7 +204,11 @@ def draw_null_onsets(store, animal: str, evoked_dir: str, *, seed: int,
     if buffer_sec is None:
         buffer_sec = band_hi_sec + 3600.0
     if min_spacing_sec is None:
-        min_spacing_sec = window_sec
+        # Space fakes >= band_hi + post-ictal guard so the scorer's guard (which
+        # re-derives an "ISI" from the inter-fake gaps -- meaningless for fakes)
+        # never drops a band window: every fake keeps all N windows, i.e. behaves
+        # like a clean, well-separated anchor. See build_null_matrix.
+        min_spacing_sec = band_hi_sec + _cfg.SLIDING_POSTICTAL_GUARD_SEC
     if N <= 0 or real.size == 0:
         return NullDraw(np.array([]), N, 0, "no scored seizures", seed)
     day_counts = (_day_counts if _day_counts is not None
