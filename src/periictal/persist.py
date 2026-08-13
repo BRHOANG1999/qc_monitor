@@ -29,8 +29,11 @@ _MAX_FILES = 2_000_000
 # Bump when the matrix column schema changes, so old cached pickles (which lack
 # the new columns) are invalidated rather than silently loaded. v2 added `rec`;
 # v3 added `phase` (pre/post) + the symmetric post-onset rows; v4 added the Chang
-# et al. 2026 feature columns (via the widened CHEAP_METRICS).
-_SCHEMA_VERSION = "4"
+# et al. 2026 feature columns (via the widened CHEAP_METRICS). v5: corrected the
+# stim-fingerprint (stim_key) channel mapping -- a dropped co-recorded animal's
+# NULL slot used to shift the ordinal and mis-read an animal off the wrong (often
+# nulled/inactive) STIM_REPORT channel, so cached stim_key/stim_status are stale.
+_SCHEMA_VERSION = "5"
 
 
 def _safe(name: str) -> str:

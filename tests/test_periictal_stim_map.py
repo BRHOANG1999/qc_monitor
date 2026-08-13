@@ -108,6 +108,56 @@ def test_resolve_record_only_when_not_stimulated(tmp_path):
     assert fp.status == "record_only"
 
 
+# A report whose Channel 1 is a NULL/inactive output and Channel 2 is the live
+# 5 nC stim -- the shape that exposed the dropped-neighbour mapping bug.
+_REPORT_NULL_5NC = """\
+--- CHANNEL PARAMETERS ---
+Channel 1: INACTIVE
+  Charge per phase:     0.0 nC
+  Pulse width:          0 us
+  Neg pulse ratio:      0.0 (width: 0 us)
+  Frequency:            0.00 Hz
+  Gain:                 0.00
+Channel 2: ACTIVE
+  Charge per phase:     5.0 nC
+  Pulse width:          150 us
+  Neg pulse ratio:      3.0 (width: 450 us)
+  Frequency:            0.50 Hz
+  Gain:                 1.00
+--- CONVERSION CHAIN ---
+"""
+
+
+def test_stim_ordinal_counts_null_slots():
+    # A NULL placeholder occupies a stim-output slot too (it carries the DAQ's
+    # analog output of a nulled stimulator channel). So when a neighbour's
+    # stimCopy is replaced by NULL, the remaining stimCopy keeps its ordinal:
+    # [NULL, B112, stimCopy, B111] -> B111's stimCopy is slot #1 -> Channel 2,
+    # NOT slot #0. Without counting NULL it would (wrongly) be 0 -> Channel 1.
+    names = ["NULL", "BCH112SLM", "stimCopy", "BCH111SLM"]
+    assert sm._stim_output_slots(names) == [0, 2]
+    assert sm._stim_ordinal(names, 3) == 1
+
+
+def test_resolve_maps_past_dropped_neighbour_null(tmp_path):
+    """Regression: a co-recorded animal dropped to NULL must NOT shift the
+    surviving animal onto the wrong (nulled/inactive) report channel. BCH111,
+    still wired to the live 5 nC Channel 2, must resolve to 5 nC ACTIVE -- not
+    the '0 nC (inactive)' Channel 1 the old stimCopy-only ordinal produced."""
+    store = Store(str(tmp_path / "data" / "m.db"))
+    sess = str(tmp_path / "chronicStim-null-5nC__NULL_BCH112SLM_stimCopy_BCH111SLM_")
+    os.makedirs(sess, exist_ok=True)
+    with open(os.path.join(sess, "x_STIM_REPORT.txt"), "w") as f:
+        f.write(_REPORT_NULL_5NC)
+    _seed_session(store, sess,
+                  ["NULL", "BCH112SLM", "stimCopy", "BCH111SLM"])
+    fp = sm.resolve_fingerprint(store, sess, "BCH111")
+    assert fp.status == "mapped" and fp.report_channel == 2
+    assert fp.charge_nC == 5.0 and fp.active is True
+    assert fp.key() == "5nC/150us/x3/0.5Hz/g1"
+    assert "inactive" not in fp.key()
+
+
 def test_resolve_unknown_when_no_report(tmp_path):
     store = Store(str(tmp_path / "data" / "m.db"))
     sess = str(tmp_path / "chronicStim__stimCopy_BCH111SR_")   # no report file

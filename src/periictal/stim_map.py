@@ -74,16 +74,33 @@ def find_stim_report(session_dir: str) -> str | None:
     return hits[0] if hits else None
 
 
+def _stim_output_slots(channel_names: list) -> list[int]:
+    """Indices of the stimulator OUTPUT channels in the recording: a recorded
+    ``stimCopy`` OR a ``NULL`` placeholder. A NULL channel still carries the DAQ's
+    analog output of a stimulator channel (just with stim OFF), so it occupies a
+    STIM_REPORT channel slot exactly like a stimCopy. Counting NULLs keeps the
+    slot -> report-channel ordinal STABLE when a co-recorded animal (and its
+    stimCopy) is dropped and its slot replaced by NULL -- without this, the
+    remaining stimCopy's ordinal shifts down and the animal is read off the wrong
+    (often nulled/inactive) report channel."""
+    slots = set(stim_copy_indices(channel_names))
+    for i, n in enumerate(channel_names or []):
+        if isinstance(n, str) and n.strip().upper() == "NULL":
+            slots.add(i)
+    return sorted(slots)
+
+
 def _stim_ordinal(channel_names: list, animal_channel_index: int) -> int | None:
-    """0-based ordinal k of the stimCopy that immediately precedes
-    *animal_channel_index* among all stimCopies -- i.e. this animal's stim is
-    STIM_REPORT Channel k+1. None when the animal isn't preceded by a stimCopy
-    (record-only)."""
+    """0-based ordinal k of the stim-OUTPUT slot immediately preceding
+    *animal_channel_index* -- i.e. this animal's stim is STIM_REPORT Channel k+1.
+    Counts NULL placeholders as slots (see ``_stim_output_slots``) so a dropped
+    neighbour can't shift the mapping. None when the animal isn't preceded by a
+    stim-output slot (record-only)."""
     assert animal_channel_index >= 0, "channel index must be >= 0"
-    sc = sorted(stim_copy_indices(channel_names))
+    slots = _stim_output_slots(channel_names)
     prev = animal_channel_index - 1
-    if prev in sc:
-        return sc.index(prev)
+    if prev in slots:
+        return slots.index(prev)
     return None
 
 
