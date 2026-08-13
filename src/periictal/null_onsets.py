@@ -231,8 +231,32 @@ def draw_null_onsets(store, animal: str, evoked_dir: str, *, seed: int,
     return NullDraw(onsets, N, int(onsets.size), reason, seed)
 
 
-def draw_null_set(store, animal: str, evoked_dir: str, *, seeds, **kw
+def draw_null_set(store, animal: str, evoked_dir: str, *, seeds, progress=None,
+                  _real=None, _day_counts=None, _coverage=None, **kw
                   ) -> list[NullDraw]:
-    """K independent matched draws, one per seed -- the null distribution."""
-    return [draw_null_onsets(store, animal, evoked_dir, seed=int(s), **kw)
-            for s in seeds]
+    """K independent matched draws, one per seed -- the null distribution.
+
+    The per-animal inputs (real onsets, seizure-day counts, and the FULL-corpus
+    stimulus-coverage array) are read ONCE here and shared across every draw.
+    Without this each draw re-ran ``_coverage_epochs`` -> ``animal_series``, i.e.
+    a full-corpus sidecar read PER draw -- turning K draws into K reads off the
+    share (the "drawing null onsets took forever" stall). Placement itself is
+    pure CPU (searchsorted), so once the inputs are in hand the K draws are fast."""
+    prog = progress or (lambda *_a: None)
+    seeds = list(seeds)
+    assert len(seeds) < 100_000, "seed count runaway"
+    if _real is None:
+        _real = np.array([s.onset_epoch for s in included_seizures(store, animal)],
+                         dtype=float)
+    if _day_counts is None:
+        _day_counts = _seizure_day_counts(store, animal)
+    if _coverage is None:
+        prog("reading stimulus coverage (once)…")
+        _coverage = _coverage_epochs(animal, evoked_dir)
+    draws: list[NullDraw] = []
+    for i, s in enumerate(seeds):
+        prog(f"placing null onsets… (draw {i + 1}/{len(seeds)})")
+        draws.append(draw_null_onsets(
+            store, animal, evoked_dir, seed=int(s), _real=_real,
+            _day_counts=_day_counts, _coverage=_coverage, **kw))
+    return draws

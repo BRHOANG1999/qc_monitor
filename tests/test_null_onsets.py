@@ -129,6 +129,36 @@ def test_draw_set_k_draws():
     assert all(d.seed == s for d, s in zip(draws, [0, 1, 2]))
 
 
+def test_draw_set_reads_coverage_once(monkeypatch):
+    """K draws must share ONE full-corpus coverage read, not one per draw --
+    the fix for 'drawing null onsets took forever'."""
+    real, dc, cov = _synthetic(seizure_days=(1, 3, 5, 7, 9))
+    calls = {"cov": 0, "days": 0, "seiz": 0}
+
+    def fake_cov(animal, evoked_dir):
+        calls["cov"] += 1
+        return cov
+
+    def fake_days(store, animal):
+        calls["days"] += 1
+        return dc
+
+    def fake_seiz(store, animal):
+        calls["seiz"] += 1
+        return [type("S", (), {"onset_epoch": float(x)})() for x in real]
+
+    monkeypatch.setattr(no, "_coverage_epochs", fake_cov)
+    monkeypatch.setattr(no, "_seizure_day_counts", fake_days)
+    monkeypatch.setattr(no, "included_seizures", fake_seiz)
+    draws = no.draw_null_set(None, "BCHxxx", "", seeds=list(range(8)), n=5,
+                             buffer_sec=BUFFER, window_sec=BAND_HI,
+                             preictal_max_sec=PRE, band_lo_sec=BAND_LO,
+                             band_hi_sec=BAND_HI, min_coverage=MIN_COV,
+                             min_spacing_sec=BAND_HI)
+    assert len(draws) == 8
+    assert calls == {"cov": 1, "days": 1, "seiz": 1}, calls
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

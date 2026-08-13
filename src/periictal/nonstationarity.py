@@ -167,7 +167,8 @@ def run_control(store, animal: str, evoked_dir: str, cache_dir: str, *,
     draws = draw_null_set(store, animal, evoked_dir,
                           seeds=list(range(int(seed), int(seed) + int(k_draws))),
                           buffer_sec=buffer_sec, window_sec=window_sec,
-                          band_lo_sec=band_lo_sec, band_hi_sec=band_hi_sec)
+                          band_lo_sec=band_lo_sec, band_hi_sec=band_hi_sec,
+                          progress=prog)
     n_placed = int(np.median([d.n_placed for d in draws])) if draws else 0
     reason = draws[0].reason if draws else "no draws"
 
