@@ -51,6 +51,7 @@ from src.periictal import matrix as _matrix
 from src.periictal import forecast as _fc
 from src.periictal import palette as _pal
 from src.periictal import passive as _passive
+from src.periictal import nonstationarity as _nscmod
 from src.periictal import stim_map as _sm
 from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
@@ -2895,6 +2896,307 @@ def layout_slidingauc(store):
     ], style={"padding": SPACE_4})
 
 
+# ===================================================================== #
+#  Nonstationarity control (null-onset test): is a preictal AUC real, or drift?
+# ===================================================================== #
+_NSC_JOBS: dict = {}
+_NSC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_NSC_CACHE_MAX = 3
+_NSC_COLORS = {("evoked", "sz"): "#5e7ce2", ("evoked", "null"): "#9aabe8",
+               ("passive", "sz"): "#e2a15e", ("passive", "null"): "#e8c79f"}
+
+
+def _nsc_key(jid, seed, k, buffer_sec, nwin, blo, bhi, wtok) -> str:
+    return f"{jid}|nsc|{seed}|{k}|{int(buffer_sec)}|{nwin}|{blo}|{bhi}|{wtok}"
+
+
+def _nsc_set(key, **kw):
+    with _LOCK:
+        _NSC_JOBS.setdefault(key, {}).update(kw)
+        _prune_jobs(_NSC_JOBS)
+
+
+def _nsc_finish(key, result):
+    with _LOCK:
+        _NSC_CACHE[key] = result
+        while len(_NSC_CACHE) > _NSC_CACHE_MAX:
+            _NSC_CACHE.popitem(last=False)
+        _NSC_JOBS[key] = {"status": "done", "progress": "done"}
+        _prune_jobs(_NSC_JOBS)
+
+
+def _nsc_kick(store, key, jid, animal, evoked_dir, cache_dir, seed, k, buffer_sec,
+              nwin, blo, bhi, ev_sv, ev_cfg, ev_from, ev_to, protocol):
+    with _LOCK:
+        if key in _NSC_CACHE:
+            return
+        st = _NSC_JOBS.get(key)
+        if st and st.get("status") == "running":
+            return
+        _NSC_JOBS[key] = {"status": "running", "progress": "starting…"}
+        _prune_jobs(_NSC_JOBS)
+    threading.Thread(
+        target=_run_admitted, name=f"nsc-{key}", daemon=True,
+        args=(_nsc_worker, _nsc_set, key,
+              (key, store, jid, animal, evoked_dir, cache_dir, seed, k, buffer_sec,
+               nwin, blo, bhi, ev_sv, ev_cfg, ev_from, ev_to, protocol))).start()
+
+
+def _nsc_worker(key, store, jid, animal, evoked_dir, cache_dir, seed, k, buffer_sec,
+                nwin, blo, bhi, ev_sv, ev_cfg, ev_from, ev_to, protocol):
+    """Build the evoked matrix (cached; warm a custom window) then run the full
+    nonstationarity control. Never raises -- errors surface in the poll."""
+    try:
+        if not animal:
+            _nsc_finish(key, {"empty": True,
+                              "reason": "Pick an animal in the scope bar first."})
+            return
+        if ev_sv not in (None, "evoked"):
+            _nsc_set(key, progress="warming the evoked window…")
+            _passive.warm_variant(
+                animal, evoked_dir, ev_sv, ev_cfg, protocol=protocol or None,
+                file_filter=_matrix.near_seizure_filter(store, animal, bhi),
+                progress=lambda d, n, _fp: _nsc_set(
+                    key, progress=f"windowing evoked traces… ({d}/{n})"))
+        _nsc_set(key, progress="building the evoked matrix…")
+        evoked_full = build_matrix_cached(
+            store, animal, evoked_dir, cache_dir, protocol=protocol or None,
+            window_sec=bhi, variant="evoked", sidecar_variant=ev_sv,
+            feature_cfg=ev_cfg)
+        feats = list(_cfg.metrics_for_variant("evoked"))
+        res = _nscmod.run_control(
+            store, animal, evoked_dir, cache_dir, base_full_evoked=evoked_full,
+            feats_evoked=feats, seed=int(seed), k_draws=int(k),
+            buffer_sec=float(buffer_sec), nwin=int(nwin), band_lo_sec=float(blo),
+            band_hi_sec=float(bhi), evoked_sidecar_variant=ev_sv,
+            evoked_feature_cfg=ev_cfg, evoked_from_ms=float(ev_from),
+            evoked_to_ms=float(ev_to), protocol=protocol or None,
+            progress=lambda m: _nsc_set(key, progress=m))
+        _nsc_finish(key, res)
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("nonstationarity control failed (key=%s): %s", key, e)
+        _nsc_set(key, status="error", progress=f"error: {e}")
+
+
+def _nsc_band_traces(x, stack, name, color, dash, show):
+    """Median line + translucent IQR band from a (units x W) AUC stack."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # all-NaN cols
+        med = np.nanmedian(stack, axis=0)
+        lo = np.nanpercentile(stack, 25, axis=0)
+        hi = np.nanpercentile(stack, 75, axis=0)
+    fill = (f"rgba({int(color[1:3], 16)},{int(color[3:5], 16)},"
+            f"{int(color[5:7], 16)},0.12)")
+    return [
+        go.Scatter(x=x, y=hi, mode="lines", line=dict(width=0), hoverinfo="skip",
+                   showlegend=False),
+        go.Scatter(x=x, y=lo, mode="lines", line=dict(width=0), fill="tonexty",
+                   fillcolor=fill, hoverinfo="skip", showlegend=False),
+        go.Scatter(x=x, y=med, mode="lines+markers", name=name,
+                   line=dict(color=color, width=2.5, dash=dash), showlegend=show,
+                   hovertemplate=name + ": AUC %{y:.3f}<extra></extra>"),
+    ]
+
+
+def _nsc_overlay_fig(res, feature) -> go.Figure:
+    """AUC-vs-lead-time for *feature*: seizure vs null medians (+IQR bands) for
+    both the evoked and passive windows. Seizure band above the null band = signal
+    above chance beyond nonstationarity."""
+    if not res or res.get("empty"):
+        return empty_fig("Run the control")
+    offs = np.asarray(res["offsets"], dtype=float) / 3600.0     # hours before onset
+    fig = go.Figure()
+    for variant in ("evoked", "passive"):
+        v = res["variants"][variant]
+        if feature not in v["feats"]:
+            continue
+        fi = v["feats"].index(feature)
+        if v["sz_stack"].shape[0]:
+            fig.add_traces(_nsc_band_traces(
+                offs, v["sz_stack"][:, fi, :], f"{variant} · seizure",
+                _NSC_COLORS[(variant, "sz")], None, True))
+        if v["null_stack"].shape[0]:
+            fig.add_traces(_nsc_band_traces(
+                offs, v["null_stack"][:, fi, :], f"{variant} · null",
+                _NSC_COLORS[(variant, "null")], "dot", True))
+    fig.add_hline(y=0.5, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+    fig.update_layout(**_pc_layout(f"Window AUC vs lead time · {feature}",
+                                   "hours before onset", height=440))
+    fig.update_xaxes(autorange="reversed")
+    fig.update_yaxes(title="window AUC", range=[0.4, 1.0])
+    return fig
+
+
+def _nsc_delta_heatmap(res, variant) -> go.Figure:
+    """Δ = AUC(seizure) − AUC(null), feature × window, diverging at 0."""
+    v = res["variants"][variant]
+    feats, ranked, labels = v["feats"], v["ranked"], res["win_labels"]
+    order = [feats.index(f) for f in ranked][::-1]
+    z = np.asarray(v["delta"])[order]
+    fig = go.Figure(go.Heatmap(
+        z=z, x=labels, y=ranked[::-1],
+        colorscale="RdBu", reversescale=True, zmid=0.0, zmin=-0.25, zmax=0.25,
+        colorbar=dict(title=dict(text="Δ AUC", font=dict(size=9)), thickness=10,
+                      len=0.85, x=1.005),
+        hovertemplate="%{y} · %{x} · Δ %{z:+.3f}<extra></extra>"))
+    fig.update_layout(**_pc_layout(f"Δ AUC (seizure − null) · {variant}",
+                                   "interictal window (before onset)", height=530),
+                      yaxis_title="")
+    return fig
+
+
+def _nsc_delta_bar(res, variant) -> go.Figure:
+    """Per-feature Δ AUC (seizure − null median); green = survives (Δ>0, p<.05)."""
+    v = res["variants"][variant]
+    show = [f for f in v["ranked"]
+            if np.isfinite(v["delta_feat"].get(f, np.nan))][:14][::-1]
+    xs = [v["delta_feat"][f] for f in show]
+    ps = [v["p"].get(f, np.nan) for f in show]
+    colours = [COLOR_SUCCESS if (d > 0 and np.isfinite(p) and p < 0.05)
+               else COLOR_DIVIDER for d, p in zip(xs, ps)]
+    txt = [(f"p={p:.3f}" if np.isfinite(p) else "") for p in ps]
+    fig = go.Figure(go.Bar(
+        x=xs, y=show, orientation="h", marker_color=colours, text=txt,
+        textposition="outside", textfont=dict(size=9),
+        hovertemplate="%{y}: Δ %{x:+.3f}<extra></extra>"))
+    fig.add_vline(x=0, line=dict(color=COLOR_TEXT_TERTIARY, dash="dash", width=1))
+    fig.update_layout(**_pc_layout(f"Δ AUC per feature · {variant}",
+                                   "Δ AUC (seizure − null)", height=440),
+                      yaxis_title="")
+    return fig
+
+
+def _nsc_verdict(res) -> object:
+    if not res or res.get("empty"):
+        return _callout(res.get("reason", "Build the evoked matrix, then Run.")
+                        if res else "Run the control.", COLOR_WARNING)
+    v = res["variants"]["evoked"]
+    top = v["ranked"][0] if v["ranked"] else None
+    if top is None:
+        return _callout("No scorable features.", COLOR_WARNING)
+    a = v["sz_group"].get(top, float("nan"))
+    m = v["null_group_median"].get(top, float("nan"))
+    d = v["delta_feat"].get(top, float("nan"))
+    p = v["p"].get(top, float("nan"))
+    ok = np.isfinite(d) and d > 0 and np.isfinite(p) and p < 0.05
+    colour = COLOR_SUCCESS if ok else COLOR_WARNING
+    verdict = ("survives the null (real pre-ictal signal)" if ok else
+               "≈ nonstationarity — NOT a pre-ictal signal")
+    txt = (f"Top evoked feature '{top}': seizure AUC {a:.3f} · null {m:.3f} · "
+           f"Δ {d:+.3f} · p {p:.3f}  →  {verdict}.  "
+           f"({res.get('n_seizures')} seizures vs {res.get('n_null_placed')}/"
+           f"{res.get('n_null_requested')} null onsets × {res.get('k_draws')} "
+           f"draws.)")
+    note = res.get("null_reason")
+    if note:
+        txt += f"  ⚠ {note}"
+    return _callout(txt, colour)
+
+
+def _nsc_render(res, feature):
+    if not res or res.get("empty") or "variants" not in res:
+        blank = empty_fig("Run the control")
+        return (_nsc_overlay_fig(res, feature), blank, blank, blank,
+                _nsc_verdict(res))
+    return (_nsc_overlay_fig(res, feature),
+            _nsc_delta_heatmap(res, "evoked"),
+            _nsc_delta_heatmap(res, "passive"),
+            _nsc_delta_bar(res, "evoked"),
+            _nsc_verdict(res))
+
+
+def layout_nonstationarity(store):
+    """The capstone control: place random deep-interictal 'null' onsets and run the
+    identical sliding-AUC on them, for the evoked window and its passive mirror.
+    Δ = AUC(seizure) − AUC(null) says whether a preictal AUC is real or just
+    feature drift. The heaviest peri-ictal step -- last in the progression."""
+    inp = {**DROPDOWN_STYLE, "width": "90px"}
+    return html.Div([
+        scope_bar(store),
+        card(section_header("Nonstationarity control — is the preictal AUC real, "
+                            "or just drift?"),
+             html.Div([
+                 html.Div("Places N random NULL onsets in deep-interictal time "
+                          "(matched to the seizure count, on days that had seizures, "
+                          "≥ lookback+1 h clear of every real seizure on both sides) "
+                          "and runs the IDENTICAL sliding-window AUC on them — for the "
+                          "evoked window AND its matched passive (pre-stim) mirror. K "
+                          "draws give a null band + p. If the null AUC matches the "
+                          "seizure AUC (Δ≈0), the 'preictal' separation is feature "
+                          "drift, not a pre-ictal signal. Build the matrix in the scope "
+                          "bar first (any variant), then Run.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 html.Div([
+                     _ctl("Windows", dcc.Input(
+                         id="pex-nsc-nwin", type="number", value=_cfg.SLIDING_N_WINDOWS,
+                         min=2, max=40, step=1, debounce=True, style=inp),
+                         "Interictal windows per onset."),
+                     _ctl("Band from (h)", dcc.Input(
+                         id="pex-nsc-bandlo", type="number", value=1, min=0.5, max=12,
+                         step=0.5, debounce=True, style=inp),
+                         "Closest the windows get to onset."),
+                     _ctl("Band to (h)", dcc.Input(
+                         id="pex-nsc-bandhi", type="number", value=6, min=1, max=24,
+                         step=0.5, debounce=True, style=inp),
+                         "Furthest before onset (the lookback)."),
+                     _ctl("Null draws K", dcc.Input(
+                         id="pex-nsc-draws", type="number", value=20, min=1, max=200,
+                         step=1, debounce=True, style=inp),
+                         "Independent matched null draws (band + p). K=1 = one draw."),
+                     _ctl("Seed", dcc.Input(
+                         id="pex-nsc-seed", type="number", value=0, min=0, step=1,
+                         debounce=True, style=inp), "Reproducible RNG seed."),
+                     _ctl("Buffer (h)", dcc.Input(
+                         id="pex-nsc-buffer", type="number", value=7, min=1, max=48,
+                         step=0.5, debounce=True, style=inp),
+                         "Seizure-free clearance each side (≥ lookback+1 h)."),
+                     _ctl("Feature", dcc.Dropdown(
+                         id="pex-nsc-feature", clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "200px"}),
+                         "Which feature's AUC-vs-lead-time to overlay."),
+                     html.Div(button("▶ Run nonstationarity control",
+                                     "pex-nsc-build", icon_name="play"),
+                              style={"alignSelf": "flex-end"}),
+                 ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+                           "alignItems": "flex-start", "marginTop": SPACE_3}),
+                 html.Div(id="pex-nsc-status",
+                          style={"marginTop": SPACE_2, "color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION}),
+                 html.Div(id="pex-nsc-verdict", style={"marginTop": SPACE_2}),
+             ], style={"display": "flex", "flexDirection": "column",
+                       "gap": SPACE_2, "marginTop": SPACE_2}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Window AUC vs lead time — seizure vs null "
+                            "(evoked & passive)"),
+             dcc.Graph(id="pex-nsc-overlay", config={"displaylogo": False},
+                       figure=empty_fig("Run to compare seizure vs null"),
+                       style={"height": "450px"}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Δ AUC (seizure − null) by feature × window — "
+                            "blue = seizure exceeds null"),
+             html.Div([
+                 dcc.Graph(id="pex-nsc-delta-evoked", config={"displaylogo": False},
+                           figure=empty_fig("evoked Δ"),
+                           style={"flex": "1 1 460px", "minWidth": "0",
+                                  "height": "540px"}),
+                 dcc.Graph(id="pex-nsc-delta-passive", config={"displaylogo": False},
+                           figure=empty_fig("passive Δ"),
+                           style={"flex": "1 1 460px", "minWidth": "0",
+                                  "height": "540px"}),
+             ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_3}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("Δ AUC per feature (evoked) — green survives the null "
+                            "(Δ>0, p<0.05)"),
+             dcc.Graph(id="pex-nsc-delta-bar", config={"displaylogo": False},
+                       figure=empty_fig("Run"), style={"height": "450px"}),
+             style={"marginTop": SPACE_4}),
+        dcc.Interval(id="pex-nsc-poll", interval=1500, disabled=True),
+        dcc.Store(id="pex-nsc-job"),
+    ], style={"padding": SPACE_4})
+
+
 def register_callbacks(app, store, config):
     global _CACHE_DIR
     _CACHE_DIR = _default_cache_dir()
@@ -3570,6 +3872,109 @@ def register_callbacks(app, store, config):
         feat = _swauc_feat(result, feature)
         g, h, b, pdf, cdf, _notes = _swauc_render(result, sel or "group", feat)
         return g, h, b, pdf, cdf
+
+    # --- Nonstationarity control (null test) callbacks --- #
+    @app.callback(
+        Output("pex-nsc-feature", "options"),
+        Output("pex-nsc-feature", "value"),
+        Input("pex-variant", "value"),
+        State("pex-nsc-feature", "value"),
+        prevent_initial_call=False,
+    )
+    def _nsc_feature_opts(_variant, cur):
+        # The overlay is per-feature and spans both windows; evoked names are the
+        # superset that always populate, so drive the picker from them.
+        opts = [{"label": m, "value": m}
+                for m in _cfg.metrics_for_variant("evoked")]
+        vals = {o["value"] for o in opts}
+        return opts, (cur if cur in vals else (opts[0]["value"] if opts else None))
+
+    @app.callback(
+        Output("pex-nsc-overlay", "figure"),
+        Output("pex-nsc-delta-evoked", "figure"),
+        Output("pex-nsc-delta-passive", "figure"),
+        Output("pex-nsc-delta-bar", "figure"),
+        Output("pex-nsc-verdict", "children"),
+        Output("pex-nsc-status", "children"),
+        Output("pex-nsc-poll", "disabled"),
+        Output("pex-nsc-job", "data"),
+        Input("pex-nsc-build", "n_clicks"),
+        Input("pex-nsc-poll", "n_intervals"),
+        State("pex-animal", "value"),
+        State("pex-protocol", "value"),
+        State("pex-winmode", "value"),
+        State("pex-win-from", "value"),
+        State("pex-win-to", "value"),
+        State("pex-win-guard", "value"),
+        State("pex-nsc-nwin", "value"),
+        State("pex-nsc-bandlo", "value"),
+        State("pex-nsc-bandhi", "value"),
+        State("pex-nsc-draws", "value"),
+        State("pex-nsc-seed", "value"),
+        State("pex-nsc-buffer", "value"),
+        State("pex-nsc-feature", "value"),
+        prevent_initial_call=True,
+    )
+    def _nsc_build_or_poll(_n, _iv, animal, protocol, winmode, wf, wt, wg,
+                           nwin, blo, bhi, draws, seed, buffer_h, feature):
+        if not animal:
+            return (no_update,) * 4 + (
+                _callout("Pick an animal in the scope bar first.", COLOR_WARNING),
+                "Pick an animal.", True, no_update)
+        nwin = int(nwin or _cfg.SLIDING_N_WINDOWS)
+        blo, bhi = float(blo or 1.0), float(bhi or 6.0)
+        k, seed = int(draws or 20), int(seed or 0)
+        buffer_h = float(buffer_h or (bhi + 1.0))
+        # The evoked window: a custom scope-bar window becomes the evoked window
+        # (its passive mirror is derived inside run_control); otherwise the fast
+        # default [1, 200] ms.
+        if (winmode or "full") == "custom" and wf is not None and wt is not None:
+            try:
+                sv, cfg = _resolve_window("evoked", "custom", wf, wt, wg)
+            except ValueError as e:
+                return (no_update,) * 4 + (
+                    _callout(f"Evoked window: {e}.", COLOR_WARNING),
+                    f"⚠ {e}", True, no_update)
+            ev_from, ev_to = float(wf), float(wt)
+        else:
+            sv, cfg, ev_from, ev_to = "evoked", None, 1.0, 200.0
+        wtok = _win_token(sv, cfg) + _excl_tok(store, animal)
+        base = f"{animal}|{protocol or ''}|{bhi}"
+        key = _nsc_key(base, seed, k, buffer_h * 3600.0, nwin, blo, bhi, wtok)
+        with _LOCK:
+            result = _NSC_CACHE.get(key)
+            state = dict(_NSC_JOBS.get(key) or {})
+        if result is not None:
+            over, de, dp, bar, verdict = _nsc_render(result, feature)
+            if result.get("empty"):
+                return (over, de, dp, bar, verdict,
+                        result.get("reason", "no data"), True, key)
+            return (over, de, dp, bar, verdict,
+                    f"✓ {result['n_seizures']} seizures vs "
+                    f"{result['n_null_placed']}×{result['k_draws']} null onsets "
+                    f"(evoked & passive)", True, key)
+        if state.get("status") == "error":
+            return (no_update,) * 4 + (
+                _callout(state.get("progress", "error"), COLOR_WARNING),
+                state.get("progress", "error"), True, no_update)
+        _nsc_kick(store, key, base, animal, evoked_dir,
+                  _CACHE_DIR or _default_cache_dir(), seed, k, buffer_h * 3600.0,
+                  nwin, blo * 3600.0, bhi * 3600.0, sv, cfg, ev_from, ev_to,
+                  protocol or "")
+        prog = (_NSC_JOBS.get(key) or {}).get("progress", "starting…")
+        return (no_update,) * 5 + (f"⏳ {prog}", False, no_update)
+
+    @app.callback(
+        Output("pex-nsc-overlay", "figure", allow_duplicate=True),
+        Input("pex-nsc-feature", "value"),
+        State("pex-nsc-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _nsc_rerender(feature, key):
+        result = _NSC_CACHE.get(key) if key else None
+        if not result or result.get("empty"):
+            return no_update
+        return _nsc_overlay_fig(result, feature)
 
     @app.callback(
         Output("pex-swauc-modal", "style"),
