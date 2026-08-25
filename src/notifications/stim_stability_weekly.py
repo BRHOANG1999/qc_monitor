@@ -73,6 +73,7 @@ def _resolve_params(cfg: dict, config: dict) -> SimpleNamespace:
         drive_auth=(gd.get("auth_mode") or "service_account"),
         token_file=_resolve_sa_path(config, tok_raw),
         sheet_id=cfg.get("sheet_id") or gs.get("spreadsheet_id") or "",
+        write_sheet=bool(cfg.get("write_sheet", True)),
         tab=cfg.get("tab_name", _TAB),
         folder_id=cfg.get("folder_id") or cfg.get("shared_drive_folder_id")
         or gd.get("folder_id") or gd.get("shared_drive_folder_id") or "",
@@ -350,7 +351,7 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
         results.append(res)
 
     sheet_res = {"updated": 0, "appended": 0}
-    if rows and not dry_run and p.sheet_id and p.sa_path:
+    if rows and not dry_run and p.write_sheet and p.sheet_id and p.sa_path:
         try:
             svc = _sw._sheets_api_rw(p.sa_path)
             _sw.ensure_tab(svc, p.sheet_id, p.tab, HEADER)

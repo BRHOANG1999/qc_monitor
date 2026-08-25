@@ -302,10 +302,10 @@ notifications:
   # Ships DISABLED -- dry-run first:
   #   python -m src.notifications.stim_stability_weekly --dry-run
   stim_stability_weekly:
-    enabled: false
+    enabled: true
     weekday: 6              # 0=Mon .. 6=Sun
     hour: 8
-    recipients: []          # falls back to alerting.smtp.recipients
+    recipients: [hoang392@umn.edu]
     sheet_id: ""            # falls back to google_sheets.spreadsheet_id
     tab_name: Stim Stability
     exclude: [Randles]      # calibration phantom
@@ -590,7 +590,7 @@ google_drive:
   # -- oauth (personal Drive) --
   oauth_client_file: secrets/drive_oauth_client.json   # downloaded Desktop-app OAuth client
   token_file: secrets/drive_oauth_token.json           # written by --authorize
-  folder_id: ""                                        # a folder id in YOUR Drive
+  folder_id: "1XzaRL8pmzD4oosUDhakYuWUMjlHxzwuC"       # QC Monitor - Stim Stability (hoangbr09@gmail.com)
   # -- service_account (Workspace Shared Drive) --
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
   # shared_drive_folder_id: ""
