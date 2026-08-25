@@ -314,7 +314,7 @@ notifications:
     min_history: 4
     perfile_span: last_day  # last_day (~24 PNGs/ch) | week (all ~168)
     upload_throttle_sec: 0.1
-    # stim_window_ms: [-1, 10]   # optional; default = full trace for stim p2p
+    stim_window_ms: [-1, 1]   # stim-pulse window: crops the stim waveforms + the p2p magnitude
 review_queue:
   # Per-undergrad behavioral review queue. Pulls a list of
   # unreviewed recordings for the user's assigned animals from

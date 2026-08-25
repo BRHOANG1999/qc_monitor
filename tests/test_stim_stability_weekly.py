@@ -98,9 +98,19 @@ def test_week_span():
 
 
 def test_magnitude_pairs():
-    xs, ys = m._magnitude_pairs([_trace(1, "2026_08_24", 0.0),
-                                 _trace(2, "2026_08_24", 0.9)], None)
-    assert len(xs) == 2 and len(ys) == 2 and all(v >= 0 for v in xs)
+    xs, ys, ts = m._magnitude_pairs([_trace(1, "2026_08_24", 0.0),
+                                     _trace(2, "2026_08_24", 0.9)], None)
+    assert len(xs) == 2 and len(ys) == 2 and len(ts) == 2
+    assert all(v >= 0 for v in xs)
+
+
+def test_crop_window():
+    t = [i * 0.1 for i in range(-20, 21)]      # -2.0 .. 2.0 ms
+    y = [float(i) for i in range(len(t))]
+    ct, cy = m._crop(t, y, (-1.0, 1.0))
+    assert ct and all(-1.0 <= x <= 1.0 for x in ct)
+    # empty/degenerate window falls back to the full trace
+    assert m._crop(t, y, (100.0, 200.0)) == (t, y)
 
 
 # --------------------------------------------------------- full send --- #

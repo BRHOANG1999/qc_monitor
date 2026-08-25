@@ -61,23 +61,42 @@ def plot_stim_trace(time_ms, y, title: str, out_png: str) -> str | None:
     return out_png
 
 
-def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str,
-                        out_png: str) -> dict:
+def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str, out_png: str, *,
+                        times=None, stim_win=None,
+                        evoked_win=(1.0, 50.0)) -> dict:
     """Stim-magnitude vs evoked-magnitude scatter + regression -> PNG.
 
-    Returns ``{r, r2, p, n, slope, png}`` (``png`` is None when <3 paired
-    points). Regression via ``scipy.stats.linregress``, skipped (r=nan) when
-    every stim magnitude is identical -- mirrors chronic_evoked._add_regression."""
+    Points are coloured by *times* (per-file epoch seconds) with a date colorbar,
+    so the week's time window is visible on the graph; the axes name the
+    measurement windows (stim *stim_win*, evoked *evoked_win*, ms). Returns
+    ``{r, r2, p, n, slope, png}`` (``png`` None when <3 paired points).
+    Regression via ``scipy.stats.linregress``, skipped when every stim magnitude
+    is identical -- mirrors chronic_evoked._add_regression."""
     xs = np.asarray([float(x) for x in stim_mags], dtype=float)
     ys = np.asarray([float(y) for y in evoked_mags], dtype=float)
+    ts = np.asarray(times, dtype=float) if times is not None else None
     ok = np.isfinite(xs) & np.isfinite(ys)
+    if ts is not None:
+        ok &= np.isfinite(ts)
     xs, ys = xs[ok], ys[ok]
+    ts = ts[ok] if ts is not None else None
     out = {"r": float("nan"), "r2": float("nan"), "p": float("nan"),
            "n": int(xs.size), "slope": float("nan"), "png": None}
     if xs.size < 3:
         return out
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    ax.scatter(xs, ys, s=14, c=_ACCENT, alpha=0.6, linewidths=0)
+    if ts is not None and np.ptp(ts) > 0:
+        sc = ax.scatter(xs, ys, s=22, c=ts, cmap="viridis", alpha=0.8,
+                        linewidths=0)
+        cb = fig.colorbar(sc, ax=ax)
+        cb.set_label("recording time")
+        from datetime import datetime
+        tk = np.linspace(ts.min(), ts.max(), 4)
+        cb.set_ticks(tk)
+        cb.set_ticklabels([datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+                           for t in tk])
+    else:
+        ax.scatter(xs, ys, s=14, c=_ACCENT, alpha=0.6, linewidths=0)
     if np.ptp(xs) > 0:
         from scipy.stats import linregress
         lr = linregress(xs, ys)
@@ -87,9 +106,11 @@ def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str,
                    p=float(lr.pvalue), slope=float(lr.slope))
         title = (f"{title}  ·  r={lr.rvalue:.2f} r²={lr.rvalue ** 2:.2f} "
                  f"p={lr.pvalue:.1e} n={xs.size}")
+    sw = f" ({stim_win[0]:g} to {stim_win[1]:g} ms)" if stim_win else ""
     ax.set_title(title, fontsize=10)
-    ax.set_xlabel("stim magnitude (peak-to-trough)")
-    ax.set_ylabel("evoked magnitude 1–50 ms (peak-to-trough)")
+    ax.set_xlabel(f"stim magnitude, peak-to-trough{sw}")
+    ax.set_ylabel(f"evoked magnitude, peak-to-trough "
+                  f"({evoked_win[0]:g}–{evoked_win[1]:g} ms)")
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)

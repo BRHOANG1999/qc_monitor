@@ -101,9 +101,11 @@ def _group_by_day(traces: list[dict]) -> dict:
     return out
 
 
-def _magnitude_pairs(traces: list[dict], stim_win) -> tuple[list, list]:
-    """Per-file (stim peak-to-trough, evoked 1-50 ms peak-to-trough)."""
-    xs, ys = [], []
+def _magnitude_pairs(traces: list[dict], stim_win) -> tuple[list, list, list]:
+    """Per-file (stim peak-to-trough over *stim_win*, evoked 1-50 ms
+    peak-to-trough, recording epoch seconds) -- the last drives the correlation
+    graph's time colouring."""
+    xs, ys, ts = [], [], []
     for t in traces:
         tm = t.get("time_ms") or []
         if not tm:
@@ -111,10 +113,25 @@ def _magnitude_pairs(traces: list[dict], stim_win) -> tuple[list, list]:
         sx0, sx1 = (stim_win if stim_win else (min(tm), max(tm)))
         sm = _peak_amplitude(tm, t.get("stim_trace") or [], sx0, sx1)
         ev = _peak_amplitude(tm, t.get("evoked_trace") or [], 1.0, 50.0)
-        if sm is not None and ev is not None:
-            xs.append(sm)
-            ys.append(ev)
-    return xs, ys
+        if sm is None or ev is None:
+            continue
+        dt = _fig._parse_chunk_dt(t.get("chunk_datetime"))
+        xs.append(sm)
+        ys.append(ev)
+        ts.append(dt.timestamp() if dt else float("nan"))
+    return xs, ys, ts
+
+
+def _crop(time_ms, y, win) -> tuple:
+    """Restrict a (time_ms, y) trace to the *win* = (x0, x1) ms window so the
+    stim-pulse figures show the pulse, not the full +/-500 ms record. Falls back
+    to the full trace when the window would keep < 2 samples."""
+    if not win or time_ms is None or y is None:
+        return time_ms, y
+    x0, x1 = win
+    ct = [t for t in time_ms if x0 <= t <= x1]
+    cy = [v for t, v in zip(time_ms, y) if x0 <= t <= x1]
+    return (ct, cy) if len(ct) >= 2 else (time_ms, y)
 
 
 # --------------------------------------------------------- per channel ---- #
@@ -131,21 +148,23 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
                    else traces)
     # per-file
+    win = p.stim_window
     perfile = []
     for t in perfile_src:
+        ct, cy = _crop(t["time_ms"], t["stim_trace"], win)
         pth = os.path.join(base, f"file_{_safe(t['chunk_datetime'])}.png")
-        if _fig.plot_stim_trace(t["time_ms"], t["stim_trace"],
+        if _fig.plot_stim_trace(ct, cy,
                                 f"{animal} {channel} · {t['chunk_datetime']}", pth):
             perfile.append(pth)
     # per-day averages
     daily = []
     for day, dts in sorted(days.items()):
-        tm, y = average_traces(dts)
+        tm, y = _crop(*average_traces(dts), win)
         pth = os.path.join(base, f"day_{_safe(day)}.png")
         if _fig.plot_stim_trace(tm, y, f"{animal} {channel} · {day} avg", pth):
             daily.append(pth)
     # weekly grand average
-    tm, y = average_traces(traces)
+    tm, y = _crop(*average_traces(traces), win)
     weekly = os.path.join(base, f"{tag}_weekly.png")
     if not _fig.plot_stim_trace(tm, y, f"{animal} {channel} · weekly avg stim",
                                 weekly):
@@ -155,9 +174,10 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
     imp = _fig.impedance_png(imp_rows, imp, title=f"{animal} {channel} Rₐ",
                              pct=p.pct, window=p.window,
                              min_history=p.min_history)
-    xs, ys = _magnitude_pairs(traces, p.stim_window)
+    xs, ys, ts = _magnitude_pairs(traces, win)
     corr_png = os.path.join(base, f"{tag}_correlation.png")
-    corr = _fig.plot_stim_vs_evoked(xs, ys, f"{animal} {channel}", corr_png)
+    corr = _fig.plot_stim_vs_evoked(xs, ys, f"{animal} {channel}", corr_png,
+                                    times=ts, stim_win=win, evoked_win=(1.0, 50.0))
     stat = _drift_stat([r.get("access_r_kohm") for r in imp_rows
                         if r.get("access_r_kohm") is not None],
                        p.window, p.min_history)
