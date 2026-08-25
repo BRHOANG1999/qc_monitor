@@ -67,12 +67,15 @@ def _resolve_params(cfg: dict, config: dict) -> SimpleNamespace:
     gd = (config.get("google_drive", {}) or {})
     sa_raw = (gd.get("service_account_file") or gs.get("service_account_file")
               or (config.get("surgeries", {}) or {}).get("service_account_file"))
+    tok_raw = gd.get("token_file") or "secrets/drive_oauth_token.json"
     return SimpleNamespace(
         sa_path=_resolve_sa_path(config, sa_raw) if sa_raw else "",
+        drive_auth=(gd.get("auth_mode") or "service_account"),
+        token_file=_resolve_sa_path(config, tok_raw),
         sheet_id=cfg.get("sheet_id") or gs.get("spreadsheet_id") or "",
         tab=cfg.get("tab_name", _TAB),
-        drive_folder=cfg.get("shared_drive_folder_id")
-        or gd.get("shared_drive_folder_id") or "",
+        folder_id=cfg.get("folder_id") or cfg.get("shared_drive_folder_id")
+        or gd.get("folder_id") or gd.get("shared_drive_folder_id") or "",
         exclude=list(cfg.get("exclude", []) or []),
         pct=float(cfg.get("drift_threshold_pct", 40.0)),
         window=int(cfg.get("baseline_weeks", 10)),
@@ -208,7 +211,34 @@ def _sheet_row(week: str, res: dict) -> dict:
 
 # --------------------------------------------------------------- email ---- #
 
-def _email_html(today, week, results, folder_link, sheet_id) -> str:
+_EMAIL_ATTACH_CAP = 20 * 1024 * 1024      # keep the digest email under ~20 MB
+
+
+def _email_pngs(results, cap_bytes: int) -> tuple[list, list, int]:
+    """Split every rendered PNG into (inline headline, downloadable rest,
+    dropped). The 3 headline figures per channel go inline (cid); daily +
+    per-file go as file attachments until the size cap, so figures survive even
+    if Drive/token ever lapses."""
+    inline, files, size, dropped = [], [], 0, 0
+    for r in results:
+        for path in (r["png_weekly"], r["png_impedance"], r["png_corr"]):
+            if path and os.path.exists(path):
+                inline.append(path)
+                size += os.path.getsize(path)
+    for r in results:
+        for path in r["daily"] + r["perfile"]:
+            if not (path and os.path.exists(path)):
+                continue
+            s = os.path.getsize(path)
+            if size + s > cap_bytes:
+                dropped += 1
+                continue
+            files.append(path)
+            size += s
+    return inline, files, dropped
+
+
+def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
     parts = [
         '<html><body style="font-family:-apple-system,sans-serif;color:#1a1a2e">',
         f'<h2>Weekly stimulus stability — {week} ({today.isoformat()})</h2>',
@@ -243,6 +273,10 @@ def _email_html(today, week, results, folder_link, sheet_id) -> str:
     if folder_link:
         parts.append(f'<p><a href="{folder_link}">Open this week\'s Drive '
                      'folder (all figures)</a></p>')
+    if dropped:
+        parts.append(f'<p style="color:#6c6c80"><small>{dropped} more per-file/'
+                     'daily figure(s) omitted to keep this email small — see the '
+                     'Drive folder for the full set.</small></p>')
     parts.append('<hr><small style="color:#6c6c80">QC Monitor stimulus-stability '
                  'weekly. Edit config.yaml → notifications.stim_stability_weekly.'
                  '</small></body></html>')
@@ -288,9 +322,15 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
     work = out_dir or tempfile.mkdtemp(prefix="stimstab_")
 
     drive = week_folder = None
-    if not dry_run and p.drive_folder and p.sa_path:
-        drive = _drive._drive_api(p.sa_path)
-        week_folder = _drive.ensure_folder(drive, week, p.drive_folder)
+    if not dry_run and p.folder_id:
+        try:
+            drive = _drive.drive_from_config(p.drive_auth, sa_path=p.sa_path,
+                                             token_file=p.token_file)
+            week_folder = _drive.ensure_folder(drive, week, p.folder_id)
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("Drive unavailable (%s), emailing figures only: %s",
+                           p.drive_auth, e)
+            drive = week_folder = None
 
     rows, results = [], []
     for animal, channel in channels:
@@ -323,15 +363,15 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
     folder_link = week_folder.get("webViewLink", "") if week_folder else ""
     sent = False
     if not dry_run and recipients and results:
-        pngs = [pp for r in results
-                for pp in (r["png_weekly"], r["png_impedance"], r["png_corr"])
-                if pp]
+        inline, files, dropped = _email_pngs(results, _EMAIL_ATTACH_CAP)
         sent = bool(emailer.send(
             subject=f"QC weekly stim stability -- {week} "
                     f"({len(results)} channel{'s' if len(results) != 1 else ''})",
             body=_email_text(today, week, results),
-            body_html=_email_html(today, week, results, folder_link, p.sheet_id),
-            recipients=recipients, subject_prefix=False, attachments=pngs))
+            body_html=_email_html(today, week, results, folder_link, p.sheet_id,
+                                  dropped=dropped),
+            recipients=recipients, subject_prefix=False,
+            attachments=inline, file_attachments=files))
 
     if not dry_run and out_dir is None:
         shutil.rmtree(work, ignore_errors=True)

@@ -41,6 +41,10 @@ requests>=2.31
 # service-account Sheets API path used by maintenance + assignments.
 google-api-python-client>=2.100
 google-auth>=2.20
+# Imported by src/utils/drive_upload.py (--authorize) for the one-time user-OAuth
+# consent used to upload the weekly stim-stability figures into a personal
+# (non-Workspace) Google Drive. Only needed for auth_mode: oauth.
+google-auth-oauthlib>=1.0
 # Optional (best-effort): static PNG export of the Overview-style impedance
 # Plotly figure in the weekly stim-stability report
 # (src/notifications/stim_figures.py). kaleido v1 needs a headless Chrome; when

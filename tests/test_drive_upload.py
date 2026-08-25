@@ -116,6 +116,30 @@ def test_upload_png_survives_permission_failure(tmp_path):
     assert out["id"] == "id0"
 
 
+def test_drive_from_config_service_account(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(du, "_drive_api", lambda sa: sentinel)
+    assert du.drive_from_config("service_account", sa_path="x.json") is sentinel
+
+
+def test_oauth_creds_missing_token_raises(tmp_path):
+    import pytest
+    missing = str(tmp_path / "nope.json")
+    with pytest.raises(RuntimeError, match="authorize"):
+        du._oauth_creds(missing)
+
+
+def test_drive_from_config_oauth_uses_token(monkeypatch, tmp_path):
+    # oauth mode must go through _oauth_creds (not the SA path); we stub creds +
+    # the discovery build so no real token/network is touched.
+    monkeypatch.setattr(du, "_oauth_creds", lambda tok: "CREDS")
+    import googleapiclient.discovery as disc
+    monkeypatch.setattr(disc, "build",
+                        lambda *a, **k: ("drive", k.get("credentials")))
+    out = du.drive_from_config("oauth", token_file=str(tmp_path / "t.json"))
+    assert out == ("drive", "CREDS")
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

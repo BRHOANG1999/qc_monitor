@@ -19,6 +19,7 @@ shared with the SA's ``client_email`` as Content Manager (one-time setup).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -49,6 +50,76 @@ def _drive_api(service_account_file: str):
     with _drive_lock:
         _drive_cache[service_account_file] = svc
     return svc
+
+
+# --------------------------------------------------------------------- #
+#  OAuth (personal Google account) path
+#
+#  A service account can't own files on a PERSONAL (non-Workspace) Drive -- it
+#  has no storage quota. To publish into a personal Gmail Drive the uploads must
+#  authenticate AS THE USER via OAuth: files are then owned by the user and count
+#  against their 15 GB. The one-time browser consent is done interactively with
+#  ``--authorize`` (below); the daemon only LOADS + refreshes the saved token and
+#  never opens a browser. Publish the OAuth consent screen to "In production" or
+#  Google expires the refresh token after 7 days.
+# --------------------------------------------------------------------- #
+
+def _project_path(rel: str) -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.abspath(os.path.join(here, "..", ".."))
+    return rel if os.path.isabs(rel) else os.path.join(root, rel)
+
+
+def _save_token(token_file: str, creds) -> None:
+    os.makedirs(os.path.dirname(token_file) or ".", exist_ok=True)
+    with open(token_file, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+
+def _oauth_creds(token_file: str):
+    """Load + (silently) refresh the stored user OAuth credentials. Raises with a
+    clear next step if no valid token exists -- the daemon must NEVER try to open
+    a browser."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    if not os.path.exists(token_file):
+        raise RuntimeError(
+            f"No Drive OAuth token at {token_file}. Run once on a machine with a "
+            f"browser: python -m src.utils.drive_upload --authorize")
+    creds = Credentials.from_authorized_user_file(token_file, _DRIVE_SCOPES)
+    if creds.valid:
+        return creds
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        _save_token(token_file, creds)
+        return creds
+    raise RuntimeError(
+        f"Drive OAuth token at {token_file} is invalid/expired without a refresh "
+        f"token. Re-run: python -m src.utils.drive_upload --authorize "
+        f"(and set the OAuth consent screen to 'In production').")
+
+
+def drive_from_config(auth_mode: str, *, sa_path: str = "",
+                      token_file: str = ""):
+    """Build a Drive client for the configured auth mode: 'oauth' (personal
+    account, via a stored user token) or 'service_account' (Shared Drive)."""
+    mode = (auth_mode or "service_account").lower()
+    if mode == "oauth":
+        from googleapiclient.discovery import build
+        assert token_file, "google_drive.token_file required for oauth mode"
+        return build("drive", "v3", credentials=_oauth_creds(token_file),
+                     cache_discovery=False)
+    return _drive_api(sa_path)
+
+
+def authorize(client_file: str, token_file: str) -> str:
+    """One-time interactive OAuth consent (opens a browser) -> saves the refresh
+    token to *token_file*. Run from a machine with a browser, not the daemon."""
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(client_file, _DRIVE_SCOPES)
+    creds = flow.run_local_server(port=0)
+    _save_token(token_file, creds)
+    return token_file
 
 
 def _escape(name: str) -> str:
@@ -105,3 +176,42 @@ def upload_png(drive, path: str, parent_id: str, *, name: str | None = None,
         time.sleep(throttle_sec)
     return {"id": fid, "webViewLink": f.get("webViewLink", ""),
             "image_url": f"https://drive.google.com/uc?export=view&id={fid}"}
+
+
+def _main(argv=None) -> int:
+    """`python -m src.utils.drive_upload --authorize` : one-time OAuth consent to
+    upload into a personal Google Drive as yourself. Reads the client-secret +
+    token paths from config.google_drive unless overridden."""
+    import argparse
+
+    import yaml
+
+    ap = argparse.ArgumentParser(description="Drive OAuth authorize (one-time)")
+    ap.add_argument("--authorize", action="store_true")
+    ap.add_argument("--config", default="config/config.yaml")
+    ap.add_argument("--client-file", default=None,
+                    help="OAuth client-secret JSON (Desktop app)")
+    ap.add_argument("--token-file", default=None)
+    args = ap.parse_args(argv)
+
+    with open(args.config, encoding="utf-8") as fh:
+        gd = (yaml.safe_load(fh).get("google_drive", {}) or {})
+    client = args.client_file or gd.get("oauth_client_file")
+    token = (args.token_file or gd.get("token_file")
+             or "secrets/drive_oauth_token.json")
+    if not args.authorize:
+        print("Pass --authorize to run the one-time browser consent.")
+        return 0
+    if not client:
+        print("Set google_drive.oauth_client_file (or --client-file) to your "
+              "downloaded OAuth Desktop-app client JSON first.")
+        return 2
+    out = authorize(_project_path(client), _project_path(token))
+    print(f"Saved Drive OAuth token -> {out}")
+    print("If the token stops working after ~7 days, set the OAuth consent "
+          "screen to 'In production'.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -73,7 +73,8 @@ def _config(**over):
 
 def _patch_backends(monkeypatch):
     """Fake Drive + capture the Sheets upsert."""
-    monkeypatch.setattr(m._drive, "_drive_api", lambda sa: FakeDrive())
+    monkeypatch.setattr(m._drive, "drive_from_config",
+                        lambda mode, **kw: FakeDrive())
     captured = {}
     monkeypatch.setattr(m._sw, "_sheets_api_rw", lambda sa: object())
     monkeypatch.setattr(m._sw, "ensure_tab",

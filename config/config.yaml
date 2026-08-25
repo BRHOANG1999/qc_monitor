@@ -572,15 +572,28 @@ google_sheets:
   # auto-detect (first existing summary tab with a Date column).
   summary_template_tab: ""
 
-# Google Drive (Shared Drive) target for the weekly stimulus-stability figures.
-# Uses the SAME service account as google_sheets, but the Drive API must be
-# ENABLED in that GCP project and shared_drive_folder_id must be a **Shared
-# Drive** folder shared with the SA's client_email as Content Manager -- a bare
-# service account has no personal-Drive storage quota, so a personal folder will
-# fail uploads. Leave shared_drive_folder_id blank to skip Drive upload.
+# Google Drive target for the weekly stimulus-stability figures. Two auth modes:
+#   auth_mode: oauth           -> upload into a PERSONAL Google Drive AS YOU (no
+#                                 Workspace needed; files count against your 15GB).
+#                                 One-time consent on a machine with a browser:
+#                                   python -m src.utils.drive_upload --authorize
+#                                 then set folder_id to a folder id in your Drive.
+#                                 Publish the OAuth consent screen to "In
+#                                 production" or the token expires after 7 days.
+#   auth_mode: service_account -> upload into a Workspace SHARED DRIVE (a bare
+#                                 service account has no personal-Drive quota, so
+#                                 it CANNOT use a normal My-Drive folder).
+# Leave folder_id blank to skip Drive upload entirely -- the figures still go out
+# as email attachments regardless (Drive is optional).
 google_drive:
+  auth_mode: oauth
+  # -- oauth (personal Drive) --
+  oauth_client_file: secrets/drive_oauth_client.json   # downloaded Desktop-app OAuth client
+  token_file: secrets/drive_oauth_token.json           # written by --authorize
+  folder_id: ""                                        # a folder id in YOUR Drive
+  # -- service_account (Workspace Shared Drive) --
   service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
-  shared_drive_folder_id: ""
+  # shared_drive_folder_id: ""
 
 surgery_digest:
   enabled: true
