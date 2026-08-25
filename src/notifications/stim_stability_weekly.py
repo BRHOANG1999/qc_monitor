@@ -141,17 +141,19 @@ def _crop(time_ms, y, win) -> tuple:
 _WIN_LABEL = {"artifact": "stim artifact", "evoked": "evoked response"}
 
 
-def _lfp_figs(tm, y, base, name, title, wins, sem=None) -> dict:
+def _lfp_figs(tm, y, base, name, title, wins, sem=None, color=None) -> dict:
     """The LFP trace at each window -> {window_key: png path}. Both windows are
     of the SAME LFP (mean_trace): 'artifact' and 'evoked'. Averaged figures pass
-    *sem* for a shaded mean +/- SEM band; per-file singles pass None."""
+    *sem* for a shaded mean +/- SEM band; *color* tints the line+band (the daily
+    averages are drawn in their day colour)."""
     out = {}
     for wkey, win in wins.items():
         ct, cy = _crop(tm, y, win)
         cs = _crop(tm, sem, win)[1] if sem is not None else None
         pth = os.path.join(base, f"{name}_{wkey}.png")
         lbl = f"{title} · {_WIN_LABEL[wkey]} ({win[0]:g} to {win[1]:g} ms)"
-        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude", sem=cs):
+        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude", sem=cs,
+                                color=color or _fig._ACCENT):
             out[wkey] = pth
     return out
 
@@ -201,7 +203,7 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
         tm, mean, sem = day_mean[d]
         daily += list(_lfp_figs(tm, mean, base, f"day_{_safe(d)}",
                                 f"{animal} {channel} · {d} avg", wins,
-                                sem=sem).values())
+                                sem=sem, color=day_color[d]).values())
     tmw, yw, semw = average_with_sem(traces, value_key="evoked_trace")   # weekly
     weekly = _lfp_figs(tmw, yw, base, f"{tag}_weekly",
                        f"{animal} {channel} · weekly avg LFP", wins, sem=semw)
