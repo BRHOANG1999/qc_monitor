@@ -42,21 +42,80 @@ def _parse_chunk_dt(s: str):
         return None
 
 
-def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
-                    ylabel: str = "amplitude", color: str = _ACCENT) -> str | None:
-    """Average waveform (amplitude vs ms) -> PNG. Returns the path, or None when
-    there's nothing plottable. Used for the LFP evoked-response figures at each
-    time window (stim-artifact and evoked)."""
-    assert out_png, "out_png required"
-    if time_ms is None or y is None or len(time_ms) != len(y) or len(y) < 3:
-        return None
+# Distinct, chronologically-ordered day colours (cool -> warm) -- a qualitative
+# palette, NOT a heat-map gradient; the order + a legend make it readable.
+_DAY_COLORS = ["#3b4cc0", "#2aa198", "#2ca02c", "#bcbd22", "#ff7f0e",
+               "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf"]
+
+
+def _day_label(day: str) -> str:
+    try:
+        return datetime.strptime(str(day)[:10], "%Y_%m_%d").strftime("%b %d")
+    except (ValueError, TypeError):
+        return str(day)
+
+
+def day_color_map(days_sorted) -> dict:
+    """{day: distinct colour} assigned in chronological order."""
+    return {d: _DAY_COLORS[i % len(_DAY_COLORS)]
+            for i, d in enumerate(days_sorted)}
+
+
+def plot_day_overlay(file_traces, daily_traces, title: str, out_png: str,
+                     day_color: dict, ylabel: str = "LFP amplitude") -> str | None:
+    """Overlay every file trace (thin, day-coloured) with the per-day MEAN traces
+    (bold) on top -- one distinct colour per day + a chronological legend. Each
+    of *file_traces* / *daily_traces* is (day, time_ms, y), pre-cropped to the
+    window. Returns the path, or None if no daily mean was drawn."""
+    drew = False
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    ax.plot(time_ms, y, color=color, lw=1.5)
+    for day, tm, y in file_traces:
+        if tm and y and len(tm) == len(y) >= 3:
+            ax.plot(tm, y, color=day_color.get(day, "#888"), lw=0.5, alpha=0.22)
+    for day, tm, y in sorted(daily_traces):
+        if not (tm and y and len(tm) == len(y) >= 3):
+            continue
+        ax.plot(tm, y, color=day_color.get(day, "#888"), lw=2.2,
+                label=_day_label(day))
+        drew = True
+    if not drew:
+        plt.close(fig)
+        return None
     ax.axhline(0.0, color="#888", lw=0.6, alpha=0.5)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("time (ms)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.2)
+    ax.legend(fontsize=7, ncol=2, framealpha=0.6, title="day")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
+                    ylabel: str = "amplitude", color: str = _ACCENT,
+                    sem=None) -> str | None:
+    """Average waveform (amplitude vs ms) -> PNG, with a shaded mean +/- SEM band
+    when *sem* is given. Returns the path, or None when there's nothing
+    plottable. Used for the LFP evoked-response figures at each time window."""
+    assert out_png, "out_png required"
+    if time_ms is None or y is None or len(time_ms) != len(y) or len(y) < 3:
+        return None
+    fig, ax = plt.subplots(figsize=_FIGSIZE)
+    if sem is not None and len(sem) == len(y):
+        ya = np.asarray(y, dtype=float)
+        sa = np.asarray(sem, dtype=float)
+        ax.fill_between(time_ms, ya - sa, ya + sa, color=color, alpha=0.22,
+                        linewidth=0, label="± SEM")
+    ax.plot(time_ms, y, color=color, lw=1.5, label="mean")
+    ax.axhline(0.0, color="#888", lw=0.6, alpha=0.5)
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.2)
+    if sem is not None:
+        ax.legend(fontsize=8, framealpha=0.6)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
@@ -64,39 +123,31 @@ def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
 
 
 def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str, out_png: str, *,
-                        times=None, stim_win=None,
+                        days=None, day_color=None, stim_win=None,
                         evoked_win=(1.0, 50.0)) -> dict:
-    """Stim-magnitude vs evoked-magnitude scatter + regression -> PNG.
+    """LFP stim-artifact vs LFP evoked magnitude scatter + regression -> PNG.
 
-    Points are coloured by *times* (per-file epoch seconds) with a date colorbar,
-    so the week's time window is visible on the graph; the axes name the
-    measurement windows (stim *stim_win*, evoked *evoked_win*, ms). Returns
+    Points are coloured by recording DAY with distinct colours + a chronological
+    legend (not a gradient); the axes name the measurement windows. Returns
     ``{r, r2, p, n, slope, png}`` (``png`` None when <3 paired points).
-    Regression via ``scipy.stats.linregress``, skipped when every stim magnitude
-    is identical -- mirrors chronic_evoked._add_regression."""
+    Regression via ``scipy.stats.linregress``, skipped when every x is identical
+    -- mirrors chronic_evoked._add_regression."""
     xs = np.asarray([float(x) for x in stim_mags], dtype=float)
     ys = np.asarray([float(y) for y in evoked_mags], dtype=float)
-    ts = np.asarray(times, dtype=float) if times is not None else None
     ok = np.isfinite(xs) & np.isfinite(ys)
-    if ts is not None:
-        ok &= np.isfinite(ts)
+    dd = ([d for d, k in zip(days, ok) if k] if days is not None else None)
     xs, ys = xs[ok], ys[ok]
-    ts = ts[ok] if ts is not None else None
     out = {"r": float("nan"), "r2": float("nan"), "p": float("nan"),
            "n": int(xs.size), "slope": float("nan"), "png": None}
     if xs.size < 3:
         return out
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    if ts is not None and np.ptp(ts) > 0:
-        sc = ax.scatter(xs, ys, s=22, c=ts, cmap="viridis", alpha=0.8,
-                        linewidths=0)
-        cb = fig.colorbar(sc, ax=ax)
-        cb.set_label("recording time")
-        from datetime import datetime
-        tk = np.linspace(ts.min(), ts.max(), 4)
-        cb.set_ticks(tk)
-        cb.set_ticklabels([datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
-                           for t in tk])
+    if dd is not None and day_color:
+        for day in sorted(set(dd)):
+            idx = [i for i, d in enumerate(dd) if d == day]
+            ax.scatter(xs[idx], ys[idx], s=24, alpha=0.8, linewidths=0,
+                       color=day_color.get(day, "#888"), label=_day_label(day))
+        ax.legend(fontsize=7, ncol=2, framealpha=0.6, title="day")
     else:
         ax.scatter(xs, ys, s=14, c=_ACCENT, alpha=0.6, linewidths=0)
     if np.ptp(xs) > 0:

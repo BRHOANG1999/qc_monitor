@@ -20,7 +20,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.db.store import Store  # noqa: E402
-from src.utils.trace_average import average_traces  # noqa: E402
+from src.utils.trace_average import average_traces, average_with_sem  # noqa: E402
 
 _ANIMAL, _CH = "BCH062", "BCH062SR"
 _T = [0.0, 0.5, 1.0]
@@ -128,6 +128,20 @@ def test_average_ignores_nan_per_sample():
 def test_average_empty_returns_none():
     assert average_traces([]) == (None, None)
     assert average_traces([{"time_ms": None, "stim_trace": None}]) == (None, None)
+
+
+def test_average_with_sem():
+    tr = [{"time_ms": _T, "stim_trace": [1.0, 2.0, 3.0]},
+          {"time_ms": _T, "stim_trace": [3.0, 4.0, 5.0]}]
+    t, mean, sem = average_with_sem(tr)
+    assert t == _T and mean == [2.0, 3.0, 4.0]
+    # 2 traces: std(ddof=1)=sqrt(2), sem = sqrt(2)/sqrt(2) = 1.0 per sample
+    assert all(abs(s - 1.0) < 1e-9 for s in sem)
+
+
+def test_average_with_sem_single_trace_zero_band():
+    t, mean, sem = average_with_sem([{"time_ms": _T, "stim_trace": [1.0, 2.0, 3.0]}])
+    assert mean == [1.0, 2.0, 3.0] and sem == [0.0, 0.0, 0.0]  # n<2 -> flat band
 
 
 def test_average_evoked_key():

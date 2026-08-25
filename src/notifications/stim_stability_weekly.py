@@ -40,13 +40,13 @@ from src.notifications.evoked_weekly import _peak_amplitude
 from src.utils import drive_upload as _drive
 from src.utils import sheets_write as _sw
 from src.utils.sheets import _resolve_sa_path
-from src.utils.trace_average import average_traces
+from src.utils.trace_average import average_traces, average_with_sem
 
 logger = logging.getLogger("qc_monitor.notifications.stim_stability_weekly")
 
 HEADER = ["Week", "Animal", "Channel", "Ra kΩ", "Ra Δ%", "corr r", "corr p",
-          "n files", "LFP artifact (-1..1ms)", "LFP evoked (1..50ms)",
-          "Impedance", "Correlation", "Figures"]
+          "n files", "LFP artifact", "LFP evoked", "Impedance", "Correlation",
+          "Figures"]
 _TAB = "Stim Stability"
 
 
@@ -108,7 +108,7 @@ def _magnitude_pairs(traces: list[dict], artifact_win, evoked_win
     """Per-file, from the SAME LFP (mean_trace): (stim-artifact peak-to-trough
     over *artifact_win*, evoked peak-to-trough over *evoked_win*, recording epoch
     seconds). The last drives the correlation graph's time colouring."""
-    xs, ys, ts = [], [], []
+    xs, ys, days = [], [], []
     for t in traces:
         tm = t.get("time_ms") or []
         lfp = t.get("evoked_trace") or []
@@ -118,11 +118,10 @@ def _magnitude_pairs(traces: list[dict], artifact_win, evoked_win
         ev = _peak_amplitude(tm, lfp, evoked_win[0], evoked_win[1])
         if art is None or ev is None:
             continue
-        dt = _fig._parse_chunk_dt(t.get("chunk_datetime"))
         xs.append(art)
         ys.append(ev)
-        ts.append(dt.timestamp() if dt else float("nan"))
-    return xs, ys, ts
+        days.append(str(t.get("chunk_datetime", ""))[:10])
+    return xs, ys, days
 
 
 def _crop(time_ms, y, win) -> tuple:
@@ -142,53 +141,80 @@ def _crop(time_ms, y, win) -> tuple:
 _WIN_LABEL = {"artifact": "stim artifact", "evoked": "evoked response"}
 
 
-def _lfp_figs(tm, y, base, name, title, wins) -> dict:
+def _lfp_figs(tm, y, base, name, title, wins, sem=None) -> dict:
     """The LFP trace at each window -> {window_key: png path}. Both windows are
-    of the SAME LFP (mean_trace): 'artifact' (~-1..1 ms) and 'evoked' (~1..50 ms)."""
+    of the SAME LFP (mean_trace): 'artifact' and 'evoked'. Averaged figures pass
+    *sem* for a shaded mean +/- SEM band; per-file singles pass None."""
     out = {}
     for wkey, win in wins.items():
         ct, cy = _crop(tm, y, win)
+        cs = _crop(tm, sem, win)[1] if sem is not None else None
         pth = os.path.join(base, f"{name}_{wkey}.png")
         lbl = f"{title} · {_WIN_LABEL[wkey]} ({win[0]:g} to {win[1]:g} ms)"
-        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude"):
+        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude", sem=cs):
             out[wkey] = pth
     return out
 
 
+def _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
+              animal, channel) -> dict:
+    """Per window, one figure overlaying all file traces (thin, day-coloured) +
+    the daily-mean traces (bold) on top. Returns {window_key: png path}."""
+    out = {}
+    for wkey, win in wins.items():
+        ftr = [(str(t["chunk_datetime"])[:10],
+                *_crop(t["time_ms"], t["evoked_trace"], win)) for t in traces]
+        dtr = [(d, *_crop(day_mean[d][0], day_mean[d][1], win)) for d in sdays]
+        pth = os.path.join(base, f"{tag}_overlay_{wkey}.png")
+        p = _fig.plot_day_overlay(
+            ftr, dtr, f"{animal} {channel} · {_WIN_LABEL[wkey]} · daily overlay "
+            f"({win[0]:g} to {win[1]:g} ms)", pth, day_color)
+        if p:
+            out[wkey] = p
+    return out
+
+
 def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
-    """Render every PNG + compute the scalars for one channel. Two LFP waveform
-    figures per level (stim-artifact + evoked windows). Returns a result dict, or
-    None when the channel has no traces this week."""
+    """Render every PNG + scalars for one channel: two LFP windows per level
+    (stim-artifact + evoked), a per-window daily overlay under the weekly average,
+    the impedance trend, and the day-coloured LFP correlation."""
     if not traces:
         return None
     base = os.path.join(work, _safe(animal), _safe(channel))
     os.makedirs(base, exist_ok=True)
     tag = f"{_safe(animal)}_{_safe(channel)}"
     days = _group_by_day(traces)
+    sdays = sorted(days)
+    day_color = _fig.day_color_map(sdays)
+    day_mean = {d: average_with_sem(days[d], value_key="evoked_trace")
+                for d in sdays}
+    wins = {"artifact": p.artifact_window, "evoked": p.evoked_window}
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
                    else traces)
-    wins = {"artifact": p.artifact_window, "evoked": p.evoked_window}
     perfile, daily = [], []
     for t in perfile_src:                                 # per file: 2 LFP figs
         perfile += list(_lfp_figs(
             t["time_ms"], t["evoked_trace"], base,
             f"file_{_safe(t['chunk_datetime'])}",
             f"{animal} {channel} · {t['chunk_datetime']}", wins).values())
-    for day, dts in sorted(days.items()):                 # per day: avg LFP, 2 figs
-        tm, y = average_traces(dts, value_key="evoked_trace")
-        daily += list(_lfp_figs(tm, y, base, f"day_{_safe(day)}",
-                                f"{animal} {channel} · {day} avg", wins).values())
-    tmw, yw = average_traces(traces, value_key="evoked_trace")   # weekly grand avg
+    for d in sdays:                                        # per day: avg LFP +/- SEM
+        tm, mean, sem = day_mean[d]
+        daily += list(_lfp_figs(tm, mean, base, f"day_{_safe(d)}",
+                                f"{animal} {channel} · {d} avg", wins,
+                                sem=sem).values())
+    tmw, yw, semw = average_with_sem(traces, value_key="evoked_trace")   # weekly
     weekly = _lfp_figs(tmw, yw, base, f"{tag}_weekly",
-                       f"{animal} {channel} · weekly avg LFP", wins)
-    # impedance trend + LFP-artifact vs LFP-evoked correlation
+                       f"{animal} {channel} · weekly avg LFP", wins, sem=semw)
+    over = _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
+                     animal, channel)
     imp = _fig.impedance_png(imp_rows, os.path.join(base, f"{tag}_impedance.png"),
                              title=f"{animal} {channel} Rₐ", pct=p.pct,
                              window=p.window, min_history=p.min_history)
-    xs, ys, ts = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
+    xs, ys, dys = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
     corr = _fig.plot_stim_vs_evoked(
         xs, ys, f"{animal} {channel}", os.path.join(base, f"{tag}_correlation.png"),
-        times=ts, stim_win=p.artifact_window, evoked_win=tuple(p.evoked_window))
+        days=dys, day_color=day_color, stim_win=p.artifact_window,
+        evoked_win=tuple(p.evoked_window))
     stat = _drift_stat([r.get("access_r_kohm") for r in imp_rows
                         if r.get("access_r_kohm") is not None],
                        p.window, p.min_history)
@@ -198,29 +224,39 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
         "ra_drift": (stat["drift_pct"] if stat else None),
         "corr": corr,
         "png_artifact": weekly.get("artifact"), "png_evoked": weekly.get("evoked"),
+        "png_artifact_overlay": over.get("artifact"),
+        "png_evoked_overlay": over.get("evoked"),
         "png_impedance": imp, "png_corr": corr["png"],
         "perfile": perfile, "daily": daily,
         "urls": {}, "folder_link": "",
     }
 
 
-# The headline figures inlined in the email + thumbnailed in the sheet.
-_HEADLINE = (("artifact", "png_artifact"), ("evoked", "png_evoked"),
-             ("impedance", "png_impedance"), ("corr", "png_corr"))
+# Sheet thumbnails = the two daily-overlay figures + impedance + correlation.
+_SHEET_HEADLINE = (("artifact", "png_artifact_overlay"),
+                   ("evoked", "png_evoked_overlay"),
+                   ("impedance", "png_impedance"), ("corr", "png_corr"))
+# Email inlines, per window, the weekly average then its daily overlay beneath.
+_EMAIL_HEADLINE = ("png_artifact", "png_artifact_overlay",
+                   "png_evoked", "png_evoked_overlay",
+                   "png_impedance", "png_corr")
 
 
 def _upload_channel(drive, week_folder_id, res, throttle) -> None:
-    """Upload every PNG into a per-channel subfolder; record headline URLs +
-    the folder link on *res*."""
+    """Upload every PNG into a per-channel subfolder; record the sheet-thumbnail
+    URLs + the folder link on *res*."""
     sub = _drive.ensure_folder(
         drive, f"{_safe(res['animal'])}_{_safe(res['channel'])}", week_folder_id)
     res["folder_link"] = sub.get("webViewLink", "")
-    for key, field in _HEADLINE:
+    for key, field in _SHEET_HEADLINE:
         if res.get(field):
             res["urls"][key] = _drive.upload_png(
                 drive, res[field], sub["id"], throttle_sec=throttle)["image_url"]
-    for path in res["daily"] + res["perfile"]:            # archived, not linked
-        _drive.upload_png(drive, path, sub["id"], throttle_sec=throttle)
+    archive = [res.get("png_artifact"), res.get("png_evoked")] \
+        + res["daily"] + res["perfile"]                   # archived, not linked
+    for path in archive:
+        if path:
+            _drive.upload_png(drive, path, sub["id"], throttle_sec=throttle)
 
 
 def _num(v, fmt: str) -> str:
@@ -238,8 +274,8 @@ def _sheet_row(week: str, res: dict) -> dict:
         "Ra kΩ": _num(res["ra"], ".1f"), "Ra Δ%": _num(res["ra_drift"], "+.0f"),
         "corr r": _num(c.get("r"), ".2f"), "corr p": _num(c.get("p"), ".1e"),
         "n files": res["n_files"],
-        "LFP artifact (-1..1ms)": img(urls.get("artifact")),
-        "LFP evoked (1..50ms)": img(urls.get("evoked")),
+        "LFP artifact": img(urls.get("artifact")),
+        "LFP evoked": img(urls.get("evoked")),
         "Impedance": img(urls.get("impedance")),
         "Correlation": img(urls.get("corr")),
         "Figures": (f'=HYPERLINK("{folder}","open folder")' if folder else ""),
@@ -258,7 +294,7 @@ def _email_pngs(results, cap_bytes: int) -> tuple[list, list, int]:
     if Drive/token ever lapses."""
     inline, files, size, dropped = [], [], 0, 0
     for r in results:
-        for _k, field in _HEADLINE:
+        for field in _EMAIL_HEADLINE:
             path = r.get(field)
             if path and os.path.exists(path):
                 inline.append(path)
@@ -301,7 +337,7 @@ def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
     parts.append('</table>')
     for r in results:                                     # headline figures inline
         parts.append(f'<h3>{escape(r["animal"])} {escape(r["channel"])}</h3>')
-        for _k, field in _HEADLINE:
+        for field in _EMAIL_HEADLINE:
             path = r.get(field)
             if path:
                 parts.append(f'<img src="cid:{os.path.basename(path)}" '

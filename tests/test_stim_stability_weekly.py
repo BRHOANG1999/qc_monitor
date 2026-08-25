@@ -98,11 +98,11 @@ def test_week_span():
 
 
 def test_magnitude_pairs():
-    xs, ys, ts = m._magnitude_pairs([_trace(1, "2026_08_24", 0.0),
-                                     _trace(2, "2026_08_24", 0.9)],
-                                    [-1.0, 1.0], [1.0, 50.0])
-    assert len(xs) == 2 and len(ys) == 2 and len(ts) == 2
-    assert all(v >= 0 for v in xs)
+    xs, ys, days = m._magnitude_pairs([_trace(1, "2026_08_24", 0.0),
+                                       _trace(2, "2026_08_25", 0.9)],
+                                      [-1.0, 1.0], [1.0, 50.0])
+    assert len(xs) == 2 and len(ys) == 2 and len(days) == 2
+    assert days == ["2026_08_24", "2026_08_25"] and all(v >= 0 for v in xs)
 
 
 def test_crop_window():
@@ -127,11 +127,11 @@ def test_full_send(monkeypatch, tmp_path):
     assert set(cap["column_map"].keys()) == set(m.HEADER)
     row = cap["rows"][0]
     assert row["Animal"] == _ANIMAL and row["Channel"] == _CH
-    assert row["LFP evoked (1..50ms)"].startswith('=IMAGE(') and \
-        row["LFP artifact (-1..1ms)"].startswith('=IMAGE(') and \
+    assert row["LFP evoked"].startswith('=IMAGE(') and \
+        row["LFP artifact"].startswith('=IMAGE(') and \
         row["Figures"].startswith('=HYPERLINK(')
     assert row["n files"] == 4
-    # email carried the 4 inline headline PNGs (artifact, evoked, impedance, corr)
+    # email carried the inline headline PNGs (avg + overlay per window, imp, corr)
     assert emailer.calls and emailer.calls[0]["subject_prefix"] is False
     assert len(emailer.calls[0]["attachments"]) >= 4
 
