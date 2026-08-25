@@ -42,18 +42,20 @@ def _parse_chunk_dt(s: str):
         return None
 
 
-def plot_stim_trace(time_ms, y, title: str, out_png: str) -> str | None:
-    """Average stimulus waveform (amplitude vs ms) -> PNG. Returns the path, or
-    None when there's nothing plottable."""
+def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
+                    ylabel: str = "amplitude", color: str = _ACCENT) -> str | None:
+    """Average waveform (amplitude vs ms) -> PNG. Returns the path, or None when
+    there's nothing plottable. Used for the LFP evoked-response figures at each
+    time window (stim-artifact and evoked)."""
     assert out_png, "out_png required"
     if time_ms is None or y is None or len(time_ms) != len(y) or len(y) < 3:
         return None
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    ax.plot(time_ms, y, color=_STIM, lw=1.5)
+    ax.plot(time_ms, y, color=color, lw=1.5)
     ax.axhline(0.0, color="#888", lw=0.6, alpha=0.5)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("time (ms)")
-    ax.set_ylabel("stim amplitude")
+    ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
@@ -108,8 +110,8 @@ def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str, out_png: str, *,
                  f"p={lr.pvalue:.1e} n={xs.size}")
     sw = f" ({stim_win[0]:g} to {stim_win[1]:g} ms)" if stim_win else ""
     ax.set_title(title, fontsize=10)
-    ax.set_xlabel(f"stim magnitude, peak-to-trough{sw}")
-    ax.set_ylabel(f"evoked magnitude, peak-to-trough "
+    ax.set_xlabel(f"LFP stim-artifact magnitude, peak-to-trough{sw}")
+    ax.set_ylabel(f"LFP evoked magnitude, peak-to-trough "
                   f"({evoked_win[0]:g}–{evoked_win[1]:g} ms)")
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
