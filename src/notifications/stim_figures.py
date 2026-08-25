@@ -174,9 +174,11 @@ def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str, out_png: str, *,
 
 def impedance_png(rows: list[dict], out_png: str, *, title: str,
                   pct: float = 40.0, window: int = 10, min_history: int = 4,
-                  engine: str = "auto") -> str | None:
+                  engine: str = "auto", highlight=None) -> str | None:
     """Access-resistance (Rₐ) drift trend for one channel -> PNG: Rₐ line +
     rolling-median baseline band + a red-ringed latest point when drifting.
+    *highlight* = (start_datetime, end_datetime) shades a date window (used to
+    mark 'this week' on the full-history plot).
 
     Tries the Overview's Plotly look via kaleido first (``engine`` 'auto'/'plotly')
     for dashboard fidelity, then falls back to a portable matplotlib render so the
@@ -190,25 +192,30 @@ def impedance_png(rows: list[dict], out_png: str, *, title: str,
     dts = [_parse_chunk_dt(r.get("chunk_datetime")) for r in rows]
     x = dts if all(d is not None for d in dts) else list(range(len(rows)))
     y = [r.get("access_r_kohm") for r in rows]
+    hl = highlight if (x and not isinstance(x[0], int)) else None  # dates only
     stat = _drift_stat(vals, window, min_history)
     drifting = bool(stat and abs(stat["drift_pct"]) >= pct)
     sub = f"  ·  Δ {stat['drift_pct']:+.0f}% vs baseline" if stat else ""
     if engine in ("auto", "plotly"):
-        p = _impedance_plotly(x, y, stat, drifting, pct, title + sub, out_png)
+        p = _impedance_plotly(x, y, stat, drifting, pct, title + sub, out_png, hl)
         if p is not None:
             return p
         if engine == "plotly":
             return None
-    return _impedance_mpl(x, y, stat, drifting, pct, title + sub, out_png)
+    return _impedance_mpl(x, y, stat, drifting, pct, title + sub, out_png, hl)
 
 
-def _impedance_plotly(x, y, stat, drifting, pct, title, out_png):
+def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight):
     """Overview-fidelity Plotly render -> PNG via kaleido; None if unavailable."""
     try:
         import plotly.graph_objects as go
     except Exception:                                     # noqa: BLE001
         return None
     fig = go.Figure()
+    if highlight is not None:
+        fig.add_vrect(x0=highlight[0], x1=highlight[1], line_width=0,
+                      fillcolor="rgba(255,159,10,0.16)",
+                      annotation_text="this week", annotation_position="top left")
     fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name="Rₐ",
                              line=dict(color=_ACCENT, width=1.8),
                              marker=dict(size=5)))
@@ -226,7 +233,7 @@ def _impedance_plotly(x, y, stat, drifting, pct, title, out_png):
                       template="plotly_white", height=420, width=900,
                       margin=dict(l=60, r=20, t=48, b=44), showlegend=False)
     fig.update_yaxes(title_text="Rₐ (kΩ)")
-    fig.update_xaxes(title_text="recording")
+    fig.update_xaxes(title_text="recording date")
     try:
         fig.write_image(out_png, scale=2)                 # needs kaleido + Chrome
     except Exception as e:                                # noqa: BLE001
@@ -235,21 +242,26 @@ def _impedance_plotly(x, y, stat, drifting, pct, title, out_png):
     return out_png
 
 
-def _impedance_mpl(x, y, stat, drifting, pct, title, out_png):
+def _impedance_mpl(x, y, stat, drifting, pct, title, out_png, highlight):
     """Portable matplotlib (Agg) render of the same Rₐ trend -- always works."""
     fig, ax = plt.subplots(figsize=_FIGSIZE)
-    ax.plot(x, y, color=_ACCENT, lw=1.8, marker="o", markersize=4)
+    if highlight is not None:
+        ax.axvspan(highlight[0], highlight[1], color="#ff9f0a", alpha=0.16,
+                   label="this week")
+    ax.plot(x, y, color=_ACCENT, lw=1.8, marker="o", markersize=4, label="Rₐ")
     if stat is not None:
         base, band = stat["baseline"], stat["baseline"] * pct / 100.0
         ax.axhspan(base - band, base + band, color=_ACCENT, alpha=0.10)
-        ax.axhline(base, color="#888", ls="--", lw=1.0)
+        ax.axhline(base, color="#888", ls="--", lw=1.0, label="baseline")
         if drifting:
             ax.scatter([x[-1]], [y[-1]], s=120, facecolors="none",
                        edgecolors=_FIT, linewidths=2.0, zorder=5)
     ax.set_title(title, fontsize=11)
     ax.set_ylabel("Rₐ (kΩ)")
-    ax.set_xlabel("recording")
+    ax.set_xlabel("recording date")
     ax.grid(True, alpha=0.2)
+    if highlight is not None:
+        ax.legend(fontsize=8, framealpha=0.6, loc="best")
     if x and not isinstance(x[0], int):
         fig.autofmt_xdate()
     fig.tight_layout()

@@ -28,7 +28,7 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
 from types import SimpleNamespace
 
@@ -169,17 +169,37 @@ def _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
         dtr = [(d, *_crop(day_mean[d][0], day_mean[d][1], win)) for d in sdays]
         pth = os.path.join(base, f"{tag}_overlay_{wkey}.png")
         p = _fig.plot_day_overlay(
-            ftr, dtr, f"{animal} {channel} · {_WIN_LABEL[wkey]} · daily overlay "
-            f"({win[0]:g} to {win[1]:g} ms)", pth, day_color)
+            ftr, dtr, f"{animal} {channel} — {_WIN_LABEL[wkey]} ({win[0]:g} to "
+            f"{win[1]:g} ms) across the week: every recording (thin) + daily "
+            f"means (bold)", pth, day_color)
         if p:
             out[wkey] = p
     return out
 
 
-def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
+def _impedance_figs(imp_rows, base, tag, animal, channel, week, start, end, p):
+    """(full-history Rₐ with THIS WEEK shaded, this-week zoom)."""
+    hl = (datetime.fromisoformat(start),
+          datetime.fromisoformat(end) + timedelta(days=1))
+    full = _fig.impedance_png(
+        imp_rows, os.path.join(base, f"{tag}_impedance.png"), highlight=hl,
+        title=f"{animal} {channel} — electrode access resistance (Rₐ), full "
+        "implant history", pct=p.pct, window=p.window, min_history=p.min_history)
+    lo, hi = start.replace("-", "_"), end.replace("-", "_")
+    wk = [r for r in imp_rows if lo <= str(r.get("chunk_datetime", ""))[:10] <= hi]
+    week_png = _fig.impedance_png(
+        wk, os.path.join(base, f"{tag}_impedance_week.png"),
+        title=f"{animal} {channel} — electrode access resistance (Rₐ), this week "
+        f"({week})", pct=p.pct, window=p.window,
+        min_history=p.min_history) if wk else None
+    return full, week_png
+
+
+def _process_channel(animal, channel, traces, imp_rows, p, work,
+                     week, start, end) -> dict | None:
     """Render every PNG + scalars for one channel: two LFP windows per level
     (stim-artifact + evoked), a per-window daily overlay under the weekly average,
-    the impedance trend, and the day-coloured LFP correlation."""
+    the impedance trend (full + this-week), and the day-coloured LFP correlation."""
     if not traces:
         return None
     base = os.path.join(work, _safe(animal), _safe(channel))
@@ -198,24 +218,28 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
         perfile += list(_lfp_figs(
             t["time_ms"], t["evoked_trace"], base,
             f"file_{_safe(t['chunk_datetime'])}",
-            f"{animal} {channel} · {t['chunk_datetime']}", wins).values())
+            f"{animal} {channel} — single recording {t['chunk_datetime']}",
+            wins).values())
     for d in sdays:                                        # per day: avg LFP +/- SEM
         tm, mean, sem = day_mean[d]
-        daily += list(_lfp_figs(tm, mean, base, f"day_{_safe(d)}",
-                                f"{animal} {channel} · {d} avg", wins,
-                                sem=sem, color=day_color[d]).values())
+        daily += list(_lfp_figs(
+            tm, mean, base, f"day_{_safe(d)}",
+            f"{animal} {channel} — daily average LFP {d} (mean ± SEM)", wins,
+            sem=sem, color=day_color[d]).values())
     tmw, yw, semw = average_with_sem(traces, value_key="evoked_trace")   # weekly
-    weekly = _lfp_figs(tmw, yw, base, f"{tag}_weekly",
-                       f"{animal} {channel} · weekly avg LFP", wins, sem=semw)
+    weekly = _lfp_figs(
+        tmw, yw, base, f"{tag}_weekly",
+        f"{animal} {channel} — weekly average LFP, {week} (mean ± SEM, "
+        f"n={len(traces)})", wins, sem=semw)
     over = _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
                      animal, channel)
-    imp = _fig.impedance_png(imp_rows, os.path.join(base, f"{tag}_impedance.png"),
-                             title=f"{animal} {channel} Rₐ", pct=p.pct,
-                             window=p.window, min_history=p.min_history)
+    imp, imp_week = _impedance_figs(imp_rows, base, tag, animal, channel, week,
+                                    start, end, p)
     xs, ys, dys = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
     corr = _fig.plot_stim_vs_evoked(
-        xs, ys, f"{animal} {channel}", os.path.join(base, f"{tag}_correlation.png"),
-        days=dys, day_color=day_color, stim_win=p.artifact_window,
+        xs, ys, f"{animal} {channel} — stim-artifact vs evoked magnitude",
+        os.path.join(base, f"{tag}_correlation.png"), days=dys,
+        day_color=day_color, stim_win=p.artifact_window,
         evoked_win=tuple(p.evoked_window))
     stat = _drift_stat([r.get("access_r_kohm") for r in imp_rows
                         if r.get("access_r_kohm") is not None],
@@ -228,7 +252,8 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
         "png_artifact": weekly.get("artifact"), "png_evoked": weekly.get("evoked"),
         "png_artifact_overlay": over.get("artifact"),
         "png_evoked_overlay": over.get("evoked"),
-        "png_impedance": imp, "png_corr": corr["png"],
+        "png_impedance": imp, "png_impedance_week": imp_week,
+        "png_corr": corr["png"],
         "perfile": perfile, "daily": daily,
         "urls": {}, "folder_link": "",
     }
@@ -238,10 +263,11 @@ def _process_channel(animal, channel, traces, imp_rows, p, work) -> dict | None:
 _SHEET_HEADLINE = (("artifact", "png_artifact_overlay"),
                    ("evoked", "png_evoked_overlay"),
                    ("impedance", "png_impedance"), ("corr", "png_corr"))
-# Email inlines, per window, the weekly average then its daily overlay beneath.
+# Email inlines, per window, the weekly average then its daily overlay beneath;
+# then the full-history impedance, this-week impedance, and the correlation.
 _EMAIL_HEADLINE = ("png_artifact", "png_artifact_overlay",
                    "png_evoked", "png_evoked_overlay",
-                   "png_impedance", "png_corr")
+                   "png_impedance", "png_impedance_week", "png_corr")
 
 
 def _upload_channel(drive, week_folder_id, res, throttle) -> None:
@@ -254,7 +280,8 @@ def _upload_channel(drive, week_folder_id, res, throttle) -> None:
         if res.get(field):
             res["urls"][key] = _drive.upload_png(
                 drive, res[field], sub["id"], throttle_sec=throttle)["image_url"]
-    archive = [res.get("png_artifact"), res.get("png_evoked")] \
+    archive = [res.get("png_artifact"), res.get("png_evoked"),
+               res.get("png_impedance_week")] \
         + res["daily"] + res["perfile"]                   # archived, not linked
     for path in archive:
         if path:
@@ -314,12 +341,53 @@ def _email_pngs(results, cap_bytes: int) -> tuple[list, list, int]:
     return inline, files, dropped
 
 
+_SUMMARY = (
+    "This report tracks whether stimulation is being delivered consistently and "
+    "whether the electrode and the brain's response stay stable over time. Per "
+    "stimulated channel it shows the stimulus artifact and the evoked LFP "
+    "response (weekly average + day-by-day), the electrode's access resistance, "
+    "and whether the artifact and the response track together.")
+
+_BATTERY_TIP = (
+    "Review tip: right after every battery change, check the stimulus-artifact "
+    "figures — a shift there is the earliest sign that delivery has changed.")
+
+_CAPTIONS = {
+    "png_artifact": "Weekly-average stimulus artifact on the LFP electrode "
+    "(-1 to 2 ms after each pulse), mean +/- SEM over the week. A consistent "
+    "shape and amplitude means stimulus delivery is stable.",
+    "png_artifact_overlay": "The -1 to 2 ms artifact for every recording this "
+    "week (thin) with each day's mean bold, one colour per day. Overlapping days "
+    "= stable; a colour-ordered drift = change across the week.",
+    "png_evoked": "Weekly-average evoked LFP response (2 to 50 ms after each "
+    "pulse), mean +/- SEM -- the brain's response to the stimulus.",
+    "png_evoked_overlay": "Evoked response (2 to 50 ms) for every recording this "
+    "week, coloured by day with daily means bold -- within- and across-day "
+    "variability at a glance.",
+    "png_impedance": "Electrode access resistance (Ra) over the whole implant "
+    "history -- a proxy for electrode/tissue health. Dashed = rolling baseline, "
+    "blue band = +/- threshold, orange = the week in this report. A large "
+    "sustained rise can indicate encapsulation.",
+    "png_impedance_week": "The same access resistance zoomed to this week (the "
+    "orange region highlighted above).",
+    "png_corr": "Does a bigger stimulus artifact drive a bigger evoked response? "
+    "One point per recording (coloured by day); the red line is the linear fit "
+    "(r, p). A strong positive r means the response scales with the delivered "
+    "stimulus.",
+}
+
+
 def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
     parts = [
         '<html><body style="font-family:-apple-system,sans-serif;color:#1a1a2e">',
         f'<h2>Weekly stimulus stability — {week} ({today.isoformat()})</h2>',
+        f'<p style="color:#333;max-width:72ch">{escape(_SUMMARY)}</p>',
+        '<p style="border-left:3px solid #ff9f0a;padding:6px 10px;'
+        f'background:#fff8ec;color:#7a5b00;max-width:72ch">{escape(_BATTERY_TIP)}'
+        '</p>',
         f'<p style="color:#6c6c80">{len(results)} stimulated channel(s). '
-        'Rₐ = access resistance; corr = stim-magnitude vs evoked (1–50 ms).</p>',
+        'Ra = electrode access resistance; corr r = artifact-vs-response '
+        'correlation.</p>',
         '<table cellpadding="6" style="border-collapse:collapse;'
         'border:1px solid #ddd"><tr style="background:#f4f6fb">'
         '<th>Channel</th><th>Rₐ kΩ</th><th>Rₐ Δ%</th><th>corr r</th>'
@@ -337,13 +405,19 @@ def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
             f'<td>{_num(r["corr"].get("p"), ".1e")}</td>'
             f'<td>{r["n_files"]}</td></tr>')
     parts.append('</table>')
-    for r in results:                                     # headline figures inline
+    for r in results:                                     # figures + captions
         parts.append(f'<h3>{escape(r["animal"])} {escape(r["channel"])}</h3>')
         for field in _EMAIL_HEADLINE:
             path = r.get(field)
-            if path:
-                parts.append(f'<img src="cid:{os.path.basename(path)}" '
-                             'style="max-width:640px;display:block;margin:6px 0">')
+            if not path:
+                continue
+            parts.append(f'<img src="cid:{os.path.basename(path)}" '
+                         'style="max-width:640px;display:block;margin:10px 0 2px">')
+            cap = _CAPTIONS.get(field)
+            if cap:
+                parts.append('<p style="color:#6c6c80;font-size:12px;'
+                             f'margin:0 0 16px;max-width:66ch"><em>{escape(cap)}'
+                             '</em></p>')
     if sheet_id:
         parts.append(f'<p><a href="https://docs.google.com/spreadsheets/d/'
                      f'{sheet_id}">Open the Stim Stability sheet</a></p>')
@@ -361,8 +435,9 @@ def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
 
 
 def _email_text(today, week, results) -> str:
-    lines = [f"Weekly stimulus stability -- {week} ({today.isoformat()})",
-             f"  {len(results)} stimulated channel(s)", ""]
+    lines = [f"Weekly stimulus stability -- {week} ({today.isoformat()})", "",
+             _SUMMARY, "", _BATTERY_TIP, "",
+             f"{len(results)} stimulated channel(s):"]
     for r in results:
         lines.append(f"  {r['animal']} {r['channel']}: Ra={_num(r['ra'], '.1f')} kΩ "
                      f"Δ={_num(r['ra_drift'], '+.0f')}% "
@@ -414,7 +489,8 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
         traces = store.channel_stim_evoked_traces_in_range(
             animal, channel, start_date, end_date)
         res = _process_channel(animal, channel, traces,
-                               imp_series.get((animal, channel), []), p, work)
+                               imp_series.get((animal, channel), []), p, work,
+                               week, start_date, end_date)
         if res is None:
             continue
         if drive is not None and week_folder is not None:
