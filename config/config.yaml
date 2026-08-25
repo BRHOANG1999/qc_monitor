@@ -292,6 +292,29 @@ notifications:
     hour: 8
     stale_hours: 48
     allowlist: []
+  # Weekly stimulus-stability report (Sunday). Per stimulated channel on the rig
+  # it renders average-stim waveform PNGs (per file/day/week), the
+  # access-resistance (Ra) drift figure, and a stim-vs-evoked (1-50 ms)
+  # correlation scatter; uploads them to a Shared Drive; keeps a running "Stim
+  # Stability" sheet (one row per week per channel, =IMAGE thumbnails + folder
+  # link); and emails the headline figures. Requires the Drive API enabled + a
+  # Shared Drive folder shared with the service account (see google_drive below).
+  # Ships DISABLED -- dry-run first:
+  #   python -m src.notifications.stim_stability_weekly --dry-run
+  stim_stability_weekly:
+    enabled: false
+    weekday: 6              # 0=Mon .. 6=Sun
+    hour: 8
+    recipients: []          # falls back to alerting.smtp.recipients
+    sheet_id: ""            # falls back to google_sheets.spreadsheet_id
+    tab_name: Stim Stability
+    exclude: [Randles]      # calibration phantom
+    drift_threshold_pct: 40
+    baseline_weeks: 10      # rolling-median window for the Ra baseline
+    min_history: 4
+    perfile_span: last_day  # last_day (~24 PNGs/ch) | week (all ~168)
+    upload_throttle_sec: 0.1
+    # stim_window_ms: [-1, 10]   # optional; default = full trace for stim p2p
 review_queue:
   # Per-undergrad behavioral review queue. Pulls a list of
   # unreviewed recordings for the user's assigned animals from
@@ -548,6 +571,16 @@ google_sheets:
   # Optional: tab whose header is copied for new animal tabs. Blank =
   # auto-detect (first existing summary tab with a Date column).
   summary_template_tab: ""
+
+# Google Drive (Shared Drive) target for the weekly stimulus-stability figures.
+# Uses the SAME service account as google_sheets, but the Drive API must be
+# ENABLED in that GCP project and shared_drive_folder_id must be a **Shared
+# Drive** folder shared with the SA's client_email as Content Manager -- a bare
+# service account has no personal-Drive storage quota, so a personal folder will
+# fail uploads. Leave shared_drive_folder_id blank to skip Drive upload.
+google_drive:
+  service_account_file: secrets/sheet-sync-473717-fb1897b8f02f.json
+  shared_drive_folder_id: ""
 
 surgery_digest:
   enabled: true

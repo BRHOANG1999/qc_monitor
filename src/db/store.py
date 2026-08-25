@@ -2376,6 +2376,69 @@ class Store:
                 continue
         return out
 
+    def channel_stim_evoked_traces_in_range(self, animal_id: str,
+                                            channel_name: str, start_date: str,
+                                            end_date: str, *,
+                                            max_traces: int = 400) -> list[dict]:
+        """Per-file STIM and EVOKED traces for one stimulated channel within an
+        inclusive date range, OLDEST-first -- the input for the weekly
+        average-stim figures (``stim_mean_trace``) and the stim-vs-evoked
+        correlation (``mean_trace``).
+
+        Same dominant-charge + valid-access-resistance restriction as
+        ``channel_traces_in_range`` (only the consistent stimStability protocol).
+        Each dict: ``{file_id, chunk_datetime, time_ms, stim_trace, evoked_trace,
+        charge_nc}``. Rows whose stim trace is NULL or whose JSON won't parse are
+        dropped. *start_date*/*end_date* are ``YYYY-MM-DD`` (end inclusive)."""
+        assert animal_id and channel_name, "animal_id and channel_name required"
+        assert start_date and end_date, "start_date and end_date required"
+        lo = f"{start_date.replace('-', '_')}__00_00_00"
+        hi = f"{end_date.replace('-', '_')}__~"
+        conn = self._connect()
+        try:
+            crow = conn.execute(
+                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
+                   WHERE animal_id = ? AND channel_name = ?
+                     AND access_r_kohm IS NOT NULL
+                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
+                   LIMIT 1""", (animal_id, channel_name)).fetchone()
+            if not crow:
+                return []
+            rows = conn.execute(
+                """SELECT pf.chunk_datetime, ew.file_id, ew.time_axis_ms,
+                          ew.stim_mean_trace, ew.mean_trace, ci.charge_nc
+                   FROM evoked_waveforms ew
+                   JOIN processed_files pf ON pf.id = ew.file_id
+                   JOIN channel_impedance ci
+                     ON ci.file_id = ew.file_id AND ci.channel = ew.channel
+                   WHERE ci.animal_id = ? AND ci.channel_name = ?
+                     AND ci.access_r_kohm IS NOT NULL
+                     AND ci.charge_nc IS ?
+                     AND pf.chunk_datetime >= ? AND pf.chunk_datetime <= ?
+                   ORDER BY pf.chunk_datetime ASC LIMIT ?""",
+                (animal_id, channel_name, crow["charge_nc"], lo, hi,
+                 int(max_traces))).fetchall()
+        finally:
+            conn.close()
+        out = []
+        max_iter = len(rows) + 1
+        for i, r in enumerate(rows):
+            assert i < max_iter, "stim/evoked trace decode runaway"
+            if r["stim_mean_trace"] is None:
+                continue
+            try:
+                out.append({
+                    "file_id": int(r["file_id"]),
+                    "chunk_datetime": r["chunk_datetime"] or "",
+                    "time_ms": json.loads(r["time_axis_ms"]),
+                    "stim_trace": json.loads(r["stim_mean_trace"]),
+                    "evoked_trace": json.loads(r["mean_trace"]),
+                    "charge_nc": r["charge_nc"],
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return out
+
     def impedance_series_by_channel(self, days: int | None = None,
                                     exclude: list[str] | None = None
                                     ) -> dict:

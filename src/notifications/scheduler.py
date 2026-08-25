@@ -57,6 +57,7 @@ class NotificationState:
     evoked_weekly: str = ""
     review_weekly: str = ""
     coverage: str = ""
+    stim_stability_weekly: str = ""
     queue_stuck: bool = False
 
 
@@ -125,6 +126,8 @@ class DigestScheduler:
                 # digest could re-send after a restart. Round-trip it.
                 review_weekly=str(raw.get("review_weekly") or ""),
                 coverage=str(raw.get("coverage") or ""),
+                stim_stability_weekly=str(
+                    raw.get("stim_stability_weekly") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
             )
         except (FileNotFoundError, json.JSONDecodeError):
@@ -209,6 +212,7 @@ class DigestScheduler:
             self._tick_eod(now, fired)
             self._tick_video_weekly(now, fired)
             self._tick_evoked_weekly(now, fired)
+            self._tick_stim_stability_weekly(now, fired)
             self._tick_review_weekly(now, fired)
             self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
@@ -344,6 +348,37 @@ class DigestScheduler:
         self._state.evoked_weekly = now.date().isoformat()
         fired["evoked_weekly"] = bool(result.get("sent"))
         logger.info("Evoked weekly result: %s", result)
+
+    def _tick_stim_stability_weekly(self, now: datetime, fired: dict) -> None:
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("stim_stability_weekly", {}) or {}
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        weekday = int(cfg.get("weekday", 6))   # 6=Sunday
+        hour = int(cfg.get("hour", 8))
+        if not self._due_weekly(now, weekday, hour,
+                                 self._state.stim_stability_weekly):
+            return
+        if not self._claim("stim_stability_weekly", now):
+            self._state.stim_stability_weekly = now.date().isoformat()
+            return
+        logger.info("Stim-stability weekly fire: %s %02d:%02d",
+                    now.date().isoformat(), now.hour, now.minute)
+        # Lazy import: keeps matplotlib/plotly/scipy out of the daemon startup
+        # path when this (heavy, optional) digest is disabled.
+        from src.notifications.stim_stability_weekly import (
+            send_stim_stability_weekly)
+        try:
+            result = send_stim_stability_weekly(now.date(), self._config,
+                                                self._store, self._emailer)
+        except Exception as e:
+            logger.error("Stim-stability weekly send raised: %s", e,
+                         exc_info=True)
+            self._release("stim_stability_weekly", now)
+            return
+        self._state.stim_stability_weekly = now.date().isoformat()
+        fired["stim_stability_weekly"] = bool(result.get("sent"))
+        logger.info("Stim-stability weekly result: %s", result)
 
     def _tick_review_weekly(self, now: datetime, fired: dict) -> None:
         cfg = ((self._config.get("review_queue", {}) or {})

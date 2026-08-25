@@ -41,3 +41,9 @@ requests>=2.31
 # service-account Sheets API path used by maintenance + assignments.
 google-api-python-client>=2.100
 google-auth>=2.20
+# Optional (best-effort): static PNG export of the Overview-style impedance
+# Plotly figure in the weekly stim-stability report
+# (src/notifications/stim_figures.py). kaleido v1 needs a headless Chrome; when
+# it's unavailable the figure falls back to a matplotlib render, so this is not
+# strictly required.
+kaleido>=0.2
