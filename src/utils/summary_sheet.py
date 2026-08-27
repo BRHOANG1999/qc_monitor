@@ -6,14 +6,15 @@ Per animal, everything is derived from data QC Monitor already has:
         (Target 1 / Surgeon / Date of Injection)
   * Time from KA -> start of recording           -> KA date -> min(chunk_datetime)
   * # overt Bh Sz in first 2 weeks of recording  -> seizure_days_per_animal
-  * Total recording (and analyzed) time          -> processed_files.duration_sec
+  * Total recording time                         -> processed_files.duration_sec
   * Total overt Bh Sz                            -> seizure_days_per_animal
   * Overall Bh Sz rate (sz / recording-day)      -> total sz / total recording days
 
 A "Bh Sz" is a scored event carrying BOTH an EEG onset (EO_sec) AND a Racine
 score -- the SAME definition Store.seizure_days_per_animal uses for the Overview
-seizure card. "Analyzed" time = recording that has been dispositioned in Video
-Review (any terminal/scored review_state status).
+seizure card. There is deliberately NO "analyzed"/"reviewed" figure: the DB only
+tracks review done in THIS app's Video Review, which under-reports animals
+analyzed in the old software, so such a number would read as false zeros.
 
 Rows are matched by MouseID (tolerates the 'BCH' prefix being present or not);
 only the DERIVED columns are written, so Comments/Notes and any manual cell is
@@ -44,12 +45,6 @@ _GAP_THRESHOLD_H = 2.0
 _DEFAULT_SHEET_ID = "1HwQlqGPERHCOVUcJDzv8yMm-vZzjqfsh25ud7rfWes8"
 _DEFAULT_TAB = "Summary"
 
-# review_state statuses that mean "this (file, animal) has been reviewed"
-# (counts toward analyzed time). 'claimed' (in progress) and 'abandoned'
-# (returned to the pool) do NOT count.
-_ANALYZED_STATUSES = {"no_events", "has_events", "needs_scoring",
-                      "pending_pi_review", "pi_approved", "pi_flagged"}
-
 # Recordings are hourly chunks (median duration_sec is exactly 3600s; 97% are
 # within +/-100s), but only ~66% of files have duration_sec computed. Estimate
 # the missing ones at one nominal chunk so "total recording time" reflects ALL
@@ -69,16 +64,13 @@ _DERIVED_COLUMNS = {
     "Surgeon": "surgeon",
     "Time from KA to start of recording": "time_from_ka",
     "# of overt Bh Sz in first 2 weeks": "bh_sz_2wk",
-    "Total recording (and analyzed) time": "recording_time",
+    "Total recording time": "recording_time",
     "Total overt bh sz during that time": "bh_sz_total",
     "Overall Bh SZ rate": "bh_sz_rate",
-    # Atomic split of the "(and analyzed)" figure -- separate cells + a
-    # reliability %: how much of the recording has actually been reviewed in
-    # Video Review. A low Analyzed % means the Sz/rate numbers lean on imported
-    # historical data, not verified scoring (informs the advisor's Finalized).
-    "Total recording (h)": "recording_total_h",
-    "Analyzed (h)": "recording_analyzed_h",
-    "Analyzed %": "analyzed_pct",
+    # NOTE: no "analyzed"/"reviewed" columns -- the DB only tracks review done in
+    # THIS app's Video Review, which under-reports animals analyzed in the old
+    # software, so an "analyzed" figure here would be misleading. Total recording
+    # time + the seizure rate stand on their own.
     # Validation / provenance columns (each its own cell, ordered easiest to
     # digest first) so a reviewer can independently verify the numbers above.
     "Electrode(s) recorded": "electrodes",
@@ -110,7 +102,6 @@ _DERIVED_COLUMNS.update({
 
 # Thresholds that make a row "Check" (not finalize-ready). Kept as named
 # constants so the verdict logic is auditable and easy to tune.
-_MIN_ANALYZED_FRAC = 0.50      # <50% reviewed -> lean on unverified data
 _MIN_COVERAGE_PCT = 80.0       # <80% coverage -> gappy recording
 
 
@@ -261,7 +252,7 @@ def _new_stat_slot() -> dict:
     """A per-animal accumulator: recording time plus earliest/latest file, the
     electrode set, every parsed recording datetime (cumulative, for animal-level
     gaps), and per-electrode datetime lists (for per-electrode gaps)."""
-    return {"total_sec": 0.0, "analyzed_sec": 0.0, "first_dt": None,
+    return {"total_sec": 0.0, "first_dt": None,
             "first_file": "", "last_dt": None, "last_file": "",
             "electrodes": set(), "dts": [], "dts_by_elec": {}}
 
@@ -271,13 +262,10 @@ def _recording_stats_per_animal(store) -> dict:
     recording datetimes + electrode set are tracked alongside recording time.
 
     A file's duration counts toward EVERY animal recorded on it (channels are
-    per-animal); 'analyzed' additionally requires a reviewed status for that
-    (file, animal). Earliest/latest consider ALL files (even those whose
-    duration wasn't computed); total/analyzed time only sums non-null durations.
+    per-animal). Earliest/latest consider ALL files (even those whose duration
+    wasn't computed); total time only sums non-null durations.
     """
     assert store is not None, "store required"
-    latest = store._sql_latest_row_correlated("rs.file_id")
-    assert latest, "latest-row SQL fragment must be non-empty"
     conn = store._connect()
     try:
         files = conn.execute(
@@ -287,17 +275,8 @@ def _recording_stats_per_animal(store) -> dict:
                JOIN session_config sc ON sc.session_dir = pf.session_dir
                WHERE sc.channel_names IS NOT NULL
                  AND pf.chunk_datetime IS NOT NULL""").fetchall()
-        rev = conn.execute(
-            f"""SELECT rs.file_id, rs.animal_id, rs.status
-                FROM review_state rs
-                WHERE rs.animal_id IS NOT NULL AND {latest}""").fetchall()
     finally:
         conn.close()
-    # (file, animal) -> reviewed?
-    reviewed: set = set()
-    for r in rev:
-        if r["status"] in _ANALYZED_STATUSES:
-            reviewed.add((int(r["file_id"]), r["animal_id"]))
     out: dict = {}
     for f in files:
         elecs = _animal_electrodes_on_file(f["channel_names"])
@@ -308,8 +287,6 @@ def _recording_stats_per_animal(store) -> dict:
         for a, electrodes in elecs.items():
             slot = out.setdefault(a, _new_stat_slot())
             slot["total_sec"] += dur
-            if (int(f["id"]), a) in reviewed:
-                slot["analyzed_sec"] += dur
             slot["electrodes"].update(electrodes)
             if dt:
                 slot["dts"].append(dt)          # cumulative animal timeline
@@ -375,22 +352,17 @@ def _fmt_hours(sec: float) -> float:
 def _reliability_flag(r: dict, coverage_pct: str) -> str:
     """Finalize-readiness verdict for one animal: 'OK', or 'Check: <reasons>'.
 
-    Flags the two data-quality signals that make the auto Sz/rate numbers
-    untrustworthy: too little of the recording actually reviewed in Video Review
-    (analyzed fraction) and a gappy recording (low coverage). Electrode count is
-    NOT a reason -- a single-electrode implant can still be reliable and is
-    already visible in the Electrode(s) column.
+    Flags a gappy recording (low coverage), which makes the auto Sz/rate numbers
+    less trustworthy. Electrode count is NOT a reason -- a single-electrode
+    implant can still be reliable and is already visible in the Electrode(s)
+    column. (No 'analyzed' reason: review done in the old software isn't tracked
+    here, so an analyzed-fraction flag would fire falsely.)
     """
     assert isinstance(r, dict), "stat slot required"
     tot = r["total_sec"]
     if tot <= 0:
         return "Check: no recording"
     reasons: list = []
-    frac = r["analyzed_sec"] / tot
-    if frac <= 0:
-        reasons.append("not analyzed (imported)")
-    elif frac < _MIN_ANALYZED_FRAC:
-        reasons.append(f"{frac * 100:.0f}% analyzed")
     cov = None
     if coverage_pct and coverage_pct.endswith("%"):
         try:
@@ -456,7 +428,6 @@ def compute_rows(store, config: dict) -> list[dict]:
             continue                            # skip excluded subjects
         r = rec[animal]
         total_h = _fmt_hours(r["total_sec"])
-        analyzed_h = _fmt_hours(r["analyzed_sec"])
         first_dt = r["first_dt"]
         days = szd.get(animal, {})
         bh_total = sum(days.values())
@@ -474,19 +445,13 @@ def compute_rows(store, config: dict) -> list[dict]:
         # rate = seizures per recording-day
         rec_days = r["total_sec"] / 86400.0
         rate = f"{(bh_total / rec_days):.2f} /day" if rec_days > 0 else ""
-        # analyzed fraction = reviewed portion of the recording (reliability)
-        analyzed_pct = (f"{100 * r['analyzed_sec'] / r['total_sec']:.0f}%"
-                        if r["total_sec"] > 0 else "")
         row = {
             "animal": animal,
             "ka_location": meta.get("ka_location", ""),
             "surgeon": meta.get("surgeon", ""),
             "time_from_ka": time_from_ka,
             "bh_sz_2wk": bh_2wk,
-            "recording_time": f"{total_h} h ({analyzed_h} h)",
-            "recording_total_h": total_h,
-            "recording_analyzed_h": analyzed_h,
-            "analyzed_pct": analyzed_pct,
+            "recording_time": f"{total_h} h",
             "bh_sz_total": bh_total,
             "bh_sz_rate": rate,
             # extras for preview
