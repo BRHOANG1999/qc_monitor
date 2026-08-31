@@ -241,25 +241,30 @@ def _overlay_bands(axes, epoch, intervals, run, seizure_epochs, t0):
                    framealpha=0.9)
 
 
-def erpimage_fig(sample: dict, intervals: list, run: dict, out_png: str) -> str:
-    """ERP-image: every sampled artifact waveform stacked by time (each row is
-    one trial, oldest at the bottom; colour = µV). Reads the whole stability
-    history at once — the polarity flip at the swap, the flat stable band, and
-    later drift. Horizontal lines mark config boundaries and the stable window."""
+def erpimage_fig(sample: dict, intervals: list, run: dict, out_png: str, *,
+                 total_trials: int | None = None) -> str:
+    """ERP-image: a time-ordered SAMPLE of artifact waveforms, each row one real
+    trial (oldest at the bottom; colour = µV). The record holds ~millions of
+    trials; this shows an evenly-spaced sample of them so the whole stability
+    history reads at once (polarity flip at the swap, flat stable band, later
+    drift). Horizontal lines mark config boundaries and the stable window."""
     seg = np.asarray(sample["seg"], float)
     ep = np.asarray(sample["epoch"], float)
     win = np.asarray(sample["win_ms"], float)
     assert seg.ndim == 2 and seg.shape[0] > 1, "need a stacked waveform sample"
+    n = seg.shape[0]
     v = float(np.percentile(np.abs(seg), 98))
     fig, ax = plt.subplots(figsize=(8.5, 9))
     im = ax.imshow(seg, aspect="auto", origin="lower", cmap="RdBu_r",
-                   vmin=-v, vmax=v, extent=[win[0], win[-1], 0, seg.shape[0]],
+                   vmin=-v, vmax=v, extent=[win[0], win[-1], 0, n],
                    interpolation="nearest")
     handles = _erp_markers(ax, ep, intervals, run, win)
     ax.axvline(0, color="k", lw=0.6, ls=":")
+    frac = f"1 of ~{round(total_trials / n):d} trials" if total_trials else ""
     ax.set_xlabel("time from stimulus (ms)")
-    ax.set_ylabel("trial number (oldest → newest; dates on right)")
-    ax.set_title("Every artifact waveform over the record (ERP-image)")
+    ax.set_ylabel("sampled trial (oldest at bottom; calendar dates at right)")
+    ax.set_title(f"Artifact waveforms over the record ({n:,}-trial sample)\n"
+                 f"each row is one real trial{'; ' + frac if frac else ''}")
     ax.legend(handles=handles, loc="lower right", fontsize=8, framealpha=0.9)
     fig.colorbar(im, ax=ax, label="artifact amplitude (µV)", shrink=0.55)
     fig.tight_layout()

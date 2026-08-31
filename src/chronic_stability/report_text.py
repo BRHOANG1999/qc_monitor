@@ -40,11 +40,14 @@ def _sec_traces(ctx) -> list:
     a = ctx["animal"]
     return [
         "## 4. Raw artifact waveforms (examples, not summaries)", "",
-        f"Configs are lettered A/B as in §1. From a uniform sample of "
-        f"{ctx['sample']['seg'].shape[0]} trials across the record:",
-        f"- `{a}_erpimage.png` — every sampled artifact stacked by time "
-        "(row = trial, colour = µV): the whole history at the waveform level "
-        "(polarity flips, amplitude drift, the swap, the flat stable plateau).",
+        f"Configs are lettered A/B as in §1. From a uniform time-ordered sample "
+        f"of {ctx['sample']['seg'].shape[0]:,} trials "
+        f"(of ~{ctx['metrics']['epoch'].size:,} total across the record):",
+        f"- `{a}_erpimage.png` = that sample stacked by time, ONE real trial per "
+        "row (colour = µV): the whole history at the waveform level "
+        "(polarity flips, amplitude drift, the swap, the flat stable plateau). "
+        "Note it is a sample, not every trial; at this image height even the "
+        "sample already exceeds the pixel rows.",
         f"- `{a}_trace_gallery.png` — ~14 individual example traces per config "
         "+ the config mean + the stable template (dashed).",
         f"- `{a}_mean_traces.png` — mean artifact ± SD per config, overlaid.", ""]

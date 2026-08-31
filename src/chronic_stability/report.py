@@ -292,7 +292,8 @@ def _trace_figs(out_dir, animal, ctx) -> None:
         return
     groups = _trace_groups(ctx)
     p = lambda n: os.path.join(out_dir, f"{animal}_{n}")
-    render.erpimage_fig(s, ctx["intervals"], ctx["run"], p("erpimage.png"))
+    render.erpimage_fig(s, ctx["intervals"], ctx["run"], p("erpimage.png"),
+                        total_trials=int(ctx["metrics"]["epoch"].size))
     render.trace_gallery_fig(s, groups, ctx["template"], p("trace_gallery.png"))
     render.mean_trace_overlay_fig(s, groups, ctx["template"],
                                   p("mean_traces.png"))
