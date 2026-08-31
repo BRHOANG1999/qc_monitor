@@ -1,0 +1,174 @@
+"""Markdown narrative for the chronic-stim stability map (mapping only)."""
+
+from __future__ import annotations
+
+import datetime as _dt
+
+import numpy as np
+
+_CONV = ("Convention: the NAMED electrode in `BCH111<AREA>` is the RECORD site; "
+         "the unnamed site is the STIM target. ⚠️ The codebase's stim_map / "
+         "impedance_refresh attribute the current (and thus the stored "
+         "`access_r_kohm`) to that named electrode, i.e. the opposite wiring; "
+         "the stored 'Rₐ' here is therefore the ΔV/ΔI on the RECORD channel "
+         "while the other site is stimulated. It is used only as a stable, "
+         "monotonic gating signal for interface stability.")
+
+
+def _iso(e) -> str:
+    return _dt.datetime.fromtimestamp(float(e)).strftime("%Y-%m-%d %H:%M")
+
+
+def build_markdown(animal: str, ctx: dict) -> str:
+    """Assemble the full mapping report."""
+    L = [f"# {animal} — Stimulus-Stability History (mapping)", "",
+         f"_Generated {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} "
+         f"· read-only · mapping only, no experimental recommendations._", "",
+         _CONV, ""]
+    L += _sec_configs(ctx)
+    L += _sec_swap(ctx)
+    L += _sec_stable(ctx)
+    L += _sec_comparisons(ctx)
+    L += _sec_collinearity(ctx)
+    L += _sec_caveats(ctx)
+    return "\n".join(L)
+
+
+def _sec_configs(ctx) -> list:
+    L = ["## 1. Configuration timeline", "",
+         "| config | stim | rec | start | end | dur (h) | trials | seizures |"
+         " charge (nC) | Rₐ med (kΩ) | amp med | corr med | nRMSE med |"
+         " pol switches |",
+         "|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+    for c in ctx["per_config"]:
+        end = "ongoing" if not np.isfinite(c["end_epoch"]) else _iso(c["end_epoch"])
+        L.append(
+            f"| {c['config_label']} | {c['stim_site']} | {c['record_site']} | "
+            f"{_iso(c['start_epoch'])} | {end} | {c['duration_h']:.0f} | "
+            f"{c['n_trials']} | {c['n_seizures']} | {c['modal_charge_nC']} | "
+            f"{c['ra_median']:.3f} | {c['amp_median']:.2f} | "
+            f"{c['corr_median']:.3f} | {c['nrmse_median']:.3f} | "
+            f"{c['polarity_switch']} |")
+    L += ["", f"Total seizures for {ctx['animal']} (record-wide): "
+          f"{ctx['n_seizures_total']}.", ""]
+    return L
+
+
+def _sec_swap(ctx) -> list:
+    L = ["## 2. Configuration swap(s) & within-config events", ""]
+    swaps = [e for e in ctx["events"] if e["event_type"] == "site_swap"]
+    if not swaps:
+        L.append("No record-site swap detected — a single configuration.")
+    for e in swaps:
+        p = e["provenance"]
+        L.append(f"- **SITE SWAP @ {_iso(e['at_epoch'])}**: {e['from_config']} "
+                 f"→ {e['to_config']}. Provenance: `{p['table']}.{p['field']}`, "
+                 f"session before `{_base(p['session_dir_before'])}` → after "
+                 f"`{_base(p['session_dir_after'])}` (report ch "
+                 f"{p['report_channel_after']}, fp {p['fp_status_after']}).")
+    chg = [e for e in ctx["events"] if e["event_type"] == "charge_change"]
+    if chg:
+        L.append("")
+        L.append(f"Within-config charge changes (NOT configuration swaps): "
+                 + "; ".join(f"{_iso(e['at_epoch'])} {e['from_config']}→"
+                             f"{e['to_config']}" for e in chg))
+    L.append("")
+    return L
+
+
+def _sec_stable(ctx) -> list:
+    r = ctx["run"]
+    v = ctx["validation"]
+    cfg = ctx["per_config"][ctx["stable_cfg"]]
+    L = ["## 3. Stable window (longest programmatic flat Rₐ run)", "",
+         f"Detected on the **{cfg['record_site']}** Rₐ trend "
+         f"(config {cfg['config_label']}).", "",
+         f"- **Boundaries:** {_iso(r['epoch_start'])} → {_iso(r['epoch_end'])} "
+         f"(trial-index {r['idx_start']}–{r['idx_end']} on the Rₐ series).",
+         f"- **Duration:** {r['duration_h']:.1f} h · {r['n_samples']} Rₐ points "
+         f"· median Rₐ {r['median_ra_kohm']:.3f} kΩ · robust CV "
+         f"{r['robust_cv_pct']:.1f}%.",
+         f"- **Artifacts:** {len(r['flagged_spikes_in_run'])} lone spike(s) "
+         f"tolerated; {r['n_gaps_tolerated']} gap(s) tolerated, max gap "
+         f"{r['max_gap_h']:.1f} h (a gap > tolerance would break the run).",
+         f"- **Seizures inside the window:** **{r['seizures_in_window']}** "
+         f"(expectation was ≥6; this is an OUTCOME, not a selection criterion).",
+         f"- **Position vs swap:** the window starts "
+         f"{(r['epoch_start']-ctx['intervals'][ctx['stable_cfg']]['start_epoch'])/3600.0:.1f} h "
+         f"after the configuration it lives in began.",
+         "",
+         f"- **Eyeball validation** (vs {_iso(ctx['eye'][0])}–"
+         f"{_iso(ctx['eye'][1])}): IoU {v['iou']:.2f}, "
+         f"{v['pct_det_covered']:.0f}% of the detected window inside the "
+         f"eyeball, {v['pct_eye_covered']:.0f}% of the eyeball covered; "
+         f"boundary Δstart {v['delta_start_h']:+.0f} h, Δend "
+         f"{v['delta_end_h']:+.0f} h. Tight-agreement verdict: "
+         f"{'PASS' if v['verdict_pass'] else 'partial (detected core is '
+          'narrower than the hand-drawn span)'}.", ""]
+    return L
+
+
+def _sec_comparisons(ctx) -> list:
+    L = ["## 4. Distributions (not point estimates)", "",
+         "| comparison | n(a) | n(b) | med(a) | med(b) | KS p | MWU p | "
+         "Cliff's δ | Δmedian [95% block-CI] |",
+         "|---|--:|--:|--:|--:|--:|--:|--:|---|"]
+    for c in ctx["comparisons"]:
+        if "median_a" not in c:
+            continue
+        L.append(
+            f"| {c['name']} | {c['n_a']} | {c['n_b']} | {c['median_a']:.3f} | "
+            f"{c['median_b']:.3f} | {c['ks_p']:.1e} | {c['mwu_p']:.1e} | "
+            f"{c['cliffs_delta']:+.3f} | {c['median_diff']:+.3f} "
+            f"[{c['ci_lo']:+.3f}, {c['ci_hi']:+.3f}] |")
+    pol = [c for c in ctx["comparisons"] if "frac_pos_a" in c]
+    for c in pol:
+        L += ["", f"Polarity ({c['name']}): frac(+) {c['frac_pos_a']:.3f} vs "
+              f"{c['frac_pos_b']:.3f}, Fisher p {c['fisher_p']:.1e}."]
+    L += ["", "_CIs use a dependence-aware moving-block bootstrap (consecutive "
+          "trials are autocorrelated; an iid bootstrap would understate the "
+          "CI)._", ""]
+    return L
+
+
+def _sec_collinearity(ctx) -> list:
+    b = ctx["collinearity"]["stable_age_band"]
+    L = ["## 5. Configuration age vs stability (collinearity — reported, not "
+         "adjusted)", "",
+         f"The stable window occupies configuration age "
+         f"{b.get('stable_age_lo_h', float('nan')):.0f}–"
+         f"{b.get('stable_age_hi_h', float('nan')):.0f} h, out of the config's "
+         f"full {b.get('config_age_lo_h', float('nan')):.0f}–"
+         f"{b.get('config_age_hi_h', float('nan')):.0f} h span "
+         f"({100*b.get('stable_frac_of_config_age', float('nan')):.0f}% of its "
+         f"age range). Stability and age are therefore confounded — a "
+         f"stable-vs-full difference is read JOINTLY with age.", "",
+         "Spearman ρ(config age, metric) per configuration:", ""]
+    for lab, d in ctx["collinearity"]["per_config"].items():
+        parts = ", ".join(f"{k} ρ={d[k]['rho']:+.2f} (p={d[k]['p']:.1e})"
+                          for k in ("amplitude", "corr", "nrmse") if k in d)
+        L.append(f"- {lab}: {parts}")
+    L.append("")
+    return L
+
+
+def _sec_caveats(ctx) -> list:
+    return [
+        "## 6. Caveats & null/ambiguous results", "",
+        "- **Cross-config shape:** the two configurations record from DIFFERENT "
+        "electrodes, so corr/nRMSE of the other config vs a stable-config "
+        "template conflate stimulus-delivery change with record-electrode "
+        "identity. Amplitude / polarity / Rₐ are the cleaner cross-config "
+        "comparators.",
+        "- **Age–stability collinearity** is intrinsic (see §5) and is not "
+        "adjusted away.",
+        f"- **Seizure expectation:** the stable window holds "
+        f"{ctx['run']['seizures_in_window']} seizures, below the anticipated ≥6 "
+        "— reported as an outcome.",
+        "- **Timestamps** are naive local wall-clock (evoked filenames and DB "
+        "chunk_datetime share the same basis; no UTC layer).", ""]
+
+
+def _base(p: str) -> str:
+    import os
+    return os.path.basename(p or "")
