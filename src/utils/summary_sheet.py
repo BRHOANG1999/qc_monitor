@@ -7,14 +7,16 @@ Per animal, everything is derived from data QC Monitor already has:
   * Time from KA -> start of recording           -> KA date -> min(chunk_datetime)
   * # overt Bh Sz in first 2 weeks of recording  -> seizure_days_per_animal
   * Total recording time                         -> processed_files.duration_sec
+  * Time analyzed in QC Monitor                  -> duration of files reviewed here
   * Total overt Bh Sz                            -> seizure_days_per_animal
   * Overall Bh Sz rate (sz / recording-day)      -> total sz / total recording days
 
 A "Bh Sz" is a scored event carrying BOTH an EEG onset (EO_sec) AND a Racine
 score -- the SAME definition Store.seizure_days_per_animal uses for the Overview
-seizure card. There is deliberately NO "analyzed"/"reviewed" figure: the DB only
-tracks review done in THIS app's Video Review, which under-reports animals
-analyzed in the old software, so such a number would read as false zeros.
+seizure card. "Time analyzed in QC Monitor" is the recording reviewed in THIS
+app's Video Review, split into its own column and NAMED for that scope on
+purpose: it cannot see analysis done in the old software (a bare "analyzed"
+would read as false zeros for those cohorts).
 
 Rows are matched by MouseID (tolerates the 'BCH' prefix being present or not);
 only the DERIVED columns are written, so Comments/Notes and any manual cell is
@@ -45,6 +47,13 @@ _GAP_THRESHOLD_H = 2.0
 _DEFAULT_SHEET_ID = "1HwQlqGPERHCOVUcJDzv8yMm-vZzjqfsh25ud7rfWes8"
 _DEFAULT_TAB = "Summary"
 
+# review_state statuses that mean this (file, animal) was analyzed IN THIS APP's
+# Video Review (any terminal/scored status). 'claimed'/'abandoned' don't count.
+# NOTE: this cannot see analysis done in the OLD software -- surfaced column name
+# + header note say so explicitly.
+_ANALYZED_STATUSES = {"no_events", "has_events", "needs_scoring",
+                      "pending_pi_review", "pi_approved", "pi_flagged"}
+
 # Recordings are hourly chunks (median duration_sec is exactly 3600s; 97% are
 # within +/-100s), but only ~66% of files have duration_sec computed. Estimate
 # the missing ones at one nominal chunk so "total recording time" reflects ALL
@@ -65,12 +74,14 @@ _DERIVED_COLUMNS = {
     "Time from KA to start of recording": "time_from_ka",
     "# of overt Bh Sz in first 2 weeks": "bh_sz_2wk",
     "Total recording time": "recording_time",
+    # Split-out companion to Total recording time, named explicitly for WHAT it
+    # measures: recording ANALYZED IN THIS APP's Video Review. It does NOT include
+    # analysis done in the OLD software (the DB has no signal for that), so the
+    # specific name + header note keep it from reading as false zeros for
+    # old-software cohorts.
+    "Time analyzed in QC Monitor": "recording_analyzed_h",
     "Total overt bh sz during that time": "bh_sz_total",
     "Overall Bh SZ rate": "bh_sz_rate",
-    # NOTE: no "analyzed"/"reviewed" columns -- the DB only tracks review done in
-    # THIS app's Video Review, which under-reports animals analyzed in the old
-    # software, so an "analyzed" figure here would be misleading. Total recording
-    # time + the seizure rate stand on their own.
     # Validation / provenance columns (each its own cell, ordered easiest to
     # digest first) so a reviewer can independently verify the numbers above.
     "Electrode(s) recorded": "electrodes",
@@ -252,7 +263,7 @@ def _new_stat_slot() -> dict:
     """A per-animal accumulator: recording time plus earliest/latest file, the
     electrode set, every parsed recording datetime (cumulative, for animal-level
     gaps), and per-electrode datetime lists (for per-electrode gaps)."""
-    return {"total_sec": 0.0, "first_dt": None,
+    return {"total_sec": 0.0, "analyzed_sec": 0.0, "first_dt": None,
             "first_file": "", "last_dt": None, "last_file": "",
             "electrodes": set(), "dts": [], "dts_by_elec": {}}
 
@@ -262,10 +273,14 @@ def _recording_stats_per_animal(store) -> dict:
     recording datetimes + electrode set are tracked alongside recording time.
 
     A file's duration counts toward EVERY animal recorded on it (channels are
-    per-animal). Earliest/latest consider ALL files (even those whose duration
-    wasn't computed); total time only sums non-null durations.
+    per-animal). ``analyzed_sec`` additionally requires a reviewed status for that
+    (file, animal) IN THIS APP's Video Review -- it does NOT capture analysis done
+    in the old software (the DB has no signal for that), which the surfaced column
+    name/note makes explicit. Earliest/latest consider ALL files.
     """
     assert store is not None, "store required"
+    latest = store._sql_latest_row_correlated("rs.file_id")
+    assert latest, "latest-row SQL fragment must be non-empty"
     conn = store._connect()
     try:
         files = conn.execute(
@@ -275,8 +290,14 @@ def _recording_stats_per_animal(store) -> dict:
                JOIN session_config sc ON sc.session_dir = pf.session_dir
                WHERE sc.channel_names IS NOT NULL
                  AND pf.chunk_datetime IS NOT NULL""").fetchall()
+        rev = conn.execute(
+            f"""SELECT rs.file_id, rs.animal_id, rs.status
+                FROM review_state rs
+                WHERE rs.animal_id IS NOT NULL AND {latest}""").fetchall()
     finally:
         conn.close()
+    reviewed = {(int(r["file_id"]), r["animal_id"]) for r in rev
+                if r["status"] in _ANALYZED_STATUSES}
     out: dict = {}
     for f in files:
         elecs = _animal_electrodes_on_file(f["channel_names"])
@@ -287,6 +308,8 @@ def _recording_stats_per_animal(store) -> dict:
         for a, electrodes in elecs.items():
             slot = out.setdefault(a, _new_stat_slot())
             slot["total_sec"] += dur
+            if (int(f["id"]), a) in reviewed:
+                slot["analyzed_sec"] += dur
             slot["electrodes"].update(electrodes)
             if dt:
                 slot["dts"].append(dt)          # cumulative animal timeline
@@ -428,6 +451,7 @@ def compute_rows(store, config: dict) -> list[dict]:
             continue                            # skip excluded subjects
         r = rec[animal]
         total_h = _fmt_hours(r["total_sec"])
+        analyzed_h = _fmt_hours(r["analyzed_sec"])
         first_dt = r["first_dt"]
         days = szd.get(animal, {})
         bh_total = sum(days.values())
@@ -452,6 +476,7 @@ def compute_rows(store, config: dict) -> list[dict]:
             "time_from_ka": time_from_ka,
             "bh_sz_2wk": bh_2wk,
             "recording_time": f"{total_h} h",
+            "recording_analyzed_h": f"{analyzed_h} h",
             "bh_sz_total": bh_total,
             "bh_sz_rate": rate,
             # extras for preview

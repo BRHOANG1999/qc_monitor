@@ -83,6 +83,10 @@ SUMMARY_NOTES = {
     "Total recording time": "Total recording hours = sum of all file durations "
         "for this animal (files with no measured duration are estimated at 1 hour "
         "per chunk).",
+    "Time analyzed in QC Monitor": "Hours of recording analyzed IN THIS APP's "
+        "Video Review (files with a scored/reviewed status). Does NOT count "
+        "analysis done in the old software, so a low value can mean 'analyzed "
+        "elsewhere', not 'unanalyzed'.",
     "Total overt bh sz during that time": "All scored seizures across the animal's "
         "recording days. A scored seizure has BOTH an EEG onset and a Racine score.",
     "Overall Bh SZ rate": "Seizures per recording-day = total scored seizures / "
