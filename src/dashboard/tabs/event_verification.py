@@ -2451,12 +2451,21 @@ def _push_scored_to_sheet(store, config: dict,
             notes.append(enote)
         # A brand-new tab is appended at the END of the spreadsheet -- re-assert
         # the canonical flow (index, then summaries, then events) so the tab bar
-        # never drifts back into creation order.
-        if created and sum_suffix:
+        # never drifts back into creation order, and stamp the new tab's headers
+        # with the per-column "how computed" notes (existing tabs are back-filled
+        # by src.utils.bhz_column_notes --apply, so this stays cheap per push).
+        if created:
             svc = sheets_write._sheets_api_rw(gs["service_account_file"])
-            sheets_write.reorder_tabs(svc, gs["spreadsheet_id"],
-                                       sum_suffix, ev_suffix)
-            notes.append("tabs reordered")
+            from src.utils import bhz_column_notes as _notes
+            for tab in created:
+                if ev_suffix and tab.endswith(ev_suffix):
+                    _notes.apply_events(svc, gs["spreadsheet_id"], tab)
+                elif sum_suffix and tab.endswith(sum_suffix):
+                    _notes.apply_daily(svc, gs["spreadsheet_id"], tab)
+            if sum_suffix:
+                sheets_write.reorder_tabs(svc, gs["spreadsheet_id"],
+                                           sum_suffix, ev_suffix)
+                notes.append("tabs reordered")
     except Exception as e:  # noqa: BLE001 -- Sheets must never block review
         logger.warning("Google Sheet push failed: %s", e)
         return f"Google Sheet sync FAILED: {e}"

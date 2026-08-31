@@ -557,6 +557,35 @@ def _sheet_ids_by_title(svc, sheet_id: str) -> dict:
     return out
 
 
+def set_header_notes(svc, sheet_id: str, tab_name: str, notes: dict) -> int:
+    """Attach a plain-text NOTE (the hover tooltip) to each row-1 header cell
+    whose text matches a key in *notes* (case-insensitively via _norm), to
+    document how that auto-computed column is derived. Idempotent -- re-running
+    just overwrites the same note; headers with no matching key (hand-filled
+    columns) are left untouched. Returns the count of headers annotated."""
+    grid = read_grid(svc, sheet_id, tab_name)
+    if not grid or not grid[0]:
+        return 0
+    ids = _sheet_ids_by_title(svc, sheet_id)
+    if tab_name not in ids:
+        return 0
+    gid = ids[tab_name][0]
+    norm_notes = {_norm(k): v for k, v in notes.items()}
+    requests = []
+    for col, h in enumerate(grid[0]):
+        note = norm_notes.get(_norm(h))
+        if not note:
+            continue
+        requests.append({"updateCells": {
+            "start": {"sheetId": gid, "rowIndex": 0, "columnIndex": col},
+            "rows": [{"values": [{"note": str(note)}]}],
+            "fields": "note"}})
+    if requests:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": requests}).execute()
+    return len(requests)
+
+
 def rename_tab(svc, sheet_id: str, old_title: str, new_title: str) -> bool:
     """Rename a tab. No-op (False) when *old_title* is absent or *new_title*
     already exists -- so a re-run of the migration is safe. A rename does NOT

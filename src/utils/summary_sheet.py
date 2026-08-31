@@ -580,6 +580,9 @@ def write_summary(store, config: dict, *, dry_run: bool = True) -> dict:
             valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
             body={"values": appends},
         ).execute()
+    # Idempotently (re)attach the per-column "how computed" header notes.
+    from src.utils import bhz_column_notes
+    bhz_column_notes.apply_summary(svc, sheet_id, tab)
     logger.info("summary_sheet: updated %d rows (%s), appended %d (%s)",
                 len(batch), matched, len(appends), result["appended"])
     return result
