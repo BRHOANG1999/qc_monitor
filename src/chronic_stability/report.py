@@ -16,8 +16,8 @@ import numpy as np
 
 from src.preictal.isi import parse_chunk_datetime, scored_seizures
 from src.utils import evoked_output as eo
-from . import compare, config_timeline as ct, metrics as M, ra_flatrun as fr
-from . import render
+from . import compare, config_timeline as ct, maintenance, metrics as M
+from . import ra_flatrun as fr, render
 
 _ART_LO, _ART_HI = -1.0, 2.0        # artifact window (ms), operator-confirmed.
 _METRIC_KEYS = ("amplitude", "corr", "nrmse")
@@ -89,9 +89,26 @@ def run(store, animal: str, evoked_dir: str, out_dir: str, *,
     ctx["sample"] = sample
     ctx["flat_params"] = flat_params
     ctx["evoked_files"] = files
+    ctx["maintenance"] = _load_maintenance(mets)
+    ctx["fig_lines"] = maintenance.figure_lines(ctx["maintenance"])
     _write_all(out_dir, animal, ctx)
     _log(f"done -> {out_dir}")
     return ctx
+
+
+def _load_maintenance(mets) -> dict:
+    """Battery / cage events over the record span (degrades cleanly if the
+    maintenance sheets are unreachable)."""
+    from src.dashboard.data_helpers import load_config
+    lo, hi = float(mets["epoch"].min()), float(mets["epoch"].max())
+    ev = maintenance.load_events(load_config(), lo, hi)
+    if ev["available"]:
+        _log(f"maintenance: {len(ev['software'])} software stop/start events, "
+             f"{len(ev['battery_human'])} battery + {len(ev['cage_human'])} "
+             f"cage human-reported")
+    else:
+        _log(f"maintenance overlay unavailable ({ev['error']})")
+    return ev
 
 
 def _template(files, animal, run_):
@@ -229,22 +246,40 @@ def _write_csvs(out_dir, animal, ctx) -> None:
         os.path.join(out_dir, f"{animal}_comparisons.csv"), index=False)
     with open(os.path.join(out_dir, f"{animal}_config_events.json"), "w") as f:
         json.dump(ctx["events"], f, indent=2, default=str)
+    _write_maintenance_csv(out_dir, animal, ctx, pd)
+
+
+def _write_maintenance_csv(out_dir, animal, ctx, pd) -> None:
+    """Software + human-reported battery/cage events as one tidy CSV."""
+    mev = ctx.get("maintenance") or {}
+    if not mev.get("available"):
+        return
+    rows = [{**e, "source": "software"} for e in mev["software"]]
+    rows += [{**e, "source": "battery_human", "kind": "battery"}
+             for e in mev["battery_human"]]
+    rows += [{**e, "source": "cage_human", "kind": "cage"}
+             for e in mev["cage_human"]]
+    if rows:
+        pd.DataFrame(rows).sort_values("epoch").to_csv(
+            os.path.join(out_dir, f"{animal}_maintenance_events.csv"),
+            index=False)
 
 
 def _write_figures(out_dir, animal, ctx) -> None:
     p = lambda n: os.path.join(out_dir, f"{animal}_{n}")
     rec_t0 = float(ctx["metrics"]["epoch"].min())     # day 0 shared by all figs
     ctx["record_t0"] = rec_t0
+    lines = ctx.get("fig_lines")
     render.ra_over_time_fig(ctx["ra"], ctx["intervals"], ctx["run"],
                             ctx["seizure_epochs"], p("ra_over_time.png"),
-                            t0=rec_t0)
+                            t0=rec_t0, events=lines)
     render.ra_aligned_fig(ctx["ra"], ctx["intervals"], ctx["run"],
                           p("ra_aligned.png"))
     _sensitivity_fig(out_dir, animal, ctx)
     m = ctx["metrics"]
     render.metric_timeseries_fig(
         m["epoch"], m, ctx["ra"], ctx["intervals"], ctx["run"],
-        ctx["seizure_epochs"], p("metric_timeseries.png"))
+        ctx["seizure_epochs"], p("metric_timeseries.png"), events=lines)
     _trace_figs(out_dir, animal, ctx)
     _distribution_figs(out_dir, animal, ctx)
 

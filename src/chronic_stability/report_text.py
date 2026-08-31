@@ -32,6 +32,7 @@ def build_markdown(animal: str, ctx: dict) -> str:
     L += _sec_comparisons(ctx)
     L += _sec_collinearity(ctx)
     L += _sec_caveats(ctx)
+    L += _sec_maintenance(ctx)
     return "\n".join(L)
 
 
@@ -192,3 +193,49 @@ def _sec_caveats(ctx) -> list:
 def _base(p: str) -> str:
     import os
     return os.path.basename(p or "")
+
+
+def _sec_maintenance(ctx) -> list:
+    """Notes section: software stop/start times around battery / cage changes,
+    plus the human-reported (approximate) change times."""
+    mev = ctx.get("maintenance") or {}
+    L = ["## 8. Maintenance log (recording stop/start around changes)", ""]
+    if not mev.get("available"):
+        return L + [f"Maintenance overlay unavailable ({mev.get('error')}). "
+                    "The battery / cage change lines are absent from the "
+                    "figures for this run.", ""]
+    soft, bat, cage = mev["software"], mev["battery_human"], mev["cage_human"]
+    L += [f"Ground truth = the recorder's software Notes tab ({len(soft)} "
+          f"battery/cage stop/start events in the record window). The per-rig "
+          f"Maintenance Tracker (Rig C) adds {len(bat)} battery and {len(cage)} "
+          f"cage change times that are HUMAN-reported and approximate (not the "
+          f"true instant of the change).", ""]
+    L += _maint_cooccurrence(ctx)
+    L += ["", "**Software stop/start events (ground truth):**", "",
+          "| datetime | event | kind | note |", "|---|---|---|---|"]
+    for e in soft:
+        L.append(f"| {e['date_iso']} | {e['event']} | {e['kind']} | "
+                 f"{e['text'][:80].replace('|', '/')} |")
+    L += ["", "**Human-reported change times (approximate):**",
+          "- Battery: " + ", ".join(e["date_iso"] for e in bat),
+          "- Cage: " + ", ".join(e["date_iso"] for e in cage), ""]
+    return L
+
+
+
+def _maint_cooccurrence(ctx) -> list:
+    """Neutral, factual co-occurrence notes (mapping only, no mechanism claim)."""
+    lines = ctx.get("fig_lines", {})
+    bat = np.asarray(lines.get("battery", []), float)
+    r = ctx["run"]
+    n_in = int(((bat >= r["epoch_start"]) & (bat <= r["epoch_end"])).sum())
+    swap = next((e for e in ctx["events"] if e["event_type"] == "site_swap"),
+                None)
+    out = [f"- {n_in} battery change(s) fall INSIDE the stable window "
+           f"(Rₐ robust CV {r['robust_cv_pct']:.1f}%); Rₐ stays flat across them."]
+    if swap is not None and bat.size:
+        near = float(np.min(np.abs(bat - swap["at_epoch"]))) / 3600.0
+        out.append(f"- The configuration swap ({_iso(swap['at_epoch'])}) is "
+                   f"{near:.1f} h from the nearest logged battery change "
+                   "(the swap and a battery change were logged together).")
+    return out

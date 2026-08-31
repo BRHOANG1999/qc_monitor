@@ -44,31 +44,59 @@ def _cfg_letter(k: int) -> str:
     return chr(65 + k)
 
 
+_BATTERY_COL = "#6b46c1"
+_CAGE_COL = "#b7791f"
+
+
+def _event_lines(axes, events, t0):
+    """Vertical battery / cage change lines across one or more axes (x in days
+    from *t0*). Returns legend handles. ``events`` = {'battery': [epoch...],
+    'cage': [epoch...]}."""
+    if not events:
+        return []
+    axlist = axes if isinstance(axes, (list, tuple, np.ndarray)) else [axes]
+    handles = []
+    for key, col, ls in (("battery", _BATTERY_COL, "-"),
+                         ("cage", _CAGE_COL, ":")):
+        eps = events.get(key) or []
+        for ep in eps:
+            for ax in axlist:
+                ax.axvline((ep - t0) / _DAY, color=col, lw=0.7, ls=ls,
+                           alpha=0.45, zorder=1)
+        if eps:
+            handles.append(Line2D([0], [0], color=col, lw=1.0, ls=ls,
+                                  label=f"{key} change ({len(eps)})"))
+    return handles
+
+
 def ra_over_time_fig(ra: dict, intervals: list, run: dict, seizure_epochs,
-                     out_png: str, *, t0: float | None = None) -> str:
+                     out_png: str, *, t0: float | None = None,
+                     events: dict | None = None) -> str:
     """Both electrodes' access-resistance trends on one wall-clock axis (days),
     so the SR→SLM hand-off at the swap and the flat stable plateau are visible.
-    Each configuration's record electrode is one coloured line. ``t0`` sets
-    day 0 (default: the earliest Rₐ point; pass the record start to match the
-    other figures)."""
+    Each configuration's record electrode is one coloured line. Battery / cage
+    change times are overlaid as vertical lines. ``t0`` sets day 0 (default: the
+    earliest Rₐ point; pass the record start to match the other figures)."""
     if t0 is None:
         t0 = min(te[0] for te, _r in ra.values() if len(te))
-    fig, ax = plt.subplots(figsize=(11, 4.6))
+    fig, ax = plt.subplots(figsize=(11.5, 4.8))
     for k, iv in enumerate(intervals):
         te, r = ra.get(k, (np.empty(0), np.empty(0)))
         if not len(te):
             continue
         ax.plot(_days(te, t0), r, lw=1.0, color=_CFG_COLORS[k % 4],
-                label=f"Config {_cfg_letter(k)} — {iv['record_site']} "
+                label=f"Config {_cfg_letter(k)}, {iv['record_site']} "
                       f"record electrode Rₐ")
     handles = _shade_stable(ax, run, t0)
+    ev = _event_lines(ax, events, t0)
     rug = _seizure_rug(ax, seizure_epochs, t0)
     ax.set_xlabel("days since recording start")
     ax.set_ylabel("access resistance Rₐ (kΩ)")
-    ax.set_title("Access resistance over time — both record electrodes")
+    ax.set_title("Access resistance over time, both record electrodes "
+                 "(battery / cage changes marked)")
     _date_top(ax, t0)
-    ax.legend(handles=ax.get_legend_handles_labels()[0] + handles + rug,
-              loc="upper left", fontsize=8, framealpha=0.9)
+    ax.legend(handles=ax.get_legend_handles_labels()[0] + handles + ev + rug,
+              loc="upper left", fontsize=7.5, framealpha=0.9, ncol=2)
     fig.tight_layout()
     fig.savefig(out_png, dpi=_DPI)
     plt.close(fig)
@@ -166,10 +194,12 @@ def sensitivity_fig(sweep: list[dict], t0: float, default: dict,
 
 
 def metric_timeseries_fig(epoch, mets: dict, ra: dict, intervals: list,
-                          run: dict, seizure_epochs, out_png: str) -> str:
+                          run: dict, seizure_epochs, out_png: str, *,
+                          events: dict | None = None) -> str:
     """Per-trial artifact metrics + both Rₐ trends over time. X axis is elapsed
     DAYS (calendar dates on top). Configuration bands and the stable window are
-    shaded; a legend labels every band and series."""
+    shaded; battery / cage changes are marked; a legend labels every band and
+    series."""
     t0 = float(np.min(epoch))
     x = _days(epoch, t0)
     fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=True)
@@ -184,9 +214,14 @@ def metric_timeseries_fig(epoch, mets: dict, ra: dict, intervals: list,
     _ra_panel(axes[3], ra, intervals, t0)
     _polarity_panel(axes[4], x, mets["polarity"])
     _overlay_bands(axes, epoch, intervals, run, seizure_epochs, t0)
+    ev = _event_lines(axes, events, t0)
     axes[4].set_xlabel("days since recording start (Day 0 = first trial)")
     _date_top(axes[0], t0)
-    axes[0].set_title("BCH111 per-trial artifact metrics and Rₐ over time")
+    if ev:
+        axes[3].legend(handles=axes[3].get_legend_handles_labels()[0] + ev,
+                       loc="upper right", fontsize=7, ncol=2)
+    axes[0].set_title("BCH111 per-trial artifact metrics and Rₐ over time "
+                      "(battery / cage changes marked)")
     fig.tight_layout()
     fig.savefig(out_png, dpi=_DPI)
     plt.close(fig)
