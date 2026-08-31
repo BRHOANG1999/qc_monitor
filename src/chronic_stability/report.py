@@ -59,8 +59,7 @@ def _detect_stable(store, animal: str, intervals: list, params: dict):
 
 
 def run(store, animal: str, evoked_dir: str, out_dir: str, *,
-        eye_lo: float, eye_hi: float, flat_params: dict | None = None,
-        n_boot: int = 2000) -> dict:
+        flat_params: dict | None = None, n_boot: int = 2000) -> dict:
     """Execute the full mapping pipeline and write all artifacts to *out_dir*."""
     assert animal and evoked_dir and out_dir, "animal/evoked_dir/out_dir req'd"
     os.makedirs(out_dir, exist_ok=True)
@@ -82,8 +81,14 @@ def run(store, animal: str, evoked_dir: str, out_dir: str, *,
     mets = M.stream_metrics(files, animal, _ART_LO, _ART_HI, tmpl)
     seiz = scored_seizures(store, animal)
     sz_ep = np.asarray([s.onset_epoch for s in seiz], float)
+    _log("sampling raw waveforms for trace figures ...")
+    sample = M.gather_sample_trials(files, animal, _ART_LO, _ART_HI,
+                                    max_trials=8000)
     ctx = _assemble(store, animal, intervals, events, ra, stable_cfg, run_,
-                    mets, seiz, sz_ep, eye_lo, eye_hi, tmpl, n_boot)
+                    mets, seiz, sz_ep, tmpl, n_boot)
+    ctx["sample"] = sample
+    ctx["flat_params"] = flat_params
+    ctx["evoked_files"] = files
     _write_all(out_dir, animal, ctx)
     _log(f"done -> {out_dir}")
     return ctx
@@ -98,22 +103,21 @@ def _template(files, animal, run_):
 
 
 def _assemble(store, animal, intervals, events, ra, stable_cfg, run_, mets,
-              seiz, sz_ep, eye_lo, eye_hi, tmpl, n_boot) -> dict:
+              seiz, sz_ep, tmpl, n_boot) -> dict:
     """Assign trials to configs, count seizures, run comparisons + collinearity."""
     cfg_idx = ct.assign_epochs_to_configs(mets["epoch"], intervals)
     in_stable = (mets["epoch"] >= run_["epoch_start"]) \
         & (mets["epoch"] <= run_["epoch_end"])
-    val = fr.validate_against_window(run_, ra[stable_cfg][0], eye_lo, eye_hi)
     per_cfg = _per_config_summary(intervals, cfg_idx, mets, sz_ep, ra)
     run_["seizures_in_window"] = int(((sz_ep >= run_["epoch_start"])
                                       & (sz_ep <= run_["epoch_end"])).sum())
     comps = _comparisons(intervals, stable_cfg, cfg_idx, in_stable, mets, n_boot)
     collin = _collinearity(intervals, stable_cfg, cfg_idx, in_stable, mets)
     return {"animal": animal, "intervals": intervals, "events": events,
-            "stable_cfg": stable_cfg, "run": run_, "validation": val,
+            "stable_cfg": stable_cfg, "run": run_,
             "per_config": per_cfg, "comparisons": comps, "collinearity": collin,
             "metrics": mets, "cfg_idx": cfg_idx, "in_stable": in_stable,
-            "ra": ra, "seizure_epochs": sz_ep, "eye": (eye_lo, eye_hi),
+            "ra": ra, "seizure_epochs": sz_ep,
             "n_seizures_total": len(seiz), "template": tmpl}
 
 
@@ -146,27 +150,40 @@ def _med(x):
     return float(np.median(x)) if x.size else float("nan")
 
 
+def _cfg_name(intervals, k: int) -> str:
+    """Readable configuration name, e.g. 'Config B (SLM record, SR stim)'."""
+    if k < 0 or k >= len(intervals):
+        return "pre-config (record-only)"
+    iv = intervals[k]
+    return (f"Config {chr(65 + k)} ({iv['record_site']} record, "
+            f"{iv['stim_site']} stim)")
+
+
 def _comparisons(intervals, stable_cfg, cfg_idx, in_stable, mets, n_boot) -> list:
     """Stable-vs-own-config, stable-config-vs-other, stable-window-vs-other."""
     sc = cfg_idx == stable_cfg
     others = [k for k in range(len(intervals)) if k != stable_cfg]
+    sname = _cfg_name(intervals, stable_cfg)
     out = []
     for key in _METRIC_KEYS:
         v = mets[key]
         out.append(compare.compare_two_groups(
             v[in_stable], v[sc & ~in_stable],
-            name=f"{key}: stable-window vs rest-of-config", n_boot=n_boot))
+            name=f"{key}: stable window vs {sname} outside the stable window",
+            n_boot=n_boot))
         for o in others:
             oc = cfg_idx == o
+            oname = _cfg_name(intervals, o)
             out.append(compare.compare_two_groups(
-                v[sc], v[oc], name=f"{key}: stable-config vs config#{o}",
+                v[sc], v[oc], name=f"{key}: {sname} vs {oname}",
                 n_boot=n_boot))
             out.append(compare.compare_two_groups(
                 v[in_stable], v[oc],
-                name=f"{key}: stable-window vs config#{o}", n_boot=n_boot))
+                name=f"{key}: stable window vs {oname}", n_boot=n_boot))
     out.append(compare.compare_polarity(
         mets["polarity"][sc], mets["polarity"][cfg_idx == others[0]],
-        name="polarity: stable-config vs other") if others else {})
+        name=f"polarity: {sname} vs {_cfg_name(intervals, others[0])}")
+        if others else {})
     return [c for c in out if c]
 
 
@@ -216,15 +233,69 @@ def _write_csvs(out_dir, animal, ctx) -> None:
 
 def _write_figures(out_dir, animal, ctx) -> None:
     p = lambda n: os.path.join(out_dir, f"{animal}_{n}")
-    sc = ctx["stable_cfg"]
-    te, r = ctx["ra"][sc]
-    render.ra_flatrun_fig(te, r, ctx["run"], *ctx["eye"], ctx["seizure_epochs"],
-                          p("flatrun_validation.png"))
+    rec_t0 = float(ctx["metrics"]["epoch"].min())     # day 0 shared by all figs
+    ctx["record_t0"] = rec_t0
+    render.ra_over_time_fig(ctx["ra"], ctx["intervals"], ctx["run"],
+                            ctx["seizure_epochs"], p("ra_over_time.png"),
+                            t0=rec_t0)
+    render.ra_aligned_fig(ctx["ra"], ctx["intervals"], ctx["run"],
+                          p("ra_aligned.png"))
+    _sensitivity_fig(out_dir, animal, ctx)
     m = ctx["metrics"]
     render.metric_timeseries_fig(
-        m["epoch"], m, te, r, ctx["intervals"], ctx["run"],
+        m["epoch"], m, ctx["ra"], ctx["intervals"], ctx["run"],
         ctx["seizure_epochs"], p("metric_timeseries.png"))
+    _trace_figs(out_dir, animal, ctx)
     _distribution_figs(out_dir, animal, ctx)
+
+
+def _sensitivity_fig(out_dir, animal, ctx) -> None:
+    """Threshold-robustness sweep on the stable config's Rₐ series."""
+    te, r = ctx["ra"][ctx["stable_cfg"]]
+    if len(te) < 8:
+        return
+    th = (te - te[0]) / 3600.0
+    grid = [dict(win_h=w, disp_k=d, slope_k=s)
+            for w in (18, 24, 36) for d in (3, 4, 5) for s in (4, 6)]
+    sweep = fr.sensitivity_sweep(th, r, te, grid)
+    default = {"win_h": 24, "disp_k": 4.0, "slope_k": 6.0,
+               **{k: v for k, v in ctx["flat_params"].items()
+                  if k in ("win_h", "disp_k", "slope_k")}}
+    render.sensitivity_fig(sweep, ctx["record_t0"], default,
+                           os.path.join(out_dir, f"{animal}_sensitivity.png"))
+
+
+def _trace_groups(ctx):
+    """(label, sample-mask, colour) tuples for the trace figures: pre-config,
+    the other config(s), the stable window, and the rest of the stable config."""
+    s = ctx["sample"]
+    sci = ct.assign_epochs_to_configs(s["epoch"], ctx["intervals"])
+    s_in = (s["epoch"] >= ctx["run"]["epoch_start"]) \
+        & (s["epoch"] <= ctx["run"]["epoch_end"])
+    sc = ctx["stable_cfg"]
+    groups = []
+    if (sci == -1).any():
+        groups.append(("pre-config (record-only)", sci == -1, "#718096"))
+    for o in range(len(ctx["intervals"])):
+        if o != sc:
+            groups.append((_cfg_name(ctx["intervals"], o), sci == o, "#3182ce"))
+    groups.append(("stable window", s_in, "#38a169"))
+    groups.append((f"Config {chr(65+sc)} outside\nthe stable window",
+                   (sci == sc) & ~s_in, "#dd6b20"))
+    return groups
+
+
+def _trace_figs(out_dir, animal, ctx) -> None:
+    """Waveform figures: ERP-image, example-trace gallery, mean-trace overlay."""
+    s = ctx["sample"]
+    if s["seg"].shape[0] < 2:
+        return
+    groups = _trace_groups(ctx)
+    p = lambda n: os.path.join(out_dir, f"{animal}_{n}")
+    render.erpimage_fig(s, ctx["intervals"], ctx["run"], p("erpimage.png"))
+    render.trace_gallery_fig(s, groups, ctx["template"], p("trace_gallery.png"))
+    render.mean_trace_overlay_fig(s, groups, ctx["template"],
+                                  p("mean_traces.png"))
 
 
 def _distribution_figs(out_dir, animal, ctx) -> None:
@@ -235,10 +306,10 @@ def _distribution_figs(out_dir, animal, ctx) -> None:
     others = [k for k in range(len(ctx["intervals"])) if k != sc]
     for key in _METRIC_KEYS:
         groups = [m[key][ins], m[key][(ci == sc) & ~ins]]
-        labels = ["stable window", "rest of stable-config"]
+        labels = ["stable window", f"Config {chr(65+sc)}\noutside stable window"]
         for o in others:
             groups.append(m[key][ci == o])
-            labels.append(f"config#{o}")
+            labels.append(f"Config {chr(65+o)}\n({ctx['intervals'][o]['record_site']} rec)")
         render.distribution_panel(
             groups, labels, key,
             os.path.join(out_dir, f"{animal}_dist_{key}.png"))

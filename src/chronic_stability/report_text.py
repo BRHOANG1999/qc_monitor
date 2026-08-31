@@ -28,10 +28,26 @@ def build_markdown(animal: str, ctx: dict) -> str:
     L += _sec_configs(ctx)
     L += _sec_swap(ctx)
     L += _sec_stable(ctx)
+    L += _sec_traces(ctx)
     L += _sec_comparisons(ctx)
     L += _sec_collinearity(ctx)
     L += _sec_caveats(ctx)
     return "\n".join(L)
+
+
+def _sec_traces(ctx) -> list:
+    """Point at the raw-waveform figures (configs named A/B as in §1)."""
+    a = ctx["animal"]
+    return [
+        "## 4. Raw artifact waveforms (examples, not summaries)", "",
+        f"Configs are lettered A/B as in §1. From a uniform sample of "
+        f"{ctx['sample']['seg'].shape[0]} trials across the record:",
+        f"- `{a}_erpimage.png` — every sampled artifact stacked by time "
+        "(row = trial, colour = µV): the whole history at the waveform level "
+        "(polarity flips, amplitude drift, the swap, the flat stable plateau).",
+        f"- `{a}_trace_gallery.png` — ~14 individual example traces per config "
+        "+ the config mean + the stable template (dashed).",
+        f"- `{a}_mean_traces.png` — mean artifact ± SD per config, overlaid.", ""]
 
 
 def _sec_configs(ctx) -> list:
@@ -40,10 +56,10 @@ def _sec_configs(ctx) -> list:
          " charge (nC) | Rₐ med (kΩ) | amp med | corr med | nRMSE med |"
          " pol switches |",
          "|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
-    for c in ctx["per_config"]:
+    for i, c in enumerate(ctx["per_config"]):
         end = "ongoing" if not np.isfinite(c["end_epoch"]) else _iso(c["end_epoch"])
         L.append(
-            f"| {c['config_label']} | {c['stim_site']} | {c['record_site']} | "
+            f"| **{chr(65+i)}** {c['config_label']} | {c['stim_site']} | {c['record_site']} | "
             f"{_iso(c['start_epoch'])} | {end} | {c['duration_h']:.0f} | "
             f"{c['n_trials']} | {c['n_seizures']} | {c['modal_charge_nC']} | "
             f"{c['ra_median']:.3f} | {c['amp_median']:.2f} | "
@@ -78,14 +94,20 @@ def _sec_swap(ctx) -> list:
 
 def _sec_stable(ctx) -> list:
     r = ctx["run"]
-    v = ctx["validation"]
     cfg = ctx["per_config"][ctx["stable_cfg"]]
+    day0 = float(_np_min_epoch(ctx))
     L = ["## 3. Stable window (longest programmatic flat Rₐ run)", "",
-         f"Detected on the **{cfg['record_site']}** Rₐ trend "
-         f"(config {cfg['config_label']}).", "",
+         f"Detected on the **{cfg['record_site']}** record-electrode Rₐ trend "
+         f"(Config {chr(65+ctx['stable_cfg'])}, {cfg['config_label']}). "
+         f"See `{ctx['animal']}_ra_over_time.png` (both electrodes on one axis) "
+         f"and `{ctx['animal']}_ra_aligned.png` (configs aligned, comparable).",
+         "",
          f"- **Boundaries:** {_iso(r['epoch_start'])} → {_iso(r['epoch_end'])} "
+         f"= **day {(r['epoch_start']-day0)/86400:.1f} → "
+         f"{(r['epoch_end']-day0)/86400:.1f}** of the record "
          f"(trial-index {r['idx_start']}–{r['idx_end']} on the Rₐ series).",
-         f"- **Duration:** {r['duration_h']:.1f} h · {r['n_samples']} Rₐ points "
+         f"- **Duration:** {r['duration_h']:.1f} h "
+         f"({r['duration_h']/24:.1f} days) · {r['n_samples']} Rₐ points "
          f"· median Rₐ {r['median_ra_kohm']:.3f} kΩ · robust CV "
          f"{r['robust_cv_pct']:.1f}%.",
          f"- **Artifacts:** {len(r['flagged_spikes_in_run'])} lone spike(s) "
@@ -94,22 +116,17 @@ def _sec_stable(ctx) -> list:
          f"- **Seizures inside the window:** **{r['seizures_in_window']}** "
          f"(expectation was ≥6; this is an OUTCOME, not a selection criterion).",
          f"- **Position vs swap:** the window starts "
-         f"{(r['epoch_start']-ctx['intervals'][ctx['stable_cfg']]['start_epoch'])/3600.0:.1f} h "
-         f"after the configuration it lives in began.",
-         "",
-         f"- **Eyeball validation** (vs {_iso(ctx['eye'][0])}–"
-         f"{_iso(ctx['eye'][1])}): IoU {v['iou']:.2f}, "
-         f"{v['pct_det_covered']:.0f}% of the detected window inside the "
-         f"eyeball, {v['pct_eye_covered']:.0f}% of the eyeball covered; "
-         f"boundary Δstart {v['delta_start_h']:+.0f} h, Δend "
-         f"{v['delta_end_h']:+.0f} h. Tight-agreement verdict: "
-         f"{'PASS' if v['verdict_pass'] else 'partial (detected core is '
-          'narrower than the hand-drawn span)'}.", ""]
+         f"{(r['epoch_start']-ctx['intervals'][ctx['stable_cfg']]['start_epoch'])/86400.0:.1f} "
+         f"days after the configuration it lives in began.", ""]
     return L
 
 
+def _np_min_epoch(ctx) -> float:
+    return float(ctx["metrics"]["epoch"].min())
+
+
 def _sec_comparisons(ctx) -> list:
-    L = ["## 4. Distributions (not point estimates)", "",
+    L = ["## 5. Distributions (not point estimates)", "",
          "| comparison | n(a) | n(b) | med(a) | med(b) | KS p | MWU p | "
          "Cliff's δ | Δmedian [95% block-CI] |",
          "|---|--:|--:|--:|--:|--:|--:|--:|---|"]
@@ -133,7 +150,7 @@ def _sec_comparisons(ctx) -> list:
 
 def _sec_collinearity(ctx) -> list:
     b = ctx["collinearity"]["stable_age_band"]
-    L = ["## 5. Configuration age vs stability (collinearity — reported, not "
+    L = ["## 6. Configuration age vs stability (collinearity — reported, not "
          "adjusted)", "",
          f"The stable window occupies configuration age "
          f"{b.get('stable_age_lo_h', float('nan')):.0f}–"
@@ -154,7 +171,7 @@ def _sec_collinearity(ctx) -> list:
 
 def _sec_caveats(ctx) -> list:
     return [
-        "## 6. Caveats & null/ambiguous results", "",
+        "## 7. Caveats & null/ambiguous results", "",
         "- **Cross-config shape:** the two configurations record from DIFFERENT "
         "electrodes, so corr/nRMSE of the other config vs a stable-config "
         "template conflate stimulus-delivery change with record-electrode "

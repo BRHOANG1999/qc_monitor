@@ -169,6 +169,53 @@ def collect_segments(files: list[str], animal: str, lo_ms: float, hi_ms: float,
     return {"seg": seg, "win_ms": win_ms}
 
 
+def gather_sample_trials(files: list[str], animal: str, lo_ms: float,
+                         hi_ms: float, *, max_trials: int = 8000,
+                         progress=None) -> dict:
+    """A representative sample of raw artifact WAVEFORMS across the whole record
+    (for trace galleries / ERP-images). Takes evenly-spaced trials from every
+    file so time coverage is uniform, then trims to ``max_trials``. Returns
+    ``{seg[N,W], epoch[N], channel[N], win_ms[W]}`` sorted by epoch."""
+    assert max_trials >= 1, "max_trials must be >= 1"
+    files = sorted(files)
+    per_file = max(1, int(np.ceil(max_trials / max(1, len(files)))))
+    segs, eps, chans = [], [], []
+    win_ms = None
+    t0 = time.time()
+    for k, fp in enumerate(files):
+        assert k < _MAX_FILES, "file scan runaway"
+        base = parse_recording_dt(os.path.basename(fp))
+        if base is None:
+            continue
+        base_ep = base.timestamp()
+        for ch, rec in read_window_traces(fp, animal, lo_ms, hi_ms).items():
+            n = rec["seg"].shape[0]
+            take = (np.linspace(0, n - 1, per_file).astype(int) if n > per_file
+                    else np.arange(n))
+            segs.append(rec["seg"][take])
+            eps.append(base_ep + rec["times"][take])
+            chans.append(np.array([ch] * take.size))
+            win_ms = rec["win_ms"]
+        _emit_progress(progress, k + 1, len(files), fp, t0)
+    return _stack_sample(segs, eps, chans, win_ms, max_trials)
+
+
+def _stack_sample(segs, eps, chans, win_ms, max_trials) -> dict:
+    """Concatenate, sort by epoch, and evenly trim a waveform sample."""
+    if not segs:
+        return {"seg": np.empty((0, 0), np.float32), "epoch": np.empty(0),
+                "channel": np.empty(0, object), "win_ms": np.empty(0)}
+    seg = np.concatenate(segs, axis=0)
+    ep = np.concatenate(eps)
+    ch = np.concatenate(chans).astype(object)
+    order = np.argsort(ep)
+    seg, ep, ch = seg[order], ep[order], ch[order]
+    if ep.size > max_trials:
+        keep = np.linspace(0, ep.size - 1, max_trials).astype(int)
+        seg, ep, ch = seg[keep], ep[keep], ch[keep]
+    return {"seg": seg, "epoch": ep, "channel": ch, "win_ms": win_ms}
+
+
 def stream_metrics(files: list[str], animal: str, lo_ms: float, hi_ms: float,
                    template, *, progress=None) -> dict:
     """Compute per-trial metrics against a FIXED *template* by streaming files

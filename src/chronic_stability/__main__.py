@@ -1,8 +1,7 @@
 """CLI for the chronic-stim stability map.
 
     python -m src.chronic_stability --animal BCH111 [--probe]
-        [--eye-start 2026-07-21 --eye-end 2026-07-31]
-        [--win-h 24 --gap-tol-h 6 --disp-frac 0.25 --slope-frac 0.40]
+        [--win-h 24 --gap-tol-h 6 --disp-k 4 --slope-k 6]
         [--out data/derivatives/chronic_stability] [--n-boot 2000]
 """
 
@@ -15,19 +14,13 @@ import sys
 
 from src.dashboard.data_helpers import load_config
 from src.db.store import Store
-from src.preictal.isi import parse_chunk_datetime, scored_seizures
+from src.preictal.isi import scored_seizures
 from src.utils import evoked_output as eo
-
-
-def _parse_day(s: str) -> float:
-    return _dt.datetime.strptime(s, "%Y-%m-%d").timestamp()
 
 
 def _args(argv=None):
     p = argparse.ArgumentParser(prog="python -m src.chronic_stability")
     p.add_argument("--animal", default="BCH111")
-    p.add_argument("--eye-start", default="2026-07-21")
-    p.add_argument("--eye-end", default="2026-07-31")
     p.add_argument("--win-h", type=float, default=24.0)
     p.add_argument("--gap-tol-h", type=float, default=6.0)
     p.add_argument("--disp-k", type=float, default=4.0)
@@ -80,7 +73,6 @@ def main(argv=None) -> int:
             "spike_k": a.spike_k}
     out_dir = os.path.join(a.out, a.animal)
     report.run(store, a.animal, evoked_dir, out_dir,
-               eye_lo=_parse_day(a.eye_start), eye_hi=_parse_day(a.eye_end),
                flat_params=flat, n_boot=a.n_boot)
     return 0
 
