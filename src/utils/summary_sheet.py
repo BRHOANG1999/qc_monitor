@@ -117,13 +117,18 @@ _MIN_COVERAGE_PCT = 80.0       # <80% coverage -> gappy recording
 
 
 def _norm_animal(raw: str) -> str:
-    """Canonical animal id: strip spaces, upper, add the 'BCH' prefix when the
-    sheet wrote just the number ('111' -> 'BCH111', 'BCH110' -> 'BCH110')."""
+    """Canonical animal id: strip spaces, upper, add the 'BCH' prefix, and
+    ZERO-PAD the number to 3 digits so padding variants reconcile. This is what
+    lets the surgery sheet's 'BCH60'/'BCH63'/'BCH0100' join the DB's zero-padded
+    'BCH060'/'BCH063'/'BCH100' (they silently missed before). Non-BCH-numeric ids
+    (e.g. 'Randles') pass through unchanged.
+    Examples: '60'/'BCH60'/'BCH060' -> 'BCH060'; 'BCH0100' -> 'BCH100'."""
     s = str(raw or "").strip().upper().replace(" ", "")
     if not s:
         return ""
-    if s.isdigit():
-        return f"BCH{s}"
+    body = s[3:] if s.startswith("BCH") else s
+    if body.isdigit():
+        return f"BCH{int(body):03d}"
     return s
 
 
@@ -461,7 +466,7 @@ def compute_rows(store, config: dict) -> list[dict]:
             cutoff = (first_dt + timedelta(days=14)).date().isoformat()
             start = first_dt.date().isoformat()
             bh_2wk = sum(n for d, n in days.items() if start <= d <= cutoff)
-        meta = surg.get(animal, {})
+        meta = surg.get(_norm_animal(animal), {})   # canonical id -> surgery meta
         ka_date = meta.get("ka_date")
         time_from_ka = ""
         if ka_date and first_dt:
