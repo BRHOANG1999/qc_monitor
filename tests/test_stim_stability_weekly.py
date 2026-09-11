@@ -35,7 +35,8 @@ class FakeStore:
         self._traces = [_trace(1, "2026_08_24", 0.0), _trace(2, "2026_08_24", 0.4),
                         _trace(3, "2026_08_25", 0.8), _trace(4, "2026_08_25", 1.2)]
         self._imp = [{"chunk_datetime": f"2026_08_{d:02d}__10_00_00",
-                      "access_r_kohm": 100.0 + (0 if d < 24 else 55.0)}
+                      "access_r_kohm": 100.0 + (0 if d < 24 else 55.0),
+                      "slow_ss_kohm": 0.120 + (0 if d < 24 else 0.060)}
                      for d in range(10, 26)]
 
     def active_impedance_channel_keys(self):
@@ -131,6 +132,11 @@ def test_full_send(monkeypatch, tmp_path):
         row["LFP artifact"].startswith('=IMAGE(') and \
         row["Figures"].startswith('=HYPERLINK(')
     assert row["n files"] == 4
+    # Z_ss (slow-phase steady-state impedance) rides alongside Rₐ: numeric
+    # drift columns + its own thumbnail, all derived from the SAME imp rows.
+    assert "Z_ss kΩ" in m.HEADER and "Z_ss Δ%" in m.HEADER and "Z_ss" in m.HEADER
+    assert row["Z_ss kΩ"] != "" and row["Z_ss Δ%"] != ""
+    assert row["Z_ss"].startswith('=IMAGE(')
     # email carried the inline headline PNGs (avg + overlay per window, imp, corr)
     assert emailer.calls and emailer.calls[0]["subject_prefix"] is False
     assert len(emailer.calls[0]["attachments"]) >= 4

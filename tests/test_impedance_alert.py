@@ -1,4 +1,7 @@
-"""Tests for the transfer-impedance drift alert (rules.check_impedance_shift)."""
+"""Tests for the transfer-impedance drift alerts: access resistance
+(rules.check_impedance_shift), current-delivery fidelity
+(rules.check_current_sag), and slow-phase steady-state impedance / Z_ss
+(rules.check_impedance_ss_shift)."""
 
 from src.alerting.rules import AlertRuleEngine, _drift_stat
 
@@ -158,3 +161,82 @@ def test_current_sag_transient_dip_not_flagged():
     eng, store = _engine(series)
     eng.check_current_sag()
     assert store.inserted == []
+
+
+# --------------------------------------------------------------------- #
+#  Slow-phase steady-state impedance (Z_ss) — check_impedance_ss_shift
+# --------------------------------------------------------------------- #
+
+def _ss_rows(vals):
+    """Slow-phase steady-state impedance series rows (oldest→newest)."""
+    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
+             "slow_ss_kohm": v}
+            for i, v in enumerate(vals, start=1)]
+
+
+def test_zss_alert_fires_on_drift():
+    series = {("BCH110", "BCH110SLM"): _ss_rows([2.0, 2.0, 2.0, 3.2])}  # +60%
+    eng, store = _engine(series)
+    eng.check_impedance_ss_shift()
+    assert len(store.inserted) == 1
+    alert_type, severity, message = store.inserted[0][:3]
+    assert alert_type == "impedance_ss_shift"
+    assert severity == "warning"
+    assert "BCH110SLM" in message and "steady-state" in message and "Z_ss" in message
+
+
+def test_zss_alert_critical_on_large_drift():
+    series = {("BCH062", "BCH062SR"): _ss_rows([1.0, 1.0, 1.0, 2.0])}  # +100%
+    eng, store = _engine(series)
+    eng.check_impedance_ss_shift()
+    assert store.inserted[0][1] == "critical"
+
+
+def test_zss_no_alert_when_stable():
+    series = {("BCH110", "BCH110SLM"): _ss_rows([2.0, 2.0, 2.0, 2.04])}  # +2%
+    eng, store = _engine(series)
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
+def test_zss_no_alert_below_min_history():
+    series = {("BCH110", "BCH110SLM"): _ss_rows([1.0, 2.0])}  # only 2 points
+    eng, store = _engine(series)
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
+def test_zss_scoped_to_active():
+    series = {("BCH111", "BCH111SR"): _ss_rows([1.0, 1.0, 1.0, 1.6])}  # +60%
+    eng, store = _engine(series, active={("BCH062", "BCH062SR")})
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
+def test_zss_thresholds_inherit_access_r_when_unset():
+    # _engine's config sets only the access-resistance thresholds; the Z_ss
+    # alert must inherit 40/75 from them (so a +100% drift is critical).
+    series = {("BCH062", "BCH062SR"): _ss_rows([1.0, 1.0, 1.0, 2.0])}
+    eng, _store = _engine(series)
+    assert eng.impedance_ss_shift_pct == 40.0
+    assert eng.impedance_ss_shift_pct_critical == 75.0
+
+
+def test_zss_independent_of_access_r():
+    # Rows carry ONLY slow_ss_kohm: Z_ss drifts, but Rₐ can't be computed, so the
+    # access-resistance alert stays silent while the Z_ss alert fires.
+    series = {("BCH110", "BCH110SLM"): _ss_rows([2.0, 2.0, 2.0, 3.2])}  # +60%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()          # Rₐ series all-None -> silent
+    assert store.inserted == []
+    eng.check_impedance_ss_shift()       # Z_ss drift -> fires
+    assert len(store.inserted) == 1
+    assert store.inserted[0][0] == "impedance_ss_shift"
+
+
+def test_zss_rate_limited():
+    from datetime import datetime
+    series = {("BCH110", "BCH110SLM"): _ss_rows([2.0, 2.0, 2.0, 3.2])}
+    eng, store = _engine(series, last_alert=datetime.now())  # just fired
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []  # suppressed by rate limit

@@ -394,6 +394,7 @@ def main():
                     # every Overview build for minutes every 30 min).
                     refresh_impedance(store, config, throttle_sec=0.03)
                     alert_engine.check_impedance_shift()
+                    alert_engine.check_impedance_ss_shift()
                     alert_engine.check_current_sag()
                 except Exception as e:
                     logger.error("Impedance refresh/check failed: %s", e)

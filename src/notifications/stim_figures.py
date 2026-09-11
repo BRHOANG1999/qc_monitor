@@ -174,38 +174,48 @@ def plot_stim_vs_evoked(stim_mags, evoked_mags, title: str, out_png: str, *,
 
 def impedance_png(rows: list[dict], out_png: str, *, title: str,
                   pct: float = 40.0, window: int = 10, min_history: int = 4,
-                  engine: str = "auto", highlight=None) -> str | None:
-    """Access-resistance (Rₐ) drift trend for one channel -> PNG: Rₐ line +
+                  engine: str = "auto", highlight=None,
+                  value_key: str = "access_r_kohm", ylabel: str = "Rₐ (kΩ)",
+                  series_name: str = "Rₐ") -> str | None:
+    """Per-channel impedance-metric drift trend -> PNG: the metric line +
     rolling-median baseline band + a red-ringed latest point when drifting.
     *highlight* = (start_datetime, end_datetime) shades a date window (used to
     mark 'this week' on the full-history plot).
+
+    *value_key* selects which per-row metric to plot (``access_r_kohm`` for the
+    access-resistance Rₐ trend, the default; ``slow_ss_kohm`` for the slow-phase
+    steady-state impedance Z_ss trend), with *ylabel* / *series_name* labelling
+    the axis + trace accordingly. Both ride the SAME ``impedance_series_by_channel``
+    rows, which carry both metrics.
 
     Tries the Overview's Plotly look via kaleido first (``engine`` 'auto'/'plotly')
     for dashboard fidelity, then falls back to a portable matplotlib render so the
     figure is ALWAYS produced even where kaleido/Chrome is unavailable. Returns
     the path, or None only when there's nothing to plot. *rows* are oldest->newest
-    ``{chunk_datetime, access_r_kohm}`` from ``impedance_series_by_channel``."""
-    vals = [r.get("access_r_kohm") for r in rows if r.get("access_r_kohm")
-            is not None]
+    from ``impedance_series_by_channel``."""
+    vals = [r.get(value_key) for r in rows if r.get(value_key) is not None]
     if len(vals) < 2:
         return None
     dts = [_parse_chunk_dt(r.get("chunk_datetime")) for r in rows]
     x = dts if all(d is not None for d in dts) else list(range(len(rows)))
-    y = [r.get("access_r_kohm") for r in rows]
+    y = [r.get(value_key) for r in rows]
     hl = highlight if (x and not isinstance(x[0], int)) else None  # dates only
     stat = _drift_stat(vals, window, min_history)
     drifting = bool(stat and abs(stat["drift_pct"]) >= pct)
     sub = f"  ·  Δ {stat['drift_pct']:+.0f}% vs baseline" if stat else ""
     if engine in ("auto", "plotly"):
-        p = _impedance_plotly(x, y, stat, drifting, pct, title + sub, out_png, hl)
+        p = _impedance_plotly(x, y, stat, drifting, pct, title + sub, out_png, hl,
+                              ylabel, series_name)
         if p is not None:
             return p
         if engine == "plotly":
             return None
-    return _impedance_mpl(x, y, stat, drifting, pct, title + sub, out_png, hl)
+    return _impedance_mpl(x, y, stat, drifting, pct, title + sub, out_png, hl,
+                          ylabel, series_name)
 
 
-def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight):
+def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight,
+                      ylabel="Rₐ (kΩ)", series_name="Rₐ"):
     """Overview-fidelity Plotly render -> PNG via kaleido; None if unavailable."""
     try:
         import plotly.graph_objects as go
@@ -216,7 +226,7 @@ def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight):
         fig.add_vrect(x0=highlight[0], x1=highlight[1], line_width=0,
                       fillcolor="rgba(255,159,10,0.16)",
                       annotation_text="this week", annotation_position="top left")
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name="Rₐ",
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name=series_name,
                              line=dict(color=_ACCENT, width=1.8),
                              marker=dict(size=5)))
     if stat is not None:
@@ -232,7 +242,7 @@ def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight):
     fig.update_layout(title=dict(text=title, font=dict(size=13)),
                       template="plotly_white", height=420, width=900,
                       margin=dict(l=60, r=20, t=48, b=44), showlegend=False)
-    fig.update_yaxes(title_text="Rₐ (kΩ)")
+    fig.update_yaxes(title_text=ylabel)
     fig.update_xaxes(title_text="recording date")
     try:
         fig.write_image(out_png, scale=2)                 # needs kaleido + Chrome
@@ -242,13 +252,15 @@ def _impedance_plotly(x, y, stat, drifting, pct, title, out_png, highlight):
     return out_png
 
 
-def _impedance_mpl(x, y, stat, drifting, pct, title, out_png, highlight):
-    """Portable matplotlib (Agg) render of the same Rₐ trend -- always works."""
+def _impedance_mpl(x, y, stat, drifting, pct, title, out_png, highlight,
+                   ylabel="Rₐ (kΩ)", series_name="Rₐ"):
+    """Portable matplotlib (Agg) render of the same metric trend -- always works."""
     fig, ax = plt.subplots(figsize=_FIGSIZE)
     if highlight is not None:
         ax.axvspan(highlight[0], highlight[1], color="#ff9f0a", alpha=0.16,
                    label="this week")
-    ax.plot(x, y, color=_ACCENT, lw=1.8, marker="o", markersize=4, label="Rₐ")
+    ax.plot(x, y, color=_ACCENT, lw=1.8, marker="o", markersize=4,
+            label=series_name)
     if stat is not None:
         base, band = stat["baseline"], stat["baseline"] * pct / 100.0
         ax.axhspan(base - band, base + band, color=_ACCENT, alpha=0.10)
@@ -257,7 +269,7 @@ def _impedance_mpl(x, y, stat, drifting, pct, title, out_png, highlight):
             ax.scatter([x[-1]], [y[-1]], s=120, facecolors="none",
                        edgecolors=_FIT, linewidths=2.0, zorder=5)
     ax.set_title(title, fontsize=11)
-    ax.set_ylabel("Rₐ (kΩ)")
+    ax.set_ylabel(ylabel)
     ax.set_xlabel("recording date")
     ax.grid(True, alpha=0.2)
     if highlight is not None:

@@ -157,6 +157,14 @@ alerting:
     impedance_shift_pct_critical: 75
     impedance_baseline_window: 10
     impedance_min_history: 4
+    # Slow-phase STEADY-STATE impedance (Z_ss) drift: the same rolling-median
+    # test as impedance_shift, but on the settled plateau of the long slow
+    # recharge phase (measured after the pulse transients have died out) --
+    # a stim-consistency signal complementary to access resistance. Shares
+    # impedance_baseline_window + impedance_min_history. Unset -> inherits the
+    # impedance_shift_pct / _critical thresholds above.
+    impedance_ss_shift_pct: 40
+    impedance_ss_shift_pct_critical: 75
     # Current-delivery fidelity (two-edge ratio, impedance-invariant): warn
     # when a channel's rolling-median fidelity drops below current_sag_pct
     # (negative) -- the reversal edge sagging means the commanded current is

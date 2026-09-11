@@ -9,6 +9,8 @@ response), this renders:
   * average-stim waveform PNGs: per file (the most recent day by default,
     ``perfile_span: week`` for all), per day, and a weekly grand average;
   * the access-resistance (Rₐ) drift figure, as on the Overview tab;
+  * the slow-phase steady-state impedance (Z_ss) drift figure -- the settled
+    recharge-phase plateau, a stim-consistency signal complementary to Rₐ;
   * a stim-magnitude vs evoked-magnitude (1-50 ms) correlation scatter.
 
 The PNGs are uploaded to a per-week Shared-Drive folder; a running "Stim
@@ -44,9 +46,9 @@ from src.utils.trace_average import average_traces, average_with_sem
 
 logger = logging.getLogger("qc_monitor.notifications.stim_stability_weekly")
 
-HEADER = ["Week", "Animal", "Channel", "Ra kΩ", "Ra Δ%", "corr r", "corr p",
-          "n files", "LFP artifact", "LFP evoked", "Impedance", "Correlation",
-          "Figures"]
+HEADER = ["Week", "Animal", "Channel", "Ra kΩ", "Ra Δ%", "Z_ss kΩ", "Z_ss Δ%",
+          "corr r", "corr p", "n files", "LFP artifact", "LFP evoked",
+          "Impedance", "Z_ss", "Correlation", "Figures"]
 _TAB = "Stim Stability"
 
 
@@ -177,21 +179,27 @@ def _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
     return out
 
 
-def _impedance_figs(imp_rows, base, tag, animal, channel, week, start, end, p):
-    """(full-history Rₐ with THIS WEEK shaded, this-week zoom)."""
+def _metric_figs(imp_rows, base, tag, animal, channel, week, start, end, p,
+                 *, value_key, ylabel, series_name, metric_label, fname):
+    """(full-history <metric> with THIS WEEK shaded, this-week zoom) for one
+    per-channel impedance metric. *value_key* selects it: 'access_r_kohm' (the
+    access-resistance Rₐ trend) or 'slow_ss_kohm' (the slow-phase steady-state
+    impedance Z_ss trend). Both read the SAME ``imp_rows`` (each row carries
+    both metrics), so Z_ss costs no extra DB read."""
     hl = (datetime.fromisoformat(start),
           datetime.fromisoformat(end) + timedelta(days=1))
     full = _fig.impedance_png(
-        imp_rows, os.path.join(base, f"{tag}_impedance.png"), highlight=hl,
-        title=f"{animal} {channel} — electrode access resistance (Rₐ), full "
-        "implant history", pct=p.pct, window=p.window, min_history=p.min_history)
+        imp_rows, os.path.join(base, f"{tag}_{fname}.png"), highlight=hl,
+        title=f"{animal} {channel} — {metric_label}, full implant history",
+        pct=p.pct, window=p.window, min_history=p.min_history,
+        value_key=value_key, ylabel=ylabel, series_name=series_name)
     lo, hi = start.replace("-", "_"), end.replace("-", "_")
     wk = [r for r in imp_rows if lo <= str(r.get("chunk_datetime", ""))[:10] <= hi]
     week_png = _fig.impedance_png(
-        wk, os.path.join(base, f"{tag}_impedance_week.png"),
-        title=f"{animal} {channel} — electrode access resistance (Rₐ), this week "
-        f"({week})", pct=p.pct, window=p.window,
-        min_history=p.min_history) if wk else None
+        wk, os.path.join(base, f"{tag}_{fname}_week.png"),
+        title=f"{animal} {channel} — {metric_label}, this week ({week})",
+        pct=p.pct, window=p.window, min_history=p.min_history,
+        value_key=value_key, ylabel=ylabel, series_name=series_name) if wk else None
     return full, week_png
 
 
@@ -233,8 +241,14 @@ def _process_channel(animal, channel, traces, imp_rows, p, work,
         f"n={len(traces)})", wins, sem=semw)
     over = _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
                      animal, channel)
-    imp, imp_week = _impedance_figs(imp_rows, base, tag, animal, channel, week,
-                                    start, end, p)
+    imp, imp_week = _metric_figs(
+        imp_rows, base, tag, animal, channel, week, start, end, p,
+        value_key="access_r_kohm", ylabel="Rₐ (kΩ)", series_name="Rₐ",
+        metric_label="electrode access resistance (Rₐ)", fname="impedance")
+    zss, zss_week = _metric_figs(
+        imp_rows, base, tag, animal, channel, week, start, end, p,
+        value_key="slow_ss_kohm", ylabel="Z_ss (kΩ)", series_name="Z_ss",
+        metric_label="slow-phase steady-state impedance (Z_ss)", fname="zss")
     xs, ys, dys = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
     corr = _fig.plot_stim_vs_evoked(
         xs, ys, f"{animal} {channel} — stim-artifact vs evoked magnitude",
@@ -244,30 +258,39 @@ def _process_channel(animal, channel, traces, imp_rows, p, work,
     stat = _drift_stat([r.get("access_r_kohm") for r in imp_rows
                         if r.get("access_r_kohm") is not None],
                        p.window, p.min_history)
+    zss_stat = _drift_stat([r.get("slow_ss_kohm") for r in imp_rows
+                            if r.get("slow_ss_kohm") is not None],
+                           p.window, p.min_history)
     return {
         "animal": animal, "channel": channel, "n_files": len(traces),
         "ra": (stat["latest"] if stat else None),
         "ra_drift": (stat["drift_pct"] if stat else None),
+        "zss": (zss_stat["latest"] if zss_stat else None),
+        "zss_drift": (zss_stat["drift_pct"] if zss_stat else None),
         "corr": corr,
         "png_artifact": weekly.get("artifact"), "png_evoked": weekly.get("evoked"),
         "png_artifact_overlay": over.get("artifact"),
         "png_evoked_overlay": over.get("evoked"),
         "png_impedance": imp, "png_impedance_week": imp_week,
+        "png_zss": zss, "png_zss_week": zss_week,
         "png_corr": corr["png"],
         "perfile": perfile, "daily": daily,
         "urls": {}, "folder_link": "",
     }
 
 
-# Sheet thumbnails = the two daily-overlay figures + impedance + correlation.
+# Sheet thumbnails = the two daily-overlay figures + Rₐ + Z_ss + correlation.
 _SHEET_HEADLINE = (("artifact", "png_artifact_overlay"),
                    ("evoked", "png_evoked_overlay"),
-                   ("impedance", "png_impedance"), ("corr", "png_corr"))
+                   ("impedance", "png_impedance"), ("zss", "png_zss"),
+                   ("corr", "png_corr"))
 # Email inlines, per window, the weekly average then its daily overlay beneath;
-# then the full-history impedance, this-week impedance, and the correlation.
+# then full-history Rₐ, this-week Rₐ, full-history Z_ss, this-week Z_ss, and the
+# correlation.
 _EMAIL_HEADLINE = ("png_artifact", "png_artifact_overlay",
                    "png_evoked", "png_evoked_overlay",
-                   "png_impedance", "png_impedance_week", "png_corr")
+                   "png_impedance", "png_impedance_week",
+                   "png_zss", "png_zss_week", "png_corr")
 
 
 def _upload_channel(drive, week_folder_id, res, throttle) -> None:
@@ -281,7 +304,7 @@ def _upload_channel(drive, week_folder_id, res, throttle) -> None:
             res["urls"][key] = _drive.upload_png(
                 drive, res[field], sub["id"], throttle_sec=throttle)["image_url"]
     archive = [res.get("png_artifact"), res.get("png_evoked"),
-               res.get("png_impedance_week")] \
+               res.get("png_impedance_week"), res.get("png_zss_week")] \
         + res["daily"] + res["perfile"]                   # archived, not linked
     for path in archive:
         if path:
@@ -301,11 +324,14 @@ def _sheet_row(week: str, res: dict) -> dict:
     return {
         "Week": week, "Animal": res["animal"], "Channel": res["channel"],
         "Ra kΩ": _num(res["ra"], ".1f"), "Ra Δ%": _num(res["ra_drift"], "+.0f"),
+        "Z_ss kΩ": _num(res.get("zss"), ".3f"),
+        "Z_ss Δ%": _num(res.get("zss_drift"), "+.0f"),
         "corr r": _num(c.get("r"), ".2f"), "corr p": _num(c.get("p"), ".1e"),
         "n files": res["n_files"],
         "LFP artifact": img(urls.get("artifact")),
         "LFP evoked": img(urls.get("evoked")),
         "Impedance": img(urls.get("impedance")),
+        "Z_ss": img(urls.get("zss")),
         "Correlation": img(urls.get("corr")),
         "Figures": (f'=HYPERLINK("{folder}","open folder")' if folder else ""),
     }
@@ -345,8 +371,9 @@ _SUMMARY = (
     "This report tracks whether stimulation is being delivered consistently and "
     "whether the electrode and the brain's response stay stable over time. Per "
     "stimulated channel it shows the stimulus artifact and the evoked LFP "
-    "response (weekly average + day-by-day), the electrode's access resistance, "
-    "and whether the artifact and the response track together.")
+    "response (weekly average + day-by-day), the electrode's access resistance "
+    "and slow-phase steady-state impedance, and whether the artifact and the "
+    "response track together.")
 
 _BATTERY_TIP = (
     "Review tip: right after every battery change, check the stimulus-artifact "
@@ -370,6 +397,13 @@ _CAPTIONS = {
     "sustained rise can indicate encapsulation.",
     "png_impedance_week": "The same access resistance zoomed to this week (the "
     "orange region highlighted above).",
+    "png_zss": "Slow-phase steady-state impedance (Z_ss) over the whole implant "
+    "history -- the settled plateau of the long recharge phase, after the pulse "
+    "transients have died out, divided by the commanded slow current. A "
+    "stim-consistency signal complementary to access resistance: same dashed "
+    "baseline + threshold band, orange = the week in this report.",
+    "png_zss_week": "The same slow-phase steady-state impedance (Z_ss) zoomed to "
+    "this week.",
     "png_corr": "Does a bigger stimulus artifact drive a bigger evoked response? "
     "One point per recording (coloured by day); the red line is the linear fit "
     "(r, p). A strong positive r means the response scales with the delivered "
@@ -386,21 +420,28 @@ def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
         f'background:#fff8ec;color:#7a5b00;max-width:72ch">{escape(_BATTERY_TIP)}'
         '</p>',
         f'<p style="color:#6c6c80">{len(results)} stimulated channel(s). '
-        'Ra = electrode access resistance; corr r = artifact-vs-response '
-        'correlation.</p>',
+        'Ra = electrode access resistance; Z_ss = slow-phase steady-state '
+        'impedance (settled recharge-phase plateau); corr r = '
+        'artifact-vs-response correlation.</p>',
         '<table cellpadding="6" style="border-collapse:collapse;'
         'border:1px solid #ddd"><tr style="background:#f4f6fb">'
-        '<th>Channel</th><th>Rₐ kΩ</th><th>Rₐ Δ%</th><th>corr r</th>'
+        '<th>Channel</th><th>Rₐ kΩ</th><th>Rₐ Δ%</th>'
+        '<th>Z_ss kΩ</th><th>Z_ss Δ%</th><th>corr r</th>'
         '<th>corr p</th><th>n</th></tr>',
     ]
     for r in results:
         drift = r["ra_drift"]
         col = ("#c0392b" if isinstance(drift, (int, float)) and abs(drift) >= 40
                else "#1a1a2e")
+        zdrift = r.get("zss_drift")
+        zcol = ("#c0392b" if isinstance(zdrift, (int, float)) and abs(zdrift) >= 40
+                else "#1a1a2e")
         parts.append(
             f'<tr><td>{escape(r["animal"])} {escape(r["channel"])}</td>'
             f'<td>{_num(r["ra"], ".1f")}</td>'
             f'<td style="color:{col}">{_num(drift, "+.0f")}</td>'
+            f'<td>{_num(r.get("zss"), ".3f")}</td>'
+            f'<td style="color:{zcol}">{_num(zdrift, "+.0f")}</td>'
             f'<td>{_num(r["corr"].get("r"), ".2f")}</td>'
             f'<td>{_num(r["corr"].get("p"), ".1e")}</td>'
             f'<td>{r["n_files"]}</td></tr>')
@@ -441,6 +482,8 @@ def _email_text(today, week, results) -> str:
     for r in results:
         lines.append(f"  {r['animal']} {r['channel']}: Ra={_num(r['ra'], '.1f')} kΩ "
                      f"Δ={_num(r['ra_drift'], '+.0f')}% "
+                     f"Z_ss={_num(r.get('zss'), '.3f')} kΩ "
+                     f"Δ={_num(r.get('zss_drift'), '+.0f')}% "
                      f"corr r={_num(r['corr'].get('r'), '.2f')} "
                      f"p={_num(r['corr'].get('p'), '.1e')} n={r['n_files']}")
     return "\n".join(lines)

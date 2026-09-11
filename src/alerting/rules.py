@@ -50,6 +50,15 @@ class AlertRuleEngine:
             rules_cfg.get("impedance_baseline_window", 10))
         self.impedance_min_history = int(
             rules_cfg.get("impedance_min_history", 4))
+        # Slow-phase steady-state impedance (Z_ss) drift: the same rolling-median
+        # drift test as access resistance, but on the settled slow-phase plateau
+        # (a stim-consistency signal). Defaults to the access-resistance
+        # thresholds above when unset; shares the baseline window + min history.
+        self.impedance_ss_shift_pct = float(
+            rules_cfg.get("impedance_ss_shift_pct", self.impedance_shift_pct))
+        self.impedance_ss_shift_pct_critical = float(
+            rules_cfg.get("impedance_ss_shift_pct_critical",
+                          self.impedance_shift_pct_critical))
         # Current-delivery fidelity: fire when a channel's rolling-median
         # two-edge fidelity drops below this (negative) percent.
         self.current_sag_pct = float(rules_cfg.get("current_sag_pct", -15))
@@ -183,6 +192,56 @@ class AlertRuleEngine:
                              self.impedance_baseline_window,
                              self.impedance_min_history)
             if st and abs(st["drift_pct"]) >= self.impedance_shift_pct:
+                flags.append((animal, ch, st))
+        flags.sort(key=lambda f: -abs(f[2]["drift_pct"]))
+        return flags
+
+    def check_impedance_ss_shift(self):
+        """Fire (rate-limited) when a channel's SLOW-PHASE STEADY-STATE
+        IMPEDANCE (Z_ss -- the settled plateau of the long slow recharge phase,
+        measured after the transients have died out) drifts past
+        ``impedance_ss_shift_pct`` from its rolling-median baseline. A
+        stim-consistency signal complementary to access resistance (Rₐ): both
+        ride the same per-channel series, but Z_ss tracks the steady-state
+        plateau while Rₐ tracks the instantaneous ohmic step, so a channel can
+        drift in one without the other. One aggregated alert lists every
+        drifting (animal, channel); severity escalates to critical past
+        ``impedance_ss_shift_pct_critical``. Scoped to the channels currently on
+        the rig; silent until a channel has ``impedance_min_history``
+        measurements."""
+        try:
+            series = self.store.impedance_series_by_channel(
+                exclude=self.impedance_exclude)
+            active = self.store.active_impedance_channel_keys()
+        except Exception:  # noqa: BLE001 -- alerting must not crash the loop
+            return
+        # Only alert on the animals currently on the rig (most-recent session).
+        if active:
+            series = {k: v for k, v in series.items() if k in active}
+        flags = self._impedance_ss_flags(series)
+        if not flags:
+            return
+        crit = any(abs(st["drift_pct"]) >= self.impedance_ss_shift_pct_critical
+                   for *_r, st in flags)
+        lines = [f"{a} {c} {st['latest']:.3f}kΩ vs "
+                 f"{st['baseline']:.3f} ({st['drift_pct']:+.0f}%)"
+                 for a, c, st in flags[:8]]
+        more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
+        self._fire_alert(
+            "impedance_ss_shift", "critical" if crit else "warning",
+            f"{len(flags)} channel(s) drifted "
+            f">{self.impedance_ss_shift_pct:.0f}% from baseline slow-phase "
+            f"steady-state impedance (Z_ss): " + "; ".join(lines) + more)
+
+    def _impedance_ss_flags(self, series: dict) -> list:
+        """Every (animal, channel, drift_stat) whose slow-phase steady-state
+        impedance is past the warn pct."""
+        flags = []
+        for (animal, ch), rows in (series or {}).items():
+            st = _drift_stat([r.get("slow_ss_kohm") for r in rows],
+                             self.impedance_baseline_window,
+                             self.impedance_min_history)
+            if st and abs(st["drift_pct"]) >= self.impedance_ss_shift_pct:
                 flags.append((animal, ch, st))
         flags.sort(key=lambda f: -abs(f[2]["drift_pct"]))
         return flags
