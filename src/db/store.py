@@ -1717,24 +1717,83 @@ class Store:
         finally:
             conn.close()
 
-    def matlab_failed_files(self, hours: int = 168) -> list[dict]:
+    def matlab_failed_files(self, hours: int = 168,
+                            max_attempts: int | None = None) -> list[dict]:
         """Recordings whose Tier-2 MATLAB step errored (status='matlab_error'),
-        newest first, with the MATLAB error_message. Powers the Overview
-        'failed processing' card so per-file failures aren't silent."""
+        newest first, ONE row per file with its attempt count + latest error.
+        Powers the Overview 'failed processing' card so per-file failures aren't
+        silent.
+
+        *max_attempts*: when set, EXCLUDE files that have already used
+        ``>= max_attempts`` attempts (1 attempt = 1 matlab_results row) -- those
+        are 'exhausted' (see ``matlab_exhausted_files``) and are no longer being
+        auto-retried, so they drop off the active card instead of re-nagging."""
         conn = self._connect()
         try:
             cutoff = (datetime.now() - timedelta(hours=int(hours))).isoformat()
             rows = conn.execute(
                 """SELECT pf.id AS file_id, pf.file_path, pf.session_dir,
                           pf.chunk_datetime, pf.processed_at,
-                          mr.error_message, mr.exit_status
+                          COUNT(mr.id) AS attempts,
+                          MAX(mr.error_message) AS error_message
                    FROM processed_files pf
                    LEFT JOIN matlab_results mr ON mr.file_id = pf.id
                    WHERE pf.status = 'matlab_error'
                      AND (pf.processed_at IS NULL OR pf.processed_at > ?)
+                   GROUP BY pf.id
                    ORDER BY pf.processed_at DESC""",
                 (cutoff,)).fetchall()
+            out = [dict(r) for r in rows]
+            if max_attempts is not None:
+                out = [r for r in out if (r.get("attempts") or 0) < max_attempts]
+            return out
+        finally:
+            conn.close()
+
+    def matlab_exhausted_files(self, max_attempts: int = 4) -> list[dict]:
+        """matlab_error recordings that have used up their auto-retries
+        (``attempts >= max_attempts``) and are no longer re-queued -- the
+        'gave up' list. One row per file with its attempt count + latest error."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT pf.id AS file_id, pf.file_path, pf.chunk_datetime,
+                          pf.processed_at, COUNT(mr.id) AS attempts,
+                          MAX(mr.error_message) AS error_message
+                   FROM processed_files pf
+                   LEFT JOIN matlab_results mr ON mr.file_id = pf.id
+                   WHERE pf.status = 'matlab_error'
+                   GROUP BY pf.id
+                   HAVING COUNT(mr.id) >= ?
+                   ORDER BY pf.processed_at DESC""",
+                (int(max_attempts),)).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def matlab_files_to_retry(self, max_attempts: int, backoff_hours: float,
+                              limit: int = 50) -> list[int]:
+        """file_ids of matlab_error recordings eligible for auto-retry: fewer
+        than ``max_attempts`` attempts AND the last attempt older than
+        ``backoff_hours`` (so a marginal timeout gets another chance without the
+        pipeline hammering the same heavy file every cycle). Newest first."""
+        conn = self._connect()
+        try:
+            backoff = (datetime.now()
+                       - timedelta(hours=float(backoff_hours))).isoformat()
+            rows = conn.execute(
+                """SELECT pf.id AS file_id
+                   FROM processed_files pf
+                   LEFT JOIN matlab_results mr ON mr.file_id = pf.id
+                   WHERE pf.status = 'matlab_error'
+                   GROUP BY pf.id
+                   HAVING COUNT(mr.id) < ?
+                      AND (MAX(mr.computed_at) IS NULL
+                           OR MAX(mr.computed_at) < ?)
+                   ORDER BY pf.processed_at DESC
+                   LIMIT ?""",
+                (int(max_attempts), backoff, int(limit))).fetchall()
+            return [int(r["file_id"]) for r in rows]
         finally:
             conn.close()
 
@@ -2105,12 +2164,18 @@ class Store:
                 " ON CONFLICT(file_id) DO UPDATE SET attempted_at=excluded.attempted_at",
                 [(fid, now) for fid in ids])
 
-    def files_blocked_on_missing_gain(self) -> list[dict]:
+    def files_blocked_on_missing_gain(self, exclude: list[str] | None = None
+                                      ) -> list[dict]:
         """Animals whose recordings can't get an access-resistance (impedance)
         value because their amplifier GAIN is missing from the File_Records
         sheet -- gain NULL leaves access_r NULL forever. Returns
         ``[{animal_id, files}]`` (distinct files) ordered by count desc. Surfaced
-        on Overview so this silent data-entry gap stops being invisible."""
+        on Overview so this silent data-entry gap stops being invisible.
+
+        *exclude* drops animals by case-insensitive exact id (the legacy,
+        pre-gain-logging animals whose gain will never resolve, so they'd nag
+        forever)."""
+        excl = {e.strip().lower() for e in (exclude or []) if e}
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -2120,7 +2185,8 @@ class Store:
                 "  AND animal_id IS NOT NULL AND animal_id != '' "
                 "GROUP BY animal_id ORDER BY files DESC").fetchall()
             return [{"animal_id": r["animal_id"], "files": int(r["files"])}
-                    for r in rows]
+                    for r in rows
+                    if (r["animal_id"] or "").strip().lower() not in excl]
         finally:
             conn.close()
 

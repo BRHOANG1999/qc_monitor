@@ -2581,8 +2581,8 @@ def _overview_tab(store: Store, config: dict | None = None):
             dcc.Loading(html.Div(id="overview-artifact-body"), type="dot"),
         ]),
         open_default=False)
-    matlab_failed = _build_matlab_failed_card(store)
-    gain_blocked = _build_gain_blocked_card(store)
+    matlab_failed = _build_matlab_failed_card(store, config)
+    gain_blocked = _build_gain_blocked_card(store, config)
 
     # No SECTION_STYLE on these wrappers -- the _collapsible they're
     # placed inside is the visible card. Nested chrome was making
@@ -2903,63 +2903,102 @@ def _excluded_animals(config) -> list[str]:
     return list(val) if isinstance(val, list) else ["Randles"]
 
 
-def _build_matlab_failed_card(store):
-    """A red banner listing recordings whose MATLAB (Tier-2) step errored, so
-    a per-file failure isn't invisible (an empty Evoked tab otherwise looks
-    identical to a legitimate no-stimuli file). Empty Div when none."""
-    try:
-        failed = store.matlab_failed_files(hours=168)
-    except Exception:  # noqa: BLE001
-        failed = []
-    if not failed:
-        return html.Div()
+def _matlab_fail_rows(failed, cap=10):
+    """One line per failed recording: basename + attempt count + latest error."""
     rows = []
-    for f in failed[:10]:
+    for f in failed[:cap]:
         name = os.path.basename(f.get("file_path") or "") or f"#{f.get('file_id')}"
         err = (f.get("error_message") or "").strip().replace("\n", " ")
+        n = f.get("attempts") or 0
         rows.append(html.Div([
             html.Span(name, style={"color": "#f0f0f5", "fontSize": "12px",
                                     "fontWeight": "600"}),
+            html.Span(f"  ×{n}" if n else "",
+                      style={"color": "#7a7a8a", "fontSize": "11px"}),
             html.Span(f"  {err[:140]}" if err else "",
                       style={"color": "#a0a0b0", "fontSize": "11px"}),
         ], style={"padding": "3px 0",
                   "borderBottom": "1px solid rgba(255,255,255,0.06)"}))
-    extra = (f"  (+{len(failed) - 10} more)" if len(failed) > 10 else "")
-    header = html.Div([
-        html.Span(f"⚠ {len(failed)} recording(s) failed MATLAB processing "
-                  f"(last 7 days){extra}",
-                  style={"color": "#ff453a", "fontWeight": "700",
-                         "fontSize": "13px"}),
-        html.Button("↻ Retry all", id="overview-retry-matlab", n_clicks=0,
-                    style={"marginLeft": "auto", "padding": "2px 10px",
-                           "fontSize": "12px", "cursor": "pointer",
-                           "borderRadius": "5px", "color": "#f0f0f5",
-                           "background": "#3a3a4a",
-                           "border": "1px solid #555"}),
-    ], style={"display": "flex", "alignItems": "center",
-              "marginBottom": "6px"})
-    return html.Div([
-        header,
-        html.Div("These produced no evoked data. Fix the cause, then Retry "
-                 "all to re-queue them (they are not retried automatically).",
-                 style={"color": "#a0a0b0", "fontSize": "11px",
-                        "marginBottom": "8px"}),
-        html.Div(id="overview-retry-matlab-status",
-                 style={"color": "#30d158", "fontSize": "11px"}),
-        *rows,
-    ], style={"marginBottom": "12px", "padding": "10px 14px",
-              "background": "rgba(255,69,58,0.08)",
-              "border": "1px solid rgba(255,69,58,0.35)",
-              "borderRadius": "8px"})
+    return rows
 
 
-def _build_gain_blocked_card(store):
+def _build_matlab_failed_card(store, config=None):
+    """A red banner listing recordings whose MATLAB (Tier-2) step errored and are
+    still being AUTO-RETRIED, so a per-file failure isn't invisible (an empty
+    Evoked tab otherwise looks identical to a legitimate no-stimuli file). Files
+    that exhausted their retries drop into a collapsed 'gave up' list below so
+    they stop re-nagging. Empty Div when nothing is failing."""
+    cap = int((config or {}).get("matlab_max_attempts", 4))
+    try:
+        failed = store.matlab_failed_files(hours=168, max_attempts=cap)
+        exhausted = store.matlab_exhausted_files(max_attempts=cap)
+    except Exception:  # noqa: BLE001
+        failed, exhausted = [], []
+    if not failed and not exhausted:
+        return html.Div()
+
+    children = []
+    if failed:
+        extra = (f"  (+{len(failed) - 10} more)" if len(failed) > 10 else "")
+        header = html.Div([
+            html.Span(f"⚠ {len(failed)} recording(s) failed MATLAB processing "
+                      f"(last 7 days){extra}",
+                      style={"color": "#ff453a", "fontWeight": "700",
+                             "fontSize": "13px"}),
+            html.Button("↻ Retry all", id="overview-retry-matlab", n_clicks=0,
+                        style={"marginLeft": "auto", "padding": "2px 10px",
+                               "fontSize": "12px", "cursor": "pointer",
+                               "borderRadius": "5px", "color": "#f0f0f5",
+                               "background": "#3a3a4a",
+                               "border": "1px solid #555"}),
+        ], style={"display": "flex", "alignItems": "center",
+                  "marginBottom": "6px"})
+        children += [
+            header,
+            html.Div("These produced no evoked data. They are auto-retried "
+                     f"(up to {cap} attempts, backing off between tries); fix "
+                     "the cause or click Retry all to re-queue now.",
+                     style={"color": "#a0a0b0", "fontSize": "11px",
+                            "marginBottom": "8px"}),
+            html.Div(id="overview-retry-matlab-status",
+                     style={"color": "#30d158", "fontSize": "11px"}),
+            *_matlab_fail_rows(failed),
+        ]
+    if exhausted:
+        gextra = (f"  (+{len(exhausted) - 10} more)"
+                  if len(exhausted) > 10 else "")
+        children.append(_collapsible(
+            f"⋯ {len(exhausted)} recording(s) gave up after {cap} attempts"
+            f"{gextra}",
+            html.Div([
+                html.Div(f"These exceeded MATLAB processing {cap} times "
+                         "(likely too heavy for matlab_timeout_sec). No longer "
+                         "auto-retried; raise the timeout / enable the local "
+                         "mirror, then Retry all to try again.",
+                         style={"color": "#a0a0b0", "fontSize": "11px",
+                                "marginBottom": "6px"}),
+                *_matlab_fail_rows(exhausted),
+            ]),
+            open_default=False, badge=str(len(exhausted)),
+            badge_color="rgba(120,120,140,0.85)", title_color="#9a9aa8"))
+    return html.Div(children, style={
+        "marginBottom": "12px", "padding": "10px 14px",
+        "background": "rgba(255,69,58,0.08)",
+        "border": "1px solid rgba(255,69,58,0.35)",
+        "borderRadius": "8px"})
+
+
+def _build_gain_blocked_card(store, config=None):
     """Amber banner naming animals whose impedance can't be computed because their
     amplifier GAIN is missing from the File_Records sheet -- a silent data-entry
     gap that otherwise just looks like 'no impedance yet' forever (BCH040's 663
-    files were invisibly stuck this way). Empty Div when nothing is blocked."""
+    files were invisibly stuck this way). Legacy animals listed in
+    ``impedance.ignore_blocked_animals`` are excluded (their gain will never
+    resolve). Empty Div when nothing is blocked."""
+    ignore = ((config or {}).get("impedance", {}) or {}).get(
+        "ignore_blocked_animals", []) or []
     try:
-        blocked = store.files_blocked_on_missing_gain()
+        blocked = store.files_blocked_on_missing_gain(exclude=ignore)
     except Exception:  # noqa: BLE001
         blocked = []
     if not blocked:

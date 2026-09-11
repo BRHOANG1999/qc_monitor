@@ -42,6 +42,9 @@ class AlertRuleEngine:
         self.rate_limit_minutes = rules_cfg.get("rate_limit_per_type_minutes", 60)
         self.network_down_minutes = rules_cfg.get("network_down_minutes", 5)
         self.no_data_hours = rules_cfg.get("no_data_hours", 2)
+        # Exclude files that exhausted their auto-retries from the MATLAB-failure
+        # alert so a permanently-too-heavy recording stops re-alerting.
+        self.matlab_max_attempts = int(config.get("matlab_max_attempts", 4))
         # Transfer-impedance drift thresholds (per channel, per phase).
         self.impedance_shift_pct = float(
             rules_cfg.get("impedance_shift_pct", 40))
@@ -157,7 +160,8 @@ class AlertRuleEngine:
         recently, so a per-file crash isn't silent -- it also shows on the
         Overview 'failed processing' card and the Alerts tab."""
         try:
-            failed = self.store.matlab_failed_files(hours=lookback_hours)
+            failed = self.store.matlab_failed_files(
+                hours=lookback_hours, max_attempts=self.matlab_max_attempts)
         except Exception:  # noqa: BLE001 -- alerting must never crash the loop
             return
         if not failed:

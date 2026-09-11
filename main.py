@@ -243,6 +243,9 @@ def main():
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift
+    matlab_retry_interval = 3600  # seconds -- auto-retry Tier-2 failures (bounded)
+    matlab_max_attempts = int(config.get("matlab_max_attempts", 4))
+    matlab_retry_backoff_hours = float(config.get("matlab_retry_backoff_hours", 12))
 
     # One-time transfer-impedance backfill in the background so a large
     # historical sweep doesn't block startup. Incremental refreshes run on
@@ -336,6 +339,7 @@ def main():
     # lock, which starved the dashboard (30s+ tab renders) and threw
     # "database is locked". The backfill thread owns the initial refresh.
     last_impedance_time = time.time()
+    last_matlab_retry_time = 0.0
     consecutive_network_failures = 0
     files_since_scan = 10  # force initial scan
 
@@ -399,6 +403,24 @@ def main():
                 except Exception as e:
                     logger.error("Impedance refresh/check failed: %s", e)
                 last_impedance_time = loop_start
+
+            # Auto-retry Tier-2 (MATLAB) failures: re-queue matlab_error files
+            # that haven't exhausted their attempts and are past their backoff,
+            # so a marginal timeout self-heals (esp. after a matlab_timeout_sec
+            # raise) instead of waiting for a human to click "Retry all".
+            if (loop_start - last_matlab_retry_time) > matlab_retry_interval:
+                try:
+                    retry_ids = store.matlab_files_to_retry(
+                        max_attempts=matlab_max_attempts,
+                        backoff_hours=matlab_retry_backoff_hours)
+                    for fid in retry_ids:
+                        store.update_file_status(fid, "pending")
+                    if retry_ids:
+                        logger.info("Auto-requeued %d matlab_error file(s) for "
+                                    "retry", len(retry_ids))
+                except Exception as e:
+                    logger.error("MATLAB auto-retry sweep failed: %s", e)
+                last_matlab_retry_time = loop_start
 
             # Scan for new files every 10 processed files or when queue is empty
             if files_since_scan >= 10 or not store.get_pending_files(limit=1):

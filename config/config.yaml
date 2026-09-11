@@ -130,8 +130,28 @@ stimnet_root: D:/code/Stimulation-Telemetry-Modulation-NeuroEngineering-Toolkit/
 matlab_exe: matlab
 # Hard cap for one file's Tier-2 MATLAB run. A 1-hour, 500+ MB recording
 # loaded over the network + evoked extraction + 25 features + wavelet CWT can
-# take 5-15 min; 300s used to time out and false-flag them as matlab_error.
-matlab_timeout_sec: 1200
+# take 5-15 min. Raised 1200 -> 1800: the heaviest multi-animal chronicStim
+# recordings (~660 MB, 5-6 channels) reach ~1180s on a SUCCESSFUL run -- right at
+# the old 1200s ceiling -- so ~25 of them false-timed-out. 1800s gives headroom.
+# (The durable fix is the local mirror below: reading 660 MB over Tailscale eats
+# most of the budget.)
+matlab_timeout_sec: 1800
+# Auto-retry Tier-2 failures instead of leaving them for a manual "Retry all".
+# A matlab_error file is re-queued up to matlab_max_attempts times (1 attempt =
+# 1 matlab_results row), no more than once per matlab_retry_backoff_hours, so a
+# marginal timeout self-heals after the raise above without hammering the queue.
+# A file that still fails after max_attempts is "exhausted": it drops off the
+# active red card into a collapsed "gave up" list and stops re-alerting.
+matlab_max_attempts: 4
+matlab_retry_backoff_hours: 12
+# Transfer-impedance housekeeping.
+impedance:
+  # Animals whose recordings predate amplifier-gain logging in File_Records --
+  # their gain can never resolve, so access resistance stays NULL forever.
+  # Exclude them from the "Blocked animals" (no-impedance) warning instead of
+  # nagging about a data-entry gap that can't be filled. Add an id per legacy
+  # animal (case-insensitive).
+  ignore_blocked_animals: [BCH040]
 alerting:
   enabled: true
   smtp:
