@@ -3,6 +3,7 @@
 import logging
 import os
 from datetime import datetime
+from html import escape
 
 from src.db.store import Store
 from src.alerting.email_alert import EmailAlerter
@@ -59,6 +60,22 @@ class AlertRuleEngine:
         self.impedance_ss_shift_pct_critical = float(
             rules_cfg.get("impedance_ss_shift_pct_critical",
                           self.impedance_shift_pct_critical))
+        # Suppress an impedance-drift alert when the newest measurement in the
+        # (recent-protocol) series is older than this many days -- a channel with
+        # no recent measurement has no basis to judge drift and would re-fire a
+        # stale value forever.
+        self.impedance_staleness_days = float(
+            rules_cfg.get("impedance_staleness_days", 3))
+        # Z_ss saturation guard: at high stim charge the amplifier saturates and
+        # the slow-phase plateau collapses (Z_ss << Rₐ). Treat a Z_ss row as
+        # invalid (drop it) when slow_ss_kohm < this fraction of access_r_kohm, so
+        # a saturating therapeutic protocol can't false-alarm the Z_ss drift.
+        self.impedance_ss_saturation_ratio = float(
+            rules_cfg.get("impedance_ss_saturation_ratio", 0.3))
+        # Attach the Rₐ / Z_ss trend figure to the drift-alert emails so a
+        # recipient can see the trend instead of guessing from a bare percentage.
+        self.impedance_alert_figures = bool(
+            rules_cfg.get("impedance_alert_figures", True))
         # Current-delivery fidelity: fire when a channel's rolling-median
         # two-edge fidelity drops below this (negative) percent.
         self.current_sag_pct = float(rules_cfg.get("current_sag_pct", -15))
@@ -152,6 +169,48 @@ class AlertRuleEngine:
             f"{lookback_hours}h (most recent: {newest}). They produce no "
             f"evoked data -- see the Overview 'failed processing' card.")
 
+    def _series_fresh(self, rows) -> bool:
+        """True if the newest recording in this per-channel series is within
+        ``impedance_staleness_days`` of now. A frozen series (the protocol
+        stopped / changed) has no recent basis to judge drift and would otherwise
+        re-fire a stale value forever. Rows are ordered oldest->newest, so the
+        last one is the newest measurement."""
+        if not rows:
+            return False
+        cd = (rows[-1] or {}).get("chunk_datetime") or ""
+        try:
+            when = datetime.strptime(cd, "%Y_%m_%d__%H_%M_%S")
+        except (ValueError, TypeError):
+            return True                       # unparseable -> fail open
+        return (datetime.now() - when).total_seconds() \
+            <= self.impedance_staleness_days * 86400
+
+    def _valid_zss_values(self, rows) -> list:
+        """``slow_ss_kohm`` per row with SATURATED rows dropped: at high stim
+        charge the amp saturates and the slow-phase plateau collapses to
+        ``Z_ss << Rₐ``. A row is saturated when ``slow_ss_kohm`` falls below
+        ``impedance_ss_saturation_ratio`` of ``access_r_kohm``. Order preserved so
+        the rolling-median drift is over the VALID measurements only."""
+        out = []
+        for r in rows:
+            z = r.get("slow_ss_kohm")
+            ra = r.get("access_r_kohm")
+            if z is None:
+                continue
+            if ra and ra > 0 and z < self.impedance_ss_saturation_ratio * ra:
+                continue                      # saturated -> invalid
+            out.append(z)
+        return out
+
+    @staticmethod
+    def _drift_signature(flags, severity: str) -> str:
+        """Stable per-condition key for daily dedup: the sorted set of drifting
+        (animal, channel) + severity. The SAME condition maps to the same key
+        (one email/day); a new channel or an escalation to critical is a new key
+        and fires again."""
+        chans = "|".join(sorted(f"{f[0]}:{f[1]}" for f in flags))
+        return f"{chans}#{severity}"
+
     def check_impedance_shift(self):
         """Fire (rate-limited) when a channel's ACCESS RESISTANCE (Rₐ, from
         the ohmic step of the stim pulse) drifts past ``impedance_shift_pct``
@@ -173,21 +232,31 @@ class AlertRuleEngine:
             return
         crit = any(abs(st["drift_pct"]) >= self.impedance_shift_pct_critical
                    for *_r, st in flags)
+        severity = "critical" if crit else "warning"
         lines = [f"{a} {c} {st['latest']:.3f}kΩ vs "
                  f"{st['baseline']:.3f} ({st['drift_pct']:+.0f}%)"
                  for a, c, st in flags[:8]]
         more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
         self._fire_alert(
-            "impedance_shift", "critical" if crit else "warning",
+            "impedance_shift", severity,
             f"{len(flags)} channel(s) drifted "
             f">{self.impedance_shift_pct:.0f}% from baseline access "
-            f"resistance: " + "; ".join(lines) + more)
+            f"resistance: " + "; ".join(lines) + more,
+            resend_key=self._drift_signature(flags, severity),
+            figure_builder=(
+                (lambda: self._drift_figures(
+                    series, flags, value_key="access_r_kohm", ylabel="Rₐ (kΩ)",
+                    series_name="Rₐ", metric_label="access resistance (Rₐ)",
+                    pct=self.impedance_shift_pct))
+                if self.impedance_alert_figures else None))
 
     def _impedance_flags(self, series: dict) -> list:
         """Every (animal, channel, drift_stat) whose access resistance is past
-        the warn pct."""
+        the warn pct. Stale (frozen) series are skipped."""
         flags = []
         for (animal, ch), rows in (series or {}).items():
+            if not self._series_fresh(rows):
+                continue
             st = _drift_stat([r.get("access_r_kohm") for r in rows],
                              self.impedance_baseline_window,
                              self.impedance_min_history)
@@ -223,22 +292,34 @@ class AlertRuleEngine:
             return
         crit = any(abs(st["drift_pct"]) >= self.impedance_ss_shift_pct_critical
                    for *_r, st in flags)
+        severity = "critical" if crit else "warning"
         lines = [f"{a} {c} {st['latest']:.3f}kΩ vs "
                  f"{st['baseline']:.3f} ({st['drift_pct']:+.0f}%)"
                  for a, c, st in flags[:8]]
         more = f" (+{len(flags) - 8} more)" if len(flags) > 8 else ""
         self._fire_alert(
-            "impedance_ss_shift", "critical" if crit else "warning",
+            "impedance_ss_shift", severity,
             f"{len(flags)} channel(s) drifted "
             f">{self.impedance_ss_shift_pct:.0f}% from baseline slow-phase "
-            f"steady-state impedance (Z_ss): " + "; ".join(lines) + more)
+            f"steady-state impedance (Z_ss): " + "; ".join(lines) + more,
+            resend_key=self._drift_signature(flags, severity),
+            figure_builder=(
+                (lambda: self._drift_figures(
+                    series, flags, value_key="slow_ss_kohm", ylabel="Z_ss (kΩ)",
+                    series_name="Z_ss",
+                    metric_label="slow-phase steady-state impedance (Z_ss)",
+                    pct=self.impedance_ss_shift_pct))
+                if self.impedance_alert_figures else None))
 
     def _impedance_ss_flags(self, series: dict) -> list:
         """Every (animal, channel, drift_stat) whose slow-phase steady-state
-        impedance is past the warn pct."""
+        impedance is past the warn pct. Stale series are skipped; saturated Z_ss
+        rows (plateau collapsed at high charge) are dropped before the drift."""
         flags = []
         for (animal, ch), rows in (series or {}).items():
-            st = _drift_stat([r.get("slow_ss_kohm") for r in rows],
+            if not self._series_fresh(rows):
+                continue
+            st = _drift_stat(self._valid_zss_values(rows),
                              self.impedance_baseline_window,
                              self.impedance_min_history)
             if st and abs(st["drift_pct"]) >= self.impedance_ss_shift_pct:
@@ -274,14 +355,17 @@ class AlertRuleEngine:
             "current_sag", "warning",
             f"{len(flags)} channel(s) show current-delivery sag "
             f"(<{self.current_sag_pct:.0f}% two-edge fidelity → commanded "
-            f"current not fully delivered): " + "; ".join(lines) + more)
+            f"current not fully delivered): " + "; ".join(lines) + more,
+            resend_key=self._drift_signature(flags, "warning"))
 
     def _current_sag_flags(self, series: dict) -> list:
         """Every (animal, channel, median_fidelity, latest) whose rolling-median
         current fidelity is below the (negative) sag threshold. Most-negative
-        first."""
+        first. Stale (frozen) series are skipped."""
         flags = []
         for (animal, ch), rows in (series or {}).items():
+            if not self._series_fresh(rows):
+                continue
             vals = [r.get("current_fidelity_pct") for r in rows]
             vals = [v for v in vals if v is not None]
             if len(vals) < max(2, self.impedance_min_history):
@@ -293,32 +377,118 @@ class AlertRuleEngine:
         return flags
 
     def _fire_alert(self, alert_type: str, severity: str, message: str,
-                    file_id: int = None, session_dir: str = None):
-        # Rate limiting
+                    file_id: int = None, session_dir: str = None, *,
+                    resend_key: str = None, figure_builder=None):
+        """Record + email an alert.
+
+        *resend_key* enables per-CONDITION daily dedup: with it, a STANDING
+        condition emails at most once per day (not once per rate-limit window),
+        so a drift that never clears stops spamming hourly; a changed signature
+        (new channel / escalation) is a new digest and fires again. Without it,
+        the legacy per-TYPE rate limit applies. *figure_builder*, when given, is
+        called only after the alert clears both gates and returns temp PNG paths
+        to embed inline (the caller-agnostic figure is deleted after send)."""
+        # Per-type burst rate limit (unchanged) -- caps any one type's cadence.
         last = self.store.get_last_alert_time(alert_type)
         if last and (datetime.now() - last).total_seconds() < self.rate_limit_minutes * 60:
             logger.debug("Alert rate-limited: %s", alert_type)
             return
+        # Per-condition daily dedup: atomically claim (type, signature) for today.
+        today = datetime.now().strftime("%Y-%m-%d")
+        digest = f"{alert_type}:{resend_key}" if resend_key is not None else None
+        if digest is not None and not self.store.record_notification_sent(
+                digest, today):
+            logger.debug("Alert deduped for today: %s", digest)
+            return
 
-        # Record it for the UI alerts log regardless (this also sets the
-        # rate-limit clock -- an occurrence is an occurrence). But CHECK the
-        # email result: send() returns False when disabled/misconfigured or on
-        # SMTP failure, and silently ignoring that meant a failed CRITICAL
-        # alert email went nowhere with no trace. Log the failure loudly.
+        # Record it for the UI alerts log regardless. CHECK the email result:
+        # send() returns False when disabled/misconfigured or on SMTP failure,
+        # and silently ignoring that meant a failed CRITICAL email went nowhere.
         self.store.insert_alert(alert_type, severity, message, file_id, session_dir)
+        figs = []
+        if figure_builder is not None:
+            try:
+                figs = figure_builder() or []
+            except Exception:  # noqa: BLE001 -- a figure must never block the alert
+                logger.exception("alert figure render failed [%s]", alert_type)
+                figs = []
+        body_html = (self._alert_body_html(severity, message, figs)
+                     if figs else None)
         try:
             ok = self.emailer.send(
-                f"{alert_type}: {message[:80]}", message, severity)
+                f"{alert_type}: {message[:80]}", message, severity,
+                body_html=body_html, attachments=(figs or None))
         except Exception as e:  # noqa: BLE001 -- alerting must not crash the loop
             ok = False
             logger.error("Alert email raised [%s/%s]: %s (%s)",
                          severity, alert_type, message, e)
+        finally:
+            for p in figs:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        if not ok and digest is not None:
+            # Send failed -> release the daily claim so a later tick can retry
+            # rather than permanently suppressing this condition for the day.
+            try:
+                self.store.release_notification_sent(digest, today)
+            except Exception:  # noqa: BLE001
+                logger.debug("release_notification_sent failed", exc_info=True)
         if ok:
             logger.warning("Alert fired [%s/%s]: %s",
                            severity, alert_type, message)
         else:
             logger.error("Alert recorded but email NOT sent [%s/%s]: %s",
                          severity, alert_type, message)
+
+    @staticmethod
+    def _alert_body_html(severity: str, message: str, figure_paths: list) -> str:
+        """HTML alert body that renders the message + inline trend figures
+        (referenced by Content-ID = basename, matching EmailAlerter._load_images)."""
+        color = {"critical": "#c0392b", "warning": "#e8833a"}.get(
+            severity, "#5e7ce2")
+        imgs = "".join(
+            f'<img src="cid:{os.path.basename(p)}" '
+            'style="max-width:760px;display:block;margin:12px 0">'
+            for p in figure_paths)
+        return (
+            '<html><body style="font-family:-apple-system,sans-serif">'
+            f'<h3 style="color:{color};margin:0 0 8px">{escape(message[:120])}</h3>'
+            '<pre style="white-space:pre-wrap;color:#333;font-size:13px">'
+            f'{escape(message)}</pre>{imgs}<hr>'
+            '<small style="color:#888">QC Monitor - '
+            f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</small>'
+            '</body></html>')
+
+    def _drift_figures(self, series: dict, flags: list, *, value_key: str,
+                       ylabel: str, series_name: str, metric_label: str,
+                       pct: float, max_figs: int = 3) -> list:
+        """Render the per-channel drift-trend PNG for the top drifting channels
+        to temp files (the caller deletes them after the email is sent). Reuses
+        the weekly report's ``impedance_png`` so the alert figure matches the
+        dashboard/report look."""
+        import tempfile
+        from src.notifications.stim_figures import impedance_png
+        paths = []
+        for f in flags[:max_figs]:
+            animal, ch = f[0], f[1]
+            rows = (series or {}).get((animal, ch)) or []
+            fd, p = tempfile.mkstemp(prefix="qc_alert_", suffix=".png")
+            os.close(fd)
+            out = impedance_png(
+                rows, p, title=f"{animal} {ch} — {metric_label}", pct=pct,
+                window=self.impedance_baseline_window,
+                min_history=self.impedance_min_history,
+                value_key=value_key, ylabel=ylabel, series_name=series_name)
+            if out:
+                paths.append(out)
+            else:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        return paths
 
     def check_flagged_events(self):
         """Email the configured recipients when a NEW seizure event is

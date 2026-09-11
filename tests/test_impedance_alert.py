@@ -3,7 +3,16 @@
 (rules.check_current_sag), and slow-phase steady-state impedance / Z_ss
 (rules.check_impedance_ss_shift)."""
 
+from datetime import datetime, timedelta
+
 from src.alerting.rules import AlertRuleEngine, _drift_stat
+
+
+def _ts(hours_ago: float) -> str:
+    """A chunk_datetime `hours_ago` before now (fresh by default, so the
+    staleness guard doesn't suppress; pass a large value to make it stale)."""
+    return (datetime.now() - timedelta(hours=hours_ago)).strftime(
+        "%Y_%m_%d__%H_%M_%S")
 
 
 class _FakeStore:
@@ -13,6 +22,7 @@ class _FakeStore:
         # Default: every channel is "active" so existing tests are unaffected.
         self._active = active if active is not None else set(series.keys())
         self.inserted = []
+        self._claims = set()
 
     def impedance_series_by_channel(self, exclude=None):
         return self._series
@@ -26,18 +36,37 @@ class _FakeStore:
     def insert_alert(self, *args):
         self.inserted.append(args)
 
+    # notification_log dedup (per-condition daily) --------------------------
+    def record_notification_sent(self, digest, sent_date):
+        key = (digest, sent_date)
+        if key in self._claims:
+            return False
+        self._claims.add(key)
+        return True
+
+    def notification_already_sent(self, digest, sent_date):
+        return (digest, sent_date) in self._claims
+
+    def release_notification_sent(self, digest, sent_date):
+        self._claims.discard((digest, sent_date))
+
 
 class _FakeEmailer:
     def __init__(self):
         self.sent = []
 
-    def send(self, subject, body, severity):
-        self.sent.append((subject, body, severity))
+    def send(self, subject, body, severity, **kwargs):
+        self.sent.append({"subject": subject, "body": body,
+                          "severity": severity, **kwargs})
+        return True
 
 
 def _engine(series, last_alert=None, active=None, **rule_overrides):
+    # Figures OFF by default in tests so the alert path doesn't render PNGs;
+    # the figure test flips it on explicitly.
     rules = {"impedance_shift_pct": 40, "impedance_shift_pct_critical": 75,
-             "impedance_baseline_window": 10, "impedance_min_history": 4}
+             "impedance_baseline_window": 10, "impedance_min_history": 4,
+             "impedance_alert_figures": False}
     rules.update(rule_overrides)
     cfg = {"alerting": {"rules": rules}}
     store = _FakeStore(series, last_alert, active)
@@ -45,9 +74,9 @@ def _engine(series, last_alert=None, active=None, **rule_overrides):
 
 
 def _rows(vals):
-    """Access-resistance series rows (oldest→newest)."""
-    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
-             "access_r_kohm": v}
+    """Access-resistance series rows (oldest→newest, all fresh)."""
+    n = len(vals)
+    return [{"file_id": i, "chunk_datetime": _ts(n - i), "access_r_kohm": v}
             for i, v in enumerate(vals, start=1)]
 
 
@@ -115,8 +144,9 @@ def test_rate_limited(monkeypatch):
 # --------------------------------------------------------------------- #
 
 def _fid_rows(vals):
-    """Current-fidelity series rows (oldest→newest); vals are signed %."""
-    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
+    """Current-fidelity series rows (oldest→newest, all fresh); vals signed %."""
+    n = len(vals)
+    return [{"file_id": i, "chunk_datetime": _ts(n - i),
              "current_fidelity_pct": v}
             for i, v in enumerate(vals, start=1)]
 
@@ -168,9 +198,9 @@ def test_current_sag_transient_dip_not_flagged():
 # --------------------------------------------------------------------- #
 
 def _ss_rows(vals):
-    """Slow-phase steady-state impedance series rows (oldest→newest)."""
-    return [{"file_id": i, "chunk_datetime": f"2026_07_0{i}__00_00_00",
-             "slow_ss_kohm": v}
+    """Slow-phase steady-state impedance series rows (oldest→newest, all fresh)."""
+    n = len(vals)
+    return [{"file_id": i, "chunk_datetime": _ts(n - i), "slow_ss_kohm": v}
             for i, v in enumerate(vals, start=1)]
 
 
@@ -240,3 +270,116 @@ def test_zss_rate_limited():
     eng, store = _engine(series, last_alert=datetime.now())  # just fired
     eng.check_impedance_ss_shift()
     assert store.inserted == []  # suppressed by rate limit
+
+
+# --------------------------------------------------------------------- #
+#  Staleness guard: a frozen (protocol-stopped) series must not re-fire
+# --------------------------------------------------------------------- #
+
+def _stale_rows(key, vals, days_old=30):
+    """Series rows whose NEWEST measurement is `days_old` days old."""
+    n = len(vals)
+    return [{"file_id": i, "chunk_datetime": _ts(days_old * 24 + (n - i)),
+             key: v}
+            for i, v in enumerate(vals, start=1)]
+
+
+def test_stale_series_suppresses_ra_alert():
+    # +60% drift but the newest point is 30 days old -> no recent basis -> silent
+    # (this is the BCH111SR "phantom": a frozen July series driving hourly email).
+    series = {("BCH111", "BCH111SR"):
+              _stale_rows("access_r_kohm", [1.0, 1.0, 1.0, 1.6])}
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    assert store.inserted == []
+
+
+def test_stale_series_suppresses_zss_alert():
+    series = {("BCH111", "BCH111SR"):
+              _stale_rows("slow_ss_kohm", [2.0, 2.0, 2.0, 3.2])}
+    eng, store = _engine(series)
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
+# --------------------------------------------------------------------- #
+#  Per-condition DAILY dedup: a standing condition emails once/day, not
+#  once/hour; a new channel / escalation is a new signature and re-fires.
+# --------------------------------------------------------------------- #
+
+def test_standing_condition_deduped_same_day():
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 1.0, 1.0, 1.6])}  # +60%
+    eng, store = _engine(series)
+    eng.check_impedance_shift()
+    eng.check_impedance_shift()          # same condition, same day
+    assert len(store.inserted) == 1      # 2nd suppressed by the daily dedup
+
+
+def test_new_drifting_channel_fires_despite_dedup():
+    eng, store = _engine({("A", "A1"): _rows([1.0, 1.0, 1.0, 1.6])})
+    eng.check_impedance_shift()
+    assert len(store.inserted) == 1
+    # a SECOND channel now drifts -> different signature -> fires again same day
+    store._series = {("A", "A1"): _rows([1.0, 1.0, 1.0, 1.6]),
+                     ("B", "B1"): _rows([1.0, 1.0, 1.0, 1.6])}
+    store._active = {("A", "A1"), ("B", "B1")}
+    eng.check_impedance_shift()
+    assert len(store.inserted) == 2
+
+
+# --------------------------------------------------------------------- #
+#  Z_ss saturation guard: at high charge the plateau collapses (Z_ss << Ra)
+# --------------------------------------------------------------------- #
+
+def test_zss_saturated_rows_dropped():
+    # Z_ss all << 0.3*Ra (0.12) -> every row saturated -> no valid Z_ss -> silent,
+    # even though the raw values "drift". (The 10 nC therapeutic-protocol case.)
+    n = 4
+    rows = [{"file_id": i, "chunk_datetime": _ts(n - i),
+             "slow_ss_kohm": z, "access_r_kohm": 0.40}
+            for i, z in enumerate([0.010, 0.010, 0.010, 0.005], start=1)]
+    eng, store = _engine({("BCH111", "BCH111SR"): rows})
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
+def test_zss_fires_when_not_saturated_with_ra():
+    # Z_ss > 0.3*Ra (not saturated) and drifting -> fires normally.
+    n = 4
+    rows = [{"file_id": i, "chunk_datetime": _ts(n - i),
+             "slow_ss_kohm": z, "access_r_kohm": 0.40}
+            for i, z in enumerate([0.30, 0.30, 0.30, 0.48], start=1)]  # +60%
+    eng, store = _engine({("BCH111", "BCH111SR"): rows})
+    eng.check_impedance_ss_shift()
+    assert len(store.inserted) == 1
+    assert store.inserted[0][0] == "impedance_ss_shift"
+
+
+# --------------------------------------------------------------------- #
+#  Figure embedded in the alert email
+# --------------------------------------------------------------------- #
+
+def test_alert_email_includes_trend_figure():
+    series = {("BCH110", "BCH110SLM"): _rows([1.0, 1.0, 1.0, 1.6])}
+    eng, store = _engine(series, impedance_alert_figures=True)
+    eng.check_impedance_shift()
+    assert len(store.inserted) == 1
+    sent = eng.emailer.sent[0]
+    assert sent.get("attachments")                       # >=1 rendered PNG path
+    assert "cid:" in (sent.get("body_html") or "")       # referenced inline
+
+
+# --------------------------------------------------------------------- #
+#  Recent-window dominant charge: the trend follows a protocol change
+# --------------------------------------------------------------------- #
+
+def test_dominant_charge_follows_recent_protocol():
+    from src.db.store import Store
+    # Old protocol: many 2 nC rows, 50 days old (the all-time mode). New protocol:
+    # fewer 10 nC rows, 2 days old. Recent-window mode = 10 nC -> keep only those.
+    old = [{"chunk_datetime": _ts(50 * 24), "charge_nc": 2.0} for _ in range(20)]
+    new = [{"chunk_datetime": _ts(2 * 24 - i), "charge_nc": 10.0}
+           for i in range(5)]
+    kept = Store._dominant_charge_only(old + new, recent_days=30)
+    assert kept and all(r["charge_nc"] == 10.0 for r in kept)
+    assert len(kept) == 5

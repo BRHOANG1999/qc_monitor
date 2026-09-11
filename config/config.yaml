@@ -165,6 +165,19 @@ alerting:
     # impedance_shift_pct / _critical thresholds above.
     impedance_ss_shift_pct: 40
     impedance_ss_shift_pct_critical: 75
+    # Suppress an impedance-drift alert when the newest measurement in the
+    # channel's (recent-protocol) series is older than this many days -- a frozen
+    # series (the stim protocol stopped/changed) has no recent basis to judge
+    # drift and would re-fire a stale value forever.
+    impedance_staleness_days: 3
+    # Z_ss saturation guard: at high stim charge the amp saturates and the
+    # slow-phase plateau collapses (Z_ss << Ra). Drop a Z_ss row as invalid when
+    # slow_ss_kohm < this fraction of access_r_kohm, so a saturating therapeutic
+    # protocol can't false-alarm the Z_ss drift.
+    impedance_ss_saturation_ratio: 0.3
+    # Attach the Ra / Z_ss trend figure to the drift-alert emails so a recipient
+    # sees the trend instead of a bare percentage. false -> text-only emails.
+    impedance_alert_figures: true
     # Current-delivery fidelity (two-edge ratio, impedance-invariant): warn
     # when a channel's rolling-median fidelity drops below current_sag_pct
     # (negative) -- the reversal edge sagging means the commanded current is

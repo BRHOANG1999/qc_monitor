@@ -2232,13 +2232,33 @@ class Store:
             conn.close()
 
     @staticmethod
-    def _dominant_charge_only(rows: list) -> list:
-        """Keep only the rows at the channel's most common stimulus charge
-        (ties → the larger charge). Recordings at other charges are a
-        different protocol (or saturating therapeutic stim) and would corrupt
-        the access-resistance trend."""
+    def _dominant_charge_only(rows: list, recent_days: int = 30) -> list:
+        """Keep only the rows at the channel's RECENT dominant stimulus charge --
+        the mode charge among recordings in the last ``recent_days`` (relative to
+        the channel's NEWEST recording), ties → the larger charge. Recordings at
+        other charges are a different protocol (or saturating therapeutic stim)
+        and would corrupt the access-resistance trend.
+
+        Keying on the RECENT window, not the all-time mode: when the stim charge
+        is permanently changed (e.g. an electrode-test protocol replaced by a
+        higher therapeutic charge), the all-time mode stayed pinned to the OLD
+        protocol, so the trend froze on stale data and never showed recent files.
+        The recent window follows the protocol change. Rows are ordered
+        oldest→newest by the caller."""
+        def _pt(cd):
+            try:
+                return datetime.strptime(cd or "", "%Y_%m_%d__%H_%M_%S")
+            except (ValueError, TypeError):
+                return None
+        dated = [(_pt(r.get("chunk_datetime")), r) for r in rows]
+        valid = [d for d, _ in dated if d is not None]
+        if valid:
+            cutoff = max(valid) - timedelta(days=recent_days)
+            window = [r for d, r in dated if d is not None and d >= cutoff]
+        else:
+            window = rows
         counts: dict = {}
-        for r in rows:
+        for r in window:
             c = r.get("charge_nc")
             if c is not None:
                 counts[c] = counts.get(c, 0) + 1
