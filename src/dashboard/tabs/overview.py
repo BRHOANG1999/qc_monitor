@@ -3523,6 +3523,7 @@ def _build_zss_consistency_card(store, config=None):
         _impedance_span_note(channels),
         _zss_bar_figure(channels),
         _zss_trend_figure(channels, icfg),
+        _zss_example_block(store, channels, icfg),
     ])
     return _collapsible(title, body, open_default=False,
                         badge=f"{len(channels)} channels")
@@ -4603,6 +4604,164 @@ def _mark_ohmic_step(fig, t, m, tr, r_rev=None, r_off=None):
             line=dict(color=color, width=3),
             marker=dict(size=8, color=color),
             hovertemplate=f"{base} ΔV: %{{y:.3f}}<extra></extra>"))
+
+
+def _zss_example_block(store, channels: list[dict], icfg: dict):
+    """Optional (collapsed) 'how Z_ss is measured' worked example for the newest
+    active stimulated channel: the plateau arithmetic + an annotated trace with
+    the steady-state window shaded."""
+    if not channels:
+        return html.Div()
+    # Pick the channel with the LARGEST latest Z_ss (the clearest, least-
+    # saturated plateau) so the worked example is legible even when the current
+    # rig protocol saturates some channels.
+    ex = max(channels, key=lambda c: (c.get("latest") or 0))
+    animal, ch = ex["animal"], ex["channel"]
+    try:
+        row = store.latest_impedance_row(animal, ch)
+    except Exception:  # noqa: BLE001
+        row = None
+    if not row:
+        return html.Div()
+    wf = None
+    try:
+        for w in store.get_evoked_waveform_by_file(row["file_id"]):
+            if int(w.get("channel") or -1) == int(row["channel"]):
+                wf = w
+                break
+    except Exception:  # noqa: BLE001
+        wf = None
+    inner = html.Div([
+        _zss_example_steps(row),
+        (_zss_example_figure(wf, row) if wf else html.Div(
+            "Waveform unavailable for this recording.",
+            style={"color": "#888", "fontSize": "11px"})),
+    ])
+    when = (row.get("chunk_datetime") or "")[:16]
+    return _collapsible(
+        f"How Z_ss is measured — example: {animal} {ch} ({when})",
+        inner, open_default=False)
+
+
+def _zss_example_steps(row: dict):
+    """The transparent slow-phase steady-state arithmetic: settled plateau
+    voltage ÷ commanded slow current, gain-corrected."""
+    from src.utils.impedance import SLOW_SS_LO, SLOW_SS_HI
+
+    def _f(k):
+        v = row.get(k)
+        return None if v is None else float(v)
+    vraw, gain, i_slow, zss = (_f("slow_ss_raw"), _f("gain"),
+                               _f("i_neg_ua"), _f("slow_ss_kohm"))
+
+    def _mono(txt, color="#cfd0d6"):
+        return html.Div(txt, style={"fontFamily": "monospace",
+                                    "fontSize": "11px", "color": color,
+                                    "marginBottom": "3px"})
+    steps = [html.Div(
+        "Slow-phase steady-state impedance Z_ss = |V_ss| ÷ I_slow. V_ss is the "
+        "SETTLED plateau of the long slow (recharge) phase — the mean of the "
+        f"recorded trace over {SLOW_SS_LO * 100:.0f}–{SLOW_SS_HI * 100:.0f}% of "
+        "the slow phase, i.e. AFTER the reversal transient has died out (shaded "
+        "green below) and before the offset transient. Gain-corrected so it is "
+        "comparable between animals — a stim-consistency signal complementary "
+        "to Rₐ (Rₐ is the instantaneous ohmic STEP; Z_ss is the settled "
+        "PLATEAU):",
+        style={"color": "#a0a0b0", "fontSize": "11px", "marginBottom": "5px"})]
+    if vraw is not None and gain and i_slow:
+        vmv = abs(vraw) / gain * 1000.0
+        steps += [
+            _mono(f"V_ss (plateau mean) = {vraw:.4f} raw ÷ gain {gain:.0f} × "
+                  f"1000 = {vmv:.3f} mV", "#2ca089"),
+            _mono(f"I_slow (commanded) = {i_slow:.1f} µA", "#ff9f0a"),
+            html.Div(f"→ Z_ss = |V_ss| ÷ I_slow = {vmv:.3f} ÷ {i_slow:.1f} = "
+                     f"{zss:.3f} kΩ" if zss is not None else "→ Z_ss = n/a",
+                     style={"color": "#f0f0f5", "fontWeight": "600",
+                            "fontSize": "11px", "marginTop": "3px",
+                            "fontFamily": "monospace"})]
+    else:
+        steps.append(_mono(f"Z_ss = {zss:.3f} kΩ" if zss is not None
+                           else "Z_ss = n/a (inputs missing)", "#f0f0f5"))
+    steps.append(html.Div(
+        "Caveats: at 20 kHz the slow phase is still decaying, so this is a "
+        "settled-PLATEAU estimate — window-dependent absolute value, valid for "
+        "drift + like-for-like comparison. High-charge pulses saturate the "
+        "plateau (Z_ss ≪ Rₐ) and are excluded; only the dominant test-pulse "
+        "charge is tracked. The dotted grey line is the stim command I(t).",
+        style={"color": "#777", "fontSize": "10px", "marginTop": "5px"}))
+    return html.Div(steps, style={"padding": "4px 2px 8px"})
+
+
+def _zss_example_figure(wf: dict, row: dict):
+    """Annotated recorded trace with the slow-phase STEADY-STATE plateau window
+    shaded (the settled region after the reversal transient dies out) and V_ss
+    (its mean) drawn — the Z_ss measurement."""
+    from src.utils.impedance import (find_current_transitions, SLOW_SS_LO,
+                                     SLOW_SS_HI)
+    t = wf.get("time_axis_ms") or []
+    m = wf.get("mean_trace") or []
+    sm = wf.get("stim_mean_trace") or []
+    if not t or not m:
+        return html.Div()
+    pw_ms = (float(row.get("pulse_width_us") or 150.0)) / 1000.0
+    ratio = float(row.get("neg_ratio") or 3.0)
+    lo, hi = -0.3, max(1.0, pw_ms * (1.0 + ratio) + 0.2)
+    n = min(len(t), len(m))
+    xs = [t[i] for i in range(n) if lo <= t[i] <= hi]
+    ys = [m[i] for i in range(n) if lo <= t[i] <= hi]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", showlegend=False,
+                             line=dict(color="#cfd0d6", width=1.5),
+                             name="recorded (raw)"))
+    smw = [sm[i] for i in range(min(len(t), len(sm))) if lo <= t[i] <= hi]
+    if smw and ys:
+        span = max((abs(v) for v in ys), default=1.0) or 1.0
+        cspan = max((abs(v) for v in smw), default=1.0) or 1.0
+        scale = 0.5 * span / cspan
+        fig.add_trace(go.Scatter(
+            x=xs, y=[v * scale for v in smw], mode="lines",
+            line=dict(color="#8a8a99", width=1, dash="dot"),
+            name="commanded current I(t) — reference, scaled", hoverinfo="skip"))
+    tr = find_current_transitions(sm, t)
+    if tr is not None:
+        _onset, reversal, offset = tr
+        span_s = (offset - reversal) if (reversal is not None
+                                         and offset is not None) else 0
+        if span_s > 1:
+            a = reversal + int(span_s * SLOW_SS_LO)
+            b = max(a + 1, reversal + int(span_s * SLOW_SS_HI))
+            b = min(b, len(t) - 1, len(m) - 1)
+            if 0 <= a < b:
+                fig.add_vrect(x0=t[a], x1=t[b], line_width=0,
+                              fillcolor="rgba(46,160,137,0.18)",
+                              annotation_text="steady-state plateau "
+                              "(transients died out)",
+                              annotation_position="top left",
+                              annotation_font_size=9)
+                vss = row.get("slow_ss_raw")
+                if vss is None:
+                    win = [m[i] for i in range(a, b + 1)]
+                    vss = sum(win) / len(win) if win else None
+                if vss is not None:
+                    fig.add_trace(go.Scatter(
+                        x=[t[a], t[b]], y=[vss, vss], mode="lines",
+                        line=dict(color="#2ca089", width=3),
+                        name=f"V_ss = {vss:.4f} raw (plateau mean)"))
+            for idx, color, base in ((reversal, "#5e7ce2", "reversal transient"),
+                                     (offset, "#ff9f0a", "offset transient")):
+                if idx is not None and 0 <= idx < len(t):
+                    fig.add_vline(x=t[idx], line=dict(color=color, width=1,
+                                  dash="dot"), opacity=0.35)
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=240, margin=dict(l=40, r=10, t=16, b=30), showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                    x=0, font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
+        font=dict(color="#cfd0d6"),
+        xaxis=dict(title="ms from stimulus", gridcolor="#2a2a3a"),
+        yaxis=dict(title="raw", gridcolor="#2a2a3a"))
+    return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                     style={"padding": "4px 2px"})
 
 
 def _fidelity_example_block(store, channels: list[dict], sag_pct: float):
