@@ -136,6 +136,32 @@ def test_date_bounds_none_when_no_history(tmp_path):
     assert s.channel_trace_date_bounds(_ANIMAL, _CH) is None
 
 
+def test_recent_dominant_charge_follows_protocol_change(tmp_path):
+    """A protocol change: MANY old recordings at one charge (>30 days ago) +
+    FEWER recent ones at a new charge. The trace methods must follow the RECENT
+    charge (time-based), not the all-time mode -- the BCH111SR 2nC→10nC case
+    that froze the overlay + the weekly report on the dead protocol."""
+    from datetime import datetime, timedelta
+    s = _store(tmp_path)
+    now = datetime.now()
+    fid = 1
+    for k in range(12):                                   # 12 OLD 2nC, ~70d ago
+        dt = (now - timedelta(days=70 - k)).strftime("%Y_%m_%d__%H_%M_%S")
+        _rec(s, fid, dt, charge=2.0)
+        fid += 1
+    for k in range(4):                                    # 4 RECENT 10nC
+        dt = (now - timedelta(days=3, hours=-k)).strftime("%Y_%m_%d__%H_%M_%S")
+        _rec(s, fid, dt, charge=10.0)
+        fid += 1
+    # bounds follow the recent 10nC protocol (all-time mode 2nC would be ~70d ago)
+    lo, _hi = s.channel_trace_date_bounds(_ANIMAL, _CH)
+    assert lo > (now - timedelta(days=30)).strftime("%Y_%m_%d__%H_%M_%S")
+    # in-range over the last week returns the 4 recent 10nC (0 under the old bug)
+    start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    end = now.strftime("%Y-%m-%d")
+    assert len(s.channel_traces_in_range(_ANIMAL, _CH, start, end)) == 4
+
+
 def test_bounds_respect_dominant_charge(tmp_path):
     """Bounds come from the dominant-charge series only, matching the traces
     the overlay actually draws."""

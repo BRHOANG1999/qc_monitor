@@ -2335,23 +2335,37 @@ class Store:
 
     @staticmethod
     def _recent_dominant_charge(conn, animal_id: str, channel_name: str,
-                               recent_window: int = 60):
-        """The mode stimulus charge among the channel's most-recent
-        ``recent_window`` valid recordings, ties → the larger charge. Keying on
-        the RECENT window (not the all-time mode) means the stim-artifact overlay
-        FOLLOWS a protocol change instead of freezing on the old test protocol --
-        the same fix as ``_dominant_charge_only`` for the drift series. Returns
-        None when the channel has no valid-access-resistance history."""
-        recent = conn.execute(
-            """SELECT ci.charge_nc FROM channel_impedance ci
+                               recent_days: int = 30):
+        """The mode stimulus charge among the channel's recordings in the last
+        ``recent_days`` (relative to its NEWEST recording), ties → the larger
+        charge. TIME-based (not a recording COUNT) so a protocol change is
+        followed even when the new protocol has FEWER recordings than the old --
+        the same rule as ``_dominant_charge_only`` for the drift series. Keying
+        on the all-time mode instead froze the stim-artifact overlays + the
+        weekly report's traces on the old test protocol (e.g. BCH111SR stuck on
+        the 2 nC July test after the rig moved to 10 nC). None when the channel
+        has no valid-access-resistance history."""
+        rows = conn.execute(
+            """SELECT ci.charge_nc, pf.chunk_datetime FROM channel_impedance ci
                JOIN processed_files pf ON pf.id = ci.file_id
                WHERE ci.animal_id = ? AND ci.channel_name = ?
-                 AND ci.access_r_kohm IS NOT NULL
-               ORDER BY pf.chunk_datetime DESC LIMIT ?""",
-            (animal_id, channel_name, int(recent_window))).fetchall()
+                 AND ci.access_r_kohm IS NOT NULL""",
+            (animal_id, channel_name)).fetchall()
+
+        def _pt(cd):
+            try:
+                return datetime.strptime(cd or "", "%Y_%m_%d__%H_%M_%S")
+            except (ValueError, TypeError):
+                return None
+        dated = [(_pt(r["chunk_datetime"]), r["charge_nc"]) for r in rows]
+        valid = [d for d, _ in dated if d is not None]
+        if valid:
+            cutoff = max(valid) - timedelta(days=recent_days)
+            window = [c for d, c in dated if d is not None and d >= cutoff]
+        else:
+            window = [c for _, c in dated]
         counts: dict = {}
-        for r in recent:
-            c = r["charge_nc"]
+        for c in window:
             if c is not None:
                 counts[c] = counts.get(c, 0) + 1
         if not counts:
@@ -2437,13 +2451,8 @@ class Store:
         assert animal_id and channel_name, "animal_id and channel_name required"
         conn = self._connect()
         try:
-            crow = conn.execute(
-                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
-                   WHERE animal_id = ? AND channel_name = ?
-                     AND access_r_kohm IS NOT NULL
-                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
-                   LIMIT 1""", (animal_id, channel_name)).fetchone()
-            if not crow:
+            charge = self._recent_dominant_charge(conn, animal_id, channel_name)
+            if charge is None:
                 return None
             row = conn.execute(
                 """SELECT MIN(pf.chunk_datetime) lo, MAX(pf.chunk_datetime) hi
@@ -2454,7 +2463,7 @@ class Store:
                    WHERE ci.animal_id = ? AND ci.channel_name = ?
                      AND ci.access_r_kohm IS NOT NULL
                      AND ci.charge_nc IS ?""",
-                (animal_id, channel_name, crow["charge_nc"])).fetchone()
+                (animal_id, channel_name, charge)).fetchone()
         finally:
             conn.close()
         if not row or not row["lo"] or not row["hi"]:
@@ -2497,13 +2506,8 @@ class Store:
         hi = f"{end_date.replace('-', '_')}__~"
         conn = self._connect()
         try:
-            crow = conn.execute(
-                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
-                   WHERE animal_id = ? AND channel_name = ?
-                     AND access_r_kohm IS NOT NULL
-                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
-                   LIMIT 1""", (animal_id, channel_name)).fetchone()
-            if not crow:
+            charge = self._recent_dominant_charge(conn, animal_id, channel_name)
+            if charge is None:
                 return []
             rows = conn.execute(
                 """SELECT pf.chunk_datetime, ew.file_id, ew.time_axis_ms,
@@ -2517,7 +2521,7 @@ class Store:
                      AND ci.charge_nc IS ?
                      AND pf.chunk_datetime >= ? AND pf.chunk_datetime <= ?
                    ORDER BY pf.chunk_datetime ASC LIMIT ?""",
-                (animal_id, channel_name, crow["charge_nc"], lo, hi,
+                (animal_id, channel_name, charge, lo, hi,
                  int(max_traces))).fetchall()
         finally:
             conn.close()
