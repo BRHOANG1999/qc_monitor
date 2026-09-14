@@ -366,10 +366,14 @@ notifications:
     evoked_window_ms: [2, 50]     # evoked-response window (correlation y)
   # Daily stimulus-stability digest: the SAME figures as the weekly one, sent
   # every morning, covering YESTERDAY's per-file (per-hour) stim-artifact +
-  # evoked overlays PLUS a running 7-day week ending yesterday. EMAIL-ONLY (no
-  # Drive/Sheet, to keep the daily cadence light). Rendering params (windows,
-  # perfile_span, thresholds, exclude) inherit stim_stability_weekly above; set
-  # enabled/hour/recipients here.
+  # evoked overlays PLUS a running 7-day week ending yesterday. ALL figures are
+  # archived to Google Drive under a "Daily/<date>" folder (uses
+  # google_drive.folder_id); it does NOT write the per-week Stim Stability Sheet.
+  # Rendering params (windows, perfile_span, thresholds, exclude) inherit
+  # stim_stability_weekly above; set enabled/hour/recipients here.
+  # NOTE: Drive upload needs a valid OAuth token -- re-authorize with
+  #   python -m src.utils.drive_upload --authorize
+  # (the token expired 2026-09; figures still email if Drive is down).
   stim_stability_daily:
     enabled: true
     hour: 8

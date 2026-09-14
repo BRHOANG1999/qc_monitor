@@ -415,7 +415,8 @@ def _email_html(today, span, results, folder_link, sheet_id, dropped=0,
                 label="weekly", daily=False) -> str:
     intro = escape(_SUMMARY) + (
         " <b>This daily digest covers the previous full day's per-recording "
-        "figures (attached) plus a running 7-day week.</b>" if daily else "")
+        "figures (attached + archived to Drive) plus a running 7-day week.</b>"
+        if daily else "")
     parts = [
         '<html><body style="font-family:-apple-system,sans-serif;color:#1a1a2e">',
         f'<h2>{label.capitalize()} stimulus stability — {span} '
@@ -468,7 +469,7 @@ def _email_html(today, span, results, folder_link, sheet_id, dropped=0,
         parts.append(f'<p><a href="https://docs.google.com/spreadsheets/d/'
                      f'{sheet_id}">Open the Stim Stability sheet</a></p>')
     if folder_link:
-        parts.append(f'<p><a href="{folder_link}">Open this week\'s Drive '
+        parts.append(f'<p><a href="{folder_link}">Open the Drive '
                      'folder (all figures)</a></p>')
     if dropped:
         parts.append(f'<p style="color:#6c6c80"><small>{dropped} more per-file/'
@@ -529,11 +530,11 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
         return {"sent": False, "reason": "no recipients"}
 
     # Daily inherits the weekly section's rendering params (same figures); its
-    # own keys override. Daily is email-only: no Drive folder, no sheet write.
+    # own keys override. Daily figures ARE archived to Drive (into a Daily/<date>
+    # subfolder), but daily does NOT write the per-week Sheet.
     p = _resolve_params({**weekly_cfg, **cfg} if daily else cfg, config)
     if daily:
         p.write_sheet = False
-        p.folder_id = ""
     label = "daily" if daily else "weekly"
     start_date, end_date, week = _week_span(today)
     span_label = end_date if daily else week
@@ -547,7 +548,14 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
         try:
             drive = _drive.drive_from_config(p.drive_auth, sa_path=p.sa_path,
                                              token_file=p.token_file)
-            week_folder = _drive.ensure_folder(drive, week, p.folder_id)
+            if daily:
+                # Nest daily figures under a "Daily" parent so per-date folders
+                # don't clutter the top-level folder alongside the weekly ones.
+                parent = _drive.ensure_folder(drive, "Daily", p.folder_id)
+                week_folder = _drive.ensure_folder(
+                    drive, span_label, parent["id"])
+            else:
+                week_folder = _drive.ensure_folder(drive, week, p.folder_id)
         except Exception as e:                            # noqa: BLE001
             logger.warning("Drive unavailable (%s), emailing figures only: %s",
                            p.drive_auth, e)

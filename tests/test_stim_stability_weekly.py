@@ -173,9 +173,9 @@ def test_dry_run_renders_no_side_effects(monkeypatch, tmp_path):
     assert any("correlation" in p for p in pngs)
 
 
-def test_daily_period_is_email_only_and_labelled(monkeypatch, tmp_path):
+def test_daily_period_labelled_and_no_sheet(monkeypatch, tmp_path):
     """The daily digest: same figures, reads stim_stability_daily, labels itself
-    'daily', and is EMAIL-ONLY (no Drive/Sheet)."""
+    'daily', archives figures to Drive, but does NOT write the per-week Sheet."""
     cap = _patch_backends(monkeypatch)
     store, emailer = FakeStore(), FakeEmailer()
     cfg = _config()
@@ -184,7 +184,7 @@ def test_daily_period_is_email_only_and_labelled(monkeypatch, tmp_path):
     res = m.send_stim_stability_weekly(date(2026, 8, 29), cfg, store, emailer,
                                        out_dir=str(tmp_path), period="daily")
     assert res["sent"] is True and res["channels"] == 1
-    assert "rows" not in cap                       # email-only: no sheet upsert
+    assert "rows" not in cap                       # daily: no per-week Sheet
     call = emailer.calls[0]
     assert "daily" in call["subject"].lower()
     assert "2026-08-29" in call["subject"]         # the report (yesterday) date
