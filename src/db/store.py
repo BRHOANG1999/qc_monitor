@@ -2333,24 +2333,45 @@ class Store:
         best = max(counts, key=lambda c: (counts[c], c))
         return [r for r in rows if r.get("charge_nc") == best]
 
+    @staticmethod
+    def _recent_dominant_charge(conn, animal_id: str, channel_name: str,
+                               recent_window: int = 60):
+        """The mode stimulus charge among the channel's most-recent
+        ``recent_window`` valid recordings, ties → the larger charge. Keying on
+        the RECENT window (not the all-time mode) means the stim-artifact overlay
+        FOLLOWS a protocol change instead of freezing on the old test protocol --
+        the same fix as ``_dominant_charge_only`` for the drift series. Returns
+        None when the channel has no valid-access-resistance history."""
+        recent = conn.execute(
+            """SELECT ci.charge_nc FROM channel_impedance ci
+               JOIN processed_files pf ON pf.id = ci.file_id
+               WHERE ci.animal_id = ? AND ci.channel_name = ?
+                 AND ci.access_r_kohm IS NOT NULL
+               ORDER BY pf.chunk_datetime DESC LIMIT ?""",
+            (animal_id, channel_name, int(recent_window))).fetchall()
+        counts: dict = {}
+        for r in recent:
+            c = r["charge_nc"]
+            if c is not None:
+                counts[c] = counts.get(c, 0) + 1
+        if not counts:
+            return None
+        return max(counts, key=lambda c: (counts[c], c))
+
     def recent_channel_traces(self, animal_id: str, channel_name: str,
                               limit: int = 24) -> list[dict]:
         """Recent recorded stim-artifact traces for one channel, newest first,
-        restricted to the channel's DOMINANT stimulus charge (the consistent
-        test protocol) and to recordings with a valid access resistance.
+        restricted to the channel's RECENT dominant stimulus charge (the current
+        test/therapeutic protocol) and to recordings with a valid access
+        resistance.
 
         Each dict: ``{chunk_datetime, time_ms, mean_trace}``. Used by the
         (lazy-loaded) stim-artifact overlay so the reviewer can see how the
-        pulse response changes alongside the Rₐ trend."""
+        pulse response changes alongside the Rₐ / Z_ss trend."""
         conn = self._connect()
         try:
-            crow = conn.execute(
-                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
-                   WHERE animal_id = ? AND channel_name = ?
-                     AND access_r_kohm IS NOT NULL
-                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
-                   LIMIT 1""", (animal_id, channel_name)).fetchone()
-            if not crow:
+            charge = self._recent_dominant_charge(conn, animal_id, channel_name)
+            if charge is None:
                 return []
             rows = conn.execute(
                 """SELECT pf.chunk_datetime, ew.time_axis_ms, ew.mean_trace
@@ -2362,8 +2383,7 @@ class Store:
                      AND ci.access_r_kohm IS NOT NULL
                      AND ci.charge_nc IS ?
                    ORDER BY pf.chunk_datetime DESC LIMIT ?""",
-                (animal_id, channel_name, crow["charge_nc"],
-                 int(limit))).fetchall()
+                (animal_id, channel_name, charge, int(limit))).fetchall()
         finally:
             conn.close()
         return self._decode_channel_trace_rows(rows)
@@ -2389,13 +2409,8 @@ class Store:
         hi = f"{end_date.replace('-', '_')}__~"
         conn = self._connect()
         try:
-            crow = conn.execute(
-                """SELECT charge_nc, COUNT(*) n FROM channel_impedance
-                   WHERE animal_id = ? AND channel_name = ?
-                     AND access_r_kohm IS NOT NULL
-                   GROUP BY charge_nc ORDER BY n DESC, charge_nc DESC
-                   LIMIT 1""", (animal_id, channel_name)).fetchone()
-            if not crow:
+            charge = self._recent_dominant_charge(conn, animal_id, channel_name)
+            if charge is None:
                 return []
             rows = conn.execute(
                 """SELECT pf.chunk_datetime, ew.time_axis_ms, ew.mean_trace
@@ -2408,7 +2423,7 @@ class Store:
                      AND ci.charge_nc IS ?
                      AND pf.chunk_datetime >= ? AND pf.chunk_datetime <= ?
                    ORDER BY pf.chunk_datetime DESC LIMIT ?""",
-                (animal_id, channel_name, crow["charge_nc"], lo, hi,
+                (animal_id, channel_name, charge, lo, hi,
                  int(max_traces))).fetchall()
         finally:
             conn.close()

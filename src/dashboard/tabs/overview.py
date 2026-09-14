@@ -3523,6 +3523,7 @@ def _build_zss_consistency_card(store, config=None):
         _impedance_span_note(channels),
         _zss_bar_figure(channels),
         _zss_trend_figure(channels, icfg),
+        _zss_artifact_overlay(store, channels),
         _zss_example_block(store, channels, icfg),
     ])
     return _collapsible(title, body, open_default=False,
@@ -4762,6 +4763,88 @@ def _zss_example_figure(wf: dict, row: dict):
         yaxis=dict(title="raw", gridcolor="#2a2a3a"))
     return dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
                      style={"padding": "4px 2px"})
+
+
+def _zss_artifact_overlay(store, channels: list[dict]):
+    """Recent stim-artifact traces for the clearest Z_ss channel, overlaid
+    old→new with the Z_ss plateau window shaded -- so a real plateau shift (a
+    genuine Z_ss change) vs saturation noise is visible right behind the trend.
+    Collapsed; loads a handful of traces."""
+    if not channels:
+        return html.Div()
+    from plotly.colors import sample_colorscale
+    from src.utils.impedance import (find_current_transitions, SLOW_SS_LO,
+                                     SLOW_SS_HI)
+    ex = max(channels, key=lambda c: (c.get("latest") or 0))
+    animal, ch = ex["animal"], ex["channel"]
+    try:
+        traces = store.recent_channel_traces(animal, ch, limit=8)
+    except Exception:  # noqa: BLE001
+        traces = []
+    if len(traces) < 2:
+        return html.Div()
+    # Plateau window from the newest recording's transitions (one waveform).
+    plateau = None
+    try:
+        row = store.latest_impedance_row(animal, ch)
+        wf = None
+        if row:
+            for w in store.get_evoked_waveform_by_file(row["file_id"]):
+                if (w.get("channel_name") or "") == ch:
+                    wf = w
+                    break
+        if wf:
+            tm = wf.get("time_axis_ms") or []
+            tr = find_current_transitions(wf.get("stim_mean_trace") or [], tm)
+            if tr is not None:
+                _o, rev, off = tr
+                span = (off - rev) if (rev is not None
+                                       and off is not None) else 0
+                if span > 1:
+                    a = rev + int(span * SLOW_SS_LO)
+                    b = min(rev + int(span * SLOW_SS_HI), len(tm) - 1)
+                    if 0 <= a < b:
+                        plateau = (tm[a], tm[b])
+    except Exception:  # noqa: BLE001
+        plateau = None
+    traces = list(reversed(traces))               # old -> new for the colour ramp
+    n = len(traces)
+    colors = sample_colorscale("Viridis",
+                               [i / max(1, n - 1) for i in range(n)])
+    lo, hi = -0.3, 0.8
+    fig = go.Figure()
+    for i, t in enumerate(traces):
+        tm = t.get("time_ms") or []
+        mt = t.get("mean_trace") or []
+        k = min(len(tm), len(mt))
+        xs = [tm[j] for j in range(k) if lo <= tm[j] <= hi]
+        ys = [mt[j] for j in range(k) if lo <= tm[j] <= hi]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", showlegend=False,
+                                 line=dict(color=colors[i], width=1),
+                                 opacity=0.85, hoverinfo="skip"))
+    if plateau:
+        fig.add_vrect(x0=plateau[0], x1=plateau[1], line_width=0,
+                      fillcolor="rgba(46,160,137,0.15)",
+                      annotation_text="Z_ss plateau", annotation_font_size=9,
+                      annotation_position="top left")
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=240, margin=dict(l=40, r=10, t=16, b=30), showlegend=False,
+        font=dict(color="#cfd0d6"),
+        xaxis=dict(title="ms from stimulus", gridcolor="#2a2a3a"),
+        yaxis=dict(title="raw", gridcolor="#2a2a3a"))
+    body = html.Div([
+        html.Div(f"{animal} {ch} — last {n} recordings (dark = older → bright = "
+                 "newer). A real Z_ss change shows as a SHIFTING plateau in the "
+                 "green window; saturation shows as a plateau crushed to ~0 "
+                 "while the fast/reversal edges clip.",
+                 style={"color": "#a0a0b0", "fontSize": "11px",
+                        "marginBottom": "4px"}),
+        dcc.Graph(figure=fig, config=_IMPEDANCE_GRAPH_CONFIG,
+                  style={"padding": "4px 2px"}),
+    ])
+    return _collapsible("Stim artifacts behind the Z_ss trend", body,
+                        open_default=False)
 
 
 def _fidelity_example_block(store, channels: list[dict], sag_pct: float):
