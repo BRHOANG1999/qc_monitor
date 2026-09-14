@@ -411,11 +411,16 @@ _CAPTIONS = {
 }
 
 
-def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
+def _email_html(today, span, results, folder_link, sheet_id, dropped=0,
+                label="weekly", daily=False) -> str:
+    intro = escape(_SUMMARY) + (
+        " <b>This daily digest covers the previous full day's per-recording "
+        "figures (attached) plus a running 7-day week.</b>" if daily else "")
     parts = [
         '<html><body style="font-family:-apple-system,sans-serif;color:#1a1a2e">',
-        f'<h2>Weekly stimulus stability — {week} ({today.isoformat()})</h2>',
-        f'<p style="color:#333;max-width:72ch">{escape(_SUMMARY)}</p>',
+        f'<h2>{label.capitalize()} stimulus stability — {span} '
+        f'({today.isoformat()})</h2>',
+        f'<p style="color:#333;max-width:72ch">{intro}</p>',
         '<p style="border-left:3px solid #ff9f0a;padding:6px 10px;'
         f'background:#fff8ec;color:#7a5b00;max-width:72ch">{escape(_BATTERY_TIP)}'
         '</p>',
@@ -470,13 +475,14 @@ def _email_html(today, week, results, folder_link, sheet_id, dropped=0) -> str:
                      'daily figure(s) omitted to keep this email small — see the '
                      'Drive folder for the full set.</small></p>')
     parts.append('<hr><small style="color:#6c6c80">QC Monitor stimulus-stability '
-                 'weekly. Edit config.yaml → notifications.stim_stability_weekly.'
+                 f'{label}. Edit config.yaml → notifications.stim_stability_{label}.'
                  '</small></body></html>')
     return "".join(parts)
 
 
-def _email_text(today, week, results) -> str:
-    lines = [f"Weekly stimulus stability -- {week} ({today.isoformat()})", "",
+def _email_text(today, span, results, label="weekly") -> str:
+    lines = [f"{label.capitalize()} stimulus stability -- {span} "
+             f"({today.isoformat()})", "",
              _SUMMARY, "", _BATTERY_TIP, "",
              f"{len(results)} stimulated channel(s):"]
     for r in results:
@@ -493,24 +499,44 @@ def _email_text(today, week, results) -> str:
 
 def send_stim_stability_weekly(today: date, config: dict, store: Store,
                                emailer: EmailAlerter, *, dry_run: bool = False,
-                               out_dir: str | None = None) -> dict:
-    """Build and dispatch the weekly stimulus-stability report. *dry_run* renders
-    PNGs into *out_dir* (or a temp dir) and returns the would-be rows/summary
-    WITHOUT uploading to Drive, writing the sheet, or emailing."""
+                               out_dir: str | None = None,
+                               period: str = "weekly") -> dict:
+    """Build and dispatch the stimulus-stability report.
+
+    *period* ``'weekly'`` (default) or ``'daily'``: the daily digest renders the
+    SAME figures but reads the ``stim_stability_daily`` config, is EMAIL-ONLY (no
+    Drive/Sheet, to keep the daily cadence light), and labels itself 'daily'. The
+    caller passes YESTERDAY as *today* so it covers the previous full day's
+    per-file (per-hour) figures + the running 7-day week ending then.
+
+    *dry_run* renders PNGs into *out_dir* (or a temp dir) and returns the
+    would-be rows/summary WITHOUT uploading to Drive, writing the sheet, or
+    emailing."""
     assert isinstance(today, date), "today must be a date"
     assert isinstance(config, dict), "config must be a dict"
-    cfg = (config.get("notifications", {}) or {}).get(
-        "stim_stability_weekly", {}) or {}
+    assert period in ("weekly", "daily"), "period must be weekly|daily"
+    daily = (period == "daily")
+    notif = (config.get("notifications", {}) or {})
+    weekly_cfg = notif.get("stim_stability_weekly", {}) or {}
+    cfg = (notif.get("stim_stability_daily", {}) or {}) if daily else weekly_cfg
     if not dry_run and not cfg.get("enabled", False):
         return {"sent": False, "reason": "disabled"}
     recipients = list(cfg.get("recipients")
+                      or (weekly_cfg.get("recipients") if daily else None)
                       or ((config.get("alerting", {}) or {}).get("smtp", {})
                           .get("recipients", []) or []))
     if not dry_run and not recipients:
         return {"sent": False, "reason": "no recipients"}
 
-    p = _resolve_params(cfg, config)
+    # Daily inherits the weekly section's rendering params (same figures); its
+    # own keys override. Daily is email-only: no Drive folder, no sheet write.
+    p = _resolve_params({**weekly_cfg, **cfg} if daily else cfg, config)
+    if daily:
+        p.write_sheet = False
+        p.folder_id = ""
+    label = "daily" if daily else "weekly"
     start_date, end_date, week = _week_span(today)
+    span_label = end_date if daily else week
     channels = [c for c in sorted(store.active_impedance_channel_keys())
                 if not _excluded(c[0], p.exclude)]
     imp_series = store.impedance_series_by_channel(exclude=p.exclude)
@@ -561,11 +587,12 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
     if not dry_run and recipients and results:
         inline, files, dropped = _email_pngs(results, _EMAIL_ATTACH_CAP)
         sent = bool(emailer.send(
-            subject=f"QC weekly stim stability -- {week} "
+            subject=f"QC {label} stim stability -- {span_label} "
                     f"({len(results)} channel{'s' if len(results) != 1 else ''})",
-            body=_email_text(today, week, results),
-            body_html=_email_html(today, week, results, folder_link, p.sheet_id,
-                                  dropped=dropped),
+            body=_email_text(today, span_label, results, label),
+            body_html=_email_html(today, span_label, results, folder_link,
+                                  p.sheet_id, dropped=dropped, label=label,
+                                  daily=daily),
             recipients=recipients, subject_prefix=False,
             attachments=inline, file_attachments=files))
 

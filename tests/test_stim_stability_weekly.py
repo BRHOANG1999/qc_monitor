@@ -173,6 +173,33 @@ def test_dry_run_renders_no_side_effects(monkeypatch, tmp_path):
     assert any("correlation" in p for p in pngs)
 
 
+def test_daily_period_is_email_only_and_labelled(monkeypatch, tmp_path):
+    """The daily digest: same figures, reads stim_stability_daily, labels itself
+    'daily', and is EMAIL-ONLY (no Drive/Sheet)."""
+    cap = _patch_backends(monkeypatch)
+    store, emailer = FakeStore(), FakeEmailer()
+    cfg = _config()
+    cfg["notifications"]["stim_stability_daily"] = {
+        "enabled": True, "hour": 8, "recipients": ["lab@x.z"]}
+    res = m.send_stim_stability_weekly(date(2026, 8, 29), cfg, store, emailer,
+                                       out_dir=str(tmp_path), period="daily")
+    assert res["sent"] is True and res["channels"] == 1
+    assert "rows" not in cap                       # email-only: no sheet upsert
+    call = emailer.calls[0]
+    assert "daily" in call["subject"].lower()
+    assert "2026-08-29" in call["subject"]         # the report (yesterday) date
+    assert "daily" in (call.get("body_html") or "").lower()
+    assert call.get("file_attachments")            # the per-file (per-hour) figs
+
+
+def test_daily_disabled_when_section_missing(monkeypatch, tmp_path):
+    _patch_backends(monkeypatch)
+    # weekly enabled but no stim_stability_daily section -> daily is disabled
+    res = m.send_stim_stability_weekly(date(2026, 8, 29), _config(), FakeStore(),
+                                       FakeEmailer(), period="daily")
+    assert res == {"sent": False, "reason": "disabled"}
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from threading import Lock
 
 from src.alerting.email_alert import EmailAlerter
@@ -58,6 +58,7 @@ class NotificationState:
     review_weekly: str = ""
     coverage: str = ""
     stim_stability_weekly: str = ""
+    stim_stability_daily: str = ""
     queue_stuck: bool = False
 
 
@@ -128,6 +129,8 @@ class DigestScheduler:
                 coverage=str(raw.get("coverage") or ""),
                 stim_stability_weekly=str(
                     raw.get("stim_stability_weekly") or ""),
+                stim_stability_daily=str(
+                    raw.get("stim_stability_daily") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
             )
         except (FileNotFoundError, json.JSONDecodeError):
@@ -213,6 +216,7 @@ class DigestScheduler:
             self._tick_video_weekly(now, fired)
             self._tick_evoked_weekly(now, fired)
             self._tick_stim_stability_weekly(now, fired)
+            self._tick_stim_stability_daily(now, fired)
             self._tick_review_weekly(now, fired)
             self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
@@ -379,6 +383,38 @@ class DigestScheduler:
         self._state.stim_stability_weekly = now.date().isoformat()
         fired["stim_stability_weekly"] = bool(result.get("sent"))
         logger.info("Stim-stability weekly result: %s", result)
+
+    def _tick_stim_stability_daily(self, now: datetime, fired: dict) -> None:
+        """Daily stim-stability digest: the SAME figures as the weekly one but
+        sent every morning, covering the PREVIOUS full day's per-file figures +
+        a running 7-day week ending yesterday (email-only)."""
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("stim_stability_daily", {}) or {}
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        hour = int(cfg.get("hour", 8))
+        if not self._due_daily(now, hour, self._state.stim_stability_daily):
+            return
+        if not self._claim("stim_stability_daily", now):
+            self._state.stim_stability_daily = now.date().isoformat()
+            return
+        logger.info("Stim-stability daily fire: %s %02d:%02d",
+                    now.date().isoformat(), now.hour, now.minute)
+        from src.notifications.stim_stability_weekly import (
+            send_stim_stability_weekly)
+        report_date = now.date() - timedelta(days=1)      # cover YESTERDAY
+        try:
+            result = send_stim_stability_weekly(
+                report_date, self._config, self._store, self._emailer,
+                period="daily")
+        except Exception as e:
+            logger.error("Stim-stability daily send raised: %s", e,
+                         exc_info=True)
+            self._release("stim_stability_daily", now)
+            return
+        self._state.stim_stability_daily = now.date().isoformat()
+        fired["stim_stability_daily"] = bool(result.get("sent"))
+        logger.info("Stim-stability daily result: %s", result)
 
     def _tick_review_weekly(self, now: datetime, fired: dict) -> None:
         cfg = ((self._config.get("review_queue", {}) or {})
