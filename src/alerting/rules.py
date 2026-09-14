@@ -75,6 +75,12 @@ class AlertRuleEngine:
         # a saturating therapeutic protocol can't false-alarm the Z_ss drift.
         self.impedance_ss_saturation_ratio = float(
             rules_cfg.get("impedance_ss_saturation_ratio", 0.3))
+        # If more than this fraction of a channel's Z_ss measurements are
+        # saturated, the whole channel is on a saturating (high-charge) protocol
+        # -> Z_ss is unreliable noise around ~0 and its rolling-median drift is
+        # meaningless, so skip the channel entirely (don't just drop rows).
+        self.impedance_ss_max_saturated_frac = float(
+            rules_cfg.get("impedance_ss_max_saturated_frac", 0.3))
         # Attach the Rₐ / Z_ss trend figure to the drift-alert emails so a
         # recipient can see the trend instead of guessing from a bare percentage.
         self.impedance_alert_figures = bool(
@@ -190,21 +196,32 @@ class AlertRuleEngine:
             <= self.impedance_staleness_days * 86400
 
     def _valid_zss_values(self, rows) -> list:
-        """``slow_ss_kohm`` per row with SATURATED rows dropped: at high stim
-        charge the amp saturates and the slow-phase plateau collapses to
-        ``Z_ss << Rₐ``. A row is saturated when ``slow_ss_kohm`` falls below
-        ``impedance_ss_saturation_ratio`` of ``access_r_kohm``. Order preserved so
-        the rolling-median drift is over the VALID measurements only."""
-        out = []
+        """``slow_ss_kohm`` per row with SATURATED rows dropped (see
+        ``_zss_valid_and_saturation``). Order preserved so the rolling-median
+        drift is over the VALID measurements only."""
+        return self._zss_valid_and_saturation(rows)[0]
+
+    def _zss_valid_and_saturation(self, rows):
+        """``(valid_values_in_order, saturated_fraction)``. At high stim charge
+        the amp saturates and the slow-phase plateau collapses to ``Z_ss << Rₐ``;
+        a row is saturated when ``slow_ss_kohm`` falls below
+        ``impedance_ss_saturation_ratio`` of ``access_r_kohm``. The fraction is
+        over rows that HAVE a Z_ss, so a channel dominated by saturated rows can
+        be skipped wholesale rather than drifting on the few noisy survivors."""
+        considered = saturated = 0
+        valid = []
         for r in rows:
             z = r.get("slow_ss_kohm")
             ra = r.get("access_r_kohm")
             if z is None:
                 continue
+            considered += 1
             if ra and ra > 0 and z < self.impedance_ss_saturation_ratio * ra:
-                continue                      # saturated -> invalid
-            out.append(z)
-        return out
+                saturated += 1
+            else:
+                valid.append(z)
+        frac = (saturated / considered) if considered else 0.0
+        return valid, frac
 
     @staticmethod
     def _drift_signature(flags, severity: str) -> str:
@@ -318,13 +335,19 @@ class AlertRuleEngine:
     def _impedance_ss_flags(self, series: dict) -> list:
         """Every (animal, channel, drift_stat) whose slow-phase steady-state
         impedance is past the warn pct. Stale series are skipped; saturated Z_ss
-        rows (plateau collapsed at high charge) are dropped before the drift."""
+        rows (plateau collapsed at high charge) are dropped; and a channel whose
+        Z_ss is MOSTLY saturated (a high-charge protocol) is skipped entirely --
+        its Z_ss is unreliable noise around ~0, so a rolling-median drift on the
+        few rows that bounce above the saturation floor is meaningless (the
+        BCH111SR-at-10nC false alarm)."""
         flags = []
         for (animal, ch), rows in (series or {}).items():
             if not self._series_fresh(rows):
                 continue
-            st = _drift_stat(self._valid_zss_values(rows),
-                             self.impedance_baseline_window,
+            valid, sat_frac = self._zss_valid_and_saturation(rows)
+            if sat_frac > self.impedance_ss_max_saturated_frac:
+                continue                 # saturating protocol -> Z_ss unreliable
+            st = _drift_stat(valid, self.impedance_baseline_window,
                              self.impedance_min_history)
             if st and abs(st["drift_pct"]) >= self.impedance_ss_shift_pct:
                 flags.append((animal, ch, st))

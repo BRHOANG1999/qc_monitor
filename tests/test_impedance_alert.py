@@ -343,6 +343,20 @@ def test_zss_saturated_rows_dropped():
     assert store.inserted == []
 
 
+def test_zss_channel_skipped_when_mostly_saturated():
+    # The BCH111SR-at-10nC case: most Z_ss rows are saturated (≪ 0.3·Rₐ) with a
+    # few noisy bounces above the floor. The surviving rows "drift" hugely, but
+    # the channel is mostly saturated -> skip it entirely (no alert).
+    n = 10
+    zs = [0.01, 0.01, 0.15, 0.01, 0.01, 0.21, 0.01, 0.01, 0.01, 0.30]  # 7/10 sat
+    rows = [{"file_id": i, "chunk_datetime": _ts(n - i),
+             "slow_ss_kohm": z, "access_r_kohm": 0.30}   # floor = 0.3·0.3 = 0.09
+            for i, z in enumerate(zs, start=1)]
+    eng, store = _engine({("BCH111", "BCH111SR"): rows})
+    eng.check_impedance_ss_shift()
+    assert store.inserted == []
+
+
 def test_zss_fires_when_not_saturated_with_ra():
     # Z_ss > 0.3*Ra (not saturated) and drifting -> fires normally.
     n = 4

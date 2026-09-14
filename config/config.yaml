@@ -195,6 +195,11 @@ alerting:
     # slow_ss_kohm < this fraction of access_r_kohm, so a saturating therapeutic
     # protocol can't false-alarm the Z_ss drift.
     impedance_ss_saturation_ratio: 0.3
+    # If more than this fraction of a channel's Z_ss measurements are saturated,
+    # the whole channel is on a saturating (high-charge) protocol -> Z_ss is
+    # noise around ~0 and its drift is meaningless, so skip the channel entirely
+    # (not just the individual rows). Stops the BCH111SR-at-10nC false alarm.
+    impedance_ss_max_saturated_frac: 0.3
     # Attach the Ra / Z_ss trend figure to the drift-alert emails so a recipient
     # sees the trend instead of a bare percentage. false -> text-only emails.
     impedance_alert_figures: true
