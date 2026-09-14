@@ -95,26 +95,35 @@ def plot_day_overlay(file_traces, daily_traces, title: str, out_png: str,
 
 def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
                     ylabel: str = "amplitude", color: str = _ACCENT,
-                    sem=None) -> str | None:
-    """Average waveform (amplitude vs ms) -> PNG, with a shaded mean +/- SEM band
-    when *sem* is given. Returns the path, or None when there's nothing
-    plottable. Used for the LFP evoked-response figures at each time window."""
+                    sem=None, overlay=None) -> str | None:
+    """Average waveform (amplitude vs ms) -> PNG. *sem* shades a mean +/- SEM
+    band; *overlay* is a list of the individual constituent traces (each on the
+    same time grid) drawn thin + transparent UNDER the bold mean, so the spread
+    of the recordings that make up the average is visible. Returns the path, or
+    None when there's nothing plottable."""
     assert out_png, "out_png required"
     if time_ms is None or y is None or len(time_ms) != len(y) or len(y) < 3:
         return None
     fig, ax = plt.subplots(figsize=_FIGSIZE)
+    n_over = 0
+    if overlay:
+        for o in overlay:
+            if o is not None and len(o) == len(time_ms):
+                ax.plot(time_ms, o, color=color, lw=0.5, alpha=0.15, zorder=1)
+                n_over += 1
     if sem is not None and len(sem) == len(y):
         ya = np.asarray(y, dtype=float)
         sa = np.asarray(sem, dtype=float)
-        ax.fill_between(time_ms, ya - sa, ya + sa, color=color, alpha=0.22,
-                        linewidth=0, label="± SEM")
-    ax.plot(time_ms, y, color=color, lw=1.5, label="mean")
+        ax.fill_between(time_ms, ya - sa, ya + sa, color=color, alpha=0.18,
+                        linewidth=0, zorder=2, label="± SEM")
+    ax.plot(time_ms, y, color=color, lw=1.8, zorder=3,
+            label=(f"mean (n={n_over})" if n_over else "mean"))
     ax.axhline(0.0, color="#888", lw=0.6, alpha=0.5)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("time (ms)")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.2)
-    if sem is not None:
+    if sem is not None or n_over:
         ax.legend(fontsize=8, framealpha=0.6)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)

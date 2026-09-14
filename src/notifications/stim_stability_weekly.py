@@ -42,7 +42,7 @@ from src.notifications.evoked_weekly import _peak_amplitude
 from src.utils import drive_upload as _drive
 from src.utils import sheets_write as _sw
 from src.utils.sheets import _resolve_sa_path
-from src.utils.trace_average import average_traces, average_with_sem
+from src.utils.trace_average import align_average_with_traces
 
 logger = logging.getLogger("qc_monitor.notifications.stim_stability_weekly")
 
@@ -143,19 +143,23 @@ def _crop(time_ms, y, win) -> tuple:
 _WIN_LABEL = {"artifact": "stim artifact", "evoked": "evoked response"}
 
 
-def _lfp_figs(tm, y, base, name, title, wins, sem=None, color=None) -> dict:
+def _lfp_figs(tm, y, base, name, title, wins, sem=None, color=None,
+              overlay=None) -> dict:
     """The LFP trace at each window -> {window_key: png path}. Both windows are
     of the SAME LFP (mean_trace): 'artifact' and 'evoked'. Averaged figures pass
     *sem* for a shaded mean +/- SEM band; *color* tints the line+band (the daily
-    averages are drawn in their day colour)."""
+    averages are drawn in their day colour). *overlay* is a list of the
+    constituent traces (on the same grid as *y*) drawn thin+transparent under the
+    mean, so the spread of the averaged recordings is visible."""
     out = {}
     for wkey, win in wins.items():
         ct, cy = _crop(tm, y, win)
         cs = _crop(tm, sem, win)[1] if sem is not None else None
+        ov = ([_crop(tm, o, win)[1] for o in overlay] if overlay else None)
         pth = os.path.join(base, f"{name}_{wkey}.png")
         lbl = f"{title} · {_WIN_LABEL[wkey]} ({win[0]:g} to {win[1]:g} ms)"
         if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude", sem=cs,
-                                color=color or _fig._ACCENT):
+                                color=color or _fig._ACCENT, overlay=ov):
             out[wkey] = pth
     return out
 
@@ -216,7 +220,10 @@ def _process_channel(animal, channel, traces, imp_rows, p, work,
     days = _group_by_day(traces)
     sdays = sorted(days)
     day_color = _fig.day_color_map(sdays)
-    day_mean = {d: average_with_sem(days[d], value_key="evoked_trace")
+    # Averages are RISING-EDGE aligned (sharp, not blurred by onset jitter) and
+    # carry their constituent traces so each figure can overlay them transparently.
+    day_mean = {d: align_average_with_traces(
+                    days[d], value_key="evoked_trace", align="rising_edge")
                 for d in sdays}
     wins = {"artifact": p.artifact_window, "evoked": p.evoked_window}
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
@@ -228,17 +235,19 @@ def _process_channel(animal, channel, traces, imp_rows, p, work,
             f"file_{_safe(t['chunk_datetime'])}",
             f"{animal} {channel} — single recording {t['chunk_datetime']}",
             wins).values())
-    for d in sdays:                                        # per day: avg LFP +/- SEM
-        tm, mean, sem = day_mean[d]
+    for d in sdays:                                        # per day: avg + traces
+        tm, mean, sem, dtraces = day_mean[d]
         daily += list(_lfp_figs(
             tm, mean, base, f"day_{_safe(d)}",
-            f"{animal} {channel} — daily average LFP {d} (mean ± SEM)", wins,
-            sem=sem, color=day_color[d]).values())
-    tmw, yw, semw = average_with_sem(traces, value_key="evoked_trace")   # weekly
+            f"{animal} {channel} — daily average LFP {d} "
+            f"(mean + {len(dtraces)} recordings)", wins,
+            sem=sem, color=day_color[d], overlay=dtraces).values())
+    tmw, yw, semw, wtraces = align_average_with_traces(   # weekly
+        traces, value_key="evoked_trace", align="rising_edge")
     weekly = _lfp_figs(
         tmw, yw, base, f"{tag}_weekly",
-        f"{animal} {channel} — weekly average LFP, {week} (mean ± SEM, "
-        f"n={len(traces)})", wins, sem=semw)
+        f"{animal} {channel} — weekly average LFP, {week} "
+        f"(mean + {len(wtraces)} recordings)", wins, sem=semw, overlay=wtraces)
     over = _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
                      animal, channel)
     imp, imp_week = _metric_figs(
