@@ -5572,6 +5572,20 @@ class Store:
         cached = self.eeg_location_get(os.path.basename(cur))
         if cached and os.path.isfile(cached):
             return cached
+        # Cache cold (or stale): try a CHEAP drive-swap onto a currently-mounted
+        # drive (no directory walk), like the path-heal worker -- so a recording
+        # on a just-attached drive (remounted under a new letter) resolves here
+        # even before the daemon has repointed the DB row. Remember the hit so
+        # other consumers skip the re-derive.
+        try:
+            from src.maintenance.relocate_paths import relocate_one
+            from src.utils.past_events import available_drive_roots
+            found = relocate_one(cur, available_drive_roots())
+            if found:
+                self.eeg_location_put(os.path.basename(cur), found)
+                return found
+        except Exception:                                  # noqa: BLE001
+            pass
         return cur
 
     def eeg_location_get(self, filename: str) -> str | None:

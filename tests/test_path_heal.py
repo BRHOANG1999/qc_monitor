@@ -248,6 +248,35 @@ def test_heal_pass_wall_clock_stops_early(tmp_path, monkeypatch):
     assert cursor == 0                                   # nothing processed
 
 
+# ------------------------------------------------------------------ #
+#  live_file_path resolves a stale path via cheap drive-swap + caches it
+# ------------------------------------------------------------------ #
+
+def test_live_file_path_drive_swaps_and_caches(tmp_path, monkeypatch):
+    # live_file_path imports available_drive_roots from past_events (not rp),
+    # so patch it there.
+    from src.utils import past_events as pe
+    store = Store(str(tmp_path / "data" / "m.db"))
+    root = str(tmp_path / "live") + os.sep
+    (tmp_path / "live" / "database" / "sessA").mkdir(parents=True)
+    moved = tmp_path / "live" / "database" / "sessA" / "rec.mat"
+    moved.write_bytes(b"x")
+    monkeypatch.setattr(pe, "available_drive_roots", lambda: [root])
+    fid = _register(store, "//100.106.104.22/database/sessA/rec.mat")
+
+    got = store.live_file_path(fid)
+    assert got == str(moved)                             # resolved onto the drive
+    assert store.eeg_location_get("rec.mat") == str(moved)   # and remembered
+
+
+def test_live_file_path_healthy_path_unchanged(tmp_path):
+    store = Store(str(tmp_path / "data" / "m.db"))
+    ok = tmp_path / "rec.mat"
+    ok.write_bytes(b"x")
+    fid = _register(store, str(ok))
+    assert store.live_file_path(fid) == str(ok)          # no drive-swap needed
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
