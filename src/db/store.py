@@ -2544,6 +2544,34 @@ class Store:
                 continue
         return out
 
+    def evoked_output_path_for_file(self, file_id: int) -> str | None:
+        """The ``*_evoked.mat`` path MATLAB wrote for *file_id*, or None.
+
+        Used to re-open one recording's per-epoch ``evokedData`` (via
+        ``read_file_evoked``) so a per-recording figure can overlay its
+        constituent epochs under the mean. Prefers the newest ``matlab_results``
+        row (has ``computed_at``); falls back to ``evoked_summary``. Returns None
+        when neither carries a path (e.g. a pre-logging legacy file)."""
+        assert file_id, "file_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT evoked_output_path FROM matlab_results
+                   WHERE file_id = ? AND evoked_output_path IS NOT NULL
+                     AND evoked_output_path != ''
+                   ORDER BY computed_at DESC LIMIT 1""",
+                (int(file_id),)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    """SELECT evoked_output_path FROM evoked_summary
+                       WHERE file_id = ? AND evoked_output_path IS NOT NULL
+                         AND evoked_output_path != ''
+                       ORDER BY id DESC LIMIT 1""",
+                    (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        return row["evoked_output_path"] if row else None
+
     def impedance_series_by_channel(self, days: int | None = None,
                                     exclude: list[str] | None = None
                                     ) -> dict:

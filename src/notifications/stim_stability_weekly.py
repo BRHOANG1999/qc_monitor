@@ -34,6 +34,8 @@ from datetime import date, datetime, timedelta
 from html import escape
 from types import SimpleNamespace
 
+import numpy as np
+
 from src.alerting.email_alert import EmailAlerter
 from src.alerting.rules import _drift_stat
 from src.db.store import Store
@@ -41,6 +43,8 @@ from src.notifications import stim_figures as _fig
 from src.notifications.evoked_weekly import _peak_amplitude
 from src.utils import drive_upload as _drive
 from src.utils import sheets_write as _sw
+from src.utils.animal import split_animal_electrode
+from src.utils.evoked_output import read_file_evoked
 from src.utils.sheets import _resolve_sa_path
 from src.utils.trace_average import align_average_with_traces
 
@@ -207,7 +211,84 @@ def _metric_figs(imp_rows, base, tag, animal, channel, week, start, end, p,
     return full, week_png
 
 
-def _process_channel(animal, channel, traces, imp_rows, p, work,
+# Cap on per-recording epochs overlaid on ONE figure: enough to show the spread
+# without turning hundreds of thin lines into an opaque smear (or a slow render).
+# Beyond this, epochs are evenly subsampled (logged, never silently dropped).
+_MAX_EPOCH_OVERLAY = 150
+
+
+def _recording_epochs(store, file_id, animal, channel) -> list[dict]:
+    """The per-epoch evoked traces of ONE recording+channel as
+    ``[{"evoked_trace": [...], "time_ms": [...]}, ...]`` -- read from that
+    recording's ``*_evoked.mat`` (``read_file_evoked``) so a per-recording figure
+    can overlay its constituent stimulus repetitions under the mean. ``[]`` when
+    the .mat is missing/unreadable or carries no per-epoch ``evokedData`` (the
+    caller then renders the DB mean alone).
+
+    Reads only this animal's channel (``only_animals``) and keeps just the
+    (sub-sampled) epochs -- the full ``evokedData`` (e.g. 1795 x 20001 ~= 287 MB)
+    is released before the next recording, so the digest never accumulates one
+    array per file (cf. the 2026-07 memory-leak incident)."""
+    if not file_id:
+        return []
+    path = store.evoked_output_path_for_file(int(file_id))
+    chans = (read_file_evoked(path, only_animals=[animal])
+             if path and os.path.exists(path) else {})
+    rec = chans.get(channel)
+    if rec is None:                       # channel_name vs evokedOutput key drift
+        want = split_animal_electrode(channel)
+        for k, v in chans.items():
+            if split_animal_electrode(k) == want:
+                rec = v
+                break
+    if not rec:
+        return []
+    traces, tms = rec.get("traces"), rec.get("time_ms")
+    if traces is None or tms is None or getattr(traces, "ndim", 0) != 2:
+        return []
+    tm_list = np.asarray(tms, dtype=float).tolist()
+    n = int(traces.shape[0])
+    if n > _MAX_EPOCH_OVERLAY:
+        logger.info("overlay: subsampling %d epochs -> %d for %s %s (file %s)",
+                    n, _MAX_EPOCH_OVERLAY, animal, channel, file_id)
+        idx = np.linspace(0, n - 1, _MAX_EPOCH_OVERLAY).astype(int)
+    else:
+        idx = range(n)
+    return [{"evoked_trace": np.asarray(traces[i], dtype=float).tolist(),
+             "time_ms": tm_list} for i in idx]
+
+
+def _perfile_figs(store, perfile_src, animal, channel, base, wins) -> list:
+    """Per-recording LFP figures. Each figure overlays that ONE recording's own
+    epochs (its stimulus repetitions, read from the ``*_evoked.mat``) thin +
+    transparent under their rising-edge-aligned mean -- a per-recording mean is
+    itself an average over epochs, so it gets its constituents like every other
+    average. Falls back to the DB per-recording mean alone when the .mat is
+    unavailable."""
+    out = []
+    for t in perfile_src:
+        name = f"file_{_safe(t['chunk_datetime'])}"
+        epochs = _recording_epochs(store, t.get("file_id"), animal, channel)
+        etm = emean = esem = None
+        eov = []
+        if epochs:
+            etm, emean, esem, eov = align_average_with_traces(
+                epochs, value_key="evoked_trace", align="rising_edge")
+        if etm is not None and eov:
+            figs = _lfp_figs(
+                etm, emean, base, name,
+                f"{animal} {channel} — single recording {t['chunk_datetime']} "
+                f"(mean + {len(eov)} epochs)", wins, sem=esem, overlay=eov)
+        else:
+            figs = _lfp_figs(
+                t["time_ms"], t["evoked_trace"], base, name,
+                f"{animal} {channel} — single recording {t['chunk_datetime']}",
+                wins)
+        out += list(figs.values())
+    return out
+
+
+def _process_channel(store, animal, channel, traces, imp_rows, p, work,
                      week, start, end) -> dict | None:
     """Render every PNG + scalars for one channel: two LFP windows per level
     (stim-artifact + evoked), a per-window daily overlay under the weekly average,
@@ -228,13 +309,9 @@ def _process_channel(animal, channel, traces, imp_rows, p, work,
     wins = {"artifact": p.artifact_window, "evoked": p.evoked_window}
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
                    else traces)
-    perfile, daily = [], []
-    for t in perfile_src:                                 # per file: 2 LFP figs
-        perfile += list(_lfp_figs(
-            t["time_ms"], t["evoked_trace"], base,
-            f"file_{_safe(t['chunk_datetime'])}",
-            f"{animal} {channel} — single recording {t['chunk_datetime']}",
-            wins).values())
+    # Per file: 2 LFP figs, each overlaying that recording's own epochs.
+    perfile = _perfile_figs(store, perfile_src, animal, channel, base, wins)
+    daily = []
     for d in sdays:                                        # per day: avg + traces
         tm, mean, sem, dtraces = day_mean[d]
         daily += list(_lfp_figs(
@@ -574,7 +651,7 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
     for animal, channel in channels:
         traces = store.channel_stim_evoked_traces_in_range(
             animal, channel, start_date, end_date)
-        res = _process_channel(animal, channel, traces,
+        res = _process_channel(store, animal, channel, traces,
                                imp_series.get((animal, channel), []), p, work,
                                week, start_date, end_date)
         if res is None:

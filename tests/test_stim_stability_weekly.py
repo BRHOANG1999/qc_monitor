@@ -48,6 +48,10 @@ class FakeStore:
     def channel_stim_evoked_traces_in_range(self, animal, channel, s, e):
         return list(self._traces) if (animal, channel) == (_ANIMAL, _CH) else []
 
+    def evoked_output_path_for_file(self, file_id):
+        # No real .mat in this fake -> per-file figures fall back to the DB mean.
+        return None
+
 
 class FakeEmailer:
     def __init__(self):
@@ -198,6 +202,73 @@ def test_daily_disabled_when_section_missing(monkeypatch, tmp_path):
     res = m.send_stim_stability_weekly(date(2026, 8, 29), _config(), FakeStore(),
                                        FakeEmailer(), period="daily")
     assert res == {"sent": False, "reason": "disabled"}
+
+
+# ------------------------------------------- per-recording epoch overlay --- #
+
+class _EpochStore:
+    """A store whose recordings resolve to a real evokedOutput path."""
+    def evoked_output_path_for_file(self, file_id):
+        return f"/fake/{file_id}_evoked.mat"
+
+
+def _fake_channels():
+    """{channel: {traces: [E,T], time_ms: [T], ...}} like read_file_evoked."""
+    import numpy as np
+    tm = np.linspace(-1.0, 2.0, 60)
+    # 8 epochs = a sharp rising edge near t=0 + per-epoch jitter/noise
+    epochs = np.vstack([np.tanh((tm - 0.02 * k) * 20) + 0.05 * k
+                        for k in range(8)])
+    return {_CH: {"traces": epochs, "time_ms": tm,
+                  "times": [], "stim_peak": [], "stim_trough": []}}
+
+
+def test_recording_epochs_reads_all(monkeypatch):
+    monkeypatch.setattr(m.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(m, "read_file_evoked",
+                        lambda path, only_animals=None: _fake_channels())
+    eps = m._recording_epochs(_EpochStore(), 7, _ANIMAL, _CH)
+    assert len(eps) == 8                       # all 8 epochs, none capped
+    assert all("evoked_trace" in e and "time_ms" in e for e in eps)
+    assert len(eps[0]["evoked_trace"]) == 60
+    # only this animal's channel is decoded (the big evokedData isn't retained)
+    seen = {}
+
+    def _only(path, only_animals=None):
+        seen["animals"] = only_animals
+        return _fake_channels()
+    monkeypatch.setattr(m, "read_file_evoked", _only)
+    m._recording_epochs(_EpochStore(), 7, _ANIMAL, _CH)
+    assert seen["animals"] == [_ANIMAL]
+
+
+def test_recording_epochs_subsamples_over_cap(monkeypatch):
+    import numpy as np
+    big = {_CH: {"traces": np.zeros((400, 60)), "time_ms": np.linspace(-1, 2, 60),
+                 "times": [], "stim_peak": [], "stim_trough": []}}
+    monkeypatch.setattr(m.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(m, "read_file_evoked",
+                        lambda path, only_animals=None: big)
+    eps = m._recording_epochs(_EpochStore(), 9, _ANIMAL, _CH)
+    assert len(eps) == m._MAX_EPOCH_OVERLAY     # evenly subsampled, not dropped
+
+
+def test_recording_epochs_missing_mat_returns_empty(monkeypatch):
+    # path is None -> no read, empty (caller renders the DB mean alone)
+    eps = m._recording_epochs(FakeStore(), 1, _ANIMAL, _CH)
+    assert eps == []
+
+
+def test_perfile_figs_overlay_renders(monkeypatch, tmp_path):
+    monkeypatch.setattr(m.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(m, "read_file_evoked",
+                        lambda path, only_animals=None: _fake_channels())
+    base = str(tmp_path)
+    wins = {"artifact": [-1.0, 1.0], "evoked": [1.0, 2.0]}
+    src = [_trace(1, "2026_08_24", 0.0), _trace(2, "2026_08_24", 0.4)]
+    figs = m._perfile_figs(_EpochStore(), src, _ANIMAL, _CH, base, wins)
+    assert figs and all(os.path.exists(p) for p in figs)
+    assert len(figs) == 4                        # 2 recordings x 2 windows
 
 
 if __name__ == "__main__":
