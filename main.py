@@ -240,6 +240,17 @@ def main():
     except Exception:
         logger.exception("summary sheet worker start failed")
 
+    # Self-heal stale recording paths: external data drives get remounted under
+    # new letters, so stored absolute paths go dead. This worker walks the DB in
+    # bounded batches and repoints every row whose file no longer resolves to
+    # wherever it now lives on a mounted drive. Re-links known files only; never
+    # re-ingests. Runs at boot + on an interval, entirely off the watch loop.
+    try:
+        from src.maintenance import path_heal as _path_heal
+        _path_heal.start_worker(store, config)
+    except Exception:
+        logger.exception("path-heal worker start failed")
+
     poll_interval = watch_cfg.get("poll_interval_sec", 30)
     health_interval = 60  # seconds
     impedance_interval = 1800  # seconds -- incremental impedance refresh + drift

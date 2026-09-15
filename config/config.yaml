@@ -469,6 +469,25 @@ past_events:
   auto_drives: true
   max_search_dirs: 200000
 
+# Automatic stale-path self-healing. External data drives get remounted under
+# different letters, so processed_files.file_path (+ session_dir, and the
+# evoked_output_path columns) captured under an old letter go stale -- the
+# dashboard/reports then can't open those recordings. This background worker
+# walks the DB in bounded batches and, for every row whose stored path no longer
+# resolves, repoints it to wherever the file currently lives on a mounted drive:
+# a cheap per-drive stat first (across past_events.auto_drives roots), a
+# recursive EEGLocator walk only for stragglers. RE-LINKS known files only;
+# never re-ingests or reprocesses. Reuses past_events.auto_drives/max_search_dirs.
+path_healing:
+  enabled: true
+  interval_sec: 3600      # re-scan cadence; also runs once at boot
+  boot_delay_sec: 120     # let the dashboard + first processing settle first
+  rows_per_pass: 2000     # bounded batch; cursor resumes next pass (wraps at end)
+  wall_clock_sec: 120     # hard budget for the whole pass (dead UNC stats block)
+  use_locator: true       # recursive-walk fallback for files that truly moved
+  max_walk_sec: 20        # per-file wall-clock cap on the recursive walk
+  include_evoked: true    # also relocate matlab_results/evoked_summary paths
+
 # Slow-gamma (30-50 Hz) induced-power feature in Video Review. Windows are
 # milliseconds relative to each stim onset. The post window starts AFTER the
 # evoked transient (~first tens of ms) so it measures an oscillation, not the

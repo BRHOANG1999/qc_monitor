@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import string
+import time
 from datetime import datetime
 from typing import Callable, Iterable
 
@@ -389,13 +390,18 @@ class EEGLocator:
                  cache_get: Callable[[str], str | None] | None = None,
                  cache_put: Callable[[str, str | None], None] | None = None,
                  auto_drives: bool = True,
-                 max_dirs: int = 200_000) -> None:
+                 max_dirs: int = 200_000,
+                 max_walk_seconds: float | None = None) -> None:
         assert max_dirs > 0, "max_dirs must be > 0"
         self.roots = [r for r in (search_roots or []) if r]
         self.cache_get = cache_get
         self.cache_put = cache_put
         self.auto_drives = bool(auto_drives)
         self.max_dirs = int(max_dirs)
+        # Wall-clock cap for ONE resolve()'s walk across all its roots. None (the
+        # default) preserves the historic behaviour: bounded only by max_dirs.
+        self.max_walk_seconds = (float(max_walk_seconds)
+                                 if max_walk_seconds else None)
 
     def resolve(self, folder: str, filename: str) -> str | None:
         assert filename, "filename required"
@@ -411,11 +417,17 @@ class EEGLocator:
                 if cached == "":
                     return None        # known-missing within the cache TTL
                 # else: stale positive -> fall through and re-search
+        deadline = (time.monotonic() + self.max_walk_seconds
+                    if self.max_walk_seconds else None)
         for root in self._roots_for(folder):
-            hit = self._recursive_find(root, name)
+            hit = self._recursive_find(root, name, deadline)
             if hit:
                 self._remember(name, hit)
                 return hit
+            if deadline is not None and time.monotonic() > deadline:
+                # Budget spent across the roots walked so far; do NOT cache a
+                # negative (the file may sit under an unwalked root).
+                return None
         self._remember(name, None)
         return None
 
@@ -464,7 +476,8 @@ class EEGLocator:
                 add(r)
         return out
 
-    def _recursive_find(self, root: str, name: str) -> str | None:
+    def _recursive_find(self, root: str, name: str,
+                        deadline: float | None = None) -> str | None:
         want = {name}
         if not name.lower().endswith(".mat"):
             want.add(name + ".mat")
@@ -477,6 +490,9 @@ class EEGLocator:
             seen += 1
             if seen > self.max_dirs:
                 logger.warning("eeg search hit max_dirs in %s", root)
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                logger.warning("eeg search hit max_walk_seconds in %s", root)
                 break
             dirnames[:] = [d for d in dirnames
                            if d.lower() not in _SKIP_DIRS
@@ -574,16 +590,20 @@ def catalog_no_event_examples(metas: list[dict]) -> list[dict]:
     return out
 
 
-def make_locator(store, config: dict) -> EEGLocator:
+def make_locator(store, config: dict, max_walk_sec: float | None = None
+                 ) -> EEGLocator:
     """An EEGLocator wired to the store's persistent location cache and the
-    configured search roots -- used for lazy, on-demand resolution."""
+    configured search roots -- used for lazy, on-demand resolution. *max_walk_sec*
+    (default None) caps one resolve()'s recursive walk by wall-clock; the path
+    self-heal passes its own budget so a single stubborn file can't stall a pass."""
     pe = (config or {}).get("past_events", {}) or {}
     return EEGLocator(
         search_roots(config),
         cache_get=getattr(store, "eeg_location_get", None),
         cache_put=getattr(store, "eeg_location_put", None),
         auto_drives=bool(pe.get("auto_drives", True)),
-        max_dirs=int(pe.get("max_search_dirs", 200_000)))
+        max_dirs=int(pe.get("max_search_dirs", 200_000)),
+        max_walk_seconds=max_walk_sec)
 
 
 def bhz_csv_dir(config: dict) -> str:

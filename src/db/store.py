@@ -5454,17 +5454,45 @@ class Store:
         collision if another row already owns that path (the stale row is then a
         harmless duplicate of a reachable one)."""
         assert file_id is not None and new_path, "file_id + new_path required"
-        conn = self._connect()
-        try:
-            conn.execute(
-                "UPDATE processed_files SET file_path=?, session_dir=? WHERE id=?",
-                (new_path, os.path.dirname(new_path), int(file_id)))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-        finally:
-            conn.close()
+        # Serialize with every other writer in the process (see _WRITE_LOCK):
+        # the path self-heal runs on a background thread alongside the daemon.
+        with self._WRITE_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "UPDATE processed_files SET file_path=?, session_dir=? "
+                    "WHERE id=?",
+                    (new_path, os.path.dirname(new_path), int(file_id)))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+            finally:
+                conn.close()
+
+    def relocate_evoked_output_path(self, old_path: str, new_path: str) -> int:
+        """Repoint every ``matlab_results`` / ``evoked_summary`` row whose
+        ``evoked_output_path`` equals *old_path* to *new_path*; return the total
+        rows updated across both tables.
+
+        Matches by the exact stale path (NOT by file_id): one file_id can own
+        several ``matlab_results`` rows with different output paths, so a
+        blanket set-by-file_id would corrupt them. Neither column is UNIQUE, so
+        there is no collision to swallow. Serialized under _WRITE_LOCK."""
+        assert old_path and new_path, "old_path + new_path required"
+        with self._WRITE_LOCK:
+            conn = self._connect()
+            try:
+                n = 0
+                for tbl in ("matlab_results", "evoked_summary"):
+                    cur = conn.execute(
+                        f"UPDATE {tbl} SET evoked_output_path=? "
+                        f"WHERE evoked_output_path=?", (new_path, old_path))
+                    n += cur.rowcount
+                conn.commit()
+                return n
+            finally:
+                conn.close()
 
     def resolve_training_file(self, file_id: int, locator) -> str | None:
         """Confirm (and if needed relocate) the recording for a Training
