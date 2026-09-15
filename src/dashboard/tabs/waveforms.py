@@ -361,9 +361,10 @@ def _build_evoked_figure(channels: dict, smooth_ms: float,
         sem = (traces.std(axis=0, ddof=1) / np.sqrt(n_ep)
                if n_ep > 1 else np.zeros_like(mean))
         mean, sem = _smooth_trace(t, mean, sem, smooth_ms)
-        _add_window_row(fig, row, 1, t, mean, None, ch, *_ARTIFACT_X_RANGE)
+        _add_window_row(fig, row, 1, t, mean, None, ch, *_ARTIFACT_X_RANGE,
+                        traces=traces)
         _add_window_row(fig, row, 2, t, mean, sem, ch, ana_start, ana_end,
-                        n_epochs=n_ep)
+                        n_epochs=n_ep, traces=traces)
     fig.update_layout(
         height=max(300, 260 * n_rows),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
@@ -392,17 +393,34 @@ def _smooth_trace(t, mean, sem, smooth_ms):
 
 
 def _add_window_row(fig, row, col, t, mean, sem, name, x0, x1, *,
-                    n_epochs=None) -> None:
+                    n_epochs=None, traces=None, max_overlay=60) -> None:
     """Plot the mean evoked trace (+ optional SEM band) sliced to [x0, x1] ms
     into subplot (*row*, *col*), with a stim-onset marker and a tight y-range.
-    Slicing keeps each SVG trace small -- raw traces are ~20 k samples over
-    ±500 ms."""
+    *traces* (the raw per-epoch stack this mean was averaged from) is overlaid
+    thin + transparent UNDER the mean so the spread of the average is visible
+    (capped at *max_overlay* by decimation). Slicing keeps each SVG trace small
+    -- raw traces are ~20 k samples over ±500 ms."""
     t = np.asarray(t, dtype=np.float64)
     mean = np.asarray(mean, dtype=np.float64)
     mask = (t >= x0) & (t <= x1)
     if not np.any(mask):
         return
     tw, mw = t[mask], mean[mask]
+    y_lo, y_hi = float(np.min(mw)), float(np.max(mw))
+    # Individual epochs (the constituents of this mean), thin + transparent.
+    if traces is not None:
+        ep = np.asarray(traces, dtype=np.float64)
+        if ep.ndim == 2 and ep.shape[1] == t.shape[0] and ep.shape[0] > 1:
+            step = max(1, ep.shape[0] // int(max_overlay))
+            sub = ep[::step][:, mask]
+            for e in sub:
+                fig.add_trace(go.Scattergl(
+                    x=tw, y=e, mode="lines",
+                    line=dict(color="#636EFA", width=0.5), opacity=0.12,
+                    showlegend=False, hoverinfo="skip"), row=row, col=col)
+            if sub.size:
+                y_lo = min(y_lo, float(np.min(sub)))
+                y_hi = max(y_hi, float(np.max(sub)))
     sw = None
     if sem is not None:
         sem = np.asarray(sem, dtype=np.float64)
@@ -415,6 +433,8 @@ def _add_window_row(fig, row, col, t, mean, sem, name, x0, x1, *,
             fill="toself", fillcolor="rgba(99,110,250,0.15)",
             line=dict(width=0), showlegend=False, hoverinfo="skip"),
             row=row, col=col)
+        y_lo = min(y_lo, float(np.min(mw - sw)))
+        y_hi = max(y_hi, float(np.max(mw + sw)))
     label = name if n_epochs is None else f"{name} (n={n_epochs})"
     fig.add_trace(go.Scatter(
         x=tw, y=mw, mode="lines", name=label,
@@ -423,7 +443,5 @@ def _add_window_row(fig, row, col, t, mean, sem, name, x0, x1, *,
     fig.add_vline(x=0, line=dict(color="white", width=1, dash="dash"),
                   row=row, col=col)
     fig.update_xaxes(range=[x0, x1], title_text="ms", row=row, col=col)
-    yv = mw if sw is None else np.concatenate([mw + sw, mw - sw])
-    mn, mx = float(np.min(yv)), float(np.max(yv))
-    pad = (mx - mn) * 0.1 if mx > mn else 0.001
-    fig.update_yaxes(range=[mn - pad, mx + pad], row=row, col=col)
+    pad = (y_hi - y_lo) * 0.1 if y_hi > y_lo else 0.001
+    fig.update_yaxes(range=[y_lo - pad, y_hi + pad], row=row, col=col)

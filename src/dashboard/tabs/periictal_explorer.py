@@ -2136,6 +2136,18 @@ def _erp_wave_figure(gathered, n, overlap, col):
         return empty_fig("No column to show"), ""
     grand = np.nanmean(trials, axis=0)                   # grand-average waveform
     fig = go.Figure()
+    # Overlay this column's constituent trials (the ones averaged into `mean`),
+    # thin + transparent, under the band/mean so the spread is visible.
+    starts = _erp.window_starts(np.asarray(trials).shape[0], int(n), step)
+    if starts:
+        c = min(max(int(col or 0), 0), len(starts) - 1)
+        seg = np.asarray(trials, dtype=float)[starts[c]:starts[c] + int(n)]
+        stp = max(1, seg.shape[0] // 40)                 # cap the overlaid count
+        for tr in seg[::stp]:
+            fig.add_trace(go.Scattergl(
+                x=row_ms, y=tr, mode="lines", opacity=0.12,
+                line=dict(color=COLOR_ACCENT, width=0.5),
+                hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(
         x=np.concatenate([row_ms, row_ms[::-1]]),
         y=np.concatenate([mean + sd, (mean - sd)[::-1]]), fill="toself",

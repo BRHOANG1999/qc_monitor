@@ -1839,7 +1839,9 @@ def _add_polyline(fig, xs, t, y, deg, color, name) -> None:
 
 
 def _build_recording_trend(rows, feature) -> go.Figure:
-    """Per-recording mean of the feature over time -- the chronic trend."""
+    """Per-recording mean of the feature over time -- the chronic trend, with the
+    individual per-epoch values overlaid faintly under each recording's mean so
+    the spread behind the average is visible."""
     label = _label(feature)
     grouped: "OrderedDict[str, list]" = OrderedDict()
     for r in rows:
@@ -1850,11 +1852,21 @@ def _build_recording_trend(rows, feature) -> go.Figure:
     ys = [statistics.mean(grouped[x]) for x in xs]
     if not xs:
         return empty_fig("No per-recording values")
-    fig = go.Figure(go.Scatter(x=xs, y=ys, mode="lines+markers",
-                               line=dict(color="#5e7ce2"),
-                               marker=dict(size=5)))
+    fig = go.Figure()
+    ex, ey = [], []                       # every per-epoch value (the constituents)
+    for x in xs:
+        for v in grouped[x]:
+            ex.append(x)
+            ey.append(v)
+    fig.add_trace(go.Scattergl(x=ex, y=ey, mode="markers", name="per epoch",
+                               marker=dict(color="#5e7ce2", size=3, opacity=0.16),
+                               hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers",
+                             name="recording mean", line=dict(color="#5e7ce2"),
+                             marker=dict(size=5)))
     fig.update_layout(title=f"{label} — per-recording mean over time",
-                      xaxis_title="Recording", yaxis_title=label, height=320)
+                      xaxis_title="Recording", yaxis_title=label, height=320,
+                      showlegend=False)
     return fig
 
 

@@ -365,23 +365,28 @@ def trace_gallery_fig(sample: dict, groups: list, template, out_png: str) -> str
 
 def mean_trace_overlay_fig(sample: dict, groups: list, template,
                            out_png: str) -> str:
-    """Mean artifact ± SD per group, overlaid, with the stable template."""
+    """Mean artifact ± SD per group, overlaid, with each group's individual
+    trials drawn thin + transparent under its mean and the stable template."""
     win = np.asarray(sample["win_ms"], float)
     seg = np.asarray(sample["seg"], float)
+    rng = np.random.default_rng(0)
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
     for label, mask, col in groups:
         idx = np.where(mask)[0]
         if idx.size == 0:
             continue
+        pick = rng.choice(idx, size=min(14, idx.size), replace=False)
+        for j in pick:                    # individual trials (the constituents)
+            ax.plot(win, seg[j], color=col, lw=0.4, alpha=0.18)
         m, sd = seg[idx].mean(0), seg[idx].std(0)
         ax.plot(win, m, color=col, lw=2, label=f"{label} (n={idx.size})")
-        ax.fill_between(win, m - sd, m + sd, color=col, alpha=0.15)
+        ax.fill_between(win, m - sd, m + sd, color=col, alpha=0.12)
     ax.plot(win, template, color="k", lw=1.4, ls="--", label="stable template")
     ax.axvline(0, color="0.6", lw=0.6, ls=":")
     ax.set_xlabel("time from stimulus (ms)")
     ax.set_ylabel("artifact amplitude (µV)")
-    ax.set_title("Mean artifact waveform ± SD per configuration "
-                 "(shaded band = ±1 SD)")
+    ax.set_title("Mean artifact waveform per configuration "
+                 "(thin = individual trials, band = ±1 SD)")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_png, dpi=_DPI)
