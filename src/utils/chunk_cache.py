@@ -10,11 +10,11 @@ with the dashboard.
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from threading import BoundedSemaphore, RLock
 
 from src.utils.mat_loader import ChunkData, load_mat
+from src.utils.offproc_guard import in_dashboard_owned_thread
 
 
 _MAX_ENTRIES = 3
@@ -106,13 +106,15 @@ def get_chunk(file_path: str, *, transient: bool = False) -> ChunkData:
                 if transient:
                     _od.move_to_end(file_path, last=False)
                 return hit
-        # In the DASHBOARD process, read the multi-GB .mat in a CHILD process so
-        # the slow SMB read never holds this process's GIL (which would freeze
+        # On a DASHBOARD-OWNED thread, read the multi-GB .mat in a CHILD process
+        # so the slow SMB read never holds this process's GIL (which would freeze
         # Overview + every other request while an LFP/Video read is in flight).
-        # The daemon (mass_analyze transient sweeps, QC_DASHBOARD_ROLE unset)
-        # keeps the plain in-process read -- it has no UI to starve. Off-proc
-        # degrades to in-process on any pool failure (see chunk_reader).
-        if os.environ.get("QC_DASHBOARD_ROLE"):
+        # The daemon (mass_analyze transient sweeps) and the off-proc worker
+        # itself keep the plain in-process read. Gate on in_dashboard_owned_thread()
+        # -- the SAME predicate load_mat's require_offproc guard uses -- so the
+        # router and the guard can never disagree (a raw read reaches load_mat
+        # in-process here iff the guard would allow it).
+        if in_dashboard_owned_thread():
             from src.utils.chunk_reader import read_chunk_offproc
             chunk = read_chunk_offproc(file_path)
         else:

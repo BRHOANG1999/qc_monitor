@@ -55,6 +55,28 @@ from src.utils.filters import (
 
 logger = logging.getLogger("qc_monitor.dashboard.lfp_browser")
 
+
+def _resolve_recording(file_path: str) -> str:
+    """A currently-readable path for *file_path*: the path itself when it exists,
+    else its live location on a mounted drive (cheap drive-swap, no walk).
+
+    The file dropdown carries a processed_files.file_path, which goes stale when
+    an external data drive is remounted under a new letter. This lets the browser
+    open a recording on a just-attached drive (e.g. H:\\) immediately, before the
+    daemon's background path-heal has repointed the DB row. Falls back to the
+    original path (which then raises a clear 'file not found') when unresolvable,
+    and is used ONLY for the chunk read -- DB lookups still key on the stored
+    path, which is what the row actually holds."""
+    try:
+        if os.path.isfile(file_path):
+            return file_path
+        from src.maintenance.relocate_paths import relocate_one
+        from src.utils.past_events import available_drive_roots
+        return relocate_one(file_path, available_drive_roots()) or file_path
+    except Exception:                                  # noqa: BLE001
+        return file_path
+
+
 # Preset -> (HP, LP) lookup. Selecting a preset populates the number
 # inputs; the user still clicks Apply to run the filter.
 _LFP_PRESETS = {
@@ -316,7 +338,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     no_update, psd_hidden_style, no_update, [])
 
         try:
-            chunk = get_chunk(file_path)
+            chunk = get_chunk(_resolve_recording(file_path))
         except Exception as e:
             return (empty_fig(f"Error loading file: {e}", height=600),
                     no_update, psd_hidden_style, no_update, [])
@@ -447,7 +469,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # Video Review side. get_chunk is cached so this is cheap on
         # a warm path.
         try:
-            chunk = get_chunk(file_path)
+            chunk = get_chunk(_resolve_recording(file_path))
             lfp_dur = float(chunk.signal.shape[0] / chunk.fs)
         except Exception as e:
             logger.warning("View video: chunk load failed: %s", e)
@@ -494,7 +516,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if x0 is None and x1 is None and not is_reset:
             return no_update
         try:
-            chunk = get_chunk(file_path)
+            chunk = get_chunk(_resolve_recording(file_path))
         except Exception:
             return no_update
 
@@ -550,7 +572,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if not show_scalo or not file_path:
             return no_update, hidden
         try:
-            chunk = get_chunk(file_path)
+            chunk = get_chunk(_resolve_recording(file_path))
         except Exception as e:
             return (empty_fig(f"Error: {e}", height=300),
                     {"display": "block", "marginTop": "12px"})
