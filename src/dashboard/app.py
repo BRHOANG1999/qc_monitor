@@ -78,6 +78,7 @@ from src.dashboard.tabs import sessions as tabs_sessions
 from src.dashboard.tabs import settings as tabs_settings
 from src.dashboard.tabs import signal_quality as tabs_signal_quality
 from src.dashboard.tabs import stim as tabs_stim
+from src.dashboard.tabs import stim_trend as tabs_stim_trend
 from src.dashboard.tabs import training as tabs_training
 from src.dashboard.tabs import waveforms as tabs_waveforms
 from src.dashboard.components import (
@@ -171,6 +172,7 @@ NAV_GROUPS = [
         {"id": "signal", "label": "Signal quality"},
         {"id": "electrode_health", "label": "Electrode health"},
         {"id": "stim", "label": "Stim QC"},
+        {"id": "stim_trend", "label": "Stim artifact trend"},
     ]},
     {"id": "lab", "label": "Lab", "subs": [
         {"id": "surgeries", "label": "Surgeries"},
@@ -1441,6 +1443,8 @@ def create_app(config: dict, store: Store) -> Dash:
                     tabs_session_compare.layout(store))
             elif tab == "stim":
                 return _enable_persistence(tabs_stim.layout(store))
+            elif tab == "stim_trend":
+                return _enable_persistence(tabs_stim_trend.layout(store, config))
             elif tab == "settings":
                 return _enable_persistence(tabs_settings.layout(store))
             elif tab == "activity_log":
@@ -1545,6 +1549,7 @@ def create_app(config: dict, store: Store) -> Dash:
     tabs_alerts.register_callbacks(app, store, config)
     tabs_signal_quality.register_callbacks(app, store, config)
     tabs_stim.register_callbacks(app, store, config)
+    tabs_stim_trend.register_callbacks(app, store, config)
     tabs_criticality.register_callbacks(app, store, config)
     tabs_session_compare.register_callbacks(app, store, config)
     tabs_activity_log.register_callbacks(app, store, config)
@@ -1615,7 +1620,7 @@ def _known_component_ids(store: Store, config: dict) -> set:
     # The base shell layout is seeded separately by the caller.
     tab_layouts = [
         tabs_alerts.layout, tabs_signal_quality.layout,
-        tabs_stim.layout, tabs_criticality.layout,
+        tabs_stim.layout, tabs_stim_trend.layout, tabs_criticality.layout,
         tabs_session_compare.layout, tabs_activity_log.layout,
         tabs_annotations.layout, tabs_sessions.layout,
         tabs_electrode_health.layout, tabs_waveforms.layout,
