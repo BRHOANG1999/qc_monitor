@@ -57,3 +57,20 @@ def test_alignment_noop_when_already_aligned():
     _t, mu, _s = average_with_sem([a, b], value_key="v")
     _t, ma, _s = average_with_sem([a, b], value_key="v", align="rising_edge")
     assert np.allclose(mu, ma, atol=1e-9)
+
+
+def test_rising_edge_picks_onset_not_recovery():
+    # A BIPHASIC stim artifact: onset rise (+5), then after the trough a STEEPER
+    # recovery rise (+8). A plain argmax of the slope would lock onto the recovery
+    # -- the bug that shifted ~12% of epochs ~0.2 ms off. The detector must return
+    # the ONSET, which precedes the dominant (trough) excursion.
+    from src.utils.trace_average import _rising_edge_time
+    i0 = _T.index(0.0)
+    v = [0.0] * len(_T)
+    v[i0] = 5.0            # onset peak (rise 0->5 from the prior sample)
+    v[i0 + 1] = 1.0
+    v[i0 + 2] = -8.0       # trough = the dominant |v| excursion
+    v[i0 + 3] = 0.0        # recovery (rise -8->0, steeper than the onset)
+    edge = _rising_edge_time(np.array(_T, float), np.array(v, float))
+    assert edge is not None
+    assert edge < 0.05     # onset foot (~ -0.05), NOT the +0.10 recovery foot

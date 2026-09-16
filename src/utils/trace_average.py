@@ -26,14 +26,23 @@ _EDGE_WIN = (-0.5, 0.5)
 
 
 def _rising_edge_time(tm: np.ndarray, v: np.ndarray, win=_EDGE_WIN):
-    """Time (ms) of the stim-artifact rising edge: the sample of maximum POSITIVE
-    slope within *win* around t=0 (the onset of the fast phase). None when the
-    window catches too few samples."""
+    """Time (ms) of the stim-artifact ONSET: the steepest POSITIVE slope within
+    *win*, searched only UP TO the artifact's dominant excursion (max |v|).
+
+    The artifact is BIPHASIC -- a sharp onset rise, then (after the trough) an
+    equally steep RECOVERY rise. A plain argmax of the slope over the whole
+    window latches onto whichever is steeper, so a chunk of epochs (~12% in the
+    measured recording) lock onto the recovery edge and end up aligned ~0.2 ms
+    off. Capping the slope search at the dominant excursion pins every epoch to
+    the onset, which always precedes the trough/recovery. None when the window
+    catches too few samples."""
     mask = (tm >= win[0]) & (tm <= win[1])
     idx = np.where(mask)[0]
     if idx.size < 3:
         return None
-    dv = np.diff(v[idx])
+    vv = np.asarray(v, dtype=float)[idx]
+    dom = int(np.argmax(np.abs(vv)))           # the artifact's main excursion
+    dv = np.diff(vv[:max(dom, 2) + 1])         # slope only up to that excursion
     if dv.size == 0:
         return None
     return float(tm[idx[int(np.argmax(dv))]])
