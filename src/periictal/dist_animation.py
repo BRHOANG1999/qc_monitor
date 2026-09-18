@@ -101,6 +101,61 @@ def _lead_label(lo: float, hi: float) -> str:
     return f"−{a:.1f} to −{b:.1f} h before onset"
 
 
+def frame_step_distances(full, sid, feature: str, *, width=WIDTH_SEC,
+                         step=STEP_SEC, lookback=LOOKBACK_SEC,
+                         equal_n: bool = True, min_n: int = 8,
+                         seed: int = 0) -> dict:
+    """Wasserstein-1 distances along the marching frames for *sid* -- the
+    prototype "does the distribution move as onset approaches?" trace.
+
+    For the same frames the GIF walks (far -> near onset), returns, keyed by each
+    frame's center time-before-onset:
+      * ``step_w1``  -- W1 between that frame and the PREVIOUS one (frame-to-frame
+        step size; small => the distribution is holding still), and
+      * ``disp_w1``  -- W1 between that frame and the far-from-onset baseline (the
+        farthest ``_BASELINE_FRAC`` of frames, pooled; how far it has drifted).
+
+    ``equal_n`` (default) subsamples both sides of every comparison to the
+    smaller n (seeded) so a distance reflects a real distribution shift, not a
+    frame-size difference (frame n varies with artifact rejection / coverage).
+    Values are NaN where either side has < ``min_n`` points. Pure + seeded."""
+    from scipy.stats import wasserstein_distance
+    frames = window_frames(full, sid, feature, width=width, step=step,
+                           lookback=lookback)
+    rng = np.random.default_rng(seed)
+
+    def _w1(a, b) -> tuple[float, int]:
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        if a.size < min_n or b.size < min_n:
+            return float("nan"), int(min(a.size, b.size))
+        m = min(a.size, b.size)
+        if equal_n and a.size > m:
+            a = rng.choice(a, m, replace=False)
+        if equal_n and b.size > m:
+            b = rng.choice(b, m, replace=False)
+        return float(wasserstein_distance(a, b)), m
+
+    n_base = max(1, int(round(len(frames) * _BASELINE_FRAC)))
+    base = np.concatenate([f["values"] for f in frames[:n_base]
+                           if f["values"].size] or [np.array([])])
+
+    hours, step_w1, disp_w1, ns, labels = [], [], [], [], []
+    for k in range(1, len(frames)):
+        sw, sn = _w1(frames[k - 1]["values"], frames[k]["values"])
+        dw, _ = _w1(frames[k]["values"], base)
+        hours.append(frames[k]["center"] / 3600.0)      # h before onset
+        step_w1.append(sw)
+        disp_w1.append(dw)
+        ns.append(sn)
+        labels.append(frames[k]["label"])
+    return {"hours_before": np.asarray(hours, dtype=float),
+            "step_w1": np.asarray(step_w1, dtype=float),
+            "disp_w1": np.asarray(disp_w1, dtype=float),
+            "n": np.asarray(ns, dtype=int), "labels": labels,
+            "n_frames": len(frames)}
+
+
 # --------------------------------------------------------------------- #
 #  Rendering (matplotlib Agg -> PIL frames -> looping GIF)
 # --------------------------------------------------------------------- #

@@ -2507,6 +2507,49 @@ def _gif_seizure_ids(full) -> list:
     return sorted({int(s) for s in pre["seizure_idx"].to_numpy().tolist()})[:500]
 
 
+def _w1trend_fig(full, sel, feature, lookback_sec):
+    """Wasserstein-1 step size (frame -> frame) + displacement (vs the far
+    baseline) vs time-before-onset, for the selected Seizure + Feature. The
+    prototype answer to "does W1 trend meaningfully from one distribution to the
+    next as onset approaches?" Synchronous -- W1 over ~23 frames is trivial."""
+    if not feature:
+        return empty_fig("Pick a Feature to see the Wasserstein step size.")
+    if full is None or feature not in full.columns:
+        return empty_fig(f"'{feature}' is not in the built matrix.")
+    sid = "group" if (sel in (None, "group", "")) else int(sel)
+    try:
+        d = _dan.frame_step_distances(full, sid, feature, lookback=lookback_sec)
+    except Exception as e:                                   # noqa: BLE001
+        return empty_fig(f"Couldn't compute W₁: {e}")
+    h = d["hours_before"]
+    if h.size == 0 or not np.any(np.isfinite(d["step_w1"])):
+        return empty_fig("Not enough stimuli per frame for a W₁ trend",
+                         hint="try the group, a wider band, or a busier seizure")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=h, y=d["step_w1"], mode="lines+markers", connectgaps=False,
+        name="step W₁ (frame → frame)",
+        line=dict(color=COLOR_ACCENT, width=2), marker=dict(size=6),
+        customdata=[[lab, int(n)] for lab, n in zip(d["labels"], d["n"])],
+        hovertemplate="%{customdata[0]}<br>step W₁=%{y:.3g} "
+                      "(n=%{customdata[1]})<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=h, y=d["disp_w1"], mode="lines", connectgaps=False,
+        name="displacement W₁ (vs far baseline)",
+        line=dict(color="#e26e6e", width=1.5, dash="dot"),
+        hovertemplate="displacement W₁=%{y:.3g}<extra></extra>"))
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=56, r=20, t=34, b=46),
+        legend=dict(orientation="h", y=1.15, x=0, font=dict(size=11)),
+        hovermode="x unified")
+    fig.update_xaxes(autorange="reversed", title_text="hours before onset",
+                     gridcolor=COLOR_DIVIDER, zeroline=False)
+    fig.update_yaxes(title_text=f"Wasserstein-1  ({feature})",
+                     gridcolor=COLOR_DIVIDER, rangemode="tozero")
+    return fig
+
+
 def _gif_kick(jid, key, sel, feature, lookback_sec, mode):
     with _LOCK:
         if key in _GIF_CACHE:
@@ -2862,6 +2905,27 @@ def layout_slidingauc(store):
                                  "width": "100%", "display": "none",
                                  "border": f"1px solid {COLOR_DIVIDER}",
                                  "borderRadius": RADIUS_SM}),
+             ], style={"display": "flex", "flexDirection": "column"}),
+             style={"marginTop": SPACE_4}),
+        card(section_header("📉 Wasserstein step size between consecutive "
+                            "distributions"),
+             html.Div([
+                 html.Div("For the Seizure + Feature selected above: the "
+                          "Wasserstein-1 distance between each 30-min frame's "
+                          "distribution and the previous one (blue = frame-to-frame "
+                          "step; small means the distribution is holding still), and "
+                          "each frame's distance from the far-from-onset baseline "
+                          "(red dotted = how far it has drifted). Both sides of every "
+                          "comparison are downsampled to equal n, so the distance "
+                          "reflects distribution shape, not frame size. Updates live "
+                          "with the Seizure / Feature / Band controls above — a "
+                          "prototype trend view, no null test.",
+                          style={"color": COLOR_TEXT_SECONDARY,
+                                 "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 dcc.Graph(id="pex-swauc-w1trend", config={"displaylogo": False},
+                           figure=empty_fig("Pick a Seizure + Feature above to see "
+                                            "the W₁ trend."),
+                           style={"marginTop": SPACE_3, "height": "380px"}),
              ], style={"display": "flex", "flexDirection": "column"}),
              style={"marginTop": SPACE_4}),
         # Click-to-expand modal: the AUC-across-windows distribution for a
@@ -3884,6 +3948,21 @@ def register_callbacks(app, store, config):
         feat = _swauc_feat(result, feature)
         g, h, b, pdf, cdf, _notes = _swauc_render(result, sel or "group", feat)
         return g, h, b, pdf, cdf
+
+    @app.callback(
+        Output("pex-swauc-w1trend", "figure"),
+        Input("pex-swauc-seizure", "value"),
+        Input("pex-swauc-feature", "value"),
+        Input("pex-swauc-bandhi", "value"),
+        State("pex-job", "data"),
+        prevent_initial_call=True,
+    )
+    def _swauc_w1trend(sel, feature, bhi, jid):
+        cached = _CACHE.get(jid) if jid else None
+        if not cached or cached.get("empty") or "full" not in cached:
+            return empty_fig("Build the matrix in the scope bar above first.")
+        lookback = float(bhi or 6.0) * 3600.0
+        return _w1trend_fig(cached["full"], sel, feature, lookback)
 
     # --- Nonstationarity control (null test) callbacks --- #
     @app.callback(
