@@ -5458,9 +5458,18 @@ class Store:
             conn.close()
 
     def relocate_file_path(self, file_id: int, new_path: str) -> bool:
-        """Repoint a processed_files row to a recording found at a new location
-        (a stale mapped-drive path -> the live drive it's actually on). Updates
-        file_path + session_dir. Returns True if updated; swallows the UNIQUE
+        """Repoint a processed_files row's PHYSICAL read path to a recording
+        found at a new location (a stale mapped-drive path -> the live drive
+        it's actually on). Updates ``file_path`` ONLY.
+
+        ``session_dir`` is deliberately left untouched: it is the *logical*
+        session key that JOINs processed_files to ``session_config`` (and the
+        review/evoked/summary queries) and is stored canonically (usually the
+        UNC network path) -- it is NEVER used as a filesystem read path (reads
+        go through ``file_path`` / the off-proc reader). Rewriting it to the
+        healed drive letter desyncs it from ``session_config.session_dir`` and
+        silently drops the recording out of the seizure card and the pools, so
+        the heal must not touch it. Returns True if updated; swallows the UNIQUE
         collision if another row already owns that path (the stale row is then a
         harmless duplicate of a reachable one)."""
         assert file_id is not None and new_path, "file_id + new_path required"
@@ -5470,15 +5479,32 @@ class Store:
             conn = self._connect()
             try:
                 conn.execute(
-                    "UPDATE processed_files SET file_path=?, session_dir=? "
-                    "WHERE id=?",
-                    (new_path, os.path.dirname(new_path), int(file_id)))
+                    "UPDATE processed_files SET file_path=? WHERE id=?",
+                    (new_path, int(file_id)))
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
             finally:
                 conn.close()
+
+    def resync_processed_session_dirs(self, pairs) -> int:
+        """Re-key ``processed_files.session_dir`` to the canonical
+        ``session_config`` key for rows whose logical key a path-heal desynced
+        (rewrote to the physical drive letter). *pairs* is an iterable of
+        ``(file_id, canonical_session_dir)``. Updates ``session_dir`` ONLY --
+        ``file_path`` (the physical read path) is left untouched. Returns the
+        number of rows updated. ``session_dir`` is not UNIQUE, so many rows can
+        share one canonical value (all files in a session)."""
+        rows = [(sd, int(fid)) for fid, sd in pairs
+                if sd and fid is not None]
+        assert isinstance(rows, list), "pairs must materialize to a list"
+        if not rows:
+            return 0
+        with self.transaction() as conn:
+            conn.executemany(
+                "UPDATE processed_files SET session_dir=? WHERE id=?", rows)
+        return len(rows)
 
     def relocate_evoked_output_path(self, old_path: str, new_path: str) -> int:
         """Repoint every ``matlab_results`` / ``evoked_summary`` row whose
@@ -5532,10 +5558,12 @@ class Store:
             return None
         conn = self._connect()
         try:
+            # Heal the PHYSICAL read path only; session_dir is the logical JOIN
+            # key shared with session_config and must not be rewritten to the
+            # healed drive letter (see relocate_file_path docstring).
             conn.execute(
-                "UPDATE processed_files SET file_path=?, session_dir=? "
-                "WHERE id=?",
-                (found, os.path.dirname(found), int(file_id)))
+                "UPDATE processed_files SET file_path=? WHERE id=?",
+                (found, int(file_id)))
             conn.commit()
         except sqlite3.IntegrityError:
             # Another processed_files row already owns *found* (the same

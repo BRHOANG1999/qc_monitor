@@ -112,15 +112,19 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch):
     assert p == r"Z:\BHZ\sessA\rec.mat"            # unchanged in a dry run
 
 
-def test_relocate_file_path_store_helper(tmp_path):
+def test_relocate_file_path_updates_file_path_only(tmp_path):
+    # Heal must repoint the PHYSICAL read path (file_path) but LEAVE session_dir
+    # (the logical JOIN key shared with session_config) untouched -- rewriting it
+    # to the healed drive desyncs the seizure card / pool JOINs. See
+    # store.relocate_file_path docstring.
     store = Store(str(tmp_path / "data" / "m.db"))
     target = tmp_path / "new" / "rec.mat"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"x")
-    fid = _register(store, r"U:\OLD\rec.mat")
+    fid = _register(store, r"U:\OLD\rec.mat")          # session_dir = U:\OLD
     assert store.relocate_file_path(fid, str(target)) is True
     with store.connection() as conn:
         row = conn.execute("SELECT file_path, session_dir FROM processed_files "
                            "WHERE id=?", (fid,)).fetchone()
-    assert row["file_path"] == str(target)
-    assert row["session_dir"] == os.path.dirname(str(target))
+    assert row["file_path"] == str(target)             # physical path healed
+    assert row["session_dir"] == r"U:\OLD"             # logical key UNCHANGED
