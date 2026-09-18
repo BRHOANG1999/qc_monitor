@@ -2507,37 +2507,58 @@ def _gif_seizure_ids(full) -> list:
     return sorted({int(s) for s in pre["seizure_idx"].to_numpy().tolist()})[:500]
 
 
-def _w1trend_fig(full, sel, feature, lookback_sec):
+def _w1trend_fig(full, sel, feature, lookback_sec, frame_sec):
     """Wasserstein-1 step size (frame -> frame) + displacement (vs the far
-    baseline) vs time-before-onset, for the selected Seizure + Feature. The
-    prototype answer to "does W1 trend meaningfully from one distribution to the
-    next as onset approaches?" Synchronous -- W1 over ~23 frames is trivial."""
+    baseline), NORMALIZED by the recording's own baseline jitter, vs time-
+    before-onset, for the selected Seizure + Feature. The prototype answer to
+    "does W1 trend meaningfully from one distribution to the next as onset
+    approaches?" Non-overlapping *frame_sec* windows; synchronous."""
     if not feature:
         return empty_fig("Pick a Feature to see the Wasserstein step size.")
     if full is None or feature not in full.columns:
         return empty_fig(f"'{feature}' is not in the built matrix.")
     sid = "group" if (sel in (None, "group", "")) else int(sel)
     try:
-        d = _dan.frame_step_distances(full, sid, feature, lookback=lookback_sec)
+        d = _dan.frame_step_distances(full, sid, feature, lookback=lookback_sec,
+                                      width=float(frame_sec))
     except Exception as e:                                   # noqa: BLE001
         return empty_fig(f"Couldn't compute W₁: {e}")
+    if d.get("insufficient"):
+        return empty_fig("Seizure excluded — insufficient pre-window",
+                         hint=d.get("reason", "no baseline to normalize to"))
     h = d["hours_before"]
-    if h.size == 0 or not np.any(np.isfinite(d["step_w1"])):
+    stepn, dispn = d.get("step_w1_norm"), d.get("disp_w1_norm")
+    if h.size == 0 or stepn is None or not np.any(np.isfinite(stepn)):
         return empty_fig("Not enough stimuli per frame for a W₁ trend",
-                         hint="try the group, a wider band, or a busier seizure")
+                         hint="try a larger Frame (min) or the group")
     fig = go.Figure()
+    fig.add_hline(y=1.0, line=dict(color="#6b6b80", width=1, dash="dash"),
+                  annotation_text="baseline jitter", annotation_position="right",
+                  annotation_font_size=10, annotation_font_color="#9a9ab0")
+    s = d.get("straightening", float("nan"))
+    if np.isfinite(s):
+        verdict = ("≈ straight → drift" if s < 1.5
+                   else "wandered → churn/switch" if s > 3.0 else "mixed")
+        fig.add_annotation(
+            x=0.01, y=0.99, xref="paper", yref="paper", showarrow=False,
+            xanchor="left", yanchor="top",
+            text=f"path/net = {s:.1f}  ·  {verdict}",
+            font=dict(size=11, color="#f0f0f5"),
+            bgcolor="rgba(38,38,58,0.75)", borderpad=4)
     fig.add_trace(go.Scatter(
-        x=h, y=d["step_w1"], mode="lines+markers", connectgaps=False,
-        name="step W₁ (frame → frame)",
-        line=dict(color=COLOR_ACCENT, width=2), marker=dict(size=6),
-        customdata=[[lab, int(n)] for lab, n in zip(d["labels"], d["n"])],
-        hovertemplate="%{customdata[0]}<br>step W₁=%{y:.3g} "
-                      "(n=%{customdata[1]})<extra></extra>"))
+        x=h, y=stepn, mode="lines+markers", connectgaps=False,
+        name="step W₁ (× baseline jitter)",
+        line=dict(color=COLOR_ACCENT, width=2), marker=dict(size=5),
+        customdata=[[lab, int(n), float(s)]
+                    for lab, n, s in zip(d["labels"], d["n"], d["step_w1"])],
+        hovertemplate="%{customdata[0]}<br>step=%{y:.2f}× baseline "
+                      "(raw W₁=%{customdata[2]:.3g}, n=%{customdata[1]})"
+                      "<extra></extra>"))
     fig.add_trace(go.Scatter(
-        x=h, y=d["disp_w1"], mode="lines", connectgaps=False,
-        name="displacement W₁ (vs far baseline)",
+        x=h, y=dispn, mode="lines", connectgaps=False,
+        name="displacement W₁ (× baseline jitter)",
         line=dict(color="#e26e6e", width=1.5, dash="dot"),
-        hovertemplate="displacement W₁=%{y:.3g}<extra></extra>"))
+        hovertemplate="displacement=%{y:.2f}× baseline<extra></extra>"))
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=56, r=20, t=34, b=46),
@@ -2545,7 +2566,7 @@ def _w1trend_fig(full, sel, feature, lookback_sec):
         hovermode="x unified")
     fig.update_xaxes(autorange="reversed", title_text="hours before onset",
                      gridcolor=COLOR_DIVIDER, zeroline=False)
-    fig.update_yaxes(title_text=f"Wasserstein-1  ({feature})",
+    fig.update_yaxes(title_text="W₁  (× recording baseline jitter)",
                      gridcolor=COLOR_DIVIDER, rangemode="tozero")
     return fig
 
@@ -2919,9 +2940,23 @@ def layout_slidingauc(store):
                           "comparison are downsampled to equal n, so the distance "
                           "reflects distribution shape, not frame size. Updates live "
                           "with the Seizure / Feature / Band controls above — a "
-                          "prototype trend view, no null test.",
+                          "prototype trend view, no null test. y is normalized to "
+                          "the recording's own baseline jitter (1.0 = a typical "
+                          "far-from-onset step), so events are comparable.",
                           style={"color": COLOR_TEXT_SECONDARY,
                                  "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch"}),
+                 html.Div([
+                     html.Label("Frame (min)", style=LABEL_STYLE,
+                                title="Width of each non-overlapping distribution "
+                                      "window. Smaller resolves finer (minute-scale) "
+                                      "structure but is noisier per frame."),
+                     dcc.Dropdown(
+                         id="pex-swauc-w1frame",
+                         options=[{"label": f"{m} min", "value": m}
+                                  for m in (5, 10, 15)],
+                         value=5, clearable=False,
+                         style={**DROPDOWN_STYLE, "minWidth": "130px"}),
+                 ], style={"marginTop": SPACE_3, "maxWidth": "160px"}),
                  dcc.Graph(id="pex-swauc-w1trend", config={"displaylogo": False},
                            figure=empty_fig("Pick a Seizure + Feature above to see "
                                             "the W₁ trend."),
@@ -3954,15 +3989,17 @@ def register_callbacks(app, store, config):
         Input("pex-swauc-seizure", "value"),
         Input("pex-swauc-feature", "value"),
         Input("pex-swauc-bandhi", "value"),
+        Input("pex-swauc-w1frame", "value"),
         State("pex-job", "data"),
         prevent_initial_call=True,
     )
-    def _swauc_w1trend(sel, feature, bhi, jid):
+    def _swauc_w1trend(sel, feature, bhi, frame_min, jid):
         cached = _CACHE.get(jid) if jid else None
         if not cached or cached.get("empty") or "full" not in cached:
             return empty_fig("Build the matrix in the scope bar above first.")
         lookback = float(bhi or 6.0) * 3600.0
-        return _w1trend_fig(cached["full"], sel, feature, lookback)
+        frame_sec = float(frame_min or 5) * 60.0
+        return _w1trend_fig(cached["full"], sel, feature, lookback, frame_sec)
 
     # --- Nonstationarity control (null test) callbacks --- #
     @app.callback(

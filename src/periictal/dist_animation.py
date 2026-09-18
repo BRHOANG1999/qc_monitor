@@ -101,25 +101,36 @@ def _lead_label(lo: float, hi: float) -> str:
     return f"−{a:.1f} to −{b:.1f} h before onset"
 
 
-def frame_step_distances(full, sid, feature: str, *, width=WIDTH_SEC,
-                         step=STEP_SEC, lookback=LOOKBACK_SEC,
+def frame_step_distances(full, sid, feature: str, *, width=600.0,
+                         step=None, lookback=LOOKBACK_SEC,
                          equal_n: bool = True, min_n: int = 8,
-                         seed: int = 0) -> dict:
+                         base_frac: float = _BASELINE_FRAC,
+                         min_base_frames: int = 3, seed: int = 0) -> dict:
     """Wasserstein-1 distances along the marching frames for *sid* -- the
     prototype "does the distribution move as onset approaches?" trace.
 
-    For the same frames the GIF walks (far -> near onset), returns, keyed by each
-    frame's center time-before-onset:
-      * ``step_w1``  -- W1 between that frame and the PREVIOUS one (frame-to-frame
-        step size; small => the distribution is holding still), and
-      * ``disp_w1``  -- W1 between that frame and the far-from-onset baseline (the
-        farthest ``_BASELINE_FRAC`` of frames, pooled; how far it has drifted).
+    Frames are NON-OVERLAPPING by default (``step`` defaults to ``width``) so
+    consecutive distributions are independent; use a small ``width`` (e.g. 300-
+    600 s) to resolve minute-scale block structure. For each frame (far -> near
+    onset) returns, keyed by its center time-before-onset:
+      * ``step_w1``  -- W1 to the PREVIOUS frame (frame-to-frame step; small =>
+        the distribution is holding still), and
+      * ``disp_w1``  -- W1 to the far-from-onset baseline (the farthest
+        ``base_frac`` of frames, pooled; how far it has drifted),
+    plus ``step_w1_norm`` / ``disp_w1_norm`` -- the same two DIVIDED BY this
+    recording's own baseline jitter (median far-frame step), so a value of 1.0 =
+    "one typical baseline step" and traces are comparable / poolable across
+    seizures with different absolute scales.
 
     ``equal_n`` (default) subsamples both sides of every comparison to the
     smaller n (seeded) so a distance reflects a real distribution shift, not a
-    frame-size difference (frame n varies with artifact rejection / coverage).
-    Values are NaN where either side has < ``min_n`` points. Pure + seeded."""
+    frame-size difference. NaN where a side has < ``min_n`` points.
+
+    A seizure whose lead-up is too short to populate a baseline (fewer than
+    ``min_base_frames`` far-from-onset frames with data) is returned with
+    ``insufficient=True`` + a ``reason`` and MUST be excluded, not plotted."""
     from scipy.stats import wasserstein_distance
+    step = width if step is None else step
     frames = window_frames(full, sid, feature, width=width, step=step,
                            lookback=lookback)
     rng = np.random.default_rng(seed)
@@ -136,8 +147,10 @@ def frame_step_distances(full, sid, feature: str, *, width=WIDTH_SEC,
             b = rng.choice(b, m, replace=False)
         return float(wasserstein_distance(a, b)), m
 
-    n_base = max(1, int(round(len(frames) * _BASELINE_FRAC)))
-    base = np.concatenate([f["values"] for f in frames[:n_base]
+    n_base = max(1, int(round(len(frames) * base_frac)))
+    base_frames = frames[:n_base]                        # far-from-onset
+    base_nonempty = sum(1 for f in base_frames if f["values"].size >= min_n)
+    base = np.concatenate([f["values"] for f in base_frames
                            if f["values"].size] or [np.array([])])
 
     hours, step_w1, disp_w1, ns, labels = [], [], [], [], []
@@ -149,11 +162,49 @@ def frame_step_distances(full, sid, feature: str, *, width=WIDTH_SEC,
         disp_w1.append(dw)
         ns.append(sn)
         labels.append(frames[k]["label"])
-    return {"hours_before": np.asarray(hours, dtype=float),
-            "step_w1": np.asarray(step_w1, dtype=float),
-            "disp_w1": np.asarray(disp_w1, dtype=float),
-            "n": np.asarray(ns, dtype=int), "labels": labels,
-            "n_frames": len(frames)}
+    step_w1 = np.asarray(step_w1, dtype=float)
+    disp_w1 = np.asarray(disp_w1, dtype=float)
+    out = {"hours_before": np.asarray(hours, dtype=float),
+           "step_w1": step_w1, "disp_w1": disp_w1,
+           "n": np.asarray(ns, dtype=int), "labels": labels,
+           "n_frames": len(frames)}
+
+    # Exclude seizures that can't anchor a baseline (short lead-up / gappy far).
+    if base_nonempty < min_base_frames or base.size < min_n:
+        out["insufficient"] = True
+        out["reason"] = (f"only {base_nonempty} far-from-onset frame(s) with data "
+                         f"(need ≥ {min_base_frames}); no baseline to normalize to")
+        return out
+
+    # Normalize by this recording's OWN jitter: the median step among the far
+    # (baseline) frames. Both traces become dimensionless "× baseline step".
+    base_steps = step_w1[:max(1, n_base - 1)]
+    base_med = (float(np.nanmedian(base_steps))
+                if np.any(np.isfinite(base_steps)) else float("nan"))
+    scale = base_med if (np.isfinite(base_med) and base_med > 0) else float("nan")
+    out["insufficient"] = False
+    out["reason"] = None
+    out["baseline_step"] = scale
+    out["step_w1_norm"] = (step_w1 / scale if np.isfinite(scale)
+                           else np.full_like(step_w1, np.nan))
+    out["disp_w1_norm"] = (disp_w1 / scale if np.isfinite(scale)
+                           else np.full_like(disp_w1, np.nan))
+
+    # Straightening index: total path length (Σ frame-to-frame steps) over the
+    # NET start->end displacement. Scale-free (both W1, same units), so it needs
+    # no baseline normalization and is directly comparable across seizures.
+    #   ~1  => it walked straight there (a clean drift)
+    #   >>1 => it wandered a lot and happened to land far (a state switch / churn)
+    finite = [f["values"] for f in frames if f["values"].size >= min_n]
+    path_len = float(np.nansum(step_w1))
+    net_disp = (_w1(finite[0], finite[-1])[0] if len(finite) >= 2
+                else float("nan"))
+    out["path_length"] = path_len
+    out["net_displacement"] = net_disp
+    out["straightening"] = (path_len / net_disp
+                            if (np.isfinite(net_disp) and net_disp > 1e-9)
+                            else float("nan"))
+    return out
 
 
 # --------------------------------------------------------------------- #
