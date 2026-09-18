@@ -59,6 +59,42 @@ def test_alignment_noop_when_already_aligned():
     assert np.allclose(mu, ma, atol=1e-9)
 
 
+def _two_ch(stim_edge: float, ev_edge: float) -> dict:
+    """A trace carrying a 'stim' step (edge at *stim_edge*) and an 'evoked' step
+    (edge at *ev_edge*) on the shared grid."""
+    return {"time_ms": _T,
+            "stim": [5.0 if x >= stim_edge else 0.0 for x in _T],
+            "evoked": [5.0 if x >= ev_edge else 0.0 for x in _T]}
+
+
+def test_align_key_uses_reference_channel():
+    # Both evoked edges coincide (0.1); the stim edges differ (0.0 vs 0.2).
+    a, b = _two_ch(0.0, 0.1), _two_ch(0.2, 0.1)
+    # Aligning ON THE EVOKED (its own edges already coincide) -> sharp mean.
+    _t, m_ev = average_with_sem([a, b], value_key="evoked", align="rising_edge")[:2]
+    # Aligning ON THE STIM (edges differ -> shifts the evoked apart) -> blurred.
+    _t, m_stim = average_with_sem([a, b], value_key="evoked", align_key="stim",
+                                  align="rising_edge")[:2]
+    assert max(abs(np.diff(m_ev))) > max(abs(np.diff(m_stim)))   # value edge sharper
+
+
+def test_align_key_none_matches_value_key():
+    a, b = _two_ch(0.0, 0.1), _two_ch(0.2, 0.15)
+    _t, m0, _s = average_with_sem([a, b], value_key="evoked", align="rising_edge")
+    _t, m1, _s = average_with_sem([a, b], value_key="evoked", align_key="evoked",
+                                  align="rising_edge")
+    assert np.allclose(m0, m1)                                   # default == self-ref
+
+
+def test_align_key_missing_falls_back_to_value():
+    # A trace with no 'stim' channel must not crash; it aligns on 'evoked'.
+    a = _two_ch(0.0, 0.1)
+    b = {"time_ms": _T, "evoked": [5.0 if x >= 0.1 else 0.0 for x in _T]}  # no stim
+    _t, m, _s = average_with_sem([a, b], value_key="evoked", align_key="stim",
+                                 align="rising_edge")
+    assert m is not None and len(m) == len(_T)
+
+
 def test_rising_edge_picks_onset_not_recovery():
     # A BIPHASIC stim artifact: onset rise (+5), then after the trough a STEEPER
     # recovery rise (+8). A plain argmax of the slope would lock onto the recovery

@@ -93,6 +93,51 @@ def plot_day_overlay(file_traces, daily_traces, title: str, out_png: str,
     return out_png
 
 
+def plot_gradient_overlay(traces, base, title: str, out_png: str, *,
+                          ylabel: str = "LFP amplitude",
+                          cbar_label: str = "hour of day (early -> late)"
+                          ) -> str | None:
+    """Overlay a sequence of traces coloured on a CONTINUOUS early->late gradient
+    (viridis) with a colorbar, under a single BOLD *base* trace -- e.g. each
+    hour's average over the full-day average, so intra-day drift reads by colour.
+
+    *traces* is a list of ``(frac, time_ms, y)`` (frac in [0,1] -> colormap);
+    *base* is ``(time_ms, y)`` (the day mean), or None. Returns the path, or None
+    if nothing was drawn."""
+    drew = False
+    cmap = plt.get_cmap("viridis")
+    fig, ax = plt.subplots(figsize=_FIGSIZE)
+    for frac, tm, y in traces:
+        if tm and y and len(tm) == len(y) >= 3:
+            ax.plot(tm, y, color=cmap(max(0.0, min(1.0, float(frac)))),
+                    lw=1.1, alpha=0.85)
+            drew = True
+    if base is not None:
+        btm, by = base
+        if btm and by and len(btm) == len(by) >= 3:
+            ax.plot(btm, by, color="#111111", lw=2.4, alpha=0.95,
+                    label="full-day mean", zorder=5)
+            drew = True
+    if not drew:
+        plt.close(fig)
+        return None
+    ax.axhline(0.0, color="#888", lw=0.6, alpha=0.5)
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.2)
+    ax.legend(fontsize=7, framealpha=0.6)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0.0, 1.0))
+    cbar = fig.colorbar(sm, ax=ax)
+    cbar.set_label(cbar_label, fontsize=8)
+    cbar.set_ticks([0.0, 1.0])
+    cbar.set_ticklabels(["early", "late"])
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
 def plot_stim_trace(time_ms, y, title: str, out_png: str, *,
                     ylabel: str = "amplitude", color: str = _ACCENT,
                     sem=None, overlay=None) -> str | None:

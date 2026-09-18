@@ -175,6 +175,17 @@ def test_dry_run_renders_no_side_effects(monkeypatch, tmp_path):
     assert any("weekly" in p for p in pngs)
     assert any("impedance" in p for p in pngs)
     assert any("correlation" in p for p in pngs)
+    # the new per-hour overlay figure (each day has >=2 hourly recordings)
+    assert any("hourly" in p for p in pngs)
+
+
+def test_group_by_hour_splits_by_hour():
+    t = [{"chunk_datetime": "2026_08_24__01_00_00"},
+         {"chunk_datetime": "2026_08_24__01_30_00"},   # same clock hour
+         {"chunk_datetime": "2026_08_24__02_00_00"}]
+    g = m._group_by_hour(t)
+    assert set(g) == {"2026_08_24__01", "2026_08_24__02"}
+    assert len(g["2026_08_24__01"]) == 2               # both 01:xx grouped
 
 
 def test_daily_period_labelled_and_no_sheet(monkeypatch, tmp_path):

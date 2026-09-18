@@ -109,6 +109,17 @@ def _group_by_day(traces: list[dict]) -> dict:
     return out
 
 
+def _group_by_hour(traces: list[dict]) -> dict:
+    """{'YYYY_MM_DD__HH': [traces...]} preserving order. Recordings are ~hourly
+    but not strictly one-per-clock-hour, so group by the hour of the start
+    timestamp -- ``chunk_datetime[:14]`` ('YYYY_MM_DD' + '__' + 'HH')."""
+    out: dict = {}
+    for t in traces:
+        hour = str(t.get("chunk_datetime", ""))[:14]
+        out.setdefault(hour, []).append(t)
+    return out
+
+
 def _magnitude_pairs(traces: list[dict], artifact_win, evoked_win
                      ) -> tuple[list, list, list]:
     """Per-file, from the SAME LFP (mean_trace): (stim-artifact peak-to-trough
@@ -288,6 +299,40 @@ def _perfile_figs(store, perfile_src, animal, channel, base, wins) -> list:
     return out
 
 
+def _hour_overlay(day_traces, day_mean_d, wins, base, tag, d,
+                  animal, channel) -> list:
+    """Per window: each HOUR's stimCopy-aligned average overlaid on the full-day
+    mean, coloured early->late (a colorbar) so intra-day drift reads at a glance.
+    Returns [png paths]; empty when the day has fewer than 2 hours to compare."""
+    hours = _group_by_hour(day_traces)
+    shours = sorted(hours)
+    if len(shours) < 2:
+        return []
+    hmeans = {h: align_average_with_traces(
+                  hours[h], value_key="evoked_trace",
+                  align_key="stim_trace", align="rising_edge")
+              for h in shours}
+    n = len(shours)
+    dtm, dy = day_mean_d[0], day_mean_d[1]
+    out = []
+    for wkey, win in wins.items():
+        gtr = []
+        for i, h in enumerate(shours):
+            htm, hy = hmeans[h][0], hmeans[h][1]
+            if htm is None:
+                continue
+            gtr.append((i / (n - 1), *_crop(htm, hy, win)))
+        base_c = _crop(dtm, dy, win) if dtm else None
+        pth = os.path.join(base, f"{tag}_hourly_{_safe(d)}_{wkey}.png")
+        p = _fig.plot_gradient_overlay(
+            gtr, base_c,
+            f"{animal} {channel} — {_WIN_LABEL[wkey]} ({win[0]:g} to {win[1]:g} ms)"
+            f" per hour on {d}: each hour vs the full-day mean", pth)
+        if p:
+            out.append(p)
+    return out
+
+
 def _process_channel(store, animal, channel, traces, imp_rows, p, work,
                      week, start, end) -> dict | None:
     """Render every PNG + scalars for one channel: two LFP windows per level
@@ -301,10 +346,13 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
     days = _group_by_day(traces)
     sdays = sorted(days)
     day_color = _fig.day_color_map(sdays)
-    # Averages are RISING-EDGE aligned (sharp, not blurred by onset jitter) and
-    # carry their constituent traces so each figure can overlay them transparently.
+    # Averages are aligned by the stimCopy command's rising edge (via align_key)
+    # -- a sharp, unambiguous pulse -- NOT the LFP artifact's own edge, which is
+    # biphasic and occasionally mis-detects the recovery rise, shifting a trace
+    # ~0.2 ms. They carry their constituent traces so figures can overlay them.
     day_mean = {d: align_average_with_traces(
-                    days[d], value_key="evoked_trace", align="rising_edge")
+                    days[d], value_key="evoked_trace",
+                    align_key="stim_trace", align="rising_edge")
                 for d in sdays}
     wins = {"artifact": p.artifact_window, "evoked": p.evoked_window}
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
@@ -319,8 +367,11 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
             f"{animal} {channel} — daily average LFP {d} "
             f"(mean + {len(dtraces)} recordings)", wins,
             sem=sem, color=day_color[d], overlay=dtraces).values())
+        daily += _hour_overlay(days[d], day_mean[d], wins, base, tag, d,
+                               animal, channel)
     tmw, yw, semw, wtraces = align_average_with_traces(   # weekly
-        traces, value_key="evoked_trace", align="rising_edge")
+        traces, value_key="evoked_trace", align_key="stim_trace",
+        align="rising_edge")
     weekly = _lfp_figs(
         tmw, yw, base, f"{tag}_weekly",
         f"{animal} {channel} — weekly average LFP, {week} "
