@@ -11,6 +11,8 @@ import os
 import sys
 from datetime import date
 
+import pytest
+
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -34,10 +36,14 @@ class FakeStore:
     def __init__(self):
         self._traces = [_trace(1, "2026_08_24", 0.0), _trace(2, "2026_08_24", 0.4),
                         _trace(3, "2026_08_25", 0.8), _trace(4, "2026_08_25", 1.2)]
-        self._imp = [{"chunk_datetime": f"2026_08_{d:02d}__10_00_00",
-                      "access_r_kohm": 100.0 + (0 if d < 24 else 55.0),
-                      "slow_ss_kohm": 0.120 + (0 if d < 24 else 0.060)}
-                     for d in range(10, 26)]
+        # Realistic magnitudes: Rₐ and Z_ss are the same order (~0.1-0.2 kΩ), so
+        # the Z_ss<0.3·Rₐ saturation gate keeps these rows.
+        self._imp = [{"chunk_datetime": f"2026_08_{d:02d}__{h:02d}_00_00",
+                      "access_r_kohm": 0.150 + (0.0 if d < 24 else 0.080),
+                      "slow_ss_kohm": 0.120 + (0.0 if d < 24 else 0.060),
+                      "v_ss_mv": 3.6 + (0.0 if d < 24 else 1.8),
+                      "slow_ss_raw": -1.08, "gain": 300.0}
+                     for d in range(10, 26) for h in (9, 10)]   # 2 hours/day
 
     def active_impedance_channel_keys(self):
         return {(_ANIMAL, _CH)}
@@ -177,6 +183,28 @@ def test_dry_run_renders_no_side_effects(monkeypatch, tmp_path):
     assert any("correlation" in p for p in pngs)
     # the new per-hour overlay figure (each day has >=2 hourly recordings)
     assert any("hourly" in p for p in pngs)
+    # the new V_ss (plateau voltage) figure + the Z_ss %-change figure
+    assert any("vss" in p for p in pngs)
+    assert any("zss_pct" in p for p in pngs)
+
+
+def test_zss_pct_change_math():
+    # hour-over-hour / vs-day / vs-week % change of per-hour mean Z_ss.
+    rows = [{"chunk_datetime": "2026_08_24__09_00_00", "slow_ss_kohm": 0.10,
+             "access_r_kohm": 0.20},
+            {"chunk_datetime": "2026_08_24__10_00_00", "slow_ss_kohm": 0.12,
+             "access_r_kohm": 0.20},
+            {"chunk_datetime": "2026_08_25__09_00_00", "slow_ss_kohm": 0.14,
+             "access_r_kohm": 0.20}]
+    d = m._zss_pct_change(rows)
+    assert d is not None and len(d["hz"]) == 3
+    assert d["pct_hoh"][0] is None                     # first hour has no prior
+    assert d["pct_hoh"][1] == pytest.approx(20.0)      # 0.10 -> 0.12
+    # a saturated row (Z_ss << Ra) is dropped before the math
+    sat = rows + [{"chunk_datetime": "2026_08_25__10_00_00",
+                   "slow_ss_kohm": 0.001, "access_r_kohm": 0.20}]
+    d2 = m._zss_pct_change(sat)
+    assert len(d2["hz"]) == 3                           # the 0.001 row dropped
 
 
 def test_group_by_hour_splits_by_hour():

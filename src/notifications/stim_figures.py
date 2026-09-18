@@ -93,6 +93,45 @@ def plot_day_overlay(file_traces, daily_traces, title: str, out_png: str,
     return out_png
 
 
+def plot_zss_pct_change(x, hz, pct_hoh, pct_day, pct_week, week_mean,
+                        title: str, out_png: str) -> str | None:
+    """Two-panel Z_ss %-change figure. Top: per-hour mean Z_ss over time with a
+    week-mean reference line. Bottom: the three % changes -- hour-over-hour, each
+    hour vs its DAY mean, each hour vs the WEEK mean -- with a zero line. *x* is a
+    list of hour datetimes; the four series are parallel lists (None gaps ok)."""
+    pts = [(xx, z) for xx, z in zip(x, hz) if xx is not None and z is not None]
+    if len(pts) < 2:
+        return None
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9.0, 6.0), sharex=True)
+    ax1.plot([p[0] for p in pts], [p[1] for p in pts], "o-",
+             color=_ACCENT, ms=3, lw=1.3)
+    if week_mean is not None:
+        ax1.axhline(week_mean, color="#888", ls="--", lw=1.0, label="week mean")
+        ax1.legend(fontsize=7)
+    ax1.set_ylabel("hourly Z_ss (kΩ)")
+    ax1.set_title(title, fontsize=10)
+    ax1.grid(True, alpha=0.2)
+
+    def _series(y, color, label):
+        xy = [(xx, yy) for xx, yy in zip(x, y) if xx is not None and yy is not None]
+        if xy:
+            ax2.plot([p[0] for p in xy], [p[1] for p in xy], "o-",
+                     color=color, ms=3, lw=1.0, label=label)
+    _series(pct_hoh, "#9467bd", "hour-over-hour")
+    _series(pct_day, "#2ca02c", "vs day mean")
+    _series(pct_week, "#d62728", "vs week mean")
+    ax2.axhline(0.0, color="#888", lw=0.6)
+    ax2.set_ylabel("Z_ss % change")
+    ax2.set_xlabel("recording hour")
+    ax2.legend(fontsize=7, ncol=3, framealpha=0.6)
+    ax2.grid(True, alpha=0.2)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
 def plot_gradient_overlay(traces, base, title: str, out_png: str, *,
                           ylabel: str = "LFP amplitude",
                           cbar_label: str = "hour of day (early -> late)"

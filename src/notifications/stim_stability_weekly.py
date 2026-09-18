@@ -333,6 +333,69 @@ def _hour_overlay(day_traces, day_mean_d, wins, base, tag, d,
     return out
 
 
+_ZSS_SAT_RATIO = 0.3       # Z_ss < ratio * Rₐ = saturated (amp railed) -> drop
+
+
+def _zss_valid_rows(imp_rows) -> list:
+    """Rows with a NON-saturated Z_ss (Z_ss >= _ZSS_SAT_RATIO * Rₐ). At high
+    charge the amp rails and the plateau collapses to Z_ss << Rₐ; those near-zero
+    rows would blow up a %-change, so drop them."""
+    out = []
+    for r in imp_rows:
+        z, ra = r.get("slow_ss_kohm"), r.get("access_r_kohm")
+        if z is None:
+            continue
+        if ra and ra > 0 and z < _ZSS_SAT_RATIO * ra:
+            continue
+        out.append(r)
+    return out
+
+
+def _zss_pct_change(imp_rows) -> dict | None:
+    """Per-hour mean Z_ss (valid rows) + % changes: hour-over-hour, vs the hour's
+    DAY mean, and vs the WEEK mean. ``None`` when fewer than 2 hours of valid
+    data. Keys: x (datetimes), hz, pct_hoh, pct_day, pct_week, week_mean."""
+    rows = _zss_valid_rows(imp_rows)
+    byh: dict = {}
+    byd: dict = {}
+    for r in rows:
+        cd = str(r["chunk_datetime"])
+        byh.setdefault(cd[:14], []).append(r["slow_ss_kohm"])
+        byd.setdefault(cd[:10], []).append(r["slow_ss_kohm"])
+    hours = sorted(byh)
+    if len(hours) < 2:
+        return None
+    hz = [float(np.mean(byh[h])) for h in hours]
+    day_mean = {d: float(np.mean(v)) for d, v in byd.items()}
+    week_mean = float(np.mean([r["slow_ss_kohm"] for r in rows]))
+
+    def _pct(a, b):
+        return (a - b) / b * 100.0 if b else None
+    pct_hoh = [None] + [_pct(hz[i], hz[i - 1]) for i in range(1, len(hz))]
+    pct_day = [_pct(hz[i], day_mean[hours[i][:10]]) for i in range(len(hz))]
+    pct_week = [_pct(z, week_mean) for z in hz]
+    x = []
+    for h in hours:
+        try:
+            x.append(datetime.strptime(h, "%Y_%m_%d__%H"))
+        except ValueError:
+            x.append(None)
+    return {"x": x, "hz": hz, "pct_hoh": pct_hoh, "pct_day": pct_day,
+            "pct_week": pct_week, "week_mean": week_mean}
+
+
+def _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week):
+    """The Z_ss %-change figure (per-hour Z_ss + the three %Δ series). Returns
+    the PNG path or None when there isn't >=2 hours of valid Z_ss."""
+    d = _zss_pct_change(imp_rows)
+    if d is None:
+        return None
+    return _fig.plot_zss_pct_change(
+        d["x"], d["hz"], d["pct_hoh"], d["pct_day"], d["pct_week"],
+        d["week_mean"], f"{animal} {channel} — Z_ss % change by hour ({week})",
+        os.path.join(base, f"{tag}_zss_pct.png"))
+
+
 def _process_channel(store, animal, channel, traces, imp_rows, p, work,
                      week, start, end) -> dict | None:
     """Render every PNG + scalars for one channel: two LFP windows per level
@@ -386,6 +449,14 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
         imp_rows, base, tag, animal, channel, week, start, end, p,
         value_key="slow_ss_kohm", ylabel="Z_ss (kΩ)", series_name="Z_ss",
         metric_label="slow-phase steady-state impedance (Z_ss)", fname="zss")
+    # Slow-phase plateau VOLTAGE (V_ss, mV) -- the raw measurement behind Z_ss
+    # (Z_ss = V_ss / commanded slow current), so a voltage change reads directly
+    # instead of being folded through the current normalisation.
+    vss, vss_week = _metric_figs(
+        imp_rows, base, tag, animal, channel, week, start, end, p,
+        value_key="v_ss_mv", ylabel="V_ss (mV)", series_name="V_ss",
+        metric_label="slow-phase plateau voltage (V_ss)", fname="vss")
+    zss_pct = _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week)
     xs, ys, dys = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
     corr = _fig.plot_stim_vs_evoked(
         xs, ys, f"{animal} {channel} — stim-artifact vs evoked magnitude",
@@ -410,6 +481,8 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
         "png_evoked_overlay": over.get("evoked"),
         "png_impedance": imp, "png_impedance_week": imp_week,
         "png_zss": zss, "png_zss_week": zss_week,
+        "png_vss": vss, "png_vss_week": vss_week,
+        "png_zss_pct": zss_pct,
         "png_corr": corr["png"],
         "perfile": perfile, "daily": daily,
         "urls": {}, "folder_link": "",
@@ -427,7 +500,8 @@ _SHEET_HEADLINE = (("artifact", "png_artifact_overlay"),
 _EMAIL_HEADLINE = ("png_artifact", "png_artifact_overlay",
                    "png_evoked", "png_evoked_overlay",
                    "png_impedance", "png_impedance_week",
-                   "png_zss", "png_zss_week", "png_corr")
+                   "png_zss", "png_zss_week",
+                   "png_vss", "png_vss_week", "png_zss_pct", "png_corr")
 
 
 def _upload_channel(drive, week_folder_id, res, throttle) -> None:
@@ -441,7 +515,9 @@ def _upload_channel(drive, week_folder_id, res, throttle) -> None:
             res["urls"][key] = _drive.upload_png(
                 drive, res[field], sub["id"], throttle_sec=throttle)["image_url"]
     archive = [res.get("png_artifact"), res.get("png_evoked"),
-               res.get("png_impedance_week"), res.get("png_zss_week")] \
+               res.get("png_impedance_week"), res.get("png_zss_week"),
+               res.get("png_vss"), res.get("png_vss_week"),
+               res.get("png_zss_pct")] \
         + res["daily"] + res["perfile"]                   # archived, not linked
     for path in archive:
         if path:
@@ -541,6 +617,17 @@ _CAPTIONS = {
     "baseline + threshold band, orange = the week in this report.",
     "png_zss_week": "The same slow-phase steady-state impedance (Z_ss) zoomed to "
     "this week.",
+    "png_vss": "Slow-phase plateau VOLTAGE (V_ss, mV) over the whole implant "
+    "history -- the raw settled voltage behind Z_ss (Z_ss = V_ss / commanded slow "
+    "current). Because the current is constant while the charge is unchanged, a "
+    "leap here IS a real voltage change, not a current/impedance artifact; if the "
+    "charge ever changes, V_ss and Z_ss diverge.",
+    "png_vss_week": "The same slow-phase plateau voltage (V_ss) zoomed to this "
+    "week.",
+    "png_zss_pct": "Z_ss % change by hour: per-hour mean Z_ss (top, with the week "
+    "mean dashed) and its % change hour-over-hour, vs that hour's full-day mean, "
+    "and vs the full-week mean (bottom). Saturated (railed) rows are dropped so "
+    "the % change tracks the real plateau, not the collapses.",
     "png_corr": "Does a bigger stimulus artifact drive a bigger evoked response? "
     "One point per recording (coloured by day); the red line is the linear fit "
     "(r, p). A strong positive r means the response scales with the delivered "

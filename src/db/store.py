@@ -2593,7 +2593,8 @@ class Store:
                 params.append(cutoff)
             sql = f"""SELECT ci.animal_id, ci.channel_name, ci.file_id,
                              pf.chunk_datetime, ci.access_r_kohm,
-                             ci.slow_ss_kohm, ci.charge_nc,
+                             ci.slow_ss_kohm, ci.slow_ss_raw, ci.gain,
+                             ci.charge_nc,
                              ci.access_r_reversal_kohm, ci.access_r_offset_kohm
                       FROM channel_impedance ci
                       JOIN processed_files pf ON pf.id = ci.file_id
@@ -2610,11 +2611,20 @@ class Store:
             if excl and any(e in animal.lower() for e in excl):
                 continue
             key = (animal, r["channel_name"] or "")
+            # Slow-phase plateau VOLTAGE (mV, gain-corrected magnitude): the raw
+            # measurement behind Z_ss (Z_ss = V_ss / i_slow), so a caller can plot
+            # voltage change independent of the commanded current.
+            vraw, gain = r["slow_ss_raw"], r["gain"]
+            v_ss_mv = (abs(float(vraw) / float(gain) * 1000.0)
+                       if (vraw is not None and gain) else None)
             out.setdefault(key, []).append({
                 "file_id": int(r["file_id"]),
                 "chunk_datetime": r["chunk_datetime"] or "",
                 "access_r_kohm": r["access_r_kohm"],
                 "slow_ss_kohm": r["slow_ss_kohm"],
+                "slow_ss_raw": vraw,
+                "gain": gain,
+                "v_ss_mv": v_ss_mv,
                 "charge_nc": r["charge_nc"],
                 "current_fidelity_pct": _current_fidelity_pct(
                     r["access_r_reversal_kohm"], r["access_r_offset_kohm"]),
