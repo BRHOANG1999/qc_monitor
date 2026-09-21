@@ -382,20 +382,25 @@ def plot_pooled_overlay(results: list, animal: str, channel: str,
 
 
 def plot_pooled(results: list, animal: str, channel: str, out_png: str) -> str:
-    """Pooled across seizures: (left) each seizure's pre/at/post magnitude means
-    connected (faint) + the across-seizure mean +/- SEM per window; (right) the
-    grand-average artifact waveform per window."""
+    """Pooled across seizures: (left) EVERY seizure's per-window magnitude as a
+    point (faint), same-seizure windows connected, + the across-seizure mean +/-
+    SEM per window; (right) the grand-average artifact waveform per window. Every
+    contributing point is drawn -- including a seizure that has only one window --
+    and each window is labelled with its own n, so the mean/SEM can never reflect a
+    hidden point or a mismatched sample across windows."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.6))
     xs = {n: i for i, n in enumerate(WIN_ORDER)}
     per = {n: [] for n in WIN_ORDER}
     for r in results:
-        pts = [(xs[n], r["windows"][n]["mag_mean"]) for n in WIN_ORDER
+        pts = [(n, r["windows"][n]["mag_mean"]) for n in WIN_ORDER
                if n in r["windows"] and np.isfinite(r["windows"][n]["mag_mean"])]
-        if len(pts) >= 2:
-            ax1.plot([p[0] for p in pts], [p[1] for p in pts], color="#aaa",
-                     lw=0.8, alpha=0.5, marker="o", ms=3)
-        for n, _ in pts:
-            per[WIN_ORDER[n]].append(r["windows"][WIN_ORDER[n]]["mag_mean"])
+        for name, mag in pts:                         # every point, nothing hidden
+            ax1.scatter(xs[name], mag, s=22, color=WIN_COLOR[name], alpha=0.4,
+                        linewidths=0, zorder=2)
+            per[name].append(mag)
+        if len(pts) >= 2:                             # within-seizure trajectory
+            ax1.plot([xs[n] for n, _ in pts], [m for _, m in pts], color="#aaa",
+                     lw=0.8, alpha=0.5, zorder=1)
     for n in WIN_ORDER:
         if per[n]:
             m = float(np.mean(per[n]))
@@ -404,7 +409,8 @@ def plot_pooled(results: list, animal: str, channel: str, out_png: str) -> str:
             ax1.errorbar(xs[n], m, yerr=s, color=WIN_COLOR[n], marker="o", ms=9,
                          capsize=4, lw=2, zorder=5)
     ax1.set_xticks(list(xs.values()))
-    ax1.set_xticklabels([WIN_LABEL[n] for n in WIN_ORDER], fontsize=8)
+    ax1.set_xticklabels([f"{WIN_LABEL[n]}\nn={len(per[n])}" for n in WIN_ORDER],
+                        fontsize=8)
     ax1.set_ylabel("artifact magnitude, p2p (µV)")
     ax1.set_title(f"{animal} {channel} — magnitude by window "
                   f"({len(results)} seizures)", fontsize=10)
