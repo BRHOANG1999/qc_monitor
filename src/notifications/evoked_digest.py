@@ -34,7 +34,7 @@ from src.utils.evoked_output import (list_evoked_files, animals_in_filename,  # 
 DEFAULT_FEATURES = ["peak_to_trough", "line_length", "rms_amplitude",
                     "peak_latency_ms", "recovery_tau"]
 HEADLINE_FEATURES = ["peak_to_trough", "line_length"]     # inline in the email
-DEFAULT_N_BANDS = 5
+DEFAULT_N_BANDS = 10          # deciles: 10 even-population bands, 10 traces
 _MIN_PER_FEATURE = 40          # too few finite responses -> skip that feature
 _MATCH_TOL_SEC = 0.5           # stim-time match tolerance (row <-> trace)
 _BG = "#1e1e2f"
@@ -53,10 +53,13 @@ def day_bounds(day: datetime) -> tuple[float, float]:
     return d0.timestamp(), (d0 + timedelta(days=1)).timestamp()
 
 
-def list_day_files(animal: str, evoked_dir: str, day: datetime) -> list[str]:
-    """The animal's *_evoked.mat files recorded on *day*, oldest first."""
-    d0 = datetime(day.year, day.month, day.day)
-    d1 = d0 + timedelta(days=1)
+def list_window_files(animal: str, evoked_dir: str, end_day: datetime,
+                      window_days: int = 1) -> list[str]:
+    """The animal's *_evoked.mat files in the *window_days* ending on *end_day*
+    (inclusive), oldest first. ``window_days=1`` = just *end_day* (daily);
+    ``7`` = a running week (weekly counterpart)."""
+    d1 = datetime(end_day.year, end_day.month, end_day.day) + timedelta(days=1)
+    d0 = d1 - timedelta(days=max(1, int(window_days)))
     out = []
     for fp in list_evoked_files(evoked_dir):
         if animal not in animals_in_filename(fp):
@@ -65,6 +68,11 @@ def list_day_files(animal: str, evoked_dir: str, day: datetime) -> list[str]:
         if dt is not None and d0 <= dt < d1:
             out.append(fp)
     return sorted(out)
+
+
+def list_day_files(animal: str, evoked_dir: str, day: datetime) -> list[str]:
+    """The animal's *_evoked.mat files recorded on *day* (daily window)."""
+    return list_window_files(animal, evoked_dir, day, 1)
 
 
 def day_series(day_files: list[str], animal: str, metrics: list[str]) -> dict:
@@ -97,34 +105,39 @@ def day_series(day_files: list[str], animal: str, metrics: list[str]) -> dict:
     return series
 
 
-def even_band_edges(vals: np.ndarray, n_bands: int = DEFAULT_N_BANDS):
-    """Percentile band edges from the finite values -- equal-population where the
-    distribution allows, but a large point mass (e.g. many flat 0-amplitude
-    responses on inactive stimuli) collapses to ONE wide band rather than being
-    split arbitrarily, so value->band stays deterministic. Returns the unique
-    edge array (>= 3 edges => >= 2 bands) or None when degenerate (single value /
-    too few points). The effective band count is ``len(edges) - 1``."""
+def compute_bands(secs: np.ndarray, vals: np.ndarray,
+                  n_bands: int = DEFAULT_N_BANDS):
+    """RANK-based equal-population bands (deciles by default): each band holds
+    ~n/n_bands responses. Assigning by RANK (not value edge) means a large point
+    mass -- e.g. the many flat 0-amplitude responses on inactive stimuli -- is
+    split evenly across the bottom bands instead of collapsing them, so you
+    always get *n_bands* equal-count traces. Ties are broken by time order.
+
+    Keyed to each response by its absolute timestamp (rounded to ms) so the trace
+    pass can look up a band without re-deriving it. Returns
+    ``{"band_of_ts", "bands" (per-index, -1 = non-finite), "edges" (display value
+    edges), "counts", "n_bands"}`` or None when too few finite responses."""
     v = np.asarray(vals, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size < max(n_bands, _MIN_PER_FEATURE):
+    s = np.asarray(secs, dtype=float)
+    fin = np.isfinite(v) & np.isfinite(s)
+    idx = np.where(fin)[0]
+    if idx.size < max(4 * n_bands, _MIN_PER_FEATURE):
         return None
-    edges = np.unique(np.quantile(v, np.linspace(0.0, 1.0, n_bands + 1)))
-    if edges.size < 3:                               # < 2 distinct bands => skip
-        return None
-    edges[-1] = np.nextafter(edges[-1], np.inf)      # include the max in the top band
-    return edges
+    order = idx[np.argsort(v[idx], kind="stable")]       # indices, value-sorted
+    n = order.size
+    band_sorted = np.minimum((np.arange(n) * n_bands) // n, n_bands - 1)
+    bands = np.full(v.size, -1, dtype=int)
+    bands[order] = band_sorted
+    band_of_ts = {round(float(s[i]), 3): int(bands[i]) for i in idx}
+    edges = np.quantile(v[idx], np.linspace(0.0, 1.0, n_bands + 1))
+    counts = np.bincount(band_sorted, minlength=n_bands)
+    return {"band_of_ts": band_of_ts, "bands": bands, "edges": edges,
+            "counts": counts, "n_bands": int(n_bands)}
 
 
-def n_bands_of(edges: np.ndarray) -> int:
-    return len(edges) - 1
-
-
-def assign_band(value: float, edges: np.ndarray) -> int:
-    """Band index [0, n_bands) for *value*, or -1 if non-finite/out of range."""
-    if not np.isfinite(value):
-        return -1
-    b = int(np.searchsorted(edges, value, side="right") - 1)
-    return b if 0 <= b < len(edges) - 1 else -1
+def _ts_key(row) -> float:
+    dt = _d.parse_iso(row.get("abs_dt")) if row.get("abs_dt") else None
+    return round((dt or datetime.min).timestamp(), 3)
 
 
 class _BandAccum:
@@ -164,13 +177,15 @@ class _BandAccum:
 
 
 def band_waveforms_multi(day_files: list[str], animal: str, channel: str,
-                         edges_by_feat: dict) -> dict:
-    """ONE streaming trace pass over the day's *channel* recordings: match each
-    epoch to its sidecar row by stim time, and for EVERY feature accumulate its
-    per-band mean +/- sd waveform. ``edges_by_feat = {feature: edges}``; returns
+                         info_by_feat: dict) -> dict:
+    """ONE streaming trace pass over the *channel* recordings: match each epoch to
+    its sidecar row by stim time, look up its (rank) band per feature by the
+    response's timestamp, and accumulate per-band mean +/- sd waveforms.
+    ``info_by_feat = {feature: compute_bands(...)}``; returns
     ``{feature: (time_ms, {band: {mean, sd, n}})}``. Reading each recording's
     traces once (not once per feature) keeps the daemon's I/O bounded."""
-    accs = {f: _BandAccum(n_bands_of(e)) for f, e in edges_by_feat.items()}
+    accs = {f: _BandAccum(info["n_bands"]) for f, info in info_by_feat.items()}
+    maps = {f: info["band_of_ts"] for f, info in info_by_feat.items()}
     for fp in day_files:
         rows = [r for r in (read_feature_sidecar(fp, animal) or [])
                 if r.get("channel") == channel]
@@ -193,52 +208,56 @@ def band_waveforms_multi(day_files: list[str], animal: str, channel: str,
                     > _MATCH_TOL_SEC:
                 continue
             trace = traces[order[min(cand, key=lambda k: abs(ts[k] - st))]]
-            for f, edges in edges_by_feat.items():
-                b = assign_band(_d._nan(r.get(f)), edges)
+            key = _ts_key(r)
+            for f, m in maps.items():
+                b = m.get(key, -1)
                 if b >= 0:
                     accs[f].add(b, trace, time_ms)
     return {f: (acc.time_ms, acc.result()) for f, acc in accs.items()}
 
 
 def band_waveforms(day_files: list[str], animal: str, channel: str,
-                   feature: str, edges: np.ndarray) -> tuple:
+                   feature: str, info: dict) -> tuple:
     """Single-feature convenience wrapper over ``band_waveforms_multi``."""
-    return band_waveforms_multi(day_files, animal, channel, {feature: edges})[feature]
+    return band_waveforms_multi(day_files, animal, channel, {feature: info})[feature]
 
 
-def _band_label(b: int, edges: np.ndarray, n_bands: int, n: int,
-                total: int) -> str:
+def _band_label(b: int, edges: np.ndarray, n_bands: int) -> str:
     lo, hi = edges[b], edges[b + 1]
-    share = f"{100 * n / total:.0f}%" if total else "?"
-    tag = "  (top)" if b == n_bands - 1 else "  (bottom)" if b == 0 else ""
-    return f"{lo:.3g}–{hi:.3g}  n={n} ({share}){tag}"
+    tag = "  ← top" if b == n_bands - 1 else "  ← bottom" if b == 0 else ""
+    return f"D{b + 1} [{lo:.3g}–{hi:.3g}]{tag}"
 
 
 def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
-                   edges: np.ndarray, time_ms, band_wf: dict, meta: dict,
-                   out_png: str, n_bands: int | None = None) -> str:
-    """2-panel PNG: (left) feature-vs-time scatter with the y-axis split at the
-    percentile band edges, points colored by band; (right) each band's mean +/-
+                   info: dict, time_ms, band_wf: dict, meta: dict,
+                   out_png: str) -> str:
+    """2-panel PNG: (left) feature-vs-time scatter split into equal-population
+    (rank) percentile bands, points colored by band; (right) each band's mean +/-
     sd evoked waveform. Saves to *out_png*, returns the path."""
-    n_bands = n_bands_of(edges) if n_bands is None else n_bands
-    total = int(sum(d["n"] for d in band_wf.values())) or 1
-    colors = plt.cm.viridis(np.linspace(0.12, 0.92, n_bands))
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.5, 4.6), facecolor=_BG,
+    n_bands, edges = info["n_bands"], info["edges"]
+    bands_idx = info["bands"]
+    colors = plt.cm.viridis(np.linspace(0.06, 0.96, n_bands))
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.8, 4.8), facecolor=_BG,
                                    gridspec_kw={"width_ratios": [1.15, 1.0]})
-    ok = np.isfinite(vals) & np.isfinite(secs)
-    s, v = secs[ok], vals[ok]
-    bands = np.array([assign_band(x, edges) for x in v])
+    ok = bands_idx >= 0
+    s, v, bb = secs[ok], vals[ok], bands_idx[ok]
     dts = mdates.date2num([datetime.fromtimestamp(x) for x in s])
     axL.set_facecolor(_PANEL)
     for b in range(n_bands):
-        m = bands == b
+        m = bb == b
         if m.any():
-            axL.scatter(dts[m], v[m], s=7, color=colors[b], alpha=0.6,
+            axL.scatter(dts[m], v[m], s=6, color=colors[b], alpha=0.6,
                         edgecolors="none")
-    for e in edges[1:-1]:
-        axL.axhline(e, color=_MUTED, lw=0.8, ls="--", alpha=0.5)
-    axL.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    axL.set_xlabel("time of day", color=_TEXT, fontsize=10)
+    for e in np.unique(edges[1:-1]):
+        axL.axhline(e, color=_MUTED, lw=0.7, ls="--", alpha=0.4)
+    _loc = mdates.AutoDateLocator()
+    axL.xaxis.set_major_locator(_loc)
+    axL.xaxis.set_major_formatter(mdates.ConciseDateFormatter(_loc))
+    vv = v[np.isfinite(v)]
+    if vv.size:                                          # robust y so outliers don't compress
+        ylo, yhi = np.percentile(vv, [0.2, 99.5])
+        axL.set_ylim(ylo - 0.05 * (yhi - ylo) - 1e-9, yhi + 0.05 * (yhi - ylo) + 1e-9)
+    axL.set_xlabel("time", color=_TEXT, fontsize=10)
     axL.set_ylabel(_pretty(feature), color=_TEXT, fontsize=10)
     axL.set_title(f"{meta['animal']} · {meta['channel']} · "
                   f"{meta['date']}  (n={int(ok.sum())})", color=_TEXT,
@@ -249,18 +268,21 @@ def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
     base_m = (tm >= -50) & (tm <= -5)                 # pre-stim baseline window
     art_m = np.abs(tm) <= 1.5                          # blank the stim artifact
     vis_m = (tm >= -20) & (tm <= 200) & ~art_m        # response window shown
+    show_sd = n_bands <= 5                              # sd fills get muddy w/ deciles
     ys = []
     for b in sorted(band_wf):
         d = band_wf[b]
         mean = d["mean"] - (np.nanmean(d["mean"][base_m]) if base_m.any() else 0.0)
-        m_plot, sd_plot = mean.copy(), d["sd"].copy()
-        m_plot[art_m] = np.nan                         # gap at the artifact
-        sd_plot[art_m] = np.nan
-        lw = 2.4 if b in (0, n_bands - 1) else 1.4
+        m_plot = mean.copy()
+        m_plot[art_m] = np.nan                          # gap at the artifact
+        lw = 2.4 if b in (0, n_bands - 1) else 1.3
         axR.plot(tm, m_plot, color=colors[b], lw=lw,
-                 label=_band_label(b, edges, n_bands, d["n"], total))
-        axR.fill_between(tm, m_plot - sd_plot, m_plot + sd_plot,
-                         color=colors[b], alpha=0.07, linewidth=0)
+                 label=_band_label(b, edges, n_bands))
+        if show_sd:
+            sd_plot = d["sd"].copy()
+            sd_plot[art_m] = np.nan
+            axR.fill_between(tm, m_plot - sd_plot, m_plot + sd_plot,
+                             color=colors[b], alpha=0.07, linewidth=0)
         seg = mean[vis_m]
         seg = seg[np.isfinite(seg)]
         if seg.size:
@@ -275,8 +297,9 @@ def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
     axR.set_ylabel("evoked (a.u.)", color=_TEXT, fontsize=10)
     axR.set_title(f"mean±sd response by {_pretty(feature)} band",
                   color=_TEXT, fontsize=11, loc="left")
-    leg = axR.legend(fontsize=7, facecolor=_PANEL, edgecolor="#3a3a52",
-                     labelcolor=_TEXT, loc="best")
+    leg = axR.legend(fontsize=6, facecolor=_PANEL, edgecolor="#3a3a52",
+                     labelcolor=_TEXT, loc="upper right", ncol=1,
+                     framealpha=0.85)
     if leg:
         leg.get_frame().set_alpha(0.85)
     for ax in (axL, axR):
@@ -289,44 +312,67 @@ def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
     return out_png
 
 
+def _date_label(end_day: datetime, window_days: int) -> str:
+    end = datetime(end_day.year, end_day.month, end_day.day).date()
+    if window_days <= 1:
+        return end.isoformat()
+    start = (datetime(end_day.year, end_day.month, end_day.day)
+             - timedelta(days=window_days - 1)).date()
+    return f"{start.isoformat()} – {end.isoformat()}"
+
+
+def _sample_files(files: list, cap: int) -> list:
+    """Evenly sample at most *cap* files across the window (for the trace pass)."""
+    if cap <= 0 or len(files) <= cap:
+        return files
+    idx = np.linspace(0, len(files) - 1, cap).round().astype(int)
+    return [files[i] for i in sorted(set(idx.tolist()))]
+
+
 def build_animal(animal: str, evoked_dir: str, day: datetime, *,
                  features=None, n_bands: int = DEFAULT_N_BANDS,
+                 window_days: int = 1, max_trace_files: int = 24,
                  work_dir: str, channel_override: str | None = None) -> dict:
-    """Render one 2-panel PNG per feature for *animal* on *day*. Returns
-    ``{"animal", "channel", "date", "n_responses", "pngs": {feature: path}}`` or
+    """Render one 2-panel PNG per feature for *animal* over the *window_days*
+    ending on *day* (1 = daily, 7 = weekly). Returns ``{"animal","channel",
+    "date","n_responses","skipped","pngs":{feature: path}}`` or
     ``{"empty": True, "reason": ...}`` when there's nothing to show."""
     features = [f for f in (features or DEFAULT_FEATURES) if f in _ef.ALL_COLUMNS]
-    day_files = list_day_files(animal, evoked_dir, day)
-    if not day_files:
+    files = list_window_files(animal, evoked_dir, day, window_days)
+    if not files:
         return {"animal": animal, "empty": True, "reason": "no recordings"}
-    series = day_series(day_files, animal, features)
+    series = day_series(files, animal, features)
     channel = _d.primary_channel(animal, series, features, channel_override)
     if channel is None or channel not in series:
         return {"animal": animal, "empty": True, "reason": "no channel data"}
     d = series[channel]
-    date_str = datetime(day.year, day.month, day.day).date().isoformat()
+    date_str = _date_label(day, window_days)
     meta = {"animal": animal, "channel": channel, "date": date_str}
-    edges_by_feat = {}
+    info_by_feat, skipped = {}, []
     for feat in features:
         vals = d["metrics"].get(feat)
-        if vals is None:
-            continue
-        edges = even_band_edges(vals, n_bands)
-        if edges is not None:
-            edges_by_feat[feat] = edges
-    if not edges_by_feat:
+        info = compute_bands(d["secs"], vals, n_bands) if vals is not None else None
+        if info is not None:
+            info_by_feat[feat] = info
+        else:
+            skipped.append(feat)                         # all-NaN / too few
+    if not info_by_feat:
         return {"animal": animal, "empty": True, "reason": "no bandable feature"}
-    wf = band_waveforms_multi(day_files, animal, channel, edges_by_feat)   # one trace pass
+    # Banding/scatter use ALL responses (cheap sidecars); the waveform pass reads
+    # traces from a bounded, evenly-sampled subset of recordings (I/O-bound).
+    trace_files = _sample_files(files, max_trace_files)
+    wf = band_waveforms_multi(trace_files, animal, channel, info_by_feat)
     pngs: dict = {}
-    for feat, edges in edges_by_feat.items():
+    for feat, info in info_by_feat.items():
         time_ms, band_wf = wf[feat]
         if not band_wf or time_ms is None:
+            skipped.append(feat)
             continue
         png = os.path.join(work_dir, f"evoked_{animal}_{channel}_{feat}.png")
-        feature_figure(feat, d["secs"], d["metrics"][feat], edges, time_ms,
+        feature_figure(feat, d["secs"], d["metrics"][feat], info, time_ms,
                        band_wf, meta, png)
         pngs[feat] = png
     if not pngs:
         return {"animal": animal, "empty": True, "reason": "no bandable feature"}
     return {"animal": animal, "channel": channel, "date": date_str,
-            "n_responses": int(d["secs"].size), "pngs": pngs}
+            "n_responses": int(d["secs"].size), "skipped": skipped, "pngs": pngs}

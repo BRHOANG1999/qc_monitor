@@ -1,5 +1,5 @@
-"""Evoked-response digest: percentile banding, per-band waveform accumulation,
-and the send/render orchestration.
+"""Evoked-response digest: rank-based percentile banding, per-band waveform
+accumulation, and the send/render orchestration.
 
 Run with: pytest tests/test_evoked_digest.py -q
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 
@@ -19,46 +20,39 @@ from src.notifications import evoked_digest as ed        # noqa: E402
 from src.notifications import evoked_daily as ev         # noqa: E402
 
 
-# ------------------------------------------------------------------ #
-#  even_band_edges + assign_band
-# ------------------------------------------------------------------ #
-
-def test_even_bands_uniform():
-    v = np.linspace(0, 100, 500)
-    e = ed.even_band_edges(v, 5)
-    assert e is not None and e.size == 6
-    assert np.all(np.diff(e) > 0)
-    # roughly equal population per band
-    counts = np.array([np.sum((v >= e[b]) & (v < e[b + 1])) for b in range(5)])
-    assert counts.min() > 0.15 * v.size
-
-
-def test_point_mass_collapses_to_fewer_bands():
-    v = np.array([0.0] * 60 + list(range(1, 41)), dtype=float)   # 60% flat zeros
-    e = ed.even_band_edges(v, 5)
-    assert e is not None and e.size >= 3          # not None; ties merged
-    assert np.all(np.diff(e) > 0)
-    # the flat mass lands in ONE bottom band, not split across many
-    assert ed.assign_band(0.0, e) == 0
-    assert ed.assign_band(40.0, e) == ed.n_bands_of(e) - 1
-
-
-def test_degenerate_and_sparse_return_none():
-    assert ed.even_band_edges(np.full(60, 5.0), 5) is None      # single value
-    assert ed.even_band_edges(np.arange(10.0), 5) is None       # too few points
-
-
-def test_assign_band_bounds():
-    e = np.array([0.0, 1.0, 2.0, np.nextafter(3.0, np.inf)])
-    assert ed.assign_band(0.5, e) == 0
-    assert ed.assign_band(2.5, e) == 2
-    assert ed.assign_band(3.0, e) == 2                          # max in top band
-    assert ed.assign_band(-1.0, e) == -1
-    assert ed.assign_band(np.nan, e) == -1
+def _secs(n, t0=1.7e9):
+    return np.arange(n, dtype=float) * 2.0 + t0
 
 
 # ------------------------------------------------------------------ #
-#  band_waveforms_multi: recovers each band's mean waveform
+#  compute_bands: equal population (deciles), even under a point mass
+# ------------------------------------------------------------------ #
+
+def test_deciles_equal_population():
+    v = np.random.default_rng(0).normal(size=500)
+    info = ed.compute_bands(_secs(500), v, 10)
+    assert info is not None and info["n_bands"] == 10
+    counts = info["counts"]
+    assert counts.sum() == 500
+    assert counts.max() - counts.min() <= 1            # equal population
+
+
+def test_point_mass_splits_across_bottom_bands():
+    v = np.array([0.0] * 300 + list(range(1, 201)), dtype=float)   # 60% flat zeros
+    info = ed.compute_bands(_secs(500), v, 10)
+    assert info is not None and info["n_bands"] == 10
+    assert info["counts"].max() - info["counts"].min() <= 1       # still even
+    # the flat zeros occupy the bottom ~6 bands (not collapsed into one)
+    zero_bands = {info["bands"][i] for i in range(300)}
+    assert len(zero_bands) >= 5
+
+
+def test_compute_bands_too_few_returns_none():
+    assert ed.compute_bands(_secs(20), np.arange(20.0), 10) is None
+
+
+# ------------------------------------------------------------------ #
+#  band_waveforms: recovers each band's mean waveform (band by timestamp)
 # ------------------------------------------------------------------ #
 
 def _flat(T):
@@ -67,80 +61,71 @@ def _flat(T):
 
 def _bump(T):
     t = np.arange(T)
-    return np.exp(-((t - T / 2) ** 2) / (2 * (T / 12) ** 2))    # a gaussian bump
+    return np.exp(-((t - T / 2) ** 2) / (2 * (T / 12) ** 2))
 
 
 def test_band_waveforms_recovers_groups(monkeypatch):
+    from datetime import timedelta
     T, n = 60, 50
-    times = (np.arange(n) * 2.0 + 10.0)
-    feats = np.array([0.0] * 25 + [1.0] * 25)                   # low half, high half
+    stim = np.arange(n) * 2.0 + 10.0                   # stim_time_sec into recording
+    base = datetime(2026, 2, 1, 0, 0, 0)
+    abs_dt = [(base + timedelta(seconds=float(stim[i]))).isoformat() for i in range(n)]
+    feats = np.array([0.0] * 25 + [1.0] * 25)          # low half, high half
     traces = np.stack([_flat(T) if i < 25 else _bump(T) for i in range(n)])
-    rows = [{"channel": "BCH999", "stim_time_sec": float(times[i]),
-             "amp": float(feats[i])} for i in range(n)]
+    rows = [{"channel": "BCH999", "stim_time_sec": float(stim[i]),
+             "abs_dt": abs_dt[i], "amp": float(feats[i])} for i in range(n)]
 
     monkeypatch.setattr(ed, "read_feature_sidecar", lambda fp, a: rows)
     monkeypatch.setattr(ed, "read_file_evoked", lambda fp, only_animals=None: {
-        "BCH999": {"times": times.tolist(), "traces": traces,
+        "BCH999": {"times": stim.tolist(), "traces": traces,
                    "time_ms": np.arange(T, dtype=float)}})
 
-    edges = np.array([0.0, 0.5, np.nextafter(1.0, np.inf)])     # 2 bands
-    tm, wf = ed.band_waveforms(["f1"], "BCH999", "BCH999", "amp", edges)
+    secs = np.array([ed._d.parse_iso(x).timestamp() for x in abs_dt])
+    info = ed.compute_bands(secs, feats, 2)            # 2 bands: low, high
+    assert info is not None
+    tm, wf = ed.band_waveforms(["f1"], "BCH999", "BCH999", "amp", info)
     assert tm is not None and set(wf) == {0, 1}
     assert wf[0]["n"] == 25 and wf[1]["n"] == 25
-    assert np.allclose(wf[0]["mean"], _flat(T), atol=1e-9)      # band0 = flat
-    assert np.allclose(wf[1]["mean"], _bump(T), atol=1e-9)      # band1 = bump
-
-
-def test_band_waveforms_stim_time_mismatch_skips(monkeypatch):
-    # sidecar stim times don't line up with any trace time -> nothing accumulates
-    rows = [{"channel": "BCH999", "stim_time_sec": 999.0, "amp": 0.2}]
-    monkeypatch.setattr(ed, "read_feature_sidecar", lambda fp, a: rows)
-    monkeypatch.setattr(ed, "read_file_evoked", lambda fp, only_animals=None: {
-        "BCH999": {"times": [10.0, 12.0], "traces": np.zeros((2, 20)),
-                   "time_ms": np.arange(20.0)}})
-    edges = np.array([0.0, 0.5, np.nextafter(1.0, np.inf)])
-    _tm, wf = ed.band_waveforms(["f1"], "BCH999", "BCH999", "amp", edges)
-    assert wf == {}
+    assert np.allclose(wf[0]["mean"], _flat(T), atol=1e-9)
+    assert np.allclose(wf[1]["mean"], _bump(T), atol=1e-9)
 
 
 # ------------------------------------------------------------------ #
-#  day scoping + orchestration
+#  day/window scoping + orchestration
 # ------------------------------------------------------------------ #
 
-def test_list_day_files_filters_by_date(monkeypatch):
-    files = ["s__BCH999_2026_02_01__10_00_00_evoked.mat",
-             "s__BCH999_2026_02_01__23_00_00_evoked.mat",
-             "s__BCH999_2026_02_02__00_30_00_evoked.mat",
-             "s__BCH888_2026_02_01__12_00_00_evoked.mat"]
+def test_window_files_daily_vs_weekly(monkeypatch):
+    files = ["s__BCH999_2026_09_14__10_00_00_evoked.mat",
+             "s__BCH999_2026_09_16__10_00_00_evoked.mat",
+             "s__BCH999_2026_09_20__10_00_00_evoked.mat",
+             "s__BCH999_2026_09_07__10_00_00_evoked.mat"]   # outside the week
     monkeypatch.setattr(ed, "list_evoked_files", lambda d: files)
-    from datetime import datetime
-    got = ed.list_day_files("BCH999", "x", datetime(2026, 2, 1))
-    assert len(got) == 2 and all("2026_02_01" in f for f in got)
+    end = datetime(2026, 9, 20)
+    assert len(ed.list_window_files("BCH999", "x", end, 1)) == 1     # daily = 09-20
+    assert len(ed.list_window_files("BCH999", "x", end, 7)) == 3     # 09-14..09-20
 
 
 def test_build_animal_no_files(monkeypatch):
     monkeypatch.setattr(ed, "list_evoked_files", lambda d: [])
-    from datetime import datetime
     res = ed.build_animal("BCH999", "x", datetime(2026, 2, 1), work_dir="x")
     assert res.get("empty") and res["reason"] == "no recordings"
 
 
 def test_send_evoked_daily_dry_run(monkeypatch, tmp_path):
     fake = {"animal": "BCH999", "channel": "BCH999", "date": "2026-02-01",
-            "n_responses": 100, "pngs": {"peak_to_trough": "a.png",
-                                         "line_length": "b.png"}}
+            "n_responses": 100, "skipped": ["recovery_tau"],
+            "pngs": {"peak_to_trough": "a.png", "line_length": "b.png"}}
     monkeypatch.setattr(ev._ed, "build_animal", lambda *a, **k: fake)
-    monkeypatch.setattr(ev, "_animals_with_data", lambda d, day: ["BCH999"])
-    from datetime import datetime
+    monkeypatch.setattr(ev, "_animals_with_data", lambda d, day, w=1: ["BCH999"])
     cfg = {"notifications": {"evoked_daily": {}},
            "chronic_evoked": {"evoked_output_dir": "x"}}
     res = ev.send_evoked_daily(datetime(2026, 2, 2), cfg, None, None,
-                               dry_run=True, out_dir=str(tmp_path))
+                               window_days=7, dry_run=True, out_dir=str(tmp_path))
     assert res["dry_run"] and res["animals"] == ["BCH999"] and not res["sent"]
+    assert "–" in res["period"]                    # a date-range label (weekly)
 
 
-def test_split_attachments_headline_inline():
+def test_split_attachments_inlines_all():
     res = [{"pngs": {"peak_to_trough": __file__, "recovery_tau": __file__}}]
-    inline, files = ev._split_attachments(res, ["peak_to_trough"])
-    assert [os.path.basename(p) for p in inline] == [os.path.basename(__file__)]
-    assert len(files) == 1                                      # recovery_tau attached
+    inline, files = ev._split_attachments(res)
+    assert len(inline) == 2 and files == []            # both under the cap -> inline
