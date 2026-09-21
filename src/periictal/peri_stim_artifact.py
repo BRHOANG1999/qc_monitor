@@ -35,6 +35,8 @@ import matplotlib.pyplot as plt          # noqa: E402
 import numpy as np                       # noqa: E402
 
 from src.notifications.evoked_weekly import _peak_amplitude  # noqa: E402
+from src.notifications.stim_figures import (  # noqa: E402
+    plot_gradient_overlay, plot_stim_trace)
 from src.preictal.isi import included_seizures, parse_chunk_datetime  # noqa: E402
 from src.utils.animal import split_animal_electrode  # noqa: E402
 from src.utils.evoked_output import read_file_evoked  # noqa: E402
@@ -163,7 +165,9 @@ def _read_epochs(store, file_id: int, start_epoch: float, animal: str,
 
 def _window_stats(abs_t, traces, tm, lo, hi) -> dict | None:
     """Mean +/- SEM artifact waveform + per-stimulus peak-to-trough magnitudes for
-    the epochs whose absolute time is in [lo, hi)."""
+    the epochs whose absolute time is in [lo, hi). Keeps EVERY constituent epoch
+    trace (``traces``, never downsampled) so each window mean can be overlaid on
+    all the recordings that make it up."""
     sel = (abs_t >= lo) & (abs_t < hi)
     n = int(sel.sum())
     if n < 1:
@@ -178,6 +182,7 @@ def _window_stats(abs_t, traces, tm, lo, hi) -> dict | None:
             else np.zeros(w.shape[1])
     return {"n": n, "time_ms": tm, "mean": mean, "sem": np.nan_to_num(sem),
             "mags": mags, "abs_t": abs_t[sel],
+            "traces": w, "trace_abs_t": abs_t[sel],
             "mag_mean": float(np.nanmean(mags)) if mags.size else float("nan"),
             "mag_sem": (float(np.nanstd(mags, ddof=1) / np.sqrt(mags.size))
                         if mags.size >= 2 else 0.0)}
@@ -209,8 +214,11 @@ def _process_seizure(store, animal, channel, files, sz, prev_on, next_on,
             per_win[name] = st
     if not per_win:
         return None
+    order = np.argsort(abs_all)                       # chronological for the gradient
     return {"onset_epoch": sz.onset_epoch, "racine": sz.racine,
-            "chunk_datetime": sz.chunk_datetime, "windows": per_win}
+            "chunk_datetime": sz.chunk_datetime, "windows": per_win,
+            "span": (span_lo, span_hi), "tm": tm,
+            "all_traces": tr_all[order], "all_abs_t": abs_all[order]}
 
 
 # --------------------------------------------------------------- figures --- #
@@ -255,6 +263,118 @@ def plot_seizure_panel(res: dict, title: str, out_png: str) -> str:
     ax2.set_ylabel("artifact magnitude, p2p (µV)")
     ax2.grid(True, alpha=0.2)
     ax2.legend(fontsize=8, framealpha=0.6)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def plot_window_overlay(res: dict, title: str, out_png: str) -> str:
+    """Overlay version of the mean panel: every window's constituent stimulus
+    artifacts drawn thin + window-coloured, with the three window MEANS bold on
+    top -- so the spread of each window (and any pre->at->post shift) is visible,
+    not just the averages."""
+    assert res and out_png, "res and out_png required"
+    fig, ax = plt.subplots(figsize=_FIGSIZE)
+    drew = False
+    for name in WIN_ORDER:
+        st = res["windows"].get(name)
+        if not st:
+            continue
+        c, tm = WIN_COLOR[name], np.asarray(st["time_ms"])
+        for row in st["traces"]:
+            if row.size == tm.size:
+                ax.plot(tm, row, color=c, lw=0.4, alpha=0.12, zorder=1)
+        ax.plot(tm, st["mean"], color=c, lw=2.2, zorder=3,
+                label=f"{WIN_LABEL[name]}  n={st['n']}")
+        drew = True
+    ax.axvline(0, color="#888", lw=0.6, ls="--")
+    ax.axhline(0, color="#888", lw=0.6, alpha=0.5)
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("time from stim (ms)")
+    ax.set_ylabel("LFP artifact (µV)")
+    ax.grid(True, alpha=0.2)
+    if drew:
+        ax.legend(fontsize=8, framealpha=0.6, title="window mean over its stimuli")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def plot_perwindow_overlays(res: dict, title_base: str, stem: str) -> list:
+    """One dedicated overlay PNG per window: the window mean +/- SEM over its own
+    constituent stimulus artifacts (thin, transparent) via the shared
+    ``plot_stim_trace`` renderer -- the same look as the stim-stability report.
+    Returns the paths written."""
+    assert res and stem, "res and stem required"
+    out = []
+    for name in WIN_ORDER:
+        st = res["windows"].get(name)
+        if not st:
+            continue
+        tm = np.asarray(st["time_ms"]).tolist()
+        overlay = [row.tolist() for row in st["traces"] if row.size == len(tm)]
+        png = f"{stem}_{name}.png"
+        p = plot_stim_trace(
+            tm, np.asarray(st["mean"]).tolist(),
+            f"{title_base} — {WIN_LABEL[name]} (n={st['n']})", png,
+            ylabel="LFP artifact (µV)", color=WIN_COLOR[name],
+            sem=np.asarray(st["sem"]).tolist(), overlay=overlay)
+        if p:
+            out.append(p)
+    return out
+
+
+def plot_seizure_gradient(res: dict, title: str, out_png: str) -> str | None:
+    """Every peri-ictal stimulus artifact drawn on a CONTINUOUS pre->post time
+    gradient (onset in the middle) under the bold grand mean -- so a smooth drift
+    of the artifact THROUGH the seizure reads as colour. Reuses the report's
+    ``plot_gradient_overlay``."""
+    assert res and out_png, "res and out_png required"
+    tr, at = res.get("all_traces"), res.get("all_abs_t")
+    if tr is None or getattr(tr, "size", 0) == 0:
+        return None
+    lo, hi = res["span"]
+    span = (hi - lo) or 1.0
+    tm = np.asarray(res["tm"]).tolist()
+    traces = [((float(t) - lo) / span, tm, row.tolist())
+              for row, t in zip(tr, at) if row.size == len(tm)]
+    base = (tm, np.nanmean(tr, axis=0).tolist()) if tr.shape[0] else None
+    return plot_gradient_overlay(
+        traces, base, title, out_png, ylabel="LFP artifact (µV)",
+        cbar_label="time through peri-ictal window (pre → post)")
+
+
+def plot_pooled_overlay(results: list, animal: str, channel: str,
+                        out_png: str) -> str:
+    """Pooled overlay: for each window, every seizure's window-mean waveform drawn
+    thin + window-coloured with the across-seizure grand mean bold -- the
+    seizure-to-seizure spread of the artifact per window in one view."""
+    assert results and out_png, "results and out_png required"
+    fig, axes = plt.subplots(1, len(WIN_ORDER), figsize=(13.5, 4.6), sharey=True)
+    for ax, name in zip(np.atleast_1d(axes), WIN_ORDER):
+        means = [(np.asarray(r["windows"][name]["time_ms"]),
+                  np.asarray(r["windows"][name]["mean"]))
+                 for r in results if name in r["windows"]]
+        for tm, y in means:
+            if tm.size == y.size:
+                ax.plot(tm, y, color=WIN_COLOR[name], lw=0.7, alpha=0.35)
+        if means:
+            k = min(y.size for _, y in means)
+            tm0 = means[0][0][:k]
+            ax.plot(tm0, np.mean([y[:k] for _, y in means], axis=0),
+                    color=WIN_COLOR[name], lw=2.6,
+                    label=f"grand mean ({len(means)} sz)")
+            ax.legend(fontsize=8, framealpha=0.6)
+        ax.axvline(0, color="#888", lw=0.6, ls="--")
+        ax.axhline(0, color="#888", lw=0.6, alpha=0.5)
+        ax.set_title(WIN_LABEL[name], fontsize=9)
+        ax.set_xlabel("time from stim (ms)")
+        ax.grid(True, alpha=0.2)
+    np.atleast_1d(axes)[0].set_ylabel("LFP artifact (µV)")
+    fig.suptitle(f"{animal} {channel} — per-seizure window means overlaid",
+                 fontsize=10)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
@@ -348,15 +468,24 @@ def run(store, animal: str, *, out_dir: str, channel=None, art_ms=_ARTIFACT_MS,
             if res is None:
                 continue
             dt = datetime.fromtimestamp(sz.onset_epoch).strftime("%Y-%m-%d %H:%M")
-            png = os.path.join(out_dir, f"{_safe(animal)}_{_safe(ch)}_sz{i+1:02d}.png")
-            plot_seizure_panel(
-                res, f"{animal} {ch} — seizure {i+1} ({dt}, R{sz.racine})", png)
-            out["panels"].append(png)
+            stem = os.path.join(out_dir,
+                                f"{_safe(animal)}_{_safe(ch)}_sz{i+1:02d}")
+            ttl = f"{animal} {ch} — seizure {i+1} ({dt}, R{sz.racine})"
+            made = [plot_seizure_panel(res, ttl, f"{stem}.png"),
+                    plot_window_overlay(res, ttl + "  · overlay",
+                                        f"{stem}_overlay.png"),
+                    plot_seizure_gradient(res, ttl + "  · time gradient",
+                                          f"{stem}_gradient.png")]
+            made.extend(plot_perwindow_overlays(res, ttl, stem))
+            out["panels"].extend(p for p in made if p)
             results.append(res)
         if results:
-            pooled = os.path.join(out_dir, f"{_safe(animal)}_{_safe(ch)}_pooled.png")
-            plot_pooled(results, animal, ch, pooled)
-            out["channels"][ch] = {"n_seizures": len(results), "pooled": pooled}
+            base = os.path.join(out_dir, f"{_safe(animal)}_{_safe(ch)}")
+            plot_pooled(results, animal, ch, f"{base}_pooled.png")
+            plot_pooled_overlay(results, animal, ch, f"{base}_pooled_overlay.png")
+            out["channels"][ch] = {"n_seizures": len(results),
+                                   "pooled": f"{base}_pooled.png",
+                                   "pooled_overlay": f"{base}_pooled_overlay.png"}
     return out
 
 
