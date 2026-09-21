@@ -382,24 +382,107 @@ def draw_artifact_panel(ax, tm, band_wf, info) -> None:
               loc="best", framealpha=0.85)
 
 
+def draw_computation_panel(ax, feature, tm, band_wf, info) -> None:
+    """Plot HOW the feature is measured, geometrically, on a reference response
+    (the top decile's mean): the peak/trough it takes, the latency it reads, the
+    windows it integrates, etc. The figure's footer carries the exact formula."""
+    n_bands = info["n_bands"]
+    rb = (n_bands - 1 if band_wf.get(n_bands - 1) and band_wf[n_bands - 1]["n"]
+          else next((b for b in sorted(band_wf) if b < n_bands), None))
+    ax.set_facecolor(_PANEL)
+    if rb is None:
+        ax.axis("off")
+        return
+    ref = _baseline(band_wf[rb]["mean"], tm)
+    win = (tm >= 1) & (tm <= 200)                         # response window only
+    tw, yw = tm[win], ref[win]
+    ax.plot(tw, yw, color="#cfd0e0", lw=1.6, zorder=3)    # artifact (t<1) excluded
+    C = "#ffd24a"
+    if yw.size >= 2:
+        ia, ii = int(np.argmax(yw)), int(np.argmin(yw))
+        if feature in ("peak_to_trough", "peak_amplitude"):
+            ax.plot(tw[ia], yw[ia], "o", color=C, ms=7)
+            ax.annotate("peak", (tw[ia], yw[ia]), color=C, fontsize=8,
+                        xytext=(3, 4), textcoords="offset points")
+        if feature in ("peak_to_trough", "trough_amplitude"):
+            ax.plot(tw[ii], yw[ii], "o", color=C, ms=7)
+            ax.annotate("trough", (tw[ii], yw[ii]), color=C, fontsize=8,
+                        xytext=(3, -10), textcoords="offset points")
+        if feature == "peak_to_trough":
+            ax.annotate("", (tw[ia], yw[ii]), (tw[ia], yw[ia]),
+                        arrowprops=dict(arrowstyle="<->", color=C, lw=1.5))
+            ax.annotate("max−min", (tw[ia], (yw[ia] + yw[ii]) / 2), color=C,
+                        fontsize=8, xytext=(5, 0), textcoords="offset points")
+        elif feature == "rms_amplitude":
+            r = float(np.sqrt(np.mean(yw ** 2)))
+            for s in (r, -r):
+                ax.axhline(s, color=C, ls="--", lw=1)
+            ax.annotate(f"±rms={r:.2g}", (tw[-1], r), color=C, fontsize=8,
+                        ha="right", va="bottom")
+        elif feature in ("peak_latency_ms", "trough_latency_ms"):
+            k = ia if feature == "peak_latency_ms" else ii
+            ax.axvline(tw[k], color=C, ls="--", lw=1.2)
+            ax.plot(tw[k], yw[k], "o", color=C, ms=7)
+            y0 = ax.get_ylim()[0] * 0.6
+            ax.annotate("", (tw[k], y0), (0, y0),
+                        arrowprops=dict(arrowstyle="<->", color=C))
+            ax.annotate(f"{tw[k]:.0f} ms", (tw[k] / 2, y0), color=C, fontsize=8,
+                        va="bottom", ha="center")
+        elif feature == "max_slope":
+            d = np.diff(yw); k = int(np.argmax(np.abs(d)))
+            dx, dy = tw[k + 1] - tw[k], yw[k + 1] - yw[k]
+            ax.plot([tw[k] - 4 * dx, tw[k] + 5 * dx],
+                    [yw[k] - 4 * dy, yw[k] + 5 * dy], color=C, lw=2)
+            ax.plot(tw[k], yw[k], "o", color=C, ms=6)
+            ax.annotate("steepest Δy/dt", (tw[k], yw[k]), color=C, fontsize=8,
+                        xytext=(4, 4), textcoords="offset points")
+        elif feature == "log_auc":
+            ax.fill_between(tw, 0, np.abs(yw), color=C, alpha=0.18)
+            ax.annotate("area Σ|y|·dt", (tw[len(tw) // 2], 0), color=C,
+                        fontsize=8, ha="center")
+        elif feature == "early_late_ratio":
+            ax.axvspan(1, 50, color="#5edc7c", alpha=0.13)
+            ax.axvspan(50, 200, color="#e2a05e", alpha=0.13)
+            yt = ax.get_ylim()[1]
+            ax.annotate("early 1–50", (25, yt), color="#5edc7c", fontsize=8,
+                        ha="center", va="top")
+            ax.annotate("late 50–200", (125, yt), color="#e2a05e", fontsize=8,
+                        ha="center", va="top")
+        elif feature == "line_length":
+            cum = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(yw)))])
+            ax2 = ax.twinx()
+            ax2.plot(tw, cum, color=C, lw=1.6, ls="--")
+            ax2.set_ylabel("cumulative Σ|Δy|", color=C, fontsize=8)
+            ax2.tick_params(colors=C, labelsize=7)
+            for sp in ax2.spines.values():
+                sp.set_color("#3a3a52")
+    ax.axvline(0, color=_MUTED, lw=0.6, ls=":", alpha=0.5)
+    ax.set_xlim(-2, 200)
+    ax.set_xlabel("ms since stim", color=_TEXT, fontsize=10)
+    ax.set_ylabel("evoked (a.u.)", color=_TEXT, fontsize=10)
+    ax.set_title(f"how measured · {_pretty(feature)}", color=_TEXT,
+                 fontsize=11, loc="left")
+
+
 def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
                    info: dict, time_ms, band_wf: dict, meta: dict,
                    out_png: str) -> str:
-    """Scatter | mean response by decile (+zeros) | (if zeros) unblanked
-    stim-artifact window. Saves to *out_png*, returns the path."""
+    """Scatter | mean response by decile (+zeros) | how-measured | (if zeros)
+    unblanked stim-artifact window. Saves to *out_png*, returns the path."""
     n_bands = info["n_bands"]
     tm = np.asarray(time_ms, dtype=float)
     has_zero = bool(band_wf.get(n_bands) and band_wf[n_bands]["n"] > 0)
-    ncols = 3 if has_zero else 2
-    widths = [1.15, 1.0, 0.7] if has_zero else [1.15, 1.0]
-    fig, axes = plt.subplots(1, ncols, figsize=(6.0 * ncols + 1.0, 4.8),
+    ncols = 4 if has_zero else 3
+    widths = [1.15, 1.0, 0.95, 0.7] if has_zero else [1.15, 1.0, 0.95]
+    fig, axes = plt.subplots(1, ncols, figsize=(5.7 * ncols + 1.0, 4.8),
                              facecolor=_BG, gridspec_kw={"width_ratios": widths})
     draw_scatter(axes[0], feature, secs, vals, info, meta)
     draw_response(axes[1], tm, band_wf, info, blank=True, show_sd=(n_bands <= 5))
     axes[1].set_title(f"mean±sd response by {_pretty(feature)} band",
                       color=_TEXT, fontsize=11, loc="left")
+    draw_computation_panel(axes[2], feature, tm, band_wf, info)
     if has_zero:
-        draw_artifact_panel(axes[2], tm, band_wf, info)
+        draw_artifact_panel(axes[3], tm, band_wf, info)
     for ax in axes:
         ax.tick_params(colors=_MUTED, labelsize=8)
         for sp in ax.spines.values():

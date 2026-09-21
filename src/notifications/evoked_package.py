@@ -417,7 +417,7 @@ def _write_index(pkg: str, manifest: dict, labels: dict) -> None:
  · {html.escape(manifest['channel'])}</h1>
 <div class=sub>week {html.escape(manifest['week'])} ·
  {len(manifest['figures'])} feature-panels · traces from
- {manifest['trace_files_used']} sampled recordings ·
+ {manifest['trace_files_used']} recordings (all, full-res) ·
  rows = periods (week first, then each day) · columns = features ·
  each cell: bands_mean thumbnail + links to sd / overlay / decilesgrid + the 10 per-decile files</div>
 <table>{head}{''.join(rows)}</table>
