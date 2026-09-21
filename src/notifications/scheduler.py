@@ -59,6 +59,7 @@ class NotificationState:
     coverage: str = ""
     stim_stability_weekly: str = ""
     stim_stability_daily: str = ""
+    evoked_daily: str = ""
     queue_stuck: bool = False
 
 
@@ -131,6 +132,7 @@ class DigestScheduler:
                     raw.get("stim_stability_weekly") or ""),
                 stim_stability_daily=str(
                     raw.get("stim_stability_daily") or ""),
+                evoked_daily=str(raw.get("evoked_daily") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
             )
         except (FileNotFoundError, json.JSONDecodeError):
@@ -217,6 +219,7 @@ class DigestScheduler:
             self._tick_evoked_weekly(now, fired)
             self._tick_stim_stability_weekly(now, fired)
             self._tick_stim_stability_daily(now, fired)
+            self._tick_evoked_daily(now, fired)
             self._tick_review_weekly(now, fired)
             self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
@@ -415,6 +418,33 @@ class DigestScheduler:
         self._state.stim_stability_daily = now.date().isoformat()
         fired["stim_stability_daily"] = bool(result.get("sent"))
         logger.info("Stim-stability daily result: %s", result)
+
+    def _tick_evoked_daily(self, now: datetime, fired: dict) -> None:
+        """Daily evoked-response digest: per-feature percentile-band "kinds" of
+        evoked response for the PREVIOUS day, per animal (email-only)."""
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("evoked_daily", {}) or {}
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        hour = int(cfg.get("hour", 8))
+        if not self._due_daily(now, hour, self._state.evoked_daily):
+            return
+        if not self._claim("evoked_daily", now):
+            self._state.evoked_daily = now.date().isoformat()      # heal JSON
+            return
+        logger.info("Evoked digest daily fire: %s %02d:%02d",
+                    now.date().isoformat(), now.hour, now.minute)
+        from src.notifications.evoked_daily import send_evoked_daily
+        try:
+            result = send_evoked_daily(now, self._config, self._store,
+                                       self._emailer)               # reports yesterday
+        except Exception as e:
+            logger.error("Evoked digest daily send raised: %s", e, exc_info=True)
+            self._release("evoked_daily", now)
+            return
+        self._state.evoked_daily = now.date().isoformat()
+        fired["evoked_daily"] = bool(result.get("sent"))
+        logger.info("Evoked digest daily result: %s", result)
 
     def _tick_review_weekly(self, now: datetime, fired: dict) -> None:
         cfg = ((self._config.get("review_queue", {}) or {})
