@@ -255,6 +255,20 @@ def _pile_label(info: dict, n: int) -> str:
     return f"pile @{pv:g} (n={n})" if pv is not None else f"pile (n={n})"
 
 
+def feature_doc(feature: str) -> str:
+    """Code-accurate one-line definition of *feature* (source of truth)."""
+    return _ef.COLUMN_DOCS.get(feature, "")
+
+
+def doc_footer(fig, feature: str) -> None:
+    """Stamp 'how computed' along the bottom of a figure. Reserve room first
+    with ``fig.tight_layout(rect=[0, 0.07, 1, 1])``."""
+    doc = feature_doc(feature)
+    if doc:
+        fig.text(0.5, 0.012, f"how computed — {_pretty(feature)}: {doc}",
+                 ha="center", va="bottom", color=_MUTED, fontsize=8, wrap=True)
+
+
 _ZCOLOR = "#ff5c5c"                                       # the zero-value group
 
 
@@ -390,7 +404,8 @@ def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
         ax.tick_params(colors=_MUTED, labelsize=8)
         for sp in ax.spines.values():
             sp.set_color("#3a3a52")
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0.07, 1, 1])
+    doc_footer(fig, feature)
     fig.savefig(out_png, dpi=130, facecolor=_BG)
     plt.close(fig)
     return out_png
@@ -405,9 +420,9 @@ def _date_label(end_day: datetime, window_days: int) -> str:
     return f"{start.isoformat()} – {end.isoformat()}"
 
 
-def _sample_files(files: list, cap: int) -> list:
-    """Evenly sample at most *cap* files across the window (for the trace pass)."""
-    if cap <= 0 or len(files) <= cap:
+def _sample_files(files: list, cap) -> list:
+    """Evenly sample at most *cap* files across the window; ``None``/0 = all."""
+    if not cap or cap <= 0 or len(files) <= cap:
         return files
     idx = np.linspace(0, len(files) - 1, cap).round().astype(int)
     return [files[i] for i in sorted(set(idx.tolist()))]
@@ -415,7 +430,7 @@ def _sample_files(files: list, cap: int) -> list:
 
 def build_animal(animal: str, evoked_dir: str, day: datetime, *,
                  features=None, n_bands: int = DEFAULT_N_BANDS,
-                 window_days: int = 1, max_trace_files: int = 24,
+                 window_days: int = 1, max_trace_files=None,
                  work_dir: str, channel_override: str | None = None) -> dict:
     """Render one 2-panel PNG per feature for *animal* over the *window_days*
     ending on *day* (1 = daily, 7 = weekly). Returns ``{"animal","channel",

@@ -117,7 +117,7 @@ def send_evoked_daily(today: datetime, config: dict, store, emailer, *,
     features = cfg.get("features") or _ed.DEFAULT_FEATURES
     n_bands = int(cfg.get("n_bands", _ed.DEFAULT_N_BANDS))
     win = int(window_days if window_days is not None else cfg.get("window_days", 1))
-    max_trace_files = int(cfg.get("max_trace_files", 24))
+    max_trace_files = cfg.get("max_trace_files") or None      # None = all recordings
     overrides = cfg.get("channel_overrides", {}) or {}
     report_date = (today - timedelta(days=1))
     period_label = _ed._date_label(report_date, win)

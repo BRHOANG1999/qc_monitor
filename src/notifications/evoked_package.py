@@ -38,8 +38,9 @@ PACKAGE_FEATURES = ["peak_to_trough", "trough_amplitude", "line_length",
                     "rms_amplitude", "log_auc", "peak_latency_ms",
                     "trough_latency_ms", "max_slope", "early_late_ratio"]
 _FIG_TYPES = ["bands_mean", "bands_sd", "bands_overlay", "deciles_grid"]
-_DEFAULT_MAX_FILES = 56           # ~8 recordings/day across the week
-_SAMPLE_DECIM_TARGET = 500        # overlay traces decimated to ~this many points
+_DEFAULT_MAX_FILES = None          # None/0 = read EVERY recording (no downsampling)
+_OVERLAY_SAMPLES = 30              # individual full-res traces drawn per band (a
+                                   # rendering limit only; mean/sd use ALL responses)
 
 
 class _BandStats:
@@ -64,7 +65,7 @@ class _BandStats:
         if self.T is None:
             self.T = t.size
             self.time_ms = np.asarray(time_ms, dtype=float)
-            self.stride = max(1, self.T // _SAMPLE_DECIM_TARGET)
+            self.stride = 1                              # never downsample (full res)
         if t.size != self.T or not np.all(np.isfinite(t)):
             return
         self.count[b] += 1
@@ -149,12 +150,14 @@ def collect_stats(files, animal, channel, info_by_period: dict, week_key: str,
 # --------------------------------------------------------------------- #
 #  figure builders (reuse evoked_digest draw_* helpers where possible)
 # --------------------------------------------------------------------- #
-def _finish(fig, out_png: str) -> str:
+def _finish(fig, out_png: str, feature: str | None = None) -> str:
     for ax in fig.axes:
         ax.tick_params(colors=_ed._MUTED, labelsize=8)
         for sp in ax.spines.values():
             sp.set_color("#3a3a52")
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0.07, 1, 1] if feature else [0, 0, 1, 1])
+    if feature:
+        _ed.doc_footer(fig, feature)
     fig.savefig(out_png, dpi=125, facecolor=_ed._BG)
     plt.close(fig)
     return out_png
@@ -178,7 +181,7 @@ def _fig_bands_sd(feat, meta, info, band_wf, tm, out) -> str:
     _ed.draw_response(ax, tm, band_wf, info, blank=True, show_sd=True)
     ax.set_title(f"{meta['date']} · {_ed._pretty(feat)} · mean±sd by decile",
                  color=_ed._TEXT, fontsize=11, loc="left")
-    return _finish(fig, out)
+    return _finish(fig, out, feat)
 
 
 def _fig_bands_overlay(feat, meta, info, band_wf, tdec, out) -> str:
@@ -197,7 +200,7 @@ def _fig_bands_overlay(feat, meta, info, band_wf, tdec, out) -> str:
     ax.set_title(f"{meta['date']} · {_ed._pretty(feat)} · sample traces by decile "
                  "(viridis low→high, zeros red)", color=_ed._TEXT, fontsize=10,
                  loc="left")
-    return _finish(fig, out)
+    return _finish(fig, out, feat)
 
 
 def _decile_panel(ax, tdec, tm, band_wf, b, color, title) -> None:
@@ -231,7 +234,7 @@ def _fig_deciles_grid(feat, meta, info, band_wf, tm, tdec, out) -> str:
         axes[j // ncol][j % ncol].axis("off")
     fig.suptitle(f"{meta['animal']} · {meta['date']} · {_ed._pretty(feat)} · "
                  "per-decile overlay + mean±sd", color=_ed._TEXT, fontsize=12)
-    return _finish(fig, out)
+    return _finish(fig, out, feat)
 
 
 def _fig_decile(feat, meta, info, band_wf, tm, tdec, b, out) -> str:
@@ -243,7 +246,7 @@ def _fig_decile(feat, meta, info, band_wf, tm, tdec, b, out) -> str:
                   f"{_ed._band_label(b, edges, n_bands)}")
     ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
     ax.set_ylabel("evoked (a.u.)", color=_ed._TEXT, fontsize=10)
-    return _finish(fig, out)
+    return _finish(fig, out, feat)
 
 
 # --------------------------------------------------------------------- #
@@ -256,8 +259,9 @@ def _period_series(animal, evoked_dir, day, window_days, features):
 
 
 def build_package(animal: str, evoked_dir: str, end_day: datetime, out_root: str,
-                  *, features=None, n_bands: int = 10, k_samples: int = 16,
-                  max_trace_files: int = _DEFAULT_MAX_FILES,
+                  *, features=None, n_bands: int = 10,
+                  k_samples: int = _OVERLAY_SAMPLES,
+                  max_trace_files=_DEFAULT_MAX_FILES,
                   channel_override: str | None = None, seed: int = 0,
                   progress=None) -> dict:
     """Render the full figure package for *animal* over the week ending *end_day*.
@@ -290,9 +294,10 @@ def build_package(animal: str, evoked_dir: str, end_day: datetime, out_root: str
     label_by_period[week_key] = _ed._date_label(end_day, 7)
     info_by_period = {p: v for p, v in info_by_period.items() if v}   # drop empties
 
+    trace_files = (_ed._sample_files(week_files, max_trace_files)
+                   if max_trace_files else week_files)     # default: every recording
     if progress:
-        progress("reading traces (one pass)…")
-    trace_files = _ed._sample_files(week_files, max_trace_files)
+        progress(f"reading traces from {len(trace_files)} recordings (one pass)…")
     stats = collect_stats(trace_files, animal, channel, info_by_period, week_key,
                           n_bands, k_samples, rng)
 
@@ -337,6 +342,7 @@ def build_package(animal: str, evoked_dir: str, end_day: datetime, out_root: str
     manifest = {"animal": animal, "channel": channel,
                 "week": label_by_period[week_key],
                 "periods": order, "features": features,
+                "docs": {f: _ed.feature_doc(f) for f in features},
                 "trace_files_used": len(trace_files),
                 "figures": figures}
     with open(os.path.join(pkg, "manifest.json"), "w", encoding="utf-8") as f:
@@ -393,7 +399,9 @@ def _write_index(pkg: str, manifest: dict, labels: dict) -> None:
                 f"<span class='lk'>{links}{zt}<br>deciles: {dl}</span></td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     head = "<tr><th></th>" + "".join(
-        f"<th>{html.escape(_ed._pretty(x))}</th>" for x in feats) + "</tr>"
+        f"<th>{html.escape(_ed._pretty(x))}"
+        f"<br><span class=def>{html.escape(_ed.feature_doc(x))}</span></th>"
+        for x in feats) + "</tr>"
     doc = f"""<!doctype html><meta charset=utf-8>
 <title>Evoked package · {html.escape(manifest['animal'])}</title>
 <style>
@@ -403,6 +411,7 @@ def _write_index(pkg: str, manifest: dict, labels: dict) -> None:
  th{{background:#1e1e2f;position:sticky;top:0}} img{{width:300px;display:block;border:1px solid #2a2a3a}}
  .lk{{font-size:11px;color:#9a9ab0}} .lk a{{color:#8ab4ff;text-decoration:none}}
  .na{{color:#555;text-align:center}} a{{color:#8ab4ff}}
+ .def{{display:block;max-width:280px;font-weight:400;font-size:10px;color:#8a8aa0;white-space:normal}}
 </style>
 <h1>Evoked-response package · {html.escape(manifest['animal'])}
  · {html.escape(manifest['channel'])}</h1>
@@ -437,7 +446,8 @@ def _main(argv=None) -> int:
     res = build_package(a.animal, evoked_dir, end, out, features=feats,
                         max_trace_files=a.max_trace_files,
                         progress=lambda m: print("  ", m, flush=True))
-    print("RESULT:", {k: v for k, v in res.items() if k != "figures"})
+    print("RESULT:", {k: v for k, v in res.items()
+                      if k not in ("figures", "docs")})
     return 0
 
 
