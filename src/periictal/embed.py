@@ -139,15 +139,21 @@ def embed(df: pd.DataFrame, metrics: list[str] | None = None, *,
 def confound_readout(emb: np.ndarray, df_sub: pd.DataFrame) -> dict:
     """Descriptive (NOT inferential) check that the embedding isn't just a
     confound: |Spearman rho| between each embedding axis and (a) time-of-day,
-    (b) the stim-fingerprint group index. A high value means the picture is
-    driven by that confound, not by seizure proximity. Returns a small dict."""
+    (b) the stim-fingerprint group index, (c) time-to-onset. A high value means
+    the picture is driven by that variable, not (or, for tto, IS driven by seizure
+    proximity -- expected/desirable when tto is folded in as an input). Returns a
+    small dict."""
     from scipy.stats import rankdata
     out: dict = {}
     if emb.shape[0] < 10:
         return out
     tod = df_sub["hour_of_day"].to_numpy()
     fp = pd.Categorical(df_sub["stim_key"]).codes.astype(float)
-    for name, v in (("time_of_day", tod), ("stim_fingerprint", fp)):
+    tto = (df_sub["time_to_onset_sec"].to_numpy()
+           if "time_to_onset_sec" in df_sub.columns
+           else np.full(len(df_sub), np.nan))
+    for name, v in (("time_of_day", tod), ("stim_fingerprint", fp),
+                    ("time_to_onset", tto)):
         if np.unique(v[np.isfinite(v)]).size < 2:
             out[name] = None
             continue

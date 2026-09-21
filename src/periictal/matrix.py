@@ -146,6 +146,26 @@ def _assign_next_onset(t: np.ndarray, onsets: np.ndarray,
     return safe, tto, keep
 
 
+def time_to_onset_for(abs_epochs: np.ndarray, onsets: np.ndarray,
+                      ceilings: np.ndarray) -> np.ndarray:
+    """Seconds from each epoch to its nearest UPCOMING seizure onset, ``NaN`` when
+    the epoch is outside every seizure's lookback window.
+
+    Same pre-onset join rule as ``build_matrix`` (via ``_assign_next_onset``), but
+    exposed for callers that hold raw epochs and want ``time_to_onset_sec`` without
+    building the full matrix (e.g. the evoked-response figure package). *onsets*
+    must be sorted ascending and *ceilings* aligned to it."""
+    abs_epochs = np.asarray(abs_epochs, dtype=np.float64)
+    onsets = np.asarray(onsets, dtype=np.float64)
+    ceilings = np.asarray(ceilings, dtype=np.float64)
+    assert onsets.shape == ceilings.shape, "onsets/ceilings shape mismatch"
+    assert onsets.size == 0 or np.all(np.diff(onsets) >= 0), "onsets must be sorted"
+    if onsets.size == 0 or abs_epochs.size == 0:
+        return np.full(abs_epochs.shape, np.nan, dtype=np.float64)
+    _idx, tto, keep = _assign_next_onset(abs_epochs, onsets, ceilings)
+    return np.where(keep, tto, np.nan)
+
+
 def _assign_prev_onset(t: np.ndarray, onsets: np.ndarray,
                        ceilings: np.ndarray):
     """Vectorized nearest-PAST-onset assignment for the post-ictal window (the
