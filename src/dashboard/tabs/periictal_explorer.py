@@ -53,6 +53,7 @@ from src.periictal import palette as _pal
 from src.periictal import passive as _passive
 from src.periictal import nonstationarity as _nscmod
 from src.periictal import stim_map as _sm
+from src.periictal import cluster_features as _clf
 from src.periictal.embed import confound_readout, embed
 from src.periictal.persist import build_matrix_cached
 from src.periictal import erpimage as _erp
@@ -150,7 +151,8 @@ def _run_admitted(target, set_fn, tok, args) -> None:
 
 
 def _kick(store, evoked_dir, job_id, animal, protocol, variant,
-          window_h, method, cap, sidecar_variant, feature_cfg) -> None:
+          window_h, method, cap, sidecar_variant, feature_cfg,
+          tto_input=False) -> None:
     """Start the build thread for *job_id* unless one is already running or the
     result is already cached."""
     with _LOCK:
@@ -165,12 +167,13 @@ def _kick(store, evoked_dir, job_id, animal, protocol, variant,
         target=_run_admitted, name=f"periictal-{job_id}", daemon=True,
         args=(_worker, _set, job_id,
               (store, evoked_dir, job_id, animal, protocol, variant,
-               window_h, method, cap, sidecar_variant, feature_cfg)))
+               window_h, method, cap, sidecar_variant, feature_cfg, tto_input)))
     th.start()
 
 
 def _worker(store, evoked_dir, job_id, animal, protocol, variant,
-            window_h, method, cap, sidecar_variant, feature_cfg) -> None:
+            window_h, method, cap, sidecar_variant, feature_cfg,
+            tto_input=False) -> None:
     """Build the matrix + embedding for one job and cache the result. Never
     raises (records the error for the poll to surface)."""
     try:
@@ -213,9 +216,25 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
                              "reason": _empty_reason(store, evoked_dir,
                                                      animal, protocol)})
             return
-        _set(job_id, progress=f"embedding {len(pre):,} stimuli ({method.upper()})…")
-        res = embed(pre, method=method, cap=cap)
-        sub = pre.loc[res["rows"]].reset_index(drop=True)
+        # Optionally FOLD time-to-onset in as an extra embedding INPUT dimension
+        # (diagnostic): if the evoked features carry pre-ictal structure, the
+        # manifold may organise more sharply once onset-proximity is a coordinate.
+        # Pre-onset rows always carry a finite tto (the join keeps only 0<tto<=ceil),
+        # so this drops ~no rows -- the with/without embeddings compare on the same
+        # events. It is opt-in and its axis influence is surfaced in the readout.
+        emb_metrics = list(_cfg.metrics_for_variant(variant))
+        pre_emb = pre
+        n_dropped = 0
+        if tto_input:
+            finite = pre["time_to_onset_sec"].notna()
+            n_dropped = int((~finite).sum())
+            pre_emb = pre[finite].reset_index(drop=True)
+            emb_metrics = emb_metrics + ["time_to_onset_sec"]
+        tag = " + time-to-onset" if tto_input else ""
+        _set(job_id, progress=f"embedding {len(pre_emb):,} stimuli "
+                              f"({method.upper()}{tag})…")
+        res = embed(pre_emb, metrics=emb_metrics, method=method, cap=cap)
+        sub = pre_emb.loc[res["rows"]].reset_index(drop=True)
         ro = confound_readout(res["emb"], sub)
         _finish(job_id, {"empty": False, "emb": res["emb"], "sub": sub,
                          "full": df.reset_index(drop=True),
@@ -223,7 +242,8 @@ def _worker(store, evoked_dir, job_id, animal, protocol, variant,
                          "cols": list(res["cols"]),
                          "readout": ro, "meta": res["meta"],
                          "method": res["method"],
-                         "n_seizures": int(pre["seizure_idx"].nunique())})
+                         "tto_input": bool(tto_input), "tto_dropped": n_dropped,
+                         "n_seizures": int(pre_emb["seizure_idx"].nunique())})
     except Exception as e:                                     # noqa: BLE001
         # Log the TRACEBACK, not just str(e). The UI can only show one line, and
         # a bare message ("assignment destination is read-only") names neither
@@ -397,12 +417,27 @@ def layout_embedding(store):
             _embed_colorby_ctl(),
             html.Div([
                 button("▶ Build passive + evoked", "pex-embed2-build"),
+                dcc.Checklist(
+                    id="pex-embed-tto-input",
+                    options=[{"label": " fold time-to-onset in as an input "
+                                       "dimension (diagnostic)",
+                              "value": "on"}],
+                    value=[], labelStyle=_RADIO_LABEL, inputStyle=_RADIO_INPUT,
+                    style={"marginLeft": SPACE_2}),
                 html.Div(id="pex-embed2-status",
                          style={"color": COLOR_TEXT_SECONDARY,
                                 "fontSize": FONT_SIZE_CAPTION,
                                 "fontFamily": "monospace", "minHeight": "16px"}),
             ], style={"display": "flex", "gap": SPACE_3, "alignItems": "center",
                       "flexWrap": "wrap", "margin": f"{SPACE_2} 0"}),
+            html.Div("Folding time-to-onset in makes onset-proximity a coordinate "
+                     "of the manifold itself (not just the colour). If the features "
+                     "carry pre-ictal structure the clusters may sharpen — a "
+                     "diagnostic to compare against the OFF build below, not proof. "
+                     "Its influence on the axes is reported on each reading strip.",
+                     style={"color": COLOR_TEXT_TERTIARY,
+                            "fontSize": FONT_SIZE_CAPTION, "maxWidth": "95ch",
+                            "marginBottom": SPACE_2}),
             _explainer(),
             # Responsive grid: passive first (DOM order = left on wide screens,
             # top when it collapses to one column on narrow ones). No horizontal
@@ -417,10 +452,72 @@ def layout_embedding(store):
             dcc.Interval(id="pex-embed2-poll", interval=1200, disabled=True),
             dcc.Store(id="pex-embed2-job", storage_type="session"),
             style={"marginTop": SPACE_4}),
+        _cluster_panel(),
         card(section_header("Features fed to the embedding"),
              _feature_reference(),
              style={"marginTop": SPACE_4}),
     ], style={"padding": SPACE_4})
+
+
+def _cluster_panel() -> object:
+    """Cluster the built embedding and rank which feature explains the clusters.
+
+    Operates on a completed build (no rebuild): pick a column, a clustering method,
+    then read the ε² separability ranking + per-cluster feature profile. This is
+    COMPILED EVIDENCE — the numbers, not a verdict on whether they're meaningful."""
+    return card(
+        section_header("Cluster the embedding — which feature explains the clusters?"),
+        html.Div("Clusters the 2-D coordinates you see above, then ranks every "
+                 "feature by how strongly cluster membership explains it "
+                 "(Kruskal–Wallis ε², 0→1). The profile heat-map shows each "
+                 "cluster's robust-z median per feature — a near-constant, "
+                 "large-magnitude column is a feature that CHARACTERISES that "
+                 "cluster (the “homogeneous colour” you noticed). Descriptive only.",
+                 style={"color": COLOR_TEXT_SECONDARY, "fontSize": FONT_SIZE_CAPTION,
+                        "maxWidth": "95ch", "marginBottom": SPACE_3}),
+        html.Div([
+            _ctl("Embedding", dcc.Dropdown(
+                id="pex-clus-col", clearable=False, value="evoked",
+                options=[{"label": "evoked (post-stim)", "value": "evoked"},
+                         {"label": "passive (pre-stim LFP)", "value": "passive"}],
+                style={**DROPDOWN_STYLE, "minWidth": "200px"}),
+                "Which built embedding to cluster."),
+            _ctl("Method", dcc.Dropdown(
+                id="pex-clus-method", clearable=False, value="hdbscan",
+                options=[{"label": "HDBSCAN (density, finds noise)",
+                          "value": "hdbscan"},
+                         {"label": "K-means (partition, no noise)",
+                          "value": "kmeans"}],
+                style={**DROPDOWN_STYLE, "minWidth": "220px"}),
+                "HDBSCAN discovers cluster count + labels sparse points as noise; "
+                "K-means partitions every point into k."),
+            _ctl("min size / k", dcc.Input(
+                id="pex-clus-param", type="number", min=2, step=1, debounce=True,
+                placeholder="auto", style={**DROPDOWN_STYLE, "width": "90px"}),
+                "HDBSCAN: minimum cluster size. K-means: number of clusters k. "
+                "Blank = auto."),
+            html.Div(button("◆ Cluster + rank", "pex-clus-run"),
+                     style={"alignSelf": "flex-end"}),
+            html.Div(id="pex-clus-status",
+                     style={"color": COLOR_TEXT_SECONDARY,
+                            "fontSize": FONT_SIZE_CAPTION, "alignSelf": "flex-end",
+                            "fontFamily": "monospace", "minHeight": "16px"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4,
+                  "alignItems": "flex-start", "marginBottom": SPACE_3}),
+        html.Div(id="pex-clus-quality", style={"marginBottom": SPACE_3}),
+        html.Div([
+            html.Div(dcc.Graph(id="pex-clus-embed", config={"displaylogo": False},
+                               figure=empty_fig("Cluster + rank to colour the "
+                                                "embedding by cluster")),
+                     style={"flex": "1 1 380px", "minWidth": "340px"}),
+            html.Div(dcc.Graph(id="pex-clus-sep", config={"displaylogo": False},
+                               figure=empty_fig("ε² feature-separability ranking")),
+                     style={"flex": "1 1 380px", "minWidth": "340px"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "gap": SPACE_4}),
+        dcc.Graph(id="pex-clus-heatmap", config={"displaylogo": False},
+                  figure=empty_fig("Per-cluster feature profile (robust-z medians)"),
+                  style={"marginTop": SPACE_3}),
+        style={"marginTop": SPACE_4})
 
 
 def layout_trend(store):
@@ -1207,7 +1304,11 @@ def _traj_y_options(variant: str):
             for m in _cfg.metrics_for_variant(variant)]
     return opts + [{"label": "PC1 (embedding position)", "value": "__pc1__"},
                    {"label": "PC2 (embedding position)", "value": "__pc2__"},
-                   {"label": "hour of day (confound check)", "value": "hour_of_day"}]
+                   {"label": "hour of day (confound check)", "value": "hour_of_day"},
+                   # tto vs lead-time is the identity (ρ≈−1) -- a positive control
+                   # that the trend machinery is wired correctly, not a finding.
+                   {"label": "time to onset (positive control ρ≈−1)",
+                    "value": "time_to_onset_sec"}]
 
 
 def _traj_values(cached, y_key):
@@ -1692,6 +1793,116 @@ def _loadings_fig(cached) -> go.Figure:
                    zeroline=False),
         yaxis=dict(title="", automargin=True), uirevision="pex-loadings")
     return fig
+
+
+# --------------------------------------------------------------------- #
+#  Cluster-the-embedding readouts (compiled evidence, no verdicts)
+# --------------------------------------------------------------------- #
+
+# Colourblind-safe qualitative cluster palette; noise (−1) is a neutral grey.
+_CLUSTER_COLORS = ["#5e7ce2", "#e2a45e", "#5ec9a4", "#c95e9e", "#b0c95e",
+                   "#9e5ec9", "#e25e5e", "#5ec9c9", "#c9c95e", "#5e9ec9"]
+_NOISE_COLOR = "#6b6b78"
+
+
+def _cluster_color(lab: int) -> str:
+    return _NOISE_COLOR if lab < 0 else _CLUSTER_COLORS[lab % len(_CLUSTER_COLORS)]
+
+
+def _cluster_scatter_fig(emb, labels, method, meta) -> go.Figure:
+    """The 2-D embedding coloured BY CLUSTER — one trace per label so the legend
+    is the cluster key; noise (−1) is grey. Flip this against a column coloured by
+    a feature to eyeball which feature is homogeneous inside each cluster."""
+    if emb is None or emb.shape[0] == 0:
+        return empty_fig("No embedding to cluster")
+    fig = go.Figure()
+    for lab in sorted(set(np.asarray(labels).tolist()), key=lambda x: (x < 0, x)):
+        mask = labels == lab
+        name = "noise" if lab < 0 else f"cluster {lab}"
+        fig.add_trace(go.Scattergl(
+            x=emb[mask, 0], y=emb[mask, 1], mode="markers", name=name,
+            marker=dict(size=4, opacity=0.65, color=_cluster_color(int(lab))),
+            hovertemplate=f"{name}<extra></extra>"))
+    fig.update_layout(showlegend=True,
+                      legend=dict(orientation="h", y=1.02, yanchor="bottom",
+                                  font=dict(size=9), itemsizing="constant"))
+    return _finish_fig(fig, method, meta)
+
+
+def _separability_bar_fig(sep) -> go.Figure:
+    """Horizontal bar of ε² per feature (ranked, highest on top). time-to-onset is
+    drawn in the accent so 'how tied are the clusters to onset?' reads at a glance."""
+    valid = sep.dropna(subset=["eps2"])
+    if valid.empty:
+        return empty_fig("Not enough clusters/data to rank features")
+    valid = valid.sort_values("eps2")                 # ascending -> top bar highest
+    feats = valid["feature"].tolist()
+    colors = [COLOR_ACCENT if f == "time_to_onset_sec" else "#8a8a99"
+              for f in feats]
+    labels = ["time-to-onset" if f == "time_to_onset_sec" else f for f in feats]
+    fig = go.Figure(go.Bar(
+        y=labels, x=valid["eps2"], orientation="h", marker_color=colors,
+        customdata=np.stack([valid["H"], valid["k_groups"], valid["n"]], axis=1),
+        hovertemplate="%{y}<br>ε²=%{x:.3f}<br>H=%{customdata[0]:.1f} · "
+                      "%{customdata[1]} clusters · n=%{customdata[2]}<extra></extra>"))
+    fig.update_layout(
+        height=max(300, 26 * len(feats) + 90),
+        margin=dict(l=170, r=20, t=48, b=44),
+        title=dict(text="Which feature explains the clusters (Kruskal–Wallis ε²)",
+                   font=dict(size=12)),
+        xaxis=dict(title="ε²  (0 = independent of clusters · 1 = fully explained)",
+                   range=[0, 1], zeroline=False),
+        yaxis=dict(title="", automargin=True), uirevision="pex-clus-sep")
+    return fig
+
+
+def _profile_heatmap_fig(prof, features) -> go.Figure:
+    """clusters × features robust-z median heat-map (diverging around 0). y-labels
+    carry each cluster's n and mean time-to-onset — a large, uniform column is a
+    feature that characterises that cluster."""
+    feats = [f for f in features if f in prof.columns]
+    if prof.empty or not feats:
+        return empty_fig("No per-cluster profile")
+    z = prof[feats].to_numpy(dtype=float)
+    ylab = []
+    for _, r in prof.iterrows():
+        c = "noise" if int(r["cluster"]) < 0 else f"cl {int(r['cluster'])}"
+        tto = r.get("mean_tto_sec")
+        tt = f", tto {_fmt_dur(tto)}" if tto == tto else ""    # NaN-safe
+        ylab.append(f"{c} (n={int(r['n'])}{tt})")
+    xlab = ["time-to-onset" if f == "time_to_onset_sec" else f for f in feats]
+    amax = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 1.0
+    amax = max(amax, 0.5)
+    fig = go.Figure(go.Heatmap(
+        z=z, x=xlab, y=ylab, colorscale="RdBu", reversescale=True,
+        zmid=0, zmin=-amax, zmax=amax,
+        colorbar=dict(title=dict(text="robust-z<br>median", font=dict(size=9)),
+                      thickness=10, len=0.7),
+        hovertemplate="%{y}<br>%{x}<br>robust-z median %{z:.2f}<extra></extra>"))
+    fig.update_layout(
+        height=max(260, 34 * len(ylab) + 130),
+        margin=dict(l=180, r=20, t=52, b=120),
+        title=dict(text="Per-cluster feature profile (robust-z medians)",
+                   font=dict(size=12)),
+        xaxis=dict(tickangle=-40), yaxis=dict(automargin=True),
+        uirevision="pex-clus-heat")
+    return fig
+
+
+def _cluster_quality_callout(quality, cached, cmethod) -> object:
+    """A one-line, verdict-free readout of the cluster-quality numbers — the
+    silhouette is a value to compare across the with/without-tto builds, not a
+    pass/fail gate."""
+    sil = quality.get("silhouette")
+    sil_s = f"{sil:.2f}" if sil is not None else "n/a (<2 clusters)"
+    tto_note = (" · time-to-onset FOLDED IN as an input dimension"
+                if cached.get("tto_input")
+                else " · features only (tto not an input)")
+    txt = (f"{cmethod.upper()}: {quality['n_clusters']} clusters, "
+           f"{quality['n_noise']} noise of {quality['n_points']} points · "
+           f"silhouette {sil_s}{tto_note}. Compare the silhouette across the "
+           f"with/without-tto builds yourself — it is a number, not a verdict.")
+    return _callout(txt, COLOR_ACCENT, "◆")
 
 
 # --------------------------------------------------------------------- #
@@ -3669,11 +3880,12 @@ def register_callbacks(app, store, config):
         State("pex-win-from", "value"),
         State("pex-win-to", "value"),
         State("pex-win-guard", "value"),
+        State("pex-embed-tto-input", "value"),
         State("pex-embed2-job", "data"),
         prevent_initial_call=True,
     )
     def _embed2_build_or_poll(_n, _iv, animal, protocol, window_h, method,
-                              winmode, wf, wt, wg, cur):
+                              winmode, wf, wt, wg, tto_val, cur):
         """Build the passive AND evoked embeddings for the current scope; publish
         {passive: jid, evoked: jid} ONLY when both are cached. Two _kick()s into
         the shared _CACHE (distinct _job_id keys) run concurrently and reuse any
@@ -3696,18 +3908,20 @@ def register_callbacks(app, store, config):
                                             *_cfg.DEFAULT_PASSIVE_WINDOW_MS, wg)
         except ValueError as e:
             return f"⚠ Passive feature window: {e}", True, no_update
+        tto_input = "on" in (tto_val or [])
+        tto_tok = "+tto" if tto_input else ""
         jids = {}
         for kind, sv, fcfg in (("passive", pa_sv, pa_cfg),
                                ("evoked", ev_sv, ev_cfg)):
             jid = _job_id(animal, protocol or "", kind, window_h, method, cap,
-                          _win_token(sv, fcfg) + _excl_tok(store, animal))
+                          _win_token(sv, fcfg) + _excl_tok(store, animal) + tto_tok)
             jids[kind] = jid
             with _LOCK:
                 have = jid in _CACHE
                 st = dict(_JOBS.get(jid) or {})
             if not have and st.get("status") != "error":
                 _kick(store, evoked_dir, jid, animal, protocol or "", kind,
-                      window_h, method, cap, sv, fcfg)
+                      window_h, method, cap, sv, fcfg, tto_input=tto_input)
 
         def _status_of(kind):
             """(human status, published-jid-or-None) for one column."""
@@ -3794,6 +4008,62 @@ def register_callbacks(app, store, config):
             out.append(_figure(cached["emb"], cached["sub"], color_by,
                                cached.get("method", "pca"), cached.get("meta"), cap))
         return tuple(out)
+
+    # ---- Cluster the built embedding + rank which feature explains it -------- #
+    @app.callback(
+        Output("pex-clus-status", "children"),
+        Output("pex-clus-quality", "children"),
+        Output("pex-clus-embed", "figure"),
+        Output("pex-clus-sep", "figure"),
+        Output("pex-clus-heatmap", "figure"),
+        Input("pex-clus-run", "n_clicks"),
+        State("pex-embed2-job", "data"),
+        State("pex-clus-col", "value"),
+        State("pex-clus-method", "value"),
+        State("pex-clus-param", "value"),
+        prevent_initial_call=True,
+    )
+    def _cluster_analyze(_n, jobs, col, cmethod, param):
+        """Cluster the chosen column's cached 2-D embedding, then compile the
+        ε² separability ranking, the per-cluster feature profile and the raw
+        quality numbers. Reads the cache — never rebuilds — so it is instant and
+        the operator can sweep method/param freely."""
+        jobs = jobs or {}
+        col = col or "evoked"
+        cached = _CACHE.get(jobs.get(col)) if jobs.get(col) else None
+        if not cached:
+            return (f"Build the {col} embedding first.", no_update, no_update,
+                    no_update, no_update)
+        if cached.get("empty"):
+            return ("That embedding is empty for this selection.", no_update,
+                    no_update, no_update, no_update)
+        emb, sub = cached["emb"], cached["sub"]
+        if emb.shape[0] < 3:
+            return ("Too few points to cluster.", no_update, no_update,
+                    no_update, no_update)
+        # Score every feature fed to the build PLUS time-to-onset (deduped, order
+        # preserved) so tto's ε² rank shows how tied the clusters are to onset.
+        feats = list(dict.fromkeys(
+            [m for m in cached.get("metrics", []) if m in sub.columns]
+            + (["time_to_onset_sec"] if "time_to_onset_sec" in sub.columns else [])))
+        p = int(param) if param else None
+        try:
+            res = _clf.analyze(
+                np.asarray(emb)[:, :2], sub, feats, method=cmethod,
+                min_cluster_size=(p if cmethod == "hdbscan" else None),
+                k=(p if cmethod == "kmeans" else None))
+        except Exception as e:                              # noqa: BLE001
+            logger.exception("cluster analyze failed (col=%s method=%s): %s",
+                             col, cmethod, e)
+            return (f"error: {e}", no_update, no_update, no_update, no_update)
+        method = cached.get("method", "pca")
+        n_cl = res["quality"]["n_clusters"]
+        return (f"✓ {n_cl} clusters on the {col} embedding",
+                _cluster_quality_callout(res["quality"], cached, cmethod),
+                _cluster_scatter_fig(emb, res["labels"], method,
+                                     cached.get("meta")),
+                _separability_bar_fig(res["separability"]),
+                _profile_heatmap_fig(res["profiles"], feats))
 
     @app.callback(
         Output("pex-traj", "figure"),
