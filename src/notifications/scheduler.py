@@ -28,7 +28,7 @@ import logging
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
-from threading import Lock
+from threading import Lock, Thread
 
 from src.alerting.email_alert import EmailAlerter
 from src.db.store import Store
@@ -62,6 +62,13 @@ class NotificationState:
     evoked_daily: str = ""
     evoked_resp_weekly: str = ""
     queue_stuck: bool = False
+    # Count-based peri-ictal trigger (non-calendar): fire an animal's peri-ictal
+    # email once each time it accumulates >= threshold NEW needs_scoring entries.
+    # ``peri_stim_baseline_id`` is the review_event_log.id high-water mark set on
+    # first watch so the pre-existing backlog never fires; ``peri_stim_marks`` is
+    # ``{animal_id: last_consumed_event_id}`` advanced only when that animal fires.
+    peri_stim_baseline_id: int = -1
+    peri_stim_marks: dict = field(default_factory=dict)
 
 
 def _project_path(relative: str) -> str:
@@ -97,6 +104,9 @@ class DigestScheduler:
         notif_cfg = (config.get("notifications", {}) or {})
         self._state_path = self._resolve_state_path(notif_cfg, surg_cfg)
         self._state = self._load_state()
+        # Animals whose peri-ictal render+email thread is in flight, so a later
+        # tick doesn't spawn a second render for the same animal.
+        self._peri_stim_inflight: set = set()
 
     # ----- state I/O -------------------------------------------------- #
 
@@ -136,6 +146,9 @@ class DigestScheduler:
                 evoked_daily=str(raw.get("evoked_daily") or ""),
                 evoked_resp_weekly=str(raw.get("evoked_resp_weekly") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
+                peri_stim_baseline_id=int(
+                    raw.get("peri_stim_baseline_id", -1)),
+                peri_stim_marks=dict(raw.get("peri_stim_marks") or {}),
             )
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -226,6 +239,7 @@ class DigestScheduler:
             self._tick_review_weekly(now, fired)
             self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
+            self._tick_peri_stim(now, fired)
             if fired:
                 self._save_state()
         return fired
@@ -541,6 +555,73 @@ class DigestScheduler:
                 logger.error("Queue clear alert raised: %s", e,
                               exc_info=True)
             self._state.queue_stuck = False
+
+    def _tick_peri_stim(self, now: datetime, fired: dict) -> None:
+        """Count-based, non-calendar trigger: when an animal accumulates >=
+        ``threshold`` (default 5) NEW ``needs_scoring`` entries since its last
+        peri-ictal email, render + email that animal's peri-ictal figures. Edge-
+        triggered off ``review_event_log`` ids against a persisted per-animal
+        high-water mark; the pre-existing backlog is baselined out on first watch
+        so enabling it never blasts. Rendering is heavy, so the send runs on a
+        background thread and the mark advances optimistically (a failed email
+        won't re-fire the whole backlog)."""
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("peri_stim", {}) or {}
+        if not cfg.get("enabled", False) or self._store is None:
+            return
+        threshold = max(1, int(cfg.get("threshold", 5)))
+        st = self._state
+        if st.peri_stim_baseline_id < 0:                 # first watch: baseline
+            try:
+                st.peri_stim_baseline_id = self._store.max_review_event_id()
+            except Exception as e:                        # noqa: BLE001
+                logger.error("peri-stim baseline query failed: %s", e)
+                return
+            fired["peri_stim_baseline"] = True            # persist the baseline
+            logger.info("peri-stim trigger armed at event id %d",
+                        st.peri_stim_baseline_id)
+            return
+        floor = min([st.peri_stim_baseline_id, *st.peri_stim_marks.values()])
+        try:
+            rows = self._store.needs_scoring_quick_flags(since_id=floor)
+        except Exception as e:                            # noqa: BLE001
+            logger.error("peri-stim quick_flag query failed: %s", e)
+            return
+        per_animal: dict[str, list] = {}
+        for r in rows:
+            animal = r.get("animal_id")
+            mark = st.peri_stim_marks.get(animal, st.peri_stim_baseline_id)
+            if animal and int(r["id"]) > mark:
+                per_animal.setdefault(animal, []).append(int(r["id"]))
+        for animal, ids in per_animal.items():
+            if len(ids) < threshold or animal in self._peri_stim_inflight:
+                continue
+            st.peri_stim_marks[animal] = max(ids)         # consume optimistically
+            fired[f"peri_stim:{animal}"] = True
+            self._spawn_peri_stim(animal, len(ids))
+
+    def _spawn_peri_stim(self, animal: str, n_new: int) -> None:
+        """Render + email one animal's peri-ictal figures on a daemon thread so
+        the (multi-minute, raw-.mat) render never blocks the main tick loop."""
+        self._peri_stim_inflight.add(animal)
+        reason = (f"{n_new} recording(s) moved into needs-onset-scoring for "
+                  f"{animal} — the peri-ictal stim-artifact summary follows.")
+
+        def _work():
+            try:
+                from src.notifications.peri_stim_needs_scoring import (
+                    send_peri_stim_artifact)
+                res = send_peri_stim_artifact(animal, self._config,
+                                              self._store, self._emailer,
+                                              reason=reason)
+                logger.info("peri-stim send for %s: %s", animal, res)
+            except Exception as e:                        # noqa: BLE001
+                logger.error("peri-stim send for %s raised: %s", animal, e,
+                             exc_info=True)
+            finally:
+                self._peri_stim_inflight.discard(animal)
+
+        Thread(target=_work, name=f"peri_stim_{animal}", daemon=True).start()
 
     # ----- ops helpers ----------------------------------------------- #
 

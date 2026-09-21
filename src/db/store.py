@@ -6114,6 +6114,38 @@ class Store:
         finally:
             conn.close()
 
+    def max_review_event_id(self) -> int:
+        """Current MAX(review_event_log.id) -- the monotonic high-water mark used
+        to seed a count-since baseline so a trigger fires only on events written
+        AFTER it starts watching (not the pre-existing backlog). 0 when empty."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT MAX(id) AS m FROM review_event_log").fetchone()
+            return int(row["m"]) if row and row["m"] is not None else 0
+        finally:
+            conn.close()
+
+    def needs_scoring_quick_flags(self, since_id: int = 0) -> list[dict]:
+        """Every ``quick_flag`` audit row with ``id > since_id``, oldest-first:
+        ``[{id, animal_id, file_id, at}]``. A ``quick_flag`` is written once each
+        time a (file, animal) newly enters the ``needs_scoring`` pool (see
+        ``_mark_review_conn``), so this is the exact edge-triggered signal for
+        'a file moved from flag to needs-onsets', countable per animal against a
+        persisted high-water mark. Rows with a NULL animal are skipped (they
+        can't be routed to a per-animal email)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT id, animal_id, file_id, at
+                   FROM review_event_log
+                   WHERE action = 'quick_flag' AND id > ?
+                     AND animal_id IS NOT NULL
+                   ORDER BY id""", (int(since_id),)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def flagged_pool_counts_per_animal(self) -> dict[str, int]:
         """Per-animal count of the AUTO-FILTER FLAG backlog still awaiting
         review -- the SAME set the Video Review "Flag" queue shows: a video

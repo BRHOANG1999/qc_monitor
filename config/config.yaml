@@ -226,8 +226,8 @@ dashboard:
 # intervals, then read memtrace.log. Env QC_MEMTRACE=1 forces it on.
 debug:
   memtrace:
-    enabled: false
-    interval_sec: 120
+    enabled: true      # DIAGNOSTIC RUN (uncommitted) -- set back to false after
+    interval_sec: 30
     top: 20
     frames: 12
     # logfile: D:/code/qc_monitor/memtrace.log   # default: <cwd>/memtrace.log
@@ -321,6 +321,20 @@ notifications:
     enabled: true
     min_pending: 100
     stall_minutes: 60
+  # Peri-ictal stim-artifact email, COUNT-triggered (not calendar): whenever an
+  # animal accumulates >= `threshold` recordings newly moved into the
+  # needs_scoring queue (flag -> needs-onsets, i.e. review_event_log quick_flag
+  # events), that animal's peri-ictal stim-artifact figures are rendered and
+  # emailed. Per-animal high-water mark; the pre-existing backlog is baselined
+  # out when first enabled, so it only fires on transitions going forward. Heavy
+  # render (raw evoked .mat) runs on a background thread. `channel` optional
+  # (defaults to the animal's stimulated channels); recipients fall back to
+  # alerting.smtp.recipients.
+  peri_stim:
+    enabled: true
+    threshold: 5
+    recipients: [hoang392@umn.edu]
+    channel: null
   # Pre-ictal daily digest: summarizes the last completed DAILY sweep (which CWT
   # time-scales survive the surrogate null). The weekly/monthly digests + the
   # scheduler ticks that ENQUEUE the sweeps land in stage 3.
@@ -378,6 +392,28 @@ notifications:
     enabled: true
     hour: 8
     recipients: [hoang392@umn.edu]
+  # Daily EVOKED-RESPONSE digest (distinct from the stim-quality digest above):
+  # for each animal's primary channel over the PREVIOUS day, split each feature
+  # into even percentile bands and show the mean response waveform per band --
+  # the "kinds" of evoked response (top-amplitude, bottom-line-length, ...).
+  # Email-only. Prototype/render with:
+  #   python -m src.notifications.evoked_daily --dry-run --date <YYYY-MM-DD> --animal <BCH###>
+  evoked_daily:
+    enabled: false
+    hour: 8
+    recipients: [hoang392@umn.edu]
+    features: [peak_to_trough, line_length, rms_amplitude, peak_latency_ms, recovery_tau]
+    n_bands: 10            # deciles: 10 even-population bands, 10 traces
+    window_days: 1        # 1 = daily; a weekly counterpart passes 7
+    max_trace_files: 0    # 0 = read every recording (no downsampling); set >0 to cap
+    animals: []            # empty = every animal with evoked data that day
+    channel_overrides: {}  # {BCH062: BCH062SLM} to pin a channel per animal
+    # Weekly counterpart (same figures over a 7-day window). Inherits the
+    # features / n_bands / recipients / animals above.
+    weekly:
+      enabled: false
+      weekday: 6          # 0=Mon .. 6=Sun
+      hour: 9
 review_queue:
   # Per-undergrad behavioral review queue. Pulls a list of
   # unreviewed recordings for the user's assigned animals from
@@ -711,6 +747,18 @@ surgeries:
     tab_name: JAX Cages
 database:
   path: D:/code/qc_monitor/data/monitor.db
+# Rolling local mirror of recent recordings. A Scheduled Task runs
+# sync_mirror.bat (robocopy /MAXAGE) to keep `root` populated with the last
+# `window_days` of .mat files on fast local disk; when enabled, load_mat reads a
+# file from `root` if the local copy exists, else falls back to the Tailscale
+# share. This collapses the multi-minute VPN reads (the dashboard GIL-holds AND
+# the daemon throughput deficit) to sub-second local reads. Leave DISABLED until
+# the mirror is populated and the scheduled task is installed (see sync_mirror.bat).
+mirror:
+  enabled: false
+  root: D:/qc_mirror
+  window_days: 60
+  # share_prefix: //100.106.104.22/   # default; override only for a different host
 logging:
   level: INFO
   dir: D:/code/qc_monitor/logs
