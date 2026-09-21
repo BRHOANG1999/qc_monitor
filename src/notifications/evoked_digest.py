@@ -36,6 +36,7 @@ DEFAULT_FEATURES = ["peak_to_trough", "line_length", "rms_amplitude",
 HEADLINE_FEATURES = ["peak_to_trough", "line_length"]     # inline in the email
 DEFAULT_N_BANDS = 10          # deciles: 10 even-population bands, 10 traces
 _MIN_PER_FEATURE = 40          # too few finite responses -> skip that feature
+_PILE_FRAC = 0.02              # a boundary value held by >= this fraction = a pile-up
 _MATCH_TOL_SEC = 0.5           # stim-time match tolerance (row <-> trace)
 _BG = "#1e1e2f"
 _PANEL = "#26263a"
@@ -120,19 +121,39 @@ def compute_bands(secs: np.ndarray, vals: np.ndarray,
     v = np.asarray(vals, dtype=float)
     s = np.asarray(secs, dtype=float)
     fin = np.isfinite(v) & np.isfinite(s)
-    idx = np.where(fin)[0]
-    if idx.size < max(4 * n_bands, _MIN_PER_FEATURE):
+    if fin.sum() < max(4 * n_bands, _MIN_PER_FEATURE):
         return None
-    order = idx[np.argsort(v[idx], kind="stable")]       # indices, value-sorted
+    # A degenerate "pile-up" at a BOUNDARY value is a distinct population, not a
+    # band: exact-0 flat responses (amplitude/line-length) OR the window floor
+    # (peak_latency piles at its 1 ms minimum = peak-at-artifact). Split the modal
+    # value out only when it sits at the min/max (where degenerate/sentinel values
+    # collect) and holds a meaningful fraction -- an interior bulk mode is a real
+    # band, not a pile.
+    uv, uc = np.unique(v[fin], return_counts=True)
+    mi = int(np.argmax(uc))
+    mode_val = float(uv[mi])
+    at_boundary = mode_val in (float(uv[0]), float(uv[-1]))
+    if at_boundary and uc[mi] >= max(5, _PILE_FRAC * fin.sum()):
+        pile, pile_val = fin & (v == mode_val), mode_val
+    else:
+        pile, pile_val = np.zeros(v.shape, dtype=bool), None
+    nz = np.where(fin & ~pile)[0]                          # the non-pile responses
+    if nz.size < max(4 * n_bands, _MIN_PER_FEATURE):
+        return None
+    order = nz[np.argsort(v[nz], kind="stable")]           # non-pile, value-sorted
     n = order.size
     band_sorted = np.minimum((np.arange(n) * n_bands) // n, n_bands - 1)
     bands = np.full(v.size, -1, dtype=int)
     bands[order] = band_sorted
-    band_of_ts = {round(float(s[i]), 3): int(bands[i]) for i in idx}
-    edges = np.quantile(v[idx], np.linspace(0.0, 1.0, n_bands + 1))
+    zidx = np.where(pile)[0]
+    bands[zidx] = n_bands                                  # the pile -> the extra band
+    band_of_ts = {round(float(s[i]), 3): int(bands[i])
+                  for i in np.concatenate([order, zidx])}
+    edges = np.quantile(v[nz], np.linspace(0.0, 1.0, n_bands + 1))
     counts = np.bincount(band_sorted, minlength=n_bands)
     return {"band_of_ts": band_of_ts, "bands": bands, "edges": edges,
-            "counts": counts, "n_bands": int(n_bands)}
+            "counts": counts, "n_zero": int(pile.sum()), "pile_val": pile_val,
+            "n_bands": int(n_bands)}
 
 
 def _ts_key(row) -> float:
@@ -184,7 +205,8 @@ def band_waveforms_multi(day_files: list[str], animal: str, channel: str,
     ``info_by_feat = {feature: compute_bands(...)}``; returns
     ``{feature: (time_ms, {band: {mean, sd, n}})}``. Reading each recording's
     traces once (not once per feature) keeps the daemon's I/O bounded."""
-    accs = {f: _BandAccum(info["n_bands"]) for f, info in info_by_feat.items()}
+    accs = {f: _BandAccum(info["n_bands"] + 1)               # +1 = the zero band
+            for f, info in info_by_feat.items()}
     maps = {f: info["band_of_ts"] for f, info in info_by_feat.items()}
     for fp in day_files:
         rows = [r for r in (read_feature_sidecar(fp, animal) or [])
@@ -228,81 +250,143 @@ def _band_label(b: int, edges: np.ndarray, n_bands: int) -> str:
     return f"D{b + 1} [{lo:.3g}–{hi:.3g}]{tag}"
 
 
-def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
-                   info: dict, time_ms, band_wf: dict, meta: dict,
-                   out_png: str) -> str:
-    """2-panel PNG: (left) feature-vs-time scatter split into equal-population
-    (rank) percentile bands, points colored by band; (right) each band's mean +/-
-    sd evoked waveform. Saves to *out_png*, returns the path."""
-    n_bands, edges = info["n_bands"], info["edges"]
-    bands_idx = info["bands"]
+def _pile_label(info: dict, n: int) -> str:
+    pv = info.get("pile_val")
+    return f"pile @{pv:g} (n={n})" if pv is not None else f"pile (n={n})"
+
+
+_ZCOLOR = "#ff5c5c"                                       # the zero-value group
+
+
+def _baseline(mean: np.ndarray, tm: np.ndarray) -> np.ndarray:
+    base_m = (tm >= -50) & (tm <= -5)
+    return mean - (np.nanmean(mean[base_m]) if base_m.any() else 0.0)
+
+
+def draw_scatter(ax, feature, secs, vals, info, meta) -> None:
+    """Feature-vs-time scatter colored by band, zeros highlighted, robust y."""
+    n_bands, edges, bands_idx = info["n_bands"], info["edges"], info["bands"]
     colors = plt.cm.viridis(np.linspace(0.06, 0.96, n_bands))
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.8, 4.8), facecolor=_BG,
-                                   gridspec_kw={"width_ratios": [1.15, 1.0]})
+    ax.set_facecolor(_PANEL)
     ok = bands_idx >= 0
     s, v, bb = secs[ok], vals[ok], bands_idx[ok]
     dts = mdates.date2num([datetime.fromtimestamp(x) for x in s])
-    axL.set_facecolor(_PANEL)
     for b in range(n_bands):
         m = bb == b
         if m.any():
-            axL.scatter(dts[m], v[m], s=6, color=colors[b], alpha=0.6,
-                        edgecolors="none")
+            ax.scatter(dts[m], v[m], s=6, color=colors[b], alpha=0.6, edgecolors="none")
+    mz = bb == n_bands
+    if mz.any():
+        ax.scatter(dts[mz], v[mz], s=8, color=_ZCOLOR, alpha=0.7, edgecolors="none")
     for e in np.unique(edges[1:-1]):
-        axL.axhline(e, color=_MUTED, lw=0.7, ls="--", alpha=0.4)
+        ax.axhline(e, color=_MUTED, lw=0.7, ls="--", alpha=0.4)
     _loc = mdates.AutoDateLocator()
-    axL.xaxis.set_major_locator(_loc)
-    axL.xaxis.set_major_formatter(mdates.ConciseDateFormatter(_loc))
+    ax.xaxis.set_major_locator(_loc)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(_loc))
     vv = v[np.isfinite(v)]
-    if vv.size:                                          # robust y so outliers don't compress
+    if vv.size:
         ylo, yhi = np.percentile(vv, [0.2, 99.5])
-        axL.set_ylim(ylo - 0.05 * (yhi - ylo) - 1e-9, yhi + 0.05 * (yhi - ylo) + 1e-9)
-    axL.set_xlabel("time", color=_TEXT, fontsize=10)
-    axL.set_ylabel(_pretty(feature), color=_TEXT, fontsize=10)
-    axL.set_title(f"{meta['animal']} · {meta['channel']} · "
-                  f"{meta['date']}  (n={int(ok.sum())})", color=_TEXT,
-                  fontsize=11, loc="left")
+        ax.set_ylim(ylo - 0.05 * (yhi - ylo) - 1e-9, yhi + 0.05 * (yhi - ylo) + 1e-9)
+    ax.set_xlabel("time", color=_TEXT, fontsize=10)
+    ax.set_ylabel(_pretty(feature), color=_TEXT, fontsize=10)
+    pv = info.get("pile_val")
+    zc = (f" · {int(mz.sum())} @{pv:g}" if mz.any() and pv is not None
+          else f" · {int(mz.sum())} pile" if mz.any() else "")
+    ax.set_title(f"{meta['animal']} · {meta['channel']} · {meta['date']}  "
+                 f"(n={int(ok.sum())}{zc})", color=_TEXT, fontsize=11, loc="left")
 
-    axR.set_facecolor(_PANEL)
-    tm = np.asarray(time_ms, dtype=float)
-    base_m = (tm >= -50) & (tm <= -5)                 # pre-stim baseline window
-    art_m = np.abs(tm) <= 1.5                          # blank the stim artifact
-    vis_m = (tm >= -20) & (tm <= 200) & ~art_m        # response window shown
-    show_sd = n_bands <= 5                              # sd fills get muddy w/ deciles
+
+def draw_response(ax, tm, band_wf, info, *, blank=True, show_sd=False) -> None:
+    """Per-band mean response (baseline-corrected; artifact blanked if *blank*),
+    plus the zeros trace. sd fills when *show_sd*."""
+    n_bands, edges = info["n_bands"], info["edges"]
+    colors = plt.cm.viridis(np.linspace(0.06, 0.96, n_bands))
+    ax.set_facecolor(_PANEL)
+    art_m = np.abs(tm) <= 1.5
+    vis_m = (tm >= -20) & (tm <= 200) & (~art_m if blank else np.ones(tm.shape, bool))
     ys = []
-    for b in sorted(band_wf):
-        d = band_wf[b]
-        mean = d["mean"] - (np.nanmean(d["mean"][base_m]) if base_m.any() else 0.0)
-        m_plot = mean.copy()
-        m_plot[art_m] = np.nan                          # gap at the artifact
-        lw = 2.4 if b in (0, n_bands - 1) else 1.3
-        axR.plot(tm, m_plot, color=colors[b], lw=lw,
-                 label=_band_label(b, edges, n_bands))
+
+    def _plot(b, color, lw, ls="-", lbl=None):
+        d = band_wf.get(b)
+        if not d or d["n"] == 0:
+            return
+        mean = _baseline(d["mean"], tm)
+        mp = mean.copy()
+        if blank:
+            mp[art_m] = np.nan
+        ax.plot(tm, mp, color=color, lw=lw, ls=ls, label=lbl)
         if show_sd:
-            sd_plot = d["sd"].copy()
-            sd_plot[art_m] = np.nan
-            axR.fill_between(tm, m_plot - sd_plot, m_plot + sd_plot,
-                             color=colors[b], alpha=0.07, linewidth=0)
+            sd = d["sd"].copy()
+            if blank:
+                sd[art_m] = np.nan
+            ax.fill_between(tm, mp - sd, mp + sd, color=color, alpha=0.08, linewidth=0)
         seg = mean[vis_m]
         seg = seg[np.isfinite(seg)]
         if seg.size:
             ys.append(np.percentile(seg, [0.5, 99.5]))
-    axR.set_xlim(-20, 200)
+
+    for b in range(n_bands):
+        _plot(b, colors[b], 2.4 if b in (0, n_bands - 1) else 1.3,
+              lbl=_band_label(b, edges, n_bands))
+    if band_wf.get(n_bands) and band_wf[n_bands]["n"]:
+        _plot(n_bands, _ZCOLOR, 2.0, ls="--",
+              lbl=_pile_label(info, band_wf[n_bands]["n"]))
+    ax.set_xlim(-20, 200)
     if ys:
         lo = min(a[0] for a in ys); hi = max(a[1] for a in ys)
         pad = 0.15 * (hi - lo) + 1e-9
-        axR.set_ylim(lo - pad, hi + pad)
-    axR.axvline(0, color=_MUTED, lw=0.6, ls=":", alpha=0.5)
-    axR.set_xlabel("ms since stim (artifact blanked)", color=_TEXT, fontsize=10)
-    axR.set_ylabel("evoked (a.u.)", color=_TEXT, fontsize=10)
-    axR.set_title(f"mean±sd response by {_pretty(feature)} band",
-                  color=_TEXT, fontsize=11, loc="left")
-    leg = axR.legend(fontsize=6, facecolor=_PANEL, edgecolor="#3a3a52",
-                     labelcolor=_TEXT, loc="upper right", ncol=1,
-                     framealpha=0.85)
-    if leg:
-        leg.get_frame().set_alpha(0.85)
-    for ax in (axL, axR):
+        ax.set_ylim(lo - pad, hi + pad)
+    ax.axvline(0, color=_MUTED, lw=0.6, ls=":", alpha=0.5)
+    ax.set_xlabel("ms since stim" + (" (artifact blanked)" if blank else ""),
+                  color=_TEXT, fontsize=10)
+    ax.set_ylabel("evoked (a.u.)", color=_TEXT, fontsize=10)
+    ax.legend(fontsize=6, facecolor=_PANEL, edgecolor="#3a3a52", labelcolor=_TEXT,
+              loc="upper right", framealpha=0.85)
+
+
+def draw_artifact_panel(ax, tm, band_wf, info) -> None:
+    """UNBLANKED stim-artifact window (~-5..25 ms) for the zeros vs the top band."""
+    n_bands = info["n_bands"]
+    colors = plt.cm.viridis(np.linspace(0.06, 0.96, n_bands))
+    ax.set_facecolor(_PANEL)
+    aw = (tm >= -5) & (tm <= 25)
+    d = band_wf[n_bands]
+    zm = _baseline(d["mean"], tm)
+    ax.plot(tm[aw], zm[aw], color=_ZCOLOR, lw=2.2, label=_pile_label(info, d["n"]))
+    ax.fill_between(tm[aw], (zm - d["sd"])[aw], (zm + d["sd"])[aw],
+                    color=_ZCOLOR, alpha=0.12, linewidth=0)
+    if band_wf.get(n_bands - 1) and band_wf[n_bands - 1]["n"]:
+        tmn = _baseline(band_wf[n_bands - 1]["mean"], tm)
+        ax.plot(tm[aw], tmn[aw], color=colors[-1], lw=1.5, label=f"D{n_bands} (top)")
+    ax.axvline(0, color=_MUTED, lw=0.8, ls=":", alpha=0.7)
+    ax.set_xlim(-5, 25)
+    ax.set_xlabel("ms since stim (UNBLANKED)", color=_TEXT, fontsize=10)
+    ax.set_ylabel("evoked (a.u.)", color=_TEXT, fontsize=10)
+    ax.set_title("stim-artifact window · pile-up (unblanked)", color=_TEXT,
+                 fontsize=11, loc="left")
+    ax.legend(fontsize=7, facecolor=_PANEL, edgecolor="#3a3a52", labelcolor=_TEXT,
+              loc="best", framealpha=0.85)
+
+
+def feature_figure(feature: str, secs: np.ndarray, vals: np.ndarray,
+                   info: dict, time_ms, band_wf: dict, meta: dict,
+                   out_png: str) -> str:
+    """Scatter | mean response by decile (+zeros) | (if zeros) unblanked
+    stim-artifact window. Saves to *out_png*, returns the path."""
+    n_bands = info["n_bands"]
+    tm = np.asarray(time_ms, dtype=float)
+    has_zero = bool(band_wf.get(n_bands) and band_wf[n_bands]["n"] > 0)
+    ncols = 3 if has_zero else 2
+    widths = [1.15, 1.0, 0.7] if has_zero else [1.15, 1.0]
+    fig, axes = plt.subplots(1, ncols, figsize=(6.0 * ncols + 1.0, 4.8),
+                             facecolor=_BG, gridspec_kw={"width_ratios": widths})
+    draw_scatter(axes[0], feature, secs, vals, info, meta)
+    draw_response(axes[1], tm, band_wf, info, blank=True, show_sd=(n_bands <= 5))
+    axes[1].set_title(f"mean±sd response by {_pretty(feature)} band",
+                      color=_TEXT, fontsize=11, loc="left")
+    if has_zero:
+        draw_artifact_panel(axes[2], tm, band_wf, info)
+    for ax in axes:
         ax.tick_params(colors=_MUTED, labelsize=8)
         for sp in ax.spines.values():
             sp.set_color("#3a3a52")

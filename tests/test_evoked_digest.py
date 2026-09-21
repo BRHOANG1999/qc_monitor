@@ -37,14 +37,16 @@ def test_deciles_equal_population():
     assert counts.max() - counts.min() <= 1            # equal population
 
 
-def test_point_mass_splits_across_bottom_bands():
-    v = np.array([0.0] * 300 + list(range(1, 201)), dtype=float)   # 60% flat zeros
+def test_zeros_separated_from_deciles():
+    v = np.array([0.0] * 300 + list(range(1, 201)), dtype=float)   # 300 exact-0
     info = ed.compute_bands(_secs(500), v, 10)
     assert info is not None and info["n_bands"] == 10
-    assert info["counts"].max() - info["counts"].min() <= 1       # still even
-    # the flat zeros occupy the bottom ~6 bands (not collapsed into one)
-    zero_bands = {info["bands"][i] for i in range(300)}
-    assert len(zero_bands) >= 5
+    assert info["n_zero"] == 300                                   # zeros counted
+    # the 200 NON-zero responses split into 10 even deciles
+    assert info["counts"].sum() == 200
+    assert info["counts"].max() - info["counts"].min() <= 1
+    # every exact-0 response is assigned the extra "zero" band (== n_bands)
+    assert set(info["bands"][:300].tolist()) == {10}
 
 
 def test_compute_bands_too_few_returns_none():
@@ -70,7 +72,8 @@ def test_band_waveforms_recovers_groups(monkeypatch):
     stim = np.arange(n) * 2.0 + 10.0                   # stim_time_sec into recording
     base = datetime(2026, 2, 1, 0, 0, 0)
     abs_dt = [(base + timedelta(seconds=float(stim[i]))).isoformat() for i in range(n)]
-    feats = np.array([0.0] * 25 + [1.0] * 25)          # low half, high half
+    feats = np.concatenate([np.linspace(1.0, 1.4, 25),   # low group (spread)
+                            np.linspace(2.0, 2.4, 25)])  # high group (no pile-up)
     traces = np.stack([_flat(T) if i < 25 else _bump(T) for i in range(n)])
     rows = [{"channel": "BCH999", "stim_time_sec": float(stim[i]),
              "abs_dt": abs_dt[i], "amp": float(feats[i])} for i in range(n)]
