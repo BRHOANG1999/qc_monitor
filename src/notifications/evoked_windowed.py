@@ -46,7 +46,7 @@ from src.utils.evoked_output import read_feature_sidecar, read_file_evoked  # no
 # (start, end) ms. All start at 2 ms (just past the 1 ms artifact guard), so the
 # crop always keeps >=2 samples -- no silent full-trace fallback. Wide windows are
 # simply capped by the file's data extent (~+/-200 or +/-500 ms).
-WINDOWS_MS = [(2.0, 50.0), (2.0, 100.0), (2.0, 500.0), (2.0, 1000.0)]
+WINDOWS_MS = [(2.0, 50.0), (2.0, 100.0), (2.0, 500.0)]
 
 _FD_W, _FD_H = 620, 360             # density raster (pixels); memory ~ W*H per band
 _A0 = 0.30                          # per-trace opacity the density reproduces
@@ -404,6 +404,55 @@ def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
 # --------------------------------------------------------------------- #
 #  package assembly
 # --------------------------------------------------------------------- #
+def _fig_metric_trends(feat, per_win, meta, out) -> str:
+    """Track a feature OVER TIME: per window, the per-day median + IQR band (light
+    raw points behind), days-primary x-axis with dates. Built from the windowed
+    values -- no extra trace reads."""
+    import matplotlib.dates as mdates
+    nwin = max(1, len(per_win))
+    fig, axes = plt.subplots(1, nwin, figsize=(5.2 * nwin, 4.0),
+                             facecolor=_ed._BG, squeeze=False)
+    for i, (wt, secs, vals) in enumerate(per_win):
+        ax = axes[0][i]
+        ax.set_facecolor(_ed._PANEL)
+        s = np.asarray(secs, dtype=float)
+        v = np.asarray(vals, dtype=float)
+        fin = np.isfinite(s) & np.isfinite(v)
+        s, v = s[fin], v[fin]
+        if s.size == 0:
+            ax.set_title(f"{wt} — no data", color=_ed._MUTED, fontsize=10)
+            continue
+        dts = np.array([datetime.fromtimestamp(x) for x in s])
+        ax.scatter(dts, v, s=3, c="#5e7ce2", alpha=0.10, linewidths=0)
+        days = np.array([d.date() for d in dts])
+        xs, md, lo, hi = [], [], [], []
+        for d in sorted(set(days)):
+            mask = days == d
+            xs.append(datetime(d.year, d.month, d.day, 12))
+            md.append(np.median(v[mask]))
+            lo.append(np.percentile(v[mask], 25))
+            hi.append(np.percentile(v[mask], 75))
+        xs = np.array(xs)
+        ax.fill_between(xs, lo, hi, color="#5e7ce2", alpha=0.25, linewidth=0,
+                        label="IQR (p25–p75)")
+        ax.plot(xs, md, color="#f0f0f5", lw=1.8, marker="o", ms=4,
+                label="daily median")
+        ax.set_title(wt, color=_ed._TEXT, fontsize=10, loc="left")
+        ax.tick_params(colors=_ed._MUTED, labelsize=8)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+        for lab in ax.get_xticklabels():
+            lab.set_rotation(35)
+            lab.set_ha("right")
+        if i == 0:
+            leg = ax.legend(fontsize=8, frameon=False)
+            for t in leg.get_texts():
+                t.set_color(_ed._TEXT)
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_ed._pretty(feat)} · "
+                 f"metric OVER TIME (per-day median ± IQR, per window)",
+                 color=_ed._TEXT, fontsize=12)
+    return _pkg._finish(fig, out, feat)
+
+
 def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                            features=None, windows=None, n_bands=10,
                            channel_override=None, include_week=True, n_days=7,
@@ -472,11 +521,33 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                                   info_pw, ylim, labels, pkg,
                                   is_week=(period == week_key), progress=progress)
 
+    # Metrics-over-time trends for the primary period (built from the windowed
+    # values -- cheap, no trace reads). One figure per feature (panel per window).
+    primary = week_key if include_week else \
+        datetime(end_day.year, end_day.month, end_day.day).date().isoformat()
+    trends: dict = {}
+    if progress:
+        progress("building metric-over-time trends…")
+    trend_dir = os.path.join(pkg, "_trends")
+    os.makedirs(trend_dir, exist_ok=True)
+    for feat in features:
+        per_win = []
+        for wt, _w in wtags_windows:
+            ser = series.get(wt, {}).get(primary)
+            if ser is not None:
+                per_win.append((wt, ser["secs"], ser["metrics"][feat]))
+        if not per_win:
+            continue
+        tp = os.path.join(trend_dir, f"{feat}.png")
+        _fig_metric_trends(feat, per_win, {"animal": animal, "channel": channel},
+                           tp)
+        trends[feat] = os.path.relpath(tp, pkg).replace("\\", "/")
+
     manifest = {"animal": animal, "channel": channel, "week": labels[week_key],
                 "windows": [wt for wt, _w in wtags_windows],
-                "periods": order, "features": features,
+                "periods": order, "features": features, "primary": primary,
                 "docs": {f: _ed.feature_doc(f) for f in features},
-                "figures": figures}
+                "trends": trends, "figures": figures}
     with open(os.path.join(pkg, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     _write_index(pkg, manifest, labels)
@@ -501,6 +572,19 @@ def _write_index(pkg, manifest, labels) -> None:
              "<p class='def'>Each feature is RE-MEASURED over each window (magnitudes "
              "&amp; deciles differ per window). Grids draw EVERY trace (full density); "
              "mean overlaid in white.</p>"]
+    trends = manifest.get("trends") or {}
+    if trends:
+        parts.append("<h2>① Metrics over time (per-day median ± IQR)</h2>")
+        parts.append("<div style='display:flex;flex-wrap:wrap;gap:12px'>")
+        for feat in feats:
+            rel = trends.get(feat)
+            if not rel:
+                continue
+            parts.append(f"<div><div class='def'>{html.escape(feat)}</div>"
+                         f"<a href='{rel}'><img src='{rel}' "
+                         f"style='width:360px'></a></div>")
+        parts.append("</div>")
+        parts.append("<h2>② Response “kinds” by decile</h2>")
     for wt in wins:
         parts.append(f"<h2>window {html.escape(wt)}</h2>")
         parts.append("<table><tr><th>period</th>"
@@ -529,63 +613,94 @@ def _write_index(pkg, manifest, labels) -> None:
 _ATTACH_CAP = 20 * 1024 * 1024        # 20 MB inline budget (mirrors the stim digest)
 
 
-def _primary_period(manifest) -> str:
-    """The period the email leads with: the week if built, else the newest day."""
-    periods = manifest.get("periods", [])
-    return "week" if "week" in periods else (periods[0] if periods else "")
+def _browse_url(manifest) -> str:
+    """A clickable file:// link to the browsable package index (the daemon runs on
+    the operator's own machine, so the local path opens for them)."""
+    idx = os.path.abspath(manifest.get("index", ""))
+    return "file:///" + idx.replace("\\", "/")
 
 
-def _select_email_figs(manifest, pkg, email_windows):
-    """Inline the PRIMARY period's grids (greedy, under the cap) for the requested
-    windows; overflow to file attachments. Returns (inline_paths, file_paths,
-    per_window records for the HTML)."""
-    period = _primary_period(manifest)
-    wins = email_windows or manifest.get("windows", [])
+def _stage_email(manifest, pkg, wins, staged):
+    """Copy the emailed figures to *staged* under UNIQUE names (so each inline
+    image gets its own Content-ID -- the earlier collision made every grid render
+    as the same picture). Returns (inline_paths, overflow_files, by_win, trends).
+    Inlines the over-time trends first, then the primary period's decile grids,
+    greedy under the 20 MB budget."""
+    import shutil
+    period = manifest.get("primary") or "week"
+    budget = _ATTACH_CAP
+    inline, files, trends = [], [], []
+    for feat, rel in (manifest.get("trends") or {}).items():
+        src = os.path.join(pkg, rel)
+        if not os.path.isfile(src):
+            continue
+        cid = f"trend_{feat}.png"
+        dst = os.path.join(staged, cid)
+        shutil.copyfile(src, dst)
+        sz = os.path.getsize(dst)
+        if sz <= budget:
+            inline.append(dst)
+            budget -= sz
+            trends.append((feat, cid))
     by_win: dict = {w: [] for w in wins}
-    inline, files, budget = [], [], _ATTACH_CAP
     for f in manifest["figures"]:
         if f["period"] != period or f["window"] not in by_win:
             continue
-        grid = os.path.join(pkg, f["dir"], f.get("grid", "deciles_grid.png"))
-        try:
-            sz = os.path.getsize(grid)
-        except OSError:
+        src = os.path.join(pkg, f["dir"], f.get("grid", "deciles_grid.png"))
+        if not os.path.isfile(src):
             continue
+        cid = f"grid_{f['window']}_{f['feature']}.png"
+        dst = os.path.join(staged, cid)
+        shutil.copyfile(src, dst)
+        sz = os.path.getsize(dst)
         if sz <= budget:
-            inline.append(grid)
+            inline.append(dst)
             budget -= sz
-            by_win[f["window"]].append((f["feature"], os.path.basename(grid),
-                                        f["dir"]))
+            by_win[f["window"]].append((f["feature"], cid))
         else:
-            files.append(grid)
-    return inline, files, period, by_win
+            files.append(src)
+    return inline, files, by_win, trends
 
 
-def _email_html(manifest, period, by_win, cadence) -> str:
-    lead = ("per-decile DAILY MEANS across the week (day-to-day drift)"
-            if period == "week" else "per-decile FULL-DENSITY grids (every trace)")
-    parts = [f"<h2 style='font-family:sans-serif'>Evoked windowed {cadence} digest "
-             f"— {html.escape(manifest['animal'])} · "
-             f"{html.escape(manifest['channel'])} · {html.escape(manifest['week'])}"
-             f"</h2>",
-             f"<p style='font-family:sans-serif;color:#444'>Each feature is "
-             f"RE-MEASURED over each window (magnitudes &amp; deciles differ per "
-             f"window). Below: {lead} for the {html.escape(period)} period. The full "
-             f"set (all windows × all periods) is in the browsable folder.</p>"]
+def _email_html(manifest, by_win, trends, cadence) -> str:
+    period = manifest.get("primary") or "week"
+    browse = _browse_url(manifest)
+    kind = ("per-day MEANS across the week" if period == "week"
+            else "FULL-DENSITY (every trace)")
+    S = "font-family:sans-serif"
+    parts = [
+        f"<h2 style='{S}'>Evoked windowed {cadence} digest — "
+        f"{html.escape(manifest['animal'])} · {html.escape(manifest['channel'])} · "
+        f"{html.escape(manifest['week'])}</h2>",
+        f"<p style='{S};color:#444'>Each feature is RE-MEASURED over each window "
+        f"({', '.join(manifest['windows'])}) — magnitudes &amp; deciles differ per "
+        f"window.</p>",
+        f"<p style='{S};font-size:14px'>📂 <a href='{html.escape(browse)}'>"
+        f"<b>Open the full browsable package (all windows × all periods)</b></a>"
+        f"<br><span style='color:#888;font-size:12px'>{html.escape(browse)}</span>"
+        f"</p>",
+        f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
+        f"① Metrics over time — per-day median ± IQR (this {period})</h3>"]
+    for feat, cid in trends:
+        parts.append(
+            f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
+            f"color:#333'><b>{html.escape(_ed._pretty(feat))}</b></div>"
+            f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
+    parts.append(
+        f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
+        f"② Response “kinds” by decile — {kind}</h3>")
     for win, items in by_win.items():
         if not items:
             continue
-        parts.append(f"<h3 style='font-family:sans-serif'>window {html.escape(win)}"
-                     f"</h3>")
-        for feat, cid, _d in items:
+        parts.append(f"<h4 style='{S};color:#5e7ce2'>window {html.escape(win)}</h4>")
+        for feat, cid in items:
             parts.append(
-                f"<div style='margin:4px 0 14px'>"
-                f"<div style='font-family:sans-serif;font-size:13px;color:#333'>"
-                f"{html.escape(_ed._pretty(feat))}</div>"
-                f"<img src='cid:{cid}' style='max-width:1000px;width:100%'></div>")
-    parts.append(f"<p style='font-family:sans-serif;font-size:12px;color:#666'>"
-                 f"Full browsable package (index.html): "
-                 f"{html.escape(manifest.get('index',''))}</p>")
+                f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
+                f"color:#333'>{html.escape(_ed._pretty(feat))}</div>"
+                f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
+    parts.append(f"<p style='{S};font-size:12px;color:#666'>📂 Full browsable "
+                 f"package: <a href='{html.escape(browse)}'>{html.escape(browse)}"
+                 f"</a></p>")
     return "\n".join(parts)
 
 
@@ -593,9 +708,10 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
                         cadence="weekly", out_root=None, features=None,
                         windows=None, email_windows=None, dry_run=False,
                         progress=None) -> dict:
-    """Build the windowed package for *cadence* ('daily'|'weekly') and email its
-    primary-period grids inline (rest linked via the folder). Never raises for a
-    data gap -- returns ``{"sent": False, "reason": ...}``."""
+    """Build the windowed package for *cadence* ('daily'|'weekly') and email it,
+    organized: a clickable browse link, the metric-over-time trends, then the
+    decile grids. Never raises for a data gap."""
+    import tempfile
     out_root = out_root or os.path.join("data", "evoked_windowed_packages")
     os.makedirs(out_root, exist_ok=True)
     weekly = cadence == "weekly"
@@ -605,27 +721,30 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
     if manifest.get("empty"):
         return {"sent": False, "reason": manifest.get("reason", "no data"),
                 "animal": animal}
-    # daily emails default to 2 windows (full-density grids are big); weekly can
-    # carry all four (day-means grids are small).
+    # weekly grids are small day-means (inline all windows); daily grids are big
+    # full-density (default to the narrow + mid window to stay under the cap).
     ew = email_windows or (manifest["windows"] if weekly
                            else ["2-50ms", "2-500ms"])
-    inline, files, period, by_win = _select_email_figs(manifest, manifest["pkg_dir"],
-                                                       ew)
+    staged = tempfile.mkdtemp(prefix="evoked_win_mail_")
+    inline, files, by_win, trends = _stage_email(manifest, manifest["pkg_dir"],
+                                                 ew, staged)
     if dry_run:
         return {"sent": False, "dry_run": True, "manifest": manifest,
-                "inline": len(inline), "attach": len(files), "period": period}
-    recipients = ((config.get("alerting", {}).get("smtp", {}) or {})
+                "inline": len(inline), "attach": len(files), "trends": len(trends)}
+    recipients = (config.get("notifications", {}).get("evoked_windowed", {})
+                  .get("recipients")
+                  or (config.get("alerting", {}).get("smtp", {}) or {})
                   .get("recipients"))
     sent = bool(emailer.send(
         subject=f"QC evoked windowed {cadence} — {animal} · {manifest['week']}",
-        body=f"Evoked windowed {cadence} digest for {animal}. See the HTML body; "
-             f"full package at {manifest.get('index','')}.",
-        body_html=_email_html(manifest, period, by_win, cadence),
+        body=f"Evoked windowed {cadence} digest for {animal}. Metrics-over-time + "
+             f"decile grids in the HTML body; full package: {_browse_url(manifest)}",
+        body_html=_email_html(manifest, by_win, trends, cadence),
         recipients=recipients, subject_prefix=False,
         attachments=inline, file_attachments=files))
     return {"sent": sent, "animal": animal, "cadence": cadence,
             "recipients": recipients, "index": manifest.get("index"),
-            "inline": len(inline), "attach": len(files)}
+            "inline": len(inline), "attach": len(files), "trends": len(trends)}
 
 
 def _main(argv=None) -> int:

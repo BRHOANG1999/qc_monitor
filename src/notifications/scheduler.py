@@ -512,8 +512,13 @@ class DigestScheduler:
             .get("evoked_windowed", {}) or {}
         if not cfg.get("enabled", False):
             return
-        hour = int(cfg.get("hour", 9))
-        if not self._due_daily(now, hour, self._state.evoked_windowed_daily):
+        # START early enough that the (multi-minute) build LANDS near the target
+        # clock time; hour+minute give sub-hour control. Reports YESTERDAY.
+        hour = int(cfg.get("hour", 7))
+        minute = int(cfg.get("minute", 45))
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now < target or \
+                self._state.evoked_windowed_daily == now.date().isoformat():
             return
         if self._evoked_windowed_inflight:
             return                                    # a build is already running
@@ -535,9 +540,13 @@ class DigestScheduler:
         if not cfg.get("enabled", False):
             return
         weekday = int(cfg.get("weekday", 6))          # 6 = Sunday
-        hour = int(cfg.get("hour", 10))
-        if not self._due_weekly(now, weekday, hour,
-                                self._state.evoked_windowed_weekly):
+        hour = int(cfg.get("hour", 6))                # start early: build ~1.5 h
+        minute = int(cfg.get("minute", 15))
+        if now.weekday() != weekday:
+            return
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now < target or \
+                self._state.evoked_windowed_weekly == now.date().isoformat():
             return
         if self._evoked_windowed_inflight:
             return

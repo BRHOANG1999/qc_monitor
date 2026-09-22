@@ -69,6 +69,7 @@ def test_finalize_values_sorts_by_time():
         out["2-50ms"]["week"]["metrics"]["line_length"], [10.0, 20.0, 30.0])
 
 
-def test_default_windows_are_the_four():
+def test_default_windows():
     tags = [ew._win_tag(w) for w in ew.WINDOWS_MS]
-    assert tags == ["2-50ms", "2-100ms", "2-500ms", "2-1000ms"]
+    assert tags == ["2-50ms", "2-100ms", "2-500ms"]      # 2-1000ms dropped
+    assert all(w[0] == 2.0 for w in ew.WINDOWS_MS)
