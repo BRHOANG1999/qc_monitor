@@ -744,10 +744,11 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
     if manifest.get("empty"):
         return {"sent": False, "reason": manifest.get("reason", "no data"),
                 "animal": animal}
-    # weekly day-means grids are small (inline all windows); daily full-density
-    # grids are big (default narrow+mid window per day to stay under the cap).
-    ew = email_windows or (manifest["windows"] if weekly
-                           else ["2-50ms", "2-500ms"])
+    # weekly day-means grids are small -> inline all windows. Daily full-density
+    # grids are BIG (~600 KB): 2 days × 3 windows × 9 feats base64-encodes past
+    # Gmail's 25 MB limit, so inline ONE balanced window per day (the trends still
+    # span all 3 windows; every window is in the browsable folder).
+    ew = email_windows or (manifest["windows"] if weekly else ["2-100ms"])
     staged = tempfile.mkdtemp(prefix="evoked_win_mail_")
     inline, files, sections, trends = _stage_email(manifest, manifest["pkg_dir"],
                                                    ew, staged)
