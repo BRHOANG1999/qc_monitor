@@ -169,8 +169,8 @@ def _finalize_ylim(extent) -> dict:
 #  per-period render pass: Welford mean/sd + full-density per band
 # --------------------------------------------------------------------- #
 class _Accum:
-    """Per (window, feature) accumulator: Welford mean/sd (all traces) + a
-    ``LineDensity`` per band (all traces, streamed)."""
+    """DAY strategy: per (window, feature) Welford mean/sd (all traces) + a
+    ``LineDensity`` per band (all traces, streamed -> full-density overlay)."""
 
     def __init__(self, n_bands, xlim, ylim):
         self.mean = _ed._BandAccum(n_bands)
@@ -179,6 +179,43 @@ class _Accum:
     def add(self, band, trace, time_ms, tdec_x, tdec_y):
         self.mean.add(band, trace, time_ms)
         self.dens[band].add(tdec_x, tdec_y)
+
+
+class _RunMean:
+    """Streaming mean of a fixed-length vector (one day's mean trace in a band)."""
+
+    def __init__(self):
+        self.sum = None
+        self.n = 0
+
+    def add(self, v):
+        v = np.asarray(v, dtype=float)
+        if not np.all(np.isfinite(v)):
+            return
+        if self.sum is None:
+            self.sum = np.zeros(v.size)
+        if v.size != self.sum.size:
+            return
+        self.sum += v
+        self.n += 1
+
+    def mean(self):
+        return self.sum / self.n if self.n else None
+
+
+class _WeekAccum:
+    """WEEK strategy (NOT an all-trace overlay): per band, the MEAN trace of each
+    DAY -- so the week grid shows day-to-day drift within each decile -- plus the
+    week Welford mean/sd for the bands_sd figure."""
+
+    def __init__(self, n_bands):
+        self.mean = _ed._BandAccum(n_bands)
+        self.days = [defaultdict(_RunMean) for _ in range(n_bands)]
+
+    def add(self, band, day, trace, time_ms):
+        self.mean.add(band, trace, time_ms)
+        if day is not None:
+            self.days[band][day].add(trace)
 
 
 def _blank_baseline(trace, time_ms):
@@ -194,14 +231,16 @@ def _blank_baseline(trace, time_ms):
 
 
 def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
-                   labels, pkg, progress=None) -> list:
-    """One trace pass over *period*'s files for ALL windows, accumulating mean/sd +
-    density per (window, feature, band); render, free. Returns figure records."""
-    # build accumulators for this period only (bounded memory)
+                   labels, pkg, is_week=False, progress=None) -> list:
+    """One trace pass over *period*'s files for ALL windows. DAY periods accumulate
+    a full-density overlay per band; the WEEK accumulates a per-day MEAN per band
+    (a different strategy). Render, free. Returns figure records."""
     accs: dict = {}
     for wt, w in wtags_windows:
         for feat, info in info_pw[wt].items():
-            accs[(wt, feat)] = _Accum(info["n_bands"] + 1, (w[0], w[1]), ylim[wt])
+            nb = info["n_bands"] + 1
+            accs[(wt, feat)] = (_WeekAccum(nb) if is_week
+                                else _Accum(nb, (w[0], w[1]), ylim[wt]))
     maps = {(wt, feat): info["band_of_ts"]
             for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
     for fp in files:
@@ -229,14 +268,20 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                 continue
             trace = traces[order[k]]
             key = _ed._ts_key(r)
-            y = _blank_baseline(trace, time_ms)
+            dt = _d.parse_iso(r.get("abs_dt")) if r.get("abs_dt") else None
+            day = dt.date().isoformat() if dt else None
+            y = None if is_week else _blank_baseline(trace, time_ms)
             for (wt, feat), m in maps.items():
                 b = m.get(key, -1)
-                if b >= 0:
+                if b < 0:
+                    continue
+                if is_week:
+                    accs[(wt, feat)].add(b, day, trace, time_ms)
+                else:
                     accs[(wt, feat)].add(b, trace, time_ms, time_ms, y)
     # render
     figs = []
-    for wt, _w in wtags_windows:
+    for wt, w in wtags_windows:
         for feat, info in info_pw[wt].items():
             acc = accs[(wt, feat)]
             band_wf = acc.mean.result()
@@ -251,11 +296,17 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                 progress(f"{wt} · {period} · {feat}")
             _pkg._fig_bands_sd(feat, meta, info, band_wf, tm,
                                os.path.join(fdir, "bands_sd.png"))
-            _fig_grid_fd(feat, meta, info, band_wf, acc.dens, tm,
-                         os.path.join(fdir, "deciles_grid_fulldensity.png"))
+            if is_week:
+                grid = "deciles_grid_daymeans.png"
+                _fig_grid_week(feat, meta, info, acc, band_wf, tm, (w[0], w[1]),
+                               ylim[wt], os.path.join(fdir, grid))
+            else:
+                grid = "deciles_grid_fulldensity.png"
+                _fig_grid_fd(feat, meta, info, band_wf, acc.dens, tm,
+                             os.path.join(fdir, grid))
             figs.append({"period": period, "window": wt, "feature": feat,
                          "dir": os.path.relpath(fdir, pkg).replace("\\", "/"),
-                         "n_zero": info.get("n_zero", 0)})
+                         "grid": grid, "n_zero": info.get("n_zero", 0)})
     return figs
 
 
@@ -276,6 +327,55 @@ def _fd_panel(ax, dens: LineDensity, band_wf, b, tm, color, title, ylim) -> None
     ax.set_xlim(d.x0, d.x1)
     ax.set_ylim(ylim)
     ax.set_title(f"{title}  (n={n})", color=_ed._TEXT, fontsize=9, loc="left")
+
+
+def _fig_grid_week(feat, meta, info, wacc, band_wf, tm, xlim, ylim, out) -> str:
+    """WEEK grid (a different strategy than the all-trace overlay): per decile, the
+    MEAN trace of each DAY (turbo ramp early->late) + the week mean in white -- so
+    day-to-day drift within each band reads at a glance."""
+    n_bands, edges = info["n_bands"], info["edges"]
+    days = sorted({d for b in range(n_bands) for d in wacc.days[b]})
+    cmap = plt.cm.turbo(np.linspace(0.10, 0.92, max(1, len(days))))
+    dcol = {d: cmap[i] for i, d in enumerate(days)}
+    art = np.abs(tm) <= 1.5
+    ncol = 5
+    nrow = int(np.ceil(n_bands / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.0 * ncol, 3.0 * nrow),
+                             facecolor=_ed._BG, squeeze=False)
+    seen: dict = {}
+    for b in range(n_bands):
+        ax = axes[b // ncol][b % ncol]
+        ax.set_facecolor(_ed._PANEL)
+        for d in days:
+            rm = wacc.days[b].get(d)
+            if not rm or rm.n < 3:
+                continue
+            m = _ed._baseline(rm.mean(), tm).copy()
+            m[art] = np.nan
+            seen[d], = ax.plot(tm, m, color=dcol[d], lw=1.0, alpha=0.9)
+        wf = band_wf.get(b)
+        if wf:
+            wm = _ed._baseline(wf["mean"], tm).copy()
+            wm[art] = np.nan
+            seen["week"], = ax.plot(tm, wm, color="#f0f0f5", lw=2.2, zorder=5)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title(_ed._band_label(b, edges, n_bands), color=_ed._TEXT,
+                     fontsize=9, loc="left")
+    for jj in range(n_bands, nrow * ncol):
+        axes[jj // ncol][jj % ncol].axis("off")
+    order = [d for d in days if d in seen] + (["week"] if "week" in seen else [])
+    if order:
+        leg = fig.legend([seen[k] for k in order],
+                         [("week" if k == "week" else k[5:]) for k in order],
+                         loc="upper right", ncol=min(8, len(order)), fontsize=8,
+                         frameon=False)
+        for txt in leg.get_texts():
+            txt.set_color(_ed._TEXT)
+    fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
+                 f"{_ed._pretty(feat)} · per-decile DAILY MEANS across the week",
+                 color=_ed._TEXT, fontsize=12)
+    return _pkg._finish(fig, out, feat)
 
 
 def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
@@ -306,31 +406,36 @@ def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
 # --------------------------------------------------------------------- #
 def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                            features=None, windows=None, n_bands=10,
-                           channel_override=None, progress=None) -> dict:
-    """Windowed + full-density package for the week ending *end_day*. Manifest dict
-    (also written as manifest.json + index.html)."""
+                           channel_override=None, include_week=True, n_days=7,
+                           progress=None) -> dict:
+    """Windowed + full-density package ending *end_day*. Renders each of the last
+    *n_days* days as a full-density (all-trace) grid, and (when *include_week*) the
+    week as a per-day-means grid. ``n_days=1, include_week=False`` -> a single-day
+    package (the daily email); the defaults -> the weekly package. Returns a
+    manifest dict (also written as manifest.json + index.html)."""
     features = [f for f in (features or _pkg.PACKAGE_FEATURES) if f in _ef.ALL_COLUMNS]
     windows = windows or WINDOWS_MS
     wtags_windows = [(_win_tag(w), w) for w in windows]
-    week_files, week_series = _pkg._period_series(animal, evoked_dir, end_day, 7,
-                                                  features)
-    if not week_files:
+    win_files, win_series = _pkg._period_series(animal, evoked_dir, end_day, n_days,
+                                                features)
+    if not win_files:
         return {"animal": animal, "empty": True, "reason": "no recordings"}
-    channel = _d.primary_channel(animal, week_series, features, channel_override)
-    if channel is None or channel not in week_series:
+    channel = _d.primary_channel(animal, win_series, features, channel_override)
+    if channel is None or channel not in win_series:
         return {"animal": animal, "empty": True, "reason": "no channel data"}
 
     week_key = "week"
-    days = [(end_day - timedelta(days=i)) for i in range(6, -1, -1)]
+    days = [(end_day - timedelta(days=i)) for i in range(n_days - 1, -1, -1)]
     if progress:
         progress(f"recomputing {len(features)} features over {len(windows)} "
-                 f"windows for {len(week_files)} recordings…")
-    series, ylim = windowed_values(week_files, animal, channel, features, windows,
+                 f"windows for {len(win_files)} recordings…")
+    series, ylim = windowed_values(win_files, animal, channel, features, windows,
                                    week_key, progress)
 
     # band per (window, period, feature)
     info: dict = {}                                  # info[period][wtag][feat]
-    labels = {week_key: _ed._date_label(end_day, 7)}
+    week_label = _ed._date_label(end_day, n_days)
+    labels = {week_key: week_label}
     for wt, _w in wtags_windows:
         for period, ser in series.get(wt, {}).items():
             info.setdefault(period, {}).setdefault(wt, {})
@@ -342,13 +447,15 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         dk = datetime(d.year, d.month, d.day).date().isoformat()
         labels.setdefault(dk, dk)
 
-    pkg = os.path.join(out_root, f"evoked_windowed_{animal}_"
-                       f"{labels[week_key]}".replace(" ", "").replace("–", "_"))
+    cadence = "week" if include_week else "day"
+    pkg = os.path.join(out_root, f"evoked_windowed_{cadence}_{animal}_"
+                       f"{week_label}".replace(" ", "").replace("–", "_"))
     os.makedirs(pkg, exist_ok=True)
 
-    # render period by period (bounded memory). week first, then each day.
-    order = [week_key] + [datetime(d.year, d.month, d.day).date().isoformat()
-                          for d in reversed(days)]
+    # render period by period (bounded memory). week first (if any), then each day.
+    order = ([week_key] if include_week else []) + \
+        [datetime(d.year, d.month, d.day).date().isoformat()
+         for d in reversed(days)]
     figures: list = []
     for period in order:
         info_pw = {wt: info.get(period, {}).get(wt, {}) for wt, _w in wtags_windows}
@@ -356,13 +463,14 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         if not info_pw:
             continue
         p_windows = [(wt, w) for wt, w in wtags_windows if wt in info_pw]
-        pfiles = (week_files if period == week_key
+        pfiles = (win_files if period == week_key
                   else _ed.list_day_files(animal, evoked_dir,
                                           datetime.fromisoformat(period)))
         if progress:
             progress(f"rendering {period} ({len(pfiles)} recordings)…")
         figures += _render_period(pfiles, animal, channel, period, p_windows,
-                                  info_pw, ylim, labels, pkg, progress)
+                                  info_pw, ylim, labels, pkg,
+                                  is_week=(period == week_key), progress=progress)
 
     manifest = {"animal": animal, "channel": channel, "week": labels[week_key],
                 "windows": [wt for wt, _w in wtags_windows],
@@ -407,14 +515,117 @@ def _write_index(pkg, manifest, labels) -> None:
                     row.append("<td class='na'>—</td>")
                     continue
                 d = f["dir"]
+                grid = f.get("grid", "deciles_grid_fulldensity.png")
                 row.append(
-                    f"<td><a href='{d}/deciles_grid_fulldensity.png'>"
-                    f"<img src='{d}/deciles_grid_fulldensity.png'></a>"
+                    f"<td><a href='{d}/{grid}'>"
+                    f"<img src='{d}/{grid}'></a>"
                     f"<a href='{d}/bands_sd.png'>mean±sd</a></td>")
             parts.append("<tr>" + "".join(row) + "</tr>")
         parts.append("</table>")
     with open(os.path.join(pkg, "index.html"), "w", encoding="utf-8") as f:
         f.write("\n".join(parts))
+
+
+_ATTACH_CAP = 20 * 1024 * 1024        # 20 MB inline budget (mirrors the stim digest)
+
+
+def _primary_period(manifest) -> str:
+    """The period the email leads with: the week if built, else the newest day."""
+    periods = manifest.get("periods", [])
+    return "week" if "week" in periods else (periods[0] if periods else "")
+
+
+def _select_email_figs(manifest, pkg, email_windows):
+    """Inline the PRIMARY period's grids (greedy, under the cap) for the requested
+    windows; overflow to file attachments. Returns (inline_paths, file_paths,
+    per_window records for the HTML)."""
+    period = _primary_period(manifest)
+    wins = email_windows or manifest.get("windows", [])
+    by_win: dict = {w: [] for w in wins}
+    inline, files, budget = [], [], _ATTACH_CAP
+    for f in manifest["figures"]:
+        if f["period"] != period or f["window"] not in by_win:
+            continue
+        grid = os.path.join(pkg, f["dir"], f.get("grid", "deciles_grid.png"))
+        try:
+            sz = os.path.getsize(grid)
+        except OSError:
+            continue
+        if sz <= budget:
+            inline.append(grid)
+            budget -= sz
+            by_win[f["window"]].append((f["feature"], os.path.basename(grid),
+                                        f["dir"]))
+        else:
+            files.append(grid)
+    return inline, files, period, by_win
+
+
+def _email_html(manifest, period, by_win, cadence) -> str:
+    lead = ("per-decile DAILY MEANS across the week (day-to-day drift)"
+            if period == "week" else "per-decile FULL-DENSITY grids (every trace)")
+    parts = [f"<h2 style='font-family:sans-serif'>Evoked windowed {cadence} digest "
+             f"— {html.escape(manifest['animal'])} · "
+             f"{html.escape(manifest['channel'])} · {html.escape(manifest['week'])}"
+             f"</h2>",
+             f"<p style='font-family:sans-serif;color:#444'>Each feature is "
+             f"RE-MEASURED over each window (magnitudes &amp; deciles differ per "
+             f"window). Below: {lead} for the {html.escape(period)} period. The full "
+             f"set (all windows × all periods) is in the browsable folder.</p>"]
+    for win, items in by_win.items():
+        if not items:
+            continue
+        parts.append(f"<h3 style='font-family:sans-serif'>window {html.escape(win)}"
+                     f"</h3>")
+        for feat, cid, _d in items:
+            parts.append(
+                f"<div style='margin:4px 0 14px'>"
+                f"<div style='font-family:sans-serif;font-size:13px;color:#333'>"
+                f"{html.escape(_ed._pretty(feat))}</div>"
+                f"<img src='cid:{cid}' style='max-width:1000px;width:100%'></div>")
+    parts.append(f"<p style='font-family:sans-serif;font-size:12px;color:#666'>"
+                 f"Full browsable package (index.html): "
+                 f"{html.escape(manifest.get('index',''))}</p>")
+    return "\n".join(parts)
+
+
+def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
+                        cadence="weekly", out_root=None, features=None,
+                        windows=None, email_windows=None, dry_run=False,
+                        progress=None) -> dict:
+    """Build the windowed package for *cadence* ('daily'|'weekly') and email its
+    primary-period grids inline (rest linked via the folder). Never raises for a
+    data gap -- returns ``{"sent": False, "reason": ...}``."""
+    out_root = out_root or os.path.join("data", "evoked_windowed_packages")
+    os.makedirs(out_root, exist_ok=True)
+    weekly = cadence == "weekly"
+    manifest = build_windowed_package(
+        animal, evoked_dir, end_day, out_root, features=features, windows=windows,
+        include_week=weekly, n_days=7 if weekly else 1, progress=progress)
+    if manifest.get("empty"):
+        return {"sent": False, "reason": manifest.get("reason", "no data"),
+                "animal": animal}
+    # daily emails default to 2 windows (full-density grids are big); weekly can
+    # carry all four (day-means grids are small).
+    ew = email_windows or (manifest["windows"] if weekly
+                           else ["2-50ms", "2-500ms"])
+    inline, files, period, by_win = _select_email_figs(manifest, manifest["pkg_dir"],
+                                                       ew)
+    if dry_run:
+        return {"sent": False, "dry_run": True, "manifest": manifest,
+                "inline": len(inline), "attach": len(files), "period": period}
+    recipients = ((config.get("alerting", {}).get("smtp", {}) or {})
+                  .get("recipients"))
+    sent = bool(emailer.send(
+        subject=f"QC evoked windowed {cadence} — {animal} · {manifest['week']}",
+        body=f"Evoked windowed {cadence} digest for {animal}. See the HTML body; "
+             f"full package at {manifest.get('index','')}.",
+        body_html=_email_html(manifest, period, by_win, cadence),
+        recipients=recipients, subject_prefix=False,
+        attachments=inline, file_attachments=files))
+    return {"sent": sent, "animal": animal, "cadence": cadence,
+            "recipients": recipients, "index": manifest.get("index"),
+            "inline": len(inline), "attach": len(files)}
 
 
 def _main(argv=None) -> int:
@@ -426,6 +637,10 @@ def _main(argv=None) -> int:
     ap.add_argument("--features", default=None, help="comma list (default: curated)")
     ap.add_argument("--windows", default=None,
                     help="comma list like 2-50,2-100 (ms); default: the four")
+    ap.add_argument("--cadence", choices=["daily", "weekly"], default="weekly",
+                    help="daily = single-day full-density; weekly = week day-means")
+    ap.add_argument("--send", action="store_true",
+                    help="also email the primary-period grids (else build only)")
     a = ap.parse_args(argv)
     import yaml
     cfg = yaml.safe_load(open(a.config, encoding="utf-8"))
@@ -436,10 +651,21 @@ def _main(argv=None) -> int:
                if a.windows else None)
     out = a.out or os.path.join("data", "evoked_windowed_packages")
     os.makedirs(out, exist_ok=True)
-    res = build_windowed_package(end_day=end, animal=a.animal, evoked_dir=evoked_dir,
-                                 out_root=out, features=feats, windows=windows,
-                                 progress=lambda m: print("  ", m))
-    print("RESULT:", {k: v for k, v in res.items() if k not in ("figures", "docs")})
+    prog = lambda m: print("  ", m)                              # noqa: E731
+    if a.send:
+        from src.alerting.email_alert import EmailAlerter
+        res = send_windowed_email(a.animal, evoked_dir, end, cfg,
+                                  EmailAlerter(cfg), cadence=a.cadence, out_root=out,
+                                  features=feats, windows=windows, progress=prog)
+    else:
+        weekly = a.cadence == "weekly"
+        res = build_windowed_package(end_day=end, animal=a.animal,
+                                     evoked_dir=evoked_dir, out_root=out,
+                                     features=feats, windows=windows,
+                                     include_week=weekly, n_days=7 if weekly else 1,
+                                     progress=prog)
+    print("RESULT:", {k: v for k, v in res.items()
+                      if k not in ("figures", "docs", "manifest")})
     return 0
 
 
