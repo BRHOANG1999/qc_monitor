@@ -61,6 +61,8 @@ class NotificationState:
     stim_stability_daily: str = ""
     evoked_daily: str = ""
     evoked_resp_weekly: str = ""
+    evoked_windowed_daily: str = ""
+    evoked_windowed_weekly: str = ""
     queue_stuck: bool = False
     # Count-based peri-ictal trigger (non-calendar): fire an animal's peri-ictal
     # email once each time it accumulates >= threshold NEW needs_scoring entries.
@@ -107,6 +109,9 @@ class DigestScheduler:
         # Animals whose peri-ictal render+email thread is in flight, so a later
         # tick doesn't spawn a second render for the same animal.
         self._peri_stim_inflight: set = set()
+        # True while a (heavy, multi-minute) windowed evoked build+send is running
+        # on a background thread, so a later tick doesn't start a second one.
+        self._evoked_windowed_inflight: bool = False
 
     # ----- state I/O -------------------------------------------------- #
 
@@ -145,6 +150,9 @@ class DigestScheduler:
                     raw.get("stim_stability_daily") or ""),
                 evoked_daily=str(raw.get("evoked_daily") or ""),
                 evoked_resp_weekly=str(raw.get("evoked_resp_weekly") or ""),
+                evoked_windowed_daily=str(raw.get("evoked_windowed_daily") or ""),
+                evoked_windowed_weekly=str(
+                    raw.get("evoked_windowed_weekly") or ""),
                 queue_stuck=bool(raw.get("queue_stuck", False)),
                 peri_stim_baseline_id=int(
                     raw.get("peri_stim_baseline_id", -1)),
@@ -236,6 +244,8 @@ class DigestScheduler:
             self._tick_stim_stability_daily(now, fired)
             self._tick_evoked_daily(now, fired)
             self._tick_evoked_resp_weekly(now, fired)
+            self._tick_evoked_windowed_daily(now, fired)
+            self._tick_evoked_windowed_weekly(now, fired)
             self._tick_review_weekly(now, fired)
             self._tick_coverage(now, fired)
             self._tick_queue_watch(now, fired)
@@ -493,6 +503,83 @@ class DigestScheduler:
         self._state.evoked_resp_weekly = now.date().isoformat()
         fired["evoked_resp_weekly"] = bool(result.get("sent"))
         logger.info("Evoked digest weekly result: %s", result)
+
+    def _tick_evoked_windowed_daily(self, now: datetime, fired: dict) -> None:
+        """Daily WINDOWED evoked package: per-animal full-density decile grids with
+        features re-measured over multiple windows, for the PREVIOUS day. Heavy
+        (recompute from raw traces) -> runs on a background thread."""
+        cfg = (self._config.get("notifications", {}) or {}) \
+            .get("evoked_windowed", {}) or {}
+        if not cfg.get("enabled", False):
+            return
+        hour = int(cfg.get("hour", 9))
+        if not self._due_daily(now, hour, self._state.evoked_windowed_daily):
+            return
+        if self._evoked_windowed_inflight:
+            return                                    # a build is already running
+        if not self._claim("evoked_windowed_daily", now):
+            self._state.evoked_windowed_daily = now.date().isoformat()
+            return
+        self._state.evoked_windowed_daily = now.date().isoformat()
+        fired["evoked_windowed_daily"] = True
+        # report YESTERDAY (a full day), like the stim daily digest.
+        self._spawn_evoked_windowed("daily", now.date() - timedelta(days=1), cfg)
+
+    def _tick_evoked_windowed_weekly(self, now: datetime, fired: dict) -> None:
+        """Weekly WINDOWED evoked package: the week's per-day-means decile grids
+        (+ full-density day grids in the folder), per animal. Config: the nested
+        ``notifications.evoked_windowed.weekly`` block."""
+        base = (self._config.get("notifications", {}) or {}) \
+            .get("evoked_windowed", {}) or {}
+        cfg = base.get("weekly", {}) or {}
+        if not cfg.get("enabled", False):
+            return
+        weekday = int(cfg.get("weekday", 6))          # 6 = Sunday
+        hour = int(cfg.get("hour", 10))
+        if not self._due_weekly(now, weekday, hour,
+                                self._state.evoked_windowed_weekly):
+            return
+        if self._evoked_windowed_inflight:
+            return
+        if not self._claim("evoked_windowed_weekly", now):
+            self._state.evoked_windowed_weekly = now.date().isoformat()
+            return
+        self._state.evoked_windowed_weekly = now.date().isoformat()
+        fired["evoked_windowed_weekly"] = True
+        self._spawn_evoked_windowed("weekly", now.date() - timedelta(days=1), base)
+
+    def _spawn_evoked_windowed(self, cadence: str, end_day: date, cfg: dict) -> None:
+        """Build + email the windowed evoked package for every configured animal on
+        a daemon thread (the recompute is multi-minute per animal, so it must never
+        block the tick loop). ``cfg`` is the top-level ``evoked_windowed`` block."""
+        self._evoked_windowed_inflight = True
+        animals = list(cfg.get("animals") or [])
+        evoked_dir = (self._config.get("chronic_evoked", {}) or {}) \
+            .get("evoked_output_dir", "")
+        feats = cfg.get("features")
+        windows = cfg.get("windows")      # e.g. [[2,50],[2,100],...]; None=default
+        windows = [tuple(w) for w in windows] if windows else None
+        out_root = cfg.get("out_dir") or os.path.join("data",
+                                                      "evoked_windowed_packages")
+
+        def _work():
+            from src.notifications.evoked_windowed import send_windowed_email
+            end_dt = datetime(end_day.year, end_day.month, end_day.day)
+            for animal in animals:
+                try:
+                    res = send_windowed_email(
+                        animal, evoked_dir, end_dt, self._config, self._emailer,
+                        cadence=cadence, out_root=out_root, features=feats,
+                        windows=windows)
+                    logger.info("evoked windowed %s for %s: %s",
+                                cadence, animal, res)
+                except Exception as e:                # noqa: BLE001
+                    logger.error("evoked windowed %s for %s raised: %s",
+                                 cadence, animal, e, exc_info=True)
+            self._evoked_windowed_inflight = False
+
+        Thread(target=_work, name=f"evoked_windowed_{cadence}",
+               daemon=True).start()
 
     def _tick_review_weekly(self, now: datetime, fired: dict) -> None:
         cfg = ((self._config.get("review_queue", {}) or {})
