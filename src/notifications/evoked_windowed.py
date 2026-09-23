@@ -617,10 +617,10 @@ def _fig_circadian_means(circ, meta, out) -> str:
         ax.set_xlim(-20, 200)
     for jj in range(len(panels), nrow * ncol):
         axes[jj // ncol][jj % ncol].axis("off")
-    h, ls = axes[0][0].get_legend_handles_labels()
-    if h:
-        leg = fig.legend(h, ls, loc="upper right", ncol=4, fontsize=8,
-                         frameon=False)
+    # legend INSIDE the first panel (a figure-level legend collided with the title)
+    leg = axes[0][0].legend(loc="lower right", fontsize=7, frameon=False,
+                            labelspacing=0.3)
+    if leg:
         for t in leg.get_texts():
             t.set_color(_ed._TEXT)
     fig.suptitle(f"{meta['animal']} · {meta['channel']} · circadian MEAN response "
