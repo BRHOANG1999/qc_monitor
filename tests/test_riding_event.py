@@ -191,6 +191,22 @@ def test_artifact_blanking_removes_spike_keeps_event():
     assert np.allclose(xb[ev0:ev0 + 40], keep), "distant event untouched"
 
 
+def test_flag_events_percentile_gate():
+    rng = np.random.default_rng(9)
+    score = np.abs(rng.normal(0, 1, size=2000)) ** 3      # heavy-tailed noise
+    score[:40] += 60.0                                    # 40 clear events
+    m_mad = p.flag_events(score, k=4.0)
+    m_pct = p.flag_events(score, k=4.0, min_pct=97.0)     # top ~3%
+    assert m_mad.sum() > m_pct.sum(), "MAD-only over-flags a heavy tail"
+    assert m_pct.sum() <= 0.05 * score.size, "percentile gate caps the count"
+    assert m_pct[:40].all(), "the clear events survive the percentile gate"
+    # noise-floor guard: on a flat (event-free) score the MAD floor binds (not the
+    # percentile), so only the statistical tail flags -- NOT a fixed top 5%.
+    flat = np.ones(500) + rng.normal(0, 1e-9, size=500)
+    assert p.flag_events(flat, k=4.0, min_pct=95.0).sum() < 0.02 * flat.size, \
+        "clean recording flags only the MAD tail, not top-pct of noise"
+
+
 def test_stim_blanking_and_amplitude_gate():
     rng = np.random.default_rng(4)
     fs = 2000.0

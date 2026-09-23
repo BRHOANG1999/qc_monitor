@@ -350,16 +350,18 @@ def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
                                    width_ratios=[3, 2])
     _style(ax1)
     if r.size:
-        x, y, _d = _decim_envelope(r, fs, 8000, t_start=0.0)
-        ax1.plot(x, y, color=_ACCENT, lw=0.6,
-                 label="matched-filter r (stim windows blanked)")
+        xb, ymax = _bin_max(r, fs, 3000)             # upper envelope: peak r/bin
+        ax1.plot(xb, ymax, color=_ACCENT, lw=0.5,
+                 label="matched-filter r (peak/bin, stim windows blanked)")
         ax1.axhline(det.get("thresh", 0.7), color=_EVENT, lw=1.0, ls="--",
                     label="threshold")
         dl = np.asarray(det.get("det_locs", []))
         if dl.size:
             ax1.plot(dl / fs, np.asarray(det["det_scores"]), "v", color=_EVENT,
                      ms=5, label=f"detections (n={dl.size})")
-    _lab(ax1, title=f"{animal} {channel} — matched-filter detection",
+        ax1.set_ylim(det.get("thresh", 0.7) - 0.25, 1.02)
+    _lab(ax1, title=f"{animal} {channel} — spontaneous-event detections "
+                    f"(between stims)",
          xlabel="time (s)", ylabel="correlation r")
     _legend(ax1, loc="upper right")
     _style(ax2)
@@ -394,6 +396,26 @@ def _blank_near_stims(r, fs, stim_times_sec, pad_sec):
         if hi > lo:
             out[lo:hi] = np.nan
     return out
+
+
+def _bin_max(r, fs, nbins: int):
+    """Per-bin MAX of the matched-filter r (the upper envelope), so the plot is a
+    clean line tracing where correlation peaks occur -- not a solid min/max fill
+    (the r spans +/-1 in every bin, so the fill hides everything). NaN (blanked
+    stim) bins render as gaps."""
+    r = np.asarray(r, dtype=np.float64)
+    n = r.size
+    assert n > 0 and fs > 0, "need samples and fs"
+    nb = int(min(max(1, nbins), n))
+    edges = np.linspace(0, n, nb + 1).astype(int)
+    xb = (edges[:-1] + edges[1:]) / (2.0 * float(fs))
+    ymax = np.full(nb, np.nan)
+    for i in range(nb):                              # bounded: nb <= nbins
+        seg = r[edges[i]:edges[i + 1]]
+        seg = seg[np.isfinite(seg)]
+        if seg.size:
+            ymax[i] = float(seg.max())
+    return xb, ymax
 
 
 def _hex_rgb(h: str) -> tuple:
