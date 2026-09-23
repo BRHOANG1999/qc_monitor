@@ -401,10 +401,107 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                 grid = "deciles_grid_fulldensity.png"
                 _fig_grid_fd(feat, meta, info, band_wf, acc.dens, tm,
                              os.path.join(fdir, grid))
+            # Clean "shapes" views (the email headline): the decile MEANS stacked
+            # (ridgeline) and peak-normalized (shape without amplitude). The busy
+            # full-density grid stays on disk for the browsable folder.
+            _fig_ridgeline(feat, meta, info, band_wf, tm, (w[0], w[1]),
+                           os.path.join(fdir, "deciles_ridgeline.png"))
+            _fig_normalized(feat, meta, info, band_wf, tm, (w[0], w[1]),
+                            os.path.join(fdir, "deciles_normalized.png"))
             figs.append({"period": period, "window": wt, "feature": feat,
                          "dir": os.path.relpath(fdir, pkg).replace("\\", "/"),
-                         "grid": grid, "n_zero": info.get("n_zero", 0)})
+                         "grid": grid, "ridgeline": "deciles_ridgeline.png",
+                         "normalized": "deciles_normalized.png",
+                         "n_zero": info.get("n_zero", 0)})
     return figs
+
+
+# --------------------------------------------------------------------- #
+#  clean "shapes" figures: stacked decile means (ridgeline) + normalized
+# --------------------------------------------------------------------- #
+def _decile_means(band_wf, info, tm, xlim):
+    """List of (b, baseline-corrected+blanked mean over [xlim]) for each populated
+    decile (0..n_bands-1). Window-cropped to xlim."""
+    n_bands = info["n_bands"]
+    art = np.abs(tm) <= 1.5
+    xm = (tm >= xlim[0]) & (tm <= xlim[1])
+    out = []
+    for b in range(n_bands):
+        wf = band_wf.get(b)
+        if wf is None:
+            continue
+        y = _ed._baseline(np.asarray(wf["mean"], dtype=float), tm).copy()
+        y[art] = np.nan
+        out.append((b, y))
+    return out, xm
+
+
+def _fig_ridgeline(feat, meta, info, band_wf, tm, xlim, out) -> str:
+    """The 10 decile MEAN waveforms STACKED with a vertical offset (bottom decile
+    at the bottom), each on its own baseline -> all shapes legible at once, no
+    smear. Offset = 0.6× the pooled p1–p99 range."""
+    n_bands, edges = info["n_bands"], info["edges"]
+    colors = plt.cm.turbo(np.linspace(0.12, 0.92, n_bands))
+    means, xm = _decile_means(band_wf, info, tm, xlim)
+    if not means:
+        return _pkg._finish(plt.figure(facecolor=_ed._BG), out)
+    allv = np.concatenate([m[xm][np.isfinite(m[xm])] for _b, m in means])
+    span = (np.percentile(allv, 99) - np.percentile(allv, 1)) if allv.size else 1.0
+    step = 0.6 * span if span > 0 else 1.0
+    fig, ax = plt.subplots(figsize=(9.0, 7.0), facecolor=_ed._BG)
+    ax.set_facecolor(_ed._PANEL)
+    yticks, ylabels = [], []
+    for b, m in means:
+        off = b * step
+        ax.plot(tm[xm], m[xm] + off, color=colors[b], lw=1.5)
+        yticks.append(off)
+        ylabels.append(_ed._band_label(b, edges, n_bands))
+    if band_wf.get(n_bands):                      # zero/pile band on top, red
+        y = _ed._baseline(np.asarray(band_wf[n_bands]["mean"], float), tm).copy()
+        y[np.abs(tm) <= 1.5] = np.nan
+        off = n_bands * step
+        ax.plot(tm[xm], y[xm] + off, color=_ed._ZCOLOR, lw=1.5)
+        yticks.append(off)
+        ylabels.append("zeros")
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels, fontsize=7)
+    ax.tick_params(colors=_ed._MUTED, labelsize=8)
+    ax.set_xlim(xlim)
+    ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
+    ax.set_title(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
+                 f"{_pretty(feat)} · decile MEAN shapes, stacked (low→high)",
+                 color=_ed._TEXT, fontsize=11, loc="left")
+    return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
+
+
+def _fig_normalized(feat, meta, info, band_wf, tm, xlim, out) -> str:
+    """Each decile MEAN peak-normalized to unit amplitude and overlaid — reveals
+    whether the SHAPE changes across deciles or it is only amplitude scaling."""
+    n_bands = info["n_bands"]
+    colors = plt.cm.turbo(np.linspace(0.12, 0.92, n_bands))
+    means, xm = _decile_means(band_wf, info, tm, xlim)
+    if not means:
+        return _pkg._finish(plt.figure(facecolor=_ed._BG), out)
+    fig, ax = plt.subplots(figsize=(9.0, 5.0), facecolor=_ed._BG)
+    ax.set_facecolor(_ed._PANEL)
+    for b, m in means:
+        pk = np.nanmax(np.abs(m[xm]))
+        yn = m / pk if pk and np.isfinite(pk) else m
+        ax.plot(tm[xm], yn[xm], color=colors[b], lw=1.2, alpha=0.9,
+                label=f"D{b + 1}")
+    ax.axhline(0, color=_ed._MUTED, lw=0.5, alpha=0.4)
+    ax.set_xlim(xlim)
+    ax.tick_params(colors=_ed._MUTED, labelsize=8)
+    ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
+    ax.set_ylabel("peak-normalized", color=_ed._TEXT, fontsize=10)
+    leg = ax.legend(fontsize=7, ncol=2, frameon=False, labelspacing=0.3,
+                    loc="lower right")
+    for t in leg.get_texts():
+        t.set_color(_ed._TEXT)
+    ax.set_title(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
+                 f"{_pretty(feat)} · decile means PEAK-NORMALIZED (shape only)",
+                 color=_ed._TEXT, fontsize=11, loc="left")
+    return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
 
 # --------------------------------------------------------------------- #
@@ -799,9 +896,12 @@ def _write_index(pkg, manifest, labels) -> None:
                     continue
                 d = f["dir"]
                 grid = f.get("grid", "deciles_grid_fulldensity.png")
+                ridge = f.get("ridgeline", "deciles_ridgeline.png")
                 row.append(
-                    f"<td><a href='{d}/{grid}'>"
-                    f"<img src='{d}/{grid}'></a>"
+                    f"<td><a href='{d}/{ridge}'>"
+                    f"<img src='{d}/{ridge}'></a>"
+                    f"<a href='{d}/deciles_normalized.png'>normalized</a> · "
+                    f"<a href='{d}/{grid}'>full-density</a> · "
                     f"<a href='{d}/bands_sd.png'>mean±sd</a></td>")
             parts.append("<tr>" + "".join(row) + "</tr>")
         parts.append("</table>")
@@ -854,25 +954,30 @@ def _stage_email(manifest, pkg, wins, staged):
     for f in manifest["figures"]:
         if f["period"] in periods and f["window"] in wins:
             fig_by.setdefault(f["period"], {}).setdefault(f["window"], []).append(f)
+    # Section ③ shows the CLEAN shapes: the stacked-means ridgeline + the
+    # peak-normalized overlay (the busy full-density grid stays folder-only).
     sections = []
     for period in periods:
         by_win: dict = {}
         for wt in wins:
             for f in fig_by.get(period, {}).get(wt, []):
-                src = os.path.join(pkg, f["dir"], f.get("grid", "grid.png"))
-                if not os.path.isfile(src):
-                    continue
-                sz = os.path.getsize(src)
-                if sz > budget:
-                    files.append(src)
-                    continue
-                cid = (f"grid_{period}_{f['window']}_{f['feature']}.png"
-                       .replace(":", "-"))
-                dst = os.path.join(staged, cid)
-                shutil.copyfile(src, dst)
-                inline.append(dst)
-                budget -= sz
-                by_win.setdefault(wt, []).append((f["feature"], cid))
+                cids = {}
+                for kind in ("ridgeline", "normalized"):
+                    src = os.path.join(pkg, f["dir"], f.get(kind, ""))
+                    if not f.get(kind) or not os.path.isfile(src):
+                        continue
+                    sz = os.path.getsize(src)
+                    if sz > budget:
+                        files.append(src)
+                        continue
+                    cid = (f"{kind}_{period}_{f['window']}_{f['feature']}.png"
+                           .replace(":", "-"))
+                    shutil.copyfile(src, os.path.join(staged, cid))
+                    inline.append(os.path.join(staged, cid))
+                    budget -= sz
+                    cids[kind] = cid
+                if cids:
+                    by_win.setdefault(wt, []).append((f["feature"], cids))
         if by_win:
             sections.append((period, by_win))
     return inline, files, sections, trends, circ_cid
@@ -911,11 +1016,12 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
             f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
             f"② Circadian mean response — 4 bins/day (07:00-anchored)</h3>"
             f"<img src='cid:{circ_cid}' style='max-width:1100px;width:100%'>")
-    kind = ("per-day MEANS across the week" if cadence == "weekly"
-            else "FULL-DENSITY (every trace)")
     parts.append(
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"③ Response “kinds” by decile — {kind}</h3>")
+        f"③ Decile mean SHAPES — stacked (low→high) + peak-normalized</h3>"
+        f"<p style='{S};font-size:12px;color:#666'>The 10 decile mean waveforms, "
+        f"stacked so each shape is legible, and peak-normalized so shape reads "
+        f"apart from amplitude. (Full-density all-trace grids are in the folder.)</p>")
     for period, by_win in sections:
         if multiday:
             parts.append(f"<h3 style='{S};color:#e2a45e;margin-top:16px'>"
@@ -923,11 +1029,14 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
         for win, items in by_win.items():
             parts.append(f"<h4 style='{S};color:#5e7ce2'>window "
                          f"{html.escape(win)}</h4>")
-            for feat, cid in items:
+            for feat, cids in items:
+                imgs = "".join(
+                    f"<img src='cid:{cids[k]}' style='max-width:560px;width:49%;"
+                    f"display:inline-block;vertical-align:top'>"
+                    for k in ("ridgeline", "normalized") if k in cids)
                 parts.append(
                     f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
-                    f"color:#333'>{html.escape(_pretty(feat))}</div>"
-                    f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
+                    f"color:#333'>{html.escape(_pretty(feat))}</div>{imgs}</div>")
     parts.append(f"<p style='{S};font-size:12px;color:#666'>📂 Full browsable "
                  f"package: <a href='{html.escape(browse)}'>{html.escape(browse)}"
                  f"</a></p>")
