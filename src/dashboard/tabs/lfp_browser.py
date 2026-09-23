@@ -52,6 +52,7 @@ from src.utils.decimate import (
 )
 from src.utils.filters import (
     compute_psd, get_filtered, band_power, SLOW_GAMMA_BAND)
+from src.dashboard.sonify import to_wav_datauri, compression_ratio
 
 logger = logging.getLogger("qc_monitor.dashboard.lfp_browser")
 
@@ -274,6 +275,36 @@ def layout(store: Store, default: str | None = None):
                     "marginBottom": "8px"},
         ),
 
+        # --- Sonify: play one channel as sound, cursor travels as it plays --- #
+        html.Div([
+            html.Label("🔊 Sonify channel", style=LABEL_STYLE),
+            dcc.Dropdown(
+                id="lfp-sonify-channel", options=[], clearable=False,
+                style={**DROPDOWN_STYLE, "minWidth": "200px"},
+                className="dark-dropdown",
+                placeholder="Load a file first"),
+            html.Label("Play in (s)", style=LABEL_STYLE,
+                       title="The visible window is time-compressed into this many "
+                             "seconds of audio (shorter = higher pitch)."),
+            dcc.Input(id="lfp-sonify-seconds", type="number", min=0.5, max=60,
+                      step=0.5, value=8, style={**DROPDOWN_STYLE, "width": "80px"}),
+            html.Button("▶ Play as sound", id="lfp-sonify-btn", n_clicks=0,
+                        style={"backgroundColor": "#5e7ce2", "color": "white",
+                               "border": "none", "padding": "6px 16px",
+                               "borderRadius": "6px", "cursor": "pointer",
+                               "fontSize": "13px", "fontWeight": "bold"}),
+            html.Audio(id="lfp-audio", controls=True,
+                       style={"height": "34px", "verticalAlign": "middle"}),
+            html.Span(id="lfp-sonify-status",
+                      style={"color": "#9a9ab0", "fontSize": "12px"}),
+        ], style={"display": "flex", "gap": "10px", "alignItems": "center",
+                  "flexWrap": "wrap", "margin": "6px 0 10px",
+                  "padding": "8px 12px", "backgroundColor": "#13131f",
+                  "borderRadius": "8px",
+                  "border": "1px solid rgba(255,255,255,0.06)"}),
+        dcc.Store(id="lfp-sonify-window"),      # {x0,x1,token} -> drives the cursor
+        dcc.Store(id="lfp-sonify-sink"),        # clientside no-op sink
+
         html.Div(
             dcc.Graph(id="lfp-psd-plot",
                       figure=empty_fig(
@@ -391,6 +422,13 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             title=title,
             height=max(600, n_ch * 80),
             showlegend=False,
+            # shapes[0] is the sonify PLAYBACK CURSOR (a full-height vertical line
+            # on the shared x-axis). The clientside audio loop moves its x via
+            # Plotly.relayout(shapes[0].x0/x1); the zoom Patch touches only data,
+            # so the cursor survives zoom. Mirrors the Video-tab cursor pattern.
+            shapes=[dict(type="line", xref="x", yref="paper",
+                         x0=0, x1=0, y0=0, y1=1,
+                         line=dict(color="#ffd166", width=1.5))],
         )
 
         # Persisted filter state -- used by the zoom callback so it
@@ -609,6 +647,117 @@ def register_callbacks(app, store: Store, config: dict) -> None:
              "value": f["file_path"]}
             for f in files
         ]
+
+    # ---- Sonify: play one channel as sound with a traveling cursor ------- #
+    @app.callback(
+        Output("lfp-sonify-channel", "options"),
+        Output("lfp-sonify-channel", "value"),
+        Input("lfp-plot", "figure"),
+        State("lfp-sonify-channel", "value"),
+        prevent_initial_call=True,
+    )
+    def _sonify_channel_options(fig, current):
+        """Populate the sonify-channel picker from the plotted trace names."""
+        traces = ((fig or {}).get("data")) or []
+        opts = [{"label": (t.get("name") or f"ch {i}"), "value": i}
+                for i, t in enumerate(traces)]
+        val = current if (isinstance(current, int) and current < len(opts)) \
+            else (0 if opts else None)
+        return opts, val
+
+    @app.callback(
+        Output("lfp-audio", "src"),
+        Output("lfp-sonify-window", "data"),
+        Output("lfp-sonify-status", "children"),
+        Input("lfp-sonify-btn", "n_clicks"),
+        State("lfp-sonify-channel", "value"),
+        State("lfp-sonify-seconds", "value"),
+        State("lfp-plot", "relayoutData"),
+        State("lfp-filter-state", "data"),
+        State("lfp-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def _sonify(n, ch, out_seconds, relayout, filter_state, file_path):
+        """Synthesize a WAV of the selected channel over the VISIBLE window and
+        hand the window bounds to the clientside cursor loop."""
+        if not n or ch is None or not file_path:
+            return no_update, no_update, "Load a file and pick a channel."
+        try:
+            chunk = get_chunk(_resolve_recording(file_path))
+        except Exception as e:                                   # noqa: BLE001
+            return no_update, no_update, f"Error: {e}"
+        fs = chunk.fs
+        st = filter_state or {}
+        signal = get_filtered(file_path, chunk.signal, fs,
+                              highpass=st.get("hp"), lowpass=st.get("lp"),
+                              notch=st.get("notch"), smoothing_ms=st.get("smooth"))
+        n_samples, n_ch = signal.shape
+        ch = int(ch)
+        if ch >= n_ch:
+            return no_update, no_update, "Channel out of range."
+        x0, x1, is_reset = parse_relayout(relayout or {})
+        if x0 is None or x1 is None or is_reset:      # not zoomed -> whole file
+            x0, x1 = 0.0, n_samples / fs
+        lo, hi = window_slice(n_samples, fs, x0, x1)
+        if hi <= lo:
+            return no_update, no_update, "Empty window."
+        out_seconds = float(out_seconds or 8)
+        uri = to_wav_datauri(signal[lo:hi, ch], fs, out_seconds=out_seconds)
+        if not uri:
+            return no_update, no_update, "Not enough signal to sonify."
+        ratio = compression_ratio(hi - lo, fs, out_seconds)
+        win = {"x0": float(x0), "x1": float(x1), "token": int(n)}
+        status = (f"{(hi - lo) / fs:.1f} s window → {out_seconds:.0f} s audio "
+                  f"(~{ratio:.0f}× faster / +{ratio:.0f}× pitch)")
+        return uri, win, status
+
+    # Clientside: on a new clip, (re)bind the audio element once, autoplay it,
+    # and drive the playback cursor (shapes[0]) via requestAnimationFrame from the
+    # audio's currentTime -- mirrors the Video tab's shapes[0] cursor. If autoplay
+    # is blocked, the user's own Play on the <audio> controls still runs the loop.
+    app.clientside_callback(
+        """
+        function(win) {
+            var NU = window.dash_clientside.no_update;
+            if (!win) { return NU; }
+            var audio = document.getElementById('lfp-audio');
+            var host = document.getElementById('lfp-plot');
+            var gd = (host && host.classList && host.classList.contains('js-plotly-plot'))
+                     ? host : (host ? host.querySelector('.js-plotly-plot') : null);
+            if (!audio || !gd || !window.Plotly) { return NU; }
+            audio._win = win;
+            if (!audio._lfpBound) {
+                audio._lfpBound = true;
+                audio._raf = null;
+                var tick = function() {
+                    if (audio.paused || audio.ended) { audio._raf = null; return; }
+                    var w = audio._win || {};
+                    var dur = audio.duration;
+                    var frac = (isFinite(dur) && dur > 0) ? (audio.currentTime / dur) : 0;
+                    var x = (w.x0 || 0) + frac * ((w.x1 || 0) - (w.x0 || 0));
+                    try { window.Plotly.relayout(gd, {'shapes[0].x0': x, 'shapes[0].x1': x}); } catch (e) {}
+                    audio._raf = window.requestAnimationFrame(tick);
+                };
+                audio.addEventListener('play', function() {
+                    if (!audio._raf) { audio._raf = window.requestAnimationFrame(tick); }
+                });
+                audio.addEventListener('ended', function() {
+                    var w = audio._win || {};
+                    try { window.Plotly.relayout(gd, {'shapes[0].x0': w.x1, 'shapes[0].x1': w.x1}); } catch (e) {}
+                });
+            }
+            try {
+                audio.currentTime = 0;
+                var p = audio.play();
+                if (p && p.catch) { p.catch(function () {}); }
+            } catch (e) {}
+            return NU;
+        }
+        """,
+        Output("lfp-sonify-sink", "data"),
+        Input("lfp-sonify-window", "data"),
+        prevent_initial_call=True,
+    )
 
 
 # --------------------------------------------------------------------- #
