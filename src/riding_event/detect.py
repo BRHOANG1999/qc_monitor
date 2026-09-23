@@ -134,25 +134,34 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
                  min_dist_sec: float = 0.05, k: float = 4.0,
                  pre_ms: float = 5.0, post_ms: float = 25.0,
                  search_ms: float = 10.0, thresh: float = 0.7,
-                 refractory_sec: float = 0.05,
-                 template_override=None) -> dict:
+                 refractory_sec: float = 0.05, template_override=None,
+                 exclude_times_sec=None, exclude_pad_sec: float = 0.25,
+                 amp_gate: bool = True) -> dict:
     """End-to-end Prong B on one continuous channel: candidates -> template ->
-    matched-filter detections. Returns everything the renderer needs, including
-    the intermediate envelope/threshold and the correlation series.
+    matched-filter detections, gated so the result is SELECTIVE for spontaneous
+    events rather than re-finding stim responses on a chronicStim recording.
 
-    ``template_override`` (e.g. Prong A's clean, artifact-removed stim-locked
-    template) is used for the matched filter when given; the self-bootstrapped
-    continuous template is still built (and returned for the alignment figure)."""
+    - ``exclude_times_sec`` (e.g. the recording's stim times) blanks +/-
+      ``exclude_pad_sec`` around each so neither the candidates/continuous
+      template nor the final detections are stim-locked evoked responses.
+    - ``amp_gate`` keeps only matched-filter detections whose band envelope is
+      also above the candidate threshold (shape match AND a real HF burst).
+
+    ``template_override`` (Prong A's clean, artifact-removed stim-locked template)
+    is used for the matched filter when given; the self-bootstrapped continuous
+    template is still built (and returned for the alignment figure)."""
     x = np.asarray(signal, dtype=np.float64)
     assert x.ndim == 1 and fs and fs > 0, "signal 1-D, fs > 0"
     locs, env, thr = _p.detect_candidates(x, fs, band=band,
                                           min_dist_sec=min_dist_sec, k=k)
+    excl = _excluded_mask(locs, fs, exclude_times_sec, exclude_pad_sec)
+    locs = locs[~excl]                             # stim pulses out of candidates
     tmpl = build_template(x, fs, locs, pre_ms=pre_ms, post_ms=post_ms,
                           search_ms=search_ms)
     out = {"fs": fs, "band": band, "cand_locs": locs, "env": env, "cand_thr": thr,
            "template": tmpl, "det_locs": np.empty(0, dtype=np.int64),
            "det_scores": np.empty(0), "r_series": np.empty(0), "thresh": thresh,
-           "template_source": None}
+           "template_source": None, "n_raw_detections": 0}
     mf = np.asarray(template_override, dtype=np.float64) \
         if template_override is not None else None
     if mf is None and tmpl and tmpl.get("template") is not None:
@@ -163,8 +172,51 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
     if mf is not None and mf.size >= 2:
         det_locs, scores, r = _p.matched_filter_detect(
             x, mf, fs, thresh=thresh, refractory_sec=refractory_sec)
+        out["n_raw_detections"] = int(det_locs.size)
+        det_locs, scores = _gate_detections(det_locs, scores, env, thr, mf.size, fs,
+                                            exclude_times_sec, exclude_pad_sec,
+                                            amp_gate)
         out.update(det_locs=det_locs, det_scores=scores, r_series=r)
     return out
+
+
+def _excluded_mask(locs, fs: float, times_sec, pad_sec: float) -> np.ndarray:
+    """Boolean mask (True = exclude) for sample *locs* within ``pad_sec`` of any
+    *times_sec* (e.g. stim times). All-False when no exclusion is requested."""
+    loc = np.asarray(locs, dtype=np.int64)
+    if times_sec is None or loc.size == 0:
+        return np.zeros(loc.size, dtype=bool)
+    ts = np.asarray(times_sec, dtype=np.float64)
+    ts = ts[np.isfinite(ts)]
+    if ts.size == 0:
+        return np.zeros(loc.size, dtype=bool)
+    pad = int(round(float(pad_sec) * float(fs)))
+    stim = np.sort((ts * fs).astype(np.int64))
+    ins = np.searchsorted(stim, loc)               # nearest stim by binary search
+    nearest = np.full(loc.size, 1 << 62, dtype=np.int64)
+    left = np.clip(ins - 1, 0, stim.size - 1)
+    right = np.clip(ins, 0, stim.size - 1)
+    nearest = np.minimum(np.abs(loc - stim[left]), np.abs(loc - stim[right]))
+    return nearest <= pad
+
+
+def _gate_detections(det_locs, scores, env, thr, w: int, fs: float,
+                     times_sec, pad_sec: float, amp_gate: bool):
+    """Keep matched-filter detections that are a real HF burst (envelope over the
+    candidate threshold within the template span) AND not within ``pad_sec`` of a
+    stim time. Returns filtered ``(locs, scores)``."""
+    dl = np.asarray(det_locs, dtype=np.int64)
+    sc = np.asarray(scores, dtype=np.float64)
+    if dl.size == 0:
+        return dl, sc
+    keep = np.ones(dl.size, dtype=bool)
+    if amp_gate and np.isfinite(thr):
+        e = np.asarray(env, dtype=np.float64)
+        envmax = np.array([e[i:i + w].max() if i + 1 < e.size else 0.0
+                           for i in dl])           # bounded: one slice per det
+        keep &= envmax > thr
+    keep &= ~_excluded_mask(dl, fs, times_sec, pad_sec)
+    return dl[keep], sc[keep]
 
 
 def scores_by_proximity(det_locs_sec, onsets_sec, *, window_sec: float = 300.0

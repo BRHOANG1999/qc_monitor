@@ -190,10 +190,14 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog):
         return
     signal, fs, ch = loaded
     override = tmpl_a.get("template") if tmpl_a else None
+    stim_times = res_a.get("times") if res_a is not None else None
+    blanked = "yes" if stim_times is not None and len(stim_times) else "no"
     prog(f"  detecting on {ch} ({len(signal)} samp @ {fs:.0f} Hz, "
-         f"{use_band[0]:.0f}–{use_band[1]:.0f} Hz; "
-         f"template={'stim-locked' if override is not None else 'continuous'})...")
-    det = _det.run_detector(signal, fs, band=use_band, template_override=override)
+         f"{use_band[0]:.0f}-{use_band[1]:.0f} Hz; "
+         f"template={'stim-locked' if override is not None else 'continuous'}; "
+         f"stim-blanked={blanked})...")
+    det = _det.run_detector(signal, fs, band=use_band, template_override=override,
+                            exclude_times_sec=stim_times)
     prox = _validation(store, animal, target, det, fs)
     figs = [_r.fig_candidates(det, stem + "_candidates.png", animal=animal,
                               channel=ch),
@@ -205,11 +209,14 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog):
     _write_detection_csv(stem + "_detections.csv", det, fs)
     summary["prong_b"] = {
         "channel": ch, "band": use_band, "n_candidates": int(det["cand_locs"].size),
+        "n_raw_detections": int(det.get("n_raw_detections", 0)),
         "n_detections": int(np.asarray(det["det_locs"]).size),
+        "template_source": det.get("template_source"),
         "template_n": det["template"].get("n") if det["template"] else 0,
         "proximity": prox}
-    prog(f"  {int(det['cand_locs'].size)} candidates -> "
-         f"{int(np.asarray(det['det_locs']).size)} matched-filter detections")
+    prog(f"  {int(det['cand_locs'].size)} spontaneous candidates -> "
+         f"{int(det.get('n_raw_detections', 0))} shape matches -> "
+         f"{int(np.asarray(det['det_locs']).size)} after amplitude gate")
 
 
 def _detect_band(band, res_a) -> tuple:

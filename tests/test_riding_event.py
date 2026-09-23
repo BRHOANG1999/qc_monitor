@@ -141,6 +141,28 @@ def test_detect_candidates_finds_bursts():
         assert np.any(np.abs(locs - c) <= int(0.3 * fs)), "should detect each burst"
 
 
+def test_stim_blanking_and_amplitude_gate():
+    rng = np.random.default_rng(4)
+    fs = 2000.0
+    n = int(24 * fs)
+    template = np.sin(2 * np.pi * 120.0 * np.arange(40) / fs) * np.hanning(40) * 6.0
+    signal = rng.normal(0, 0.4, size=n)
+    planted = np.arange(2000, n - 2000, 4000)
+    for loc in planted:
+        signal[loc:loc + template.size] += template
+    stim_idx = [0, 2, 4]                                # 3 planted events are "stim"
+    stim_times = [planted[i] / fs for i in stim_idx]
+    d = det.run_detector(signal, fs, band=(20.0, 200.0), min_dist_sec=0.3,
+                         thresh=0.5, refractory_sec=0.3, template_override=template,
+                         exclude_times_sec=stim_times, exclude_pad_sec=0.15)
+    dl = np.asarray(d["det_locs"])
+    for i in stim_idx:                                  # stim-coincident excluded
+        assert not np.any(np.abs(dl - planted[i]) <= 200), "stim event not blanked"
+    spont = [i for i in range(planted.size) if i not in stim_idx]
+    hit = sum(np.any(np.abs(dl - planted[i]) <= 20) for i in spont)
+    assert hit >= len(spont) - 1, "spontaneous events should survive the gate"
+
+
 def test_degenerate_inputs():
     z = np.zeros((10, 200))
     template, keep = p.robust_template(z, iters=1)
