@@ -473,17 +473,21 @@ def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
 
 def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal="",
                         channel="", n: int = 12, pre_ms: float = 20.0,
-                        post_ms: float = 100.0) -> str:
-    """The actual LFP traces at the strongest matched-filter detections (a grid,
-    one per detection, aligned to the detection at t=0). Shows what the detector
-    fired on so it can be judged by eye -- the raw LFP (blue) with the band-passed
-    ripple (orange) overlaid."""
+                        post_ms: float = 100.0, onset_sec=None) -> str:
+    """The actual LFP traces at matched-filter detections (a grid, one per
+    detection, aligned to the detection at t=0). Shows what the detector fired on
+    so it can be judged by eye -- raw LFP (blue) + band-passed ripple (orange).
+    With *onset_sec* (a seizure recording), shows the detections nearest the
+    onset; else the strongest."""
     x = np.asarray(signal, dtype=np.float64)
     dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
     sc = np.asarray(det.get("det_scores", []), dtype=np.float64)
     if dl.size == 0:
         return _empty(out_png, f"{animal} {channel}: no detections")
-    order = np.argsort(-sc)[:int(n)]               # strongest first
+    if onset_sec is not None:                       # detections nearest the seizure
+        order = np.argsort(np.abs(dl / fs - float(onset_sec)))[:int(n)]
+    else:
+        order = np.argsort(-sc)[:int(n)]            # strongest first
     sel = dl[order]
     pre = max(1, int(round(pre_ms * 1e-3 * fs)))
     post = max(1, int(round(post_ms * 1e-3 * fs)))
@@ -507,7 +511,9 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
         ax.axvline(0, color=_MUTED, lw=0.6, ls="--")
         ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}", color=_TEXT, fontsize=8,
                      loc="left")
-    fig.suptitle(f"{animal} {channel} — {sel.size} strongest detections "
+    which = (f"nearest the seizure onset ({onset_sec:.0f}s)"
+             if onset_sec is not None else "strongest")
+    fig.suptitle(f"{animal} {channel} — {sel.size} detections {which} "
                  f"(blue = LFP, orange = {band[0]:.0f}-{band[1]:.0f} Hz; t=0 = "
                  f"detection)", color=_TEXT, fontsize=11, x=0.02, ha="left")
     return _finish(fig, out_png)
@@ -523,7 +529,7 @@ def _ef_bandpass(seg, fs, band):
 
 
 def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
-                       prox: dict | None = None) -> str:
+                       prox: dict | None = None, onset_sec=None) -> str:
     """Matched-filter correlation over the recording with the threshold +
     detections, and the detection-score histogram (with near/far-from-onset split
     when validation onsets are supplied)."""
@@ -544,6 +550,9 @@ def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
             ax1.plot(dl / fs, np.asarray(det["det_scores"]), "v", color=_EVENT,
                      ms=5, label=f"detections (n={dl.size})")
         ax1.set_ylim(det.get("thresh", 0.7) - 0.25, 1.02)
+    if onset_sec is not None:
+        ax1.axvline(float(onset_sec), color="#ff3b3b", lw=1.5,
+                    label="seizure onset")
     _lab(ax1, title=f"{animal} {channel} — spontaneous-event detections "
                     f"(between stims)",
          xlabel="time (s)", ylabel="correlation r")

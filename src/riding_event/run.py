@@ -66,6 +66,38 @@ def discover(store, animal: str) -> list[dict]:
     return out
 
 
+def find_seizure_target(store, animal: str) -> dict | None:
+    """A recording that CONTAINS a scored seizure, for the unambiguous
+    spontaneous-ripple test (BCH111 has no purely passive recording; ictal
+    activity is dense during a seizure). Returns the raw ``file_path`` + its own
+    stim times (from its evoked ``.mat``, for blanking) + the onset seconds into
+    the recording. None when no scored-seizure recording is on disk."""
+    from src.preictal.isi import scored_seizures
+    from src.utils.animal import is_animal_channel, split_animal_electrode
+    from src.utils.evoked_output import read_file_evoked
+    for z in scored_seizures(store, animal):
+        if not (z.file_path and os.path.exists(z.file_path)):
+            continue
+        ep = (store.evoked_output_path_for_file(int(z.file_id))
+              if z.file_id else None)
+        stim_times = None
+        if ep and os.path.exists(ep):
+            try:
+                chans = read_file_evoked(ep, only_animals=[animal])
+                for chn, rc in chans.items():
+                    if (split_animal_electrode(chn)[0] == animal
+                            and is_animal_channel(chn)):
+                        stim_times = rc.get("times")
+                        break
+            except Exception:                        # noqa: BLE001
+                stim_times = None
+        return {"file_path": z.file_path, "evoked_path": ep,
+                "stim_times": stim_times, "onset_sec": z.eo_sec,
+                "onset_epoch": z.onset_epoch, "racine": z.racine,
+                "chunk_datetime": z.chunk_datetime, "file_id": z.file_id}
+    return None
+
+
 def _evoked_path(store, rec: dict) -> str | None:
     """Resolve + cache a recording's evoked ``.mat`` path (None when absent)."""
     if "evoked_path" not in rec:
@@ -101,7 +133,7 @@ def autopick(store, recs: list, animal: str, *, scan_files: int = 20,
 def build(store, animal: str, *, out_dir: str, mode: str = "both",
           recording: str | None = None, band=None, scan_files: int = 40,
           flag_pct: float = 95.0, thresh: float = 0.7,
-          progress=None) -> dict:
+          detect_recording: str | None = None, progress=None) -> dict:
     """Render the requested prong(s) for *animal*. *recording* forces a specific
     evoked path (skips auto-pick). *flag_pct* = Prong-A event selectivity (higher
     = fewer, stronger ripple events); *thresh* = Prong-B matched-filter cutoff.
@@ -120,8 +152,18 @@ def build(store, animal: str, *, out_dir: str, mode: str = "both",
         res_a = _run_prong_a(target, animal, out_dir, summary, prog,
                              flag_pct=flag_pct)
     if mode in ("both", "detect"):
+        det_tgt, onset = None, None
+        if detect_recording == "seizure":
+            det_tgt = find_seizure_target(store, animal)
+            if det_tgt:
+                onset = det_tgt.get("onset_sec")
+                prog(f"detecting on a SEIZURE recording "
+                     f"({os.path.basename(det_tgt['file_path'])}, onset {onset:.0f}s, "
+                     f"R{det_tgt.get('racine')}) — the unambiguous spontaneous test")
+            else:
+                prog("no scored-seizure recording on disk; using the Prong-A recording")
         _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog,
-                     thresh=thresh)
+                     thresh=thresh, detect_target=det_tgt, onset_sec=onset)
     _write_manifest(out_dir, animal, summary)
     return summary
 
@@ -185,44 +227,55 @@ def _run_prong_a(target, animal, out_dir, summary, prog, *,
 
 
 def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
-                 thresh: float = 0.7):
+                 thresh: float = 0.7, detect_target=None, onset_sec=None):
     prog("Prong B: continuous detection + matched filter...")
     elec = split_animal_electrode(res_a["channel"])[1] if res_a else None
     use_band = _detect_band(band, res_a)
-    stem = os.path.join(out_dir, f"{_safe(animal)}_B")
+    cross = detect_target is not None
+    stem = os.path.join(out_dir, f"{_safe(animal)}_B" + ("_seizure" if cross else ""))
     tmpl_a = _det.harvest_from_prongA(res_a) if res_a is not None else {}
-    if tmpl_a:                                     # artifact-free stim-locked template
+    if tmpl_a and not cross:                        # artifact-free stim-locked template
         summary["figures"].append(_r.fig_alignment(
             tmpl_a, stem + "_stimlocked_template.png", fs=res_a["fs"],
             animal=animal, channel=res_a["channel"],
             title_extra="(stim-locked, artifact-removed)"))
-    if not target.get("file_path"):
+    tgt = detect_target or target
+    if not tgt.get("file_path"):
         prog("  no raw continuous path for this recording; skipping the LFP sweep")
         summary["prong_b"] = {"reason": "no raw file_path", "band": use_band}
         return
-    loaded = _det.load_channel(target["file_path"], animal, prefer=elec)
+    loaded = _det.load_channel(tgt["file_path"], animal, prefer=elec)
     if loaded is None:
         prog("  animal channel not found in the raw recording; skipping")
         summary["prong_b"] = {"reason": "no animal channel", "band": use_band}
         return
     signal, fs, ch = loaded
     override = tmpl_a.get("template") if tmpl_a else None
-    stim_times = res_a.get("times") if res_a is not None else None
+    stim_times = (detect_target.get("stim_times") if cross
+                  else (res_a.get("times") if res_a is not None else None))
     blanked = "yes" if stim_times is not None and len(stim_times) else "no"
     prog(f"  detecting on {ch} ({len(signal)} samp @ {fs:.0f} Hz, "
-         f"{use_band[0]:.0f}-{use_band[1]:.0f} Hz; "
-         f"template={'stim-locked' if override is not None else 'continuous'}; "
-         f"stim-blanked={blanked})...")
+         f"{use_band[0]:.0f}-{use_band[1]:.0f} Hz; template=stim-locked; "
+         f"stim-blanked={blanked}" + (f"; seizure onset @ {onset_sec:.0f}s"
+                                      if onset_sec else "") + ")...")
     det = _det.run_detector(signal, fs, band=use_band, template_override=override,
                             exclude_times_sec=stim_times, thresh=thresh)
     prox = _validation(store, animal, target, det, fs)
-    # No continuous self-template figure: we use Prong A's clean stim-locked
-    # template for the matched filter, and the self-bootstrapped continuous
-    # template was noise (not a ripple) + carried the artifact.
+    if onset_sec is not None:                       # detections near the seizure
+        dsec = np.asarray(det.get("det_locs", []), float) / fs
+        near = int((np.abs(dsec - float(onset_sec)) <= 60.0).sum())
+        rate_in = near / 120.0
+        base = np.asarray(det.get("det_locs", []), float).size / max(1.0, len(signal) / fs)
+        prox = {"onset_sec": float(onset_sec), "n_within_60s": near,
+                "rate_near_hz": rate_in, "rate_overall_hz": base,
+                "enrichment": (rate_in / base) if base > 0 else float("nan")}
+        prog(f"  {near} detections within +/-60 s of the seizure onset "
+             f"({rate_in:.3f}/s vs {base:.3f}/s overall = "
+             f"{prox['enrichment']:.1f}x enrichment)")
     figs = [_r.fig_detected_events(signal, det, stem + "_detected.png", fs=fs,
-                                   animal=animal, channel=ch),
+                                   animal=animal, channel=ch, onset_sec=onset_sec),
             _r.fig_matched_filter(det, stem + "_matched.png", animal=animal,
-                                  channel=ch, prox=prox),
+                                  channel=ch, prox=prox, onset_sec=onset_sec),
             _r.fig_candidates(det, stem + "_candidates.png", animal=animal,
                               channel=ch)]
     summary["figures"].extend(figs)

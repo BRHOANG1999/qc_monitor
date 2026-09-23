@@ -39,6 +39,11 @@ def _main(argv=None) -> int:
                          "stronger ripple events; default 95 = top 5%%)")
     ap.add_argument("--thresh", type=float, default=0.7,
                     help="Prong-B matched-filter correlation cutoff (default 0.7)")
+    ap.add_argument("--detect-recording", default=None,
+                    help="run Prong B detection on a DIFFERENT recording than the "
+                         "template's; 'seizure' auto-picks a recording containing a "
+                         "scored seizure (BCH111 has no passive recording) and marks "
+                         "the onset")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
 
@@ -51,7 +56,7 @@ def _main(argv=None) -> int:
     summary = _run.build(store, args.animal, out_dir=out_dir, mode=args.mode,
                          recording=args.recording, band=args.band,
                          scan_files=args.scan_files, flag_pct=args.flag_pct,
-                         thresh=args.thresh,
+                         thresh=args.thresh, detect_recording=args.detect_recording,
                          progress=lambda m: print("  ", m, flush=True))
     if summary.get("reason"):
         print(f"{args.animal}: {summary['reason']}")
