@@ -108,6 +108,47 @@ def find_fundamental(freqs, exc_db, *, fmin: float = 4.0, fmax: float = 2000.0,
             "harmonics": harmonics, "n_harmonics": len(harmonics)}
 
 
+def epoch_psds(traces, fs: float, *, time_ms=None, win_ms=None,
+               nperseg: int | None = None) -> tuple:
+    """Per-epoch Welch PSD (not averaged) over the analysis window: returns
+    ``(freqs, psds[E x F])`` for clustering epochs by spectral SHAPE."""
+    from scipy.signal import welch
+    a = np.asarray(traces, dtype=np.float64)
+    assert a.ndim == 2 and fs and fs > 0, "traces 2-D, fs > 0"
+    if time_ms is not None and win_ms is not None:
+        t = np.asarray(time_ms, dtype=np.float64)
+        m = (t >= float(win_ms[0])) & (t <= float(win_ms[1]))
+        if m.sum() >= 8:
+            a = a[:, m]
+    if a.shape[0] < 1 or a.shape[1] < 8:
+        return np.empty(0), np.empty((0, 0))
+    nps = int(nperseg or min(a.shape[1], 4096))
+    nps = max(16, min(nps, a.shape[1]))
+    f, pxx = welch(a, fs=float(fs), nperseg=nps, noverlap=nps // 2, axis=1)
+    return f, pxx
+
+
+def cluster_spectra(psds, freqs, *, band=(100.0, 1200.0), k: int = 3) -> np.ndarray:
+    """K-means labels grouping epochs by PSD SHAPE in *band* (log power,
+    per-epoch mean-removed so it's shape not level, then per-frequency z-scored).
+    Separates e.g. the 247 Hz ripple hump from a sharp-line footprint. Returns
+    an int label per epoch (all-0 when too few epochs)."""
+    from scipy.cluster.vq import kmeans2
+    p = np.asarray(psds, dtype=np.float64)
+    f = np.asarray(freqs, dtype=np.float64)
+    assert p.ndim == 2 and f.size == p.shape[1], "psds/freqs shape mismatch"
+    kk = int(max(1, min(k, p.shape[0])))
+    if p.shape[0] < 4 or kk < 2:
+        return np.zeros(p.shape[0], dtype=int)
+    m = (f >= float(band[0])) & (f <= float(band[1]))
+    x = np.log10(p[:, m] + _EPS)
+    x = x - x.mean(axis=1, keepdims=True)            # shape, not overall level
+    sd = x.std(axis=0, keepdims=True)
+    x = x / np.where(sd > _EPS, sd, 1.0)             # z-score per frequency
+    _cent, labels = kmeans2(x, kk, seed=0, minit="++", missing="warn")
+    return np.asarray(labels, dtype=int)
+
+
 def excess_band(freqs, exc_db, *, thresh_db: float = 3.0, fmin: float = 4.0,
                 fmax: float = 8000.0) -> tuple:
     """Contiguous frequency band around the peak excess where the event exceeds

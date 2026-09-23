@@ -161,7 +161,8 @@ def _run_prong_a(target, animal, out_dir, summary, prog, *,
     figs = [_r.fig_raw_overlay(res, stem + "_ridgeline.png"),
             _r.fig_residual_erpimage(res, stem + "_erpimage.png"),
             _r.fig_density(res, stem + "_density.png"),
-            _r.fig_spectral(res, stem + "_spectrum.png")]
+            _r.fig_spectral(res, stem + "_spectrum.png"),
+            _r.fig_spectral_clusters(res, stem + "_clusters.png")]
     summary["figures"].extend(figs)
     inspector = _ri.write_event_inspector(res, stem + "_inspector.html")
     summary["figures"].append(inspector)

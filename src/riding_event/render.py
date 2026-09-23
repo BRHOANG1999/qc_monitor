@@ -133,6 +133,88 @@ def fig_raw_overlay(res: dict, out_png: str, *, n_rows: int = 36) -> str:
     return _finish(fig, out_png)
 
 
+def fig_spectral_clusters(res: dict, out_png: str, *, k: int = 3,
+                          n_ex: int = 5) -> str:
+    """Cluster the flagged event epochs by PSD SHAPE and show each cluster's
+    spectral footprint (median PSD, peak Hz labelled) beside example traces — so
+    the 247 Hz ripple is separated from any other footprint (e.g. a sharp-line
+    artifact) that the HF flag also caught."""
+    from src.riding_event import spectra as _sp
+    ev = np.flatnonzero(res["event_mask"])
+    tm = np.asarray(res["time_ms"])
+    fs = float(res["fs"])
+    win = res["spec_win_ms"]
+    f, psds = _sp.epoch_psds(res["resid"][ev], fs, time_ms=tm, win_ms=win) \
+        if ev.size else (np.empty(0), np.empty((0, 0)))
+    if psds.shape[0] < 4:
+        return _empty(out_png, f"{res['animal']} {res['channel']}: too few events")
+    labels = _sp.cluster_spectra(psds, f, k=k)
+    uniq = sorted(set(labels.tolist()))
+    fmax = min(1500.0, 0.5 * fs)
+    keep = (f > 0) & (f <= fmax)
+    fig, axes = plt.subplots(len(uniq), 2, figsize=(11.5, 2.5 * len(uniq) + 0.7),
+                             facecolor=_BG, squeeze=False,
+                             gridspec_kw={"width_ratios": [2, 3]})
+    cmap = plt.get_cmap("turbo")
+    for row, lab in enumerate(uniq):
+        idx = np.flatnonzero(labels == lab)
+        c = cmap(0.1 + 0.8 * row / max(1, len(uniq) - 1))
+        _cluster_psd_panel(axes[row][0], f, psds, idx, keep, lab, c)
+        _cluster_trace_panel(axes[row][1], tm, res["traces"], ev[idx], win, c, n_ex)
+    fig.suptitle(f"{res['animal']} {res['channel']} — event epochs clustered by "
+                 f"spectral footprint ({len(uniq)} groups of {ev.size})",
+                 color=_TEXT, fontsize=11, x=0.02, ha="left")
+    return _finish(fig, out_png)
+
+
+def _cluster_psd_panel(ax, f, psds, idx, keep, lab, c) -> None:
+    _style(ax)
+    for j in idx[:80]:
+        ax.semilogy(f[keep], np.maximum(psds[j][keep], 1e-20), color=c, lw=0.3,
+                    alpha=0.15)
+    med = np.median(psds[idx], axis=0)
+    ax.semilogy(f[keep], np.maximum(med[keep], 1e-20), color=c, lw=2.2,
+                label=f"cluster {lab} (n={idx.size})")
+    for pk_hz, pk_p in _psd_peaks(f[keep], med[keep], n=2):   # distinctive HF peaks
+        ax.annotate(f"{pk_hz:.0f} Hz", xy=(pk_hz, pk_p), xytext=(4, 2),
+                    textcoords="offset points", color=_TEXT, fontsize=11,
+                    fontweight="bold")
+    _lab(ax, xlabel="frequency (Hz)", ylabel="PSD (µV²/Hz)")
+    _legend(ax, loc="upper right")
+
+
+def _psd_peaks(fb, mb, *, fmin=100.0, n=2):
+    """The *n* most PROMINENT peaks of a PSD above *fmin* Hz (on log power, so
+    1/f doesn't win) — the cluster's distinctive footprint frequencies."""
+    from scipy.signal import find_peaks
+    fb = np.asarray(fb, dtype=np.float64)
+    mb = np.asarray(mb, dtype=np.float64)
+    band = fb >= fmin
+    if band.sum() < 3:
+        return []
+    lg = np.log10(np.maximum(mb, 1e-20))
+    idx, props = find_peaks(np.where(band, lg, -np.inf), prominence=0.3,
+                            distance=max(1, int(fb.size / 40)))
+    if idx.size == 0:
+        return []
+    top = idx[np.argsort(-props["prominences"])[:int(n)]]
+    return [(float(fb[i]), float(mb[i])) for i in sorted(top)]
+
+
+def _cluster_trace_panel(ax, tm, traces, epochs, win, c, n_ex) -> None:
+    _style(ax)
+    take = epochs[np.linspace(0, epochs.size - 1, min(n_ex, epochs.size)).astype(int)]
+    off_step = 1.2
+    for i, j in enumerate(take):
+        tr = traces[j]
+        norm = np.max(np.abs(tr[(tm >= win[0]) & (tm <= win[1])])) or 1.0
+        ax.plot(tm, tr / norm + i * off_step, color=c, lw=0.7)
+    ax.axvspan(win[0], win[1], color=_TEXT, alpha=0.05)
+    ax.set_xlim(min(tm[0], -10.0), win[1] + 10.0)
+    ax.set_yticks([])
+    _lab(ax, xlabel="time from stim (ms)", ylabel="example traces")
+
+
 def fig_residual_erpimage(res: dict, out_png: str) -> str:
     """Residual ERP-image: rows = epochs (time order), cols = post-stim ms,
     colour = residual amplitude. The riding events read as bright rows; a right-
