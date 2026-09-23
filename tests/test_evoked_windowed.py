@@ -73,3 +73,66 @@ def test_default_windows():
     tags = [ew._win_tag(w) for w in ew.WINDOWS_MS]
     assert tags == ["2-50ms", "2-100ms", "2-500ms"]      # 2-1000ms dropped
     assert all(w[0] == 2.0 for w in ew.WINDOWS_MS)
+
+
+# --------------------------------------------------------------------- #
+#  HF band power, circadian binning, stim P2P (the 2026-09-23 additions)
+# --------------------------------------------------------------------- #
+from datetime import datetime as _D                            # noqa: E402
+
+
+def test_hf_band_power_localizes_a_tone():
+    fs = 20000.0
+    n = 2000
+    t = np.arange(n) / fs
+    tone = np.sin(2 * np.pi * 1500.0 * t)[None, :]             # 1500 Hz -> 1000-2000
+    hf = ew._hf_powers(tone, fs)
+    assert set(hf) == set(ew.HF_NAMES)
+    p = {k: float(v[0]) for k, v in hf.items()}
+    assert p["hf_1000_2000"] == max(p.values())
+    assert p["hf_1000_2000"] > 5 * max(p["hf_500_1000"], p["hf_2000_4000"])
+
+
+def test_hf_top_band_clamps_to_nyquist():
+    fs = 12000.0                                               # 0.49*fs = 5880 Hz
+    n = 2000
+    t = np.arange(n) / fs
+    tone = np.sin(2 * np.pi * 5000.0 * t)[None, :]             # in [4000, 5880]
+    hf = ew._hf_powers(tone, fs)
+    assert float(hf["hf_4000_8000"][0]) > 0.0                  # captured despite <8 kHz
+
+
+def test_hf_degenerate_window():
+    hf = ew._hf_powers(np.zeros((3, 2)), 20000.0)              # <4 samples -> NaN
+    assert all(np.isnan(hf[n]).all() for n in ew.HF_NAMES)
+
+
+def test_circadian_bins_and_cycle():
+    assert ew._circadian(_D(2026, 9, 20, 10))[1] == 0          # day-early 07-13
+    assert ew._circadian(_D(2026, 9, 20, 16))[1] == 1          # day-late 13-19
+    assert ew._circadian(_D(2026, 9, 20, 22))[1] == 2          # night-early 19-01
+    assert ew._circadian(_D(2026, 9, 21, 4))[1] == 3           # night-late 01-07
+    # 04:00 on the 21st belongs to the 07:00-anchored cycle of the 20th
+    assert ew._circadian(_D(2026, 9, 21, 4))[0] == "2026-09-20"
+    assert ew._circadian(_D(2026, 9, 20, 10))[0] == "2026-09-20"
+
+
+def test_bin_circadian_four_points_per_day():
+    secs, vals = [], []
+    for h, val in [(10, 1.0), (16, 2.0), (22, 3.0)]:
+        for _ in range(5):
+            secs.append(_D(2026, 9, 20, h).timestamp())
+            vals.append(val)
+    for _ in range(5):
+        secs.append(_D(2026, 9, 21, 4).timestamp())           # night-late of the 20th
+        vals.append(4.0)
+    xs, md, lo, hi = ew._bin_circadian(secs, vals)
+    assert len(xs) == 4                                        # 4 bins -> 4 points
+    assert list(md) == [1.0, 2.0, 3.0, 4.0]                    # sorted by bin time
+
+
+def test_hf_names_pass_filter_and_have_labels():
+    for nm in ew.HF_NAMES:
+        assert nm not in _ef.ALL_COLUMNS                       # not a real column
+        assert (nm in _ef.ALL_COLUMNS) or (nm in ew.HF_NAMES)  # allowlisted
+        assert "HF" in ew._doc(nm) and "Hz" in ew._pretty(nm)

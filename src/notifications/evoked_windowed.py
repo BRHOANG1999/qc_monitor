@@ -51,6 +51,63 @@ WINDOWS_MS = [(2.0, 50.0), (2.0, 100.0), (2.0, 500.0)]
 _FD_W, _FD_H = 620, 360             # density raster (pixels); memory ~ W*H per band
 _A0 = 0.30                          # per-trace opacity the density reproduces
 
+# High-frequency band-power features (Σ PSD of the cropped window per response).
+# Added as FULL features (trends + decile grids) alongside the curated set.
+HF_BANDS = [("hf_500_1000", (500.0, 1000.0)), ("hf_1000_2000", (1000.0, 2000.0)),
+            ("hf_2000_4000", (2000.0, 4000.0)), ("hf_4000_8000", (4000.0, 8000.0))]
+HF_NAMES = [n for n, _ in HF_BANDS]
+_HF_DOCS = {n: f"HF band power {int(lo)}–{int(hi)} Hz — Σ periodogram power over "
+               f"the cropped analysis window." for n, (lo, hi) in HF_BANDS}
+
+# Circadian: four 6 h bins over a 07:00-ANCHORED 24 h cycle (so a bin never splits
+# across midnight). "day" = 07:00–19:00, "night" = 19:00–07:00.
+_CIRC_LABELS = ["day-early (07–13)", "day-late (13–19)",
+                "night-early (19–01)", "night-late (01–07)"]
+_CIRC_COLORS = ["#f2c14e", "#e08a3c", "#6a8cff", "#3550a0"]   # warm=day, cool=night
+
+
+def _circadian(dt):
+    """(07:00-anchored cycle-date iso, bin 0..3) for a datetime. bin 0=day-early
+    07–13, 1=day-late 13–19, 2=night-early 19–01, 3=night-late 01–07."""
+    shifted = dt - timedelta(hours=7)
+    return shifted.date().isoformat(), int(min(3, shifted.hour // 6))
+
+
+def _pretty(feat: str) -> str:
+    """Label for a feature, including the HF bands (which _ed._pretty doesn't know)."""
+    if feat in _HF_DOCS:
+        lo, hi = dict(HF_BANDS)[feat]
+        return f"HF power {int(lo)}–{int(hi)} Hz"
+    return _ed._pretty(feat)
+
+
+def _doc(feat: str) -> str:
+    return _HF_DOCS.get(feat) or _ed.feature_doc(feat)
+
+
+def _hf_powers(win_traces, fs) -> dict:
+    """Σ-PSD power per epoch in each HF band. *win_traces* = [epochs, samples]
+    already cropped to the analysis window. Top edge clamped to 0.49*fs."""
+    from scipy.signal import periodogram
+    from scipy.fft import next_fast_len
+    win_traces = np.asarray(win_traces, dtype=float)
+    n = win_traces.shape[0]
+    if win_traces.ndim != 2 or win_traces.shape[1] < 4:
+        return {nm: np.full(n, np.nan) for nm in HF_NAMES}
+    f, pxx = periodogram(win_traces, fs=fs,
+                         nfft=next_fast_len(win_traces.shape[1]), axis=1)
+    nyq = 0.49 * fs
+    return {nm: _ef._band_sum(f, pxx, (lo, min(hi, nyq)))
+            for nm, (lo, hi) in HF_BANDS}
+
+
+def _crop_window(traces, time_ms, cfg):
+    """Columns of *traces* inside the cfg's [start,end] ms window (crop only)."""
+    t = np.asarray(time_ms, dtype=float)
+    ws = cfg.window_start_ms if cfg.window_start_ms is not None else t[0]
+    we = cfg.window_end_ms if cfg.window_end_ms is not None else t[-1]
+    return np.asarray(traces, dtype=float)[:, (t >= ws) & (t <= we)]
+
 
 def _win_tag(w) -> str:
     return f"{int(round(w[0]))}-{int(round(w[1]))}ms"
@@ -71,19 +128,24 @@ def _fs_of(time_ms) -> float:
 
 
 def windowed_values(files, animal, channel, features, windows, week_key,
-                    progress=None) -> tuple[dict, dict]:
-    """ONE trace pass. For each response, recompute *features* over each window and
-    fan (timestamp, value) into its DAY period and the WEEK. Also track, per window,
-    the robust amplitude extent (for a shared y-limit). Returns
-    ``(series[wtag][period][feat] = {"secs","metrics"}, ylim[wtag] = (y0,y1))``."""
+                    progress=None) -> tuple:
+    """ONE trace pass. Per response: recompute *features* (incl. HF band powers)
+    over each window and fan (timestamp, value) to its DAY + the WEEK; track the
+    stimulus peak-to-peak amplitude (window-independent); and accumulate the mean
+    RESPONSE WAVEFORM per 07:00-anchored circadian bin. Returns
+    ``(series, ylim, stim, circ)`` where ``stim[period] = {"secs","p2p"}`` and
+    ``circ = {"time_ms", "cycles": {cyc: [mean×4]}, "week": [mean×4]}``."""
     cfgs = {_win_tag(w): _win_cfg(w) for w in windows}
-    # The CWT bank dominates compute (~15 s/file); skip it unless a selected
-    # feature actually needs the wavelet columns (the curated set does not).
     want_wavelet = any(f in _ef.WAVELET_COLUMNS for f in features)
-    # raw accumulators: secs/vals per (wtag, period, feat)
-    secs: dict = defaultdict(lambda: defaultdict(list))          # [wtag][period] -> [ts...]
+    hf_names = [f for f in features if f in HF_NAMES]
+    secs: dict = defaultdict(lambda: defaultdict(list))
     vals: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    extent: dict = {wt: [] for wt in cfgs}                       # [wtag] -> [(p1,p99)...]
+    extent: dict = {wt: [] for wt in cfgs}
+    stim_secs: dict = defaultdict(list)
+    stim_p2p: dict = defaultdict(list)
+    circ_cycles: dict = defaultdict(lambda: [_RunMean() for _ in range(4)])
+    circ_week = [_RunMean() for _ in range(4)]
+    circ_time = [None]
     n_files = len(files)
     for i, fp in enumerate(files):
         if progress and i % 5 == 0:
@@ -98,16 +160,36 @@ def windowed_values(files, animal, channel, features, windows, week_key,
         traces = np.asarray(ev["traces"], dtype=float)
         time_ms = np.asarray(ev["time_ms"], dtype=float)
         st_times = np.asarray(ev["times"], dtype=float)
+        s_peak = np.asarray(ev.get("stim_peak") or [], dtype=float)
+        s_trough = np.asarray(ev.get("stim_trough") or [], dtype=float)
         fs = _fs_of(time_ms)
         avg = _ef.trial_moving_average(traces)
-        # timestamp per epoch, matched to a sidecar row by stim time.
+        if circ_time[0] is None:
+            circ_time[0] = time_ms
         st2dt = {round(float(_d._nan(r.get("stim_time_sec"))), 4):
                  (_d.parse_iso(r.get("abs_dt")) if r.get("abs_dt") else None)
                  for r in rows if np.isfinite(_d._nan(r.get("stim_time_sec")))}
         dt_by_epoch = [st2dt.get(round(float(s), 4)) for s in st_times]
+        # window-INDEPENDENT: stimulus P2P + circadian mean waveform (once/response)
+        for j, dt in enumerate(dt_by_epoch):
+            if dt is None:
+                continue
+            ts = dt.timestamp()
+            p2p = (float(s_peak[j] - s_trough[j])
+                   if j < s_peak.size and j < s_trough.size else np.nan)
+            for period in (dt.date().isoformat(), week_key):
+                stim_secs[period].append(ts)
+                stim_p2p[period].append(p2p)
+            cyc, b = _circadian(dt)
+            circ_cycles[cyc][b].add(traces[j])
+            circ_week[b].add(traces[j])
+        # window-DEPENDENT: features (incl. HF band powers merged in)
         for wt, cfg in cfgs.items():
             feats = _ef.compute_all(avg, time_ms, fs, expensive=False, cfg=cfg,
                                     include_wavelet=want_wavelet)
+            if hf_names:
+                feats = dict(feats)
+                feats.update(_hf_powers(_crop_window(avg, time_ms, cfg), fs))
             for j, dt in enumerate(dt_by_epoch):
                 if dt is None:
                     continue
@@ -121,7 +203,22 @@ def windowed_values(files, animal, channel, features, windows, week_key,
                             float(arr[j]) if arr is not None
                             and np.isfinite(arr[j]) else np.nan)
             extent[wt].append(_win_amp_extent(avg, time_ms, cfg))
-    return _finalize_values(secs, vals, features), _finalize_ylim(extent)
+    circ = {"time_ms": circ_time[0],
+            "cycles": {c: [rm.mean() for rm in bins]
+                       for c, bins in sorted(circ_cycles.items())},
+            "week": [rm.mean() for rm in circ_week]}
+    return (_finalize_values(secs, vals, features), _finalize_ylim(extent),
+            _finalize_stim(stim_secs, stim_p2p), circ)
+
+
+def _finalize_stim(stim_secs, stim_p2p) -> dict:
+    out = {}
+    for period in stim_secs:
+        s = np.asarray(stim_secs[period], dtype=float)
+        p = np.asarray(stim_p2p[period], dtype=float)
+        order = np.argsort(s, kind="stable")
+        out[period] = {"secs": s[order], "p2p": p[order]}
+    return out
 
 
 def _win_amp_extent(traces, time_ms, cfg):
@@ -373,7 +470,7 @@ def _fig_grid_week(feat, meta, info, wacc, band_wf, tm, xlim, ylim, out) -> str:
         for txt in leg.get_texts():
             txt.set_color(_ed._TEXT)
     fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_ed._pretty(feat)} · per-decile DAILY MEANS across the week",
+                 f"{_pretty(feat)} · per-decile DAILY MEANS across the week",
                  color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat)
 
@@ -396,7 +493,7 @@ def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
     for jj in range(n_bands, nrow * ncol):
         axes[jj // ncol][jj % ncol].axis("off")
     fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_ed._pretty(feat)} · per-decile FULL-DENSITY (every trace) "
+                 f"{_pretty(feat)} · per-decile FULL-DENSITY (every trace) "
                  f"+ mean", color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat)
 
@@ -404,53 +501,132 @@ def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
 # --------------------------------------------------------------------- #
 #  package assembly
 # --------------------------------------------------------------------- #
-def _fig_metric_trends(feat, per_win, meta, out) -> str:
-    """Track a feature OVER TIME: per window, the per-day median + IQR band (light
-    raw points behind), days-primary x-axis with dates. Built from the windowed
-    values -- no extra trace reads."""
+def _bin_circadian(secs, vals):
+    """Aggregate (secs, vals) into 07:00-anchored 6 h circadian bins → (xs[datetime],
+    median, p25, p75) sorted by time, ONE point per (cycle, bin) = 4 points/day."""
+    s = np.asarray(secs, dtype=float)
+    v = np.asarray(vals, dtype=float)
+    fin = np.isfinite(s) & np.isfinite(v)
+    s, v = s[fin], v[fin]
+    groups: dict = {}
+    for ts, val in zip(s, v):
+        cyc, b = _circadian(datetime.fromtimestamp(ts))
+        groups.setdefault((cyc, b), []).append(val)
+    rows = []
+    for (cyc, b), vs in groups.items():
+        cy = datetime.fromisoformat(cyc)
+        x = datetime(cy.year, cy.month, cy.day, 7) + timedelta(hours=6 * b + 3)
+        a = np.asarray(vs)
+        rows.append((x, float(np.median(a)), float(np.percentile(a, 25)),
+                     float(np.percentile(a, 75))))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[0])
+    xs, md, lo, hi = zip(*rows)
+    return np.array(xs), np.array(md), np.array(lo), np.array(hi)
+
+
+def _fig_metric_trends(feat, per_win, stim, meta, out) -> str:
+    """Track a feature OVER TIME at circadian (6 h) resolution: per window, the
+    per-bin median + IQR (4 points/day, light raw points behind), with the stimulus
+    peak-to-peak amplitude overlaid on a 2nd y-axis to check whether the metric's
+    swings track the stimulus. Built from the windowed values -- no trace reads."""
     import matplotlib.dates as mdates
     nwin = max(1, len(per_win))
-    fig, axes = plt.subplots(1, nwin, figsize=(5.2 * nwin, 4.0),
+    fig, axes = plt.subplots(1, nwin, figsize=(5.6 * nwin, 4.2),
                              facecolor=_ed._BG, squeeze=False)
+    stim_binned = _bin_circadian(stim["secs"], stim["p2p"]) if stim else None
     for i, (wt, secs, vals) in enumerate(per_win):
         ax = axes[0][i]
         ax.set_facecolor(_ed._PANEL)
         s = np.asarray(secs, dtype=float)
         v = np.asarray(vals, dtype=float)
         fin = np.isfinite(s) & np.isfinite(v)
-        s, v = s[fin], v[fin]
-        if s.size == 0:
+        if fin.sum() == 0:
             ax.set_title(f"{wt} — no data", color=_ed._MUTED, fontsize=10)
             continue
-        dts = np.array([datetime.fromtimestamp(x) for x in s])
-        ax.scatter(dts, v, s=3, c="#5e7ce2", alpha=0.10, linewidths=0)
-        days = np.array([d.date() for d in dts])
-        xs, md, lo, hi = [], [], [], []
-        for d in sorted(set(days)):
-            mask = days == d
-            xs.append(datetime(d.year, d.month, d.day, 12))
-            md.append(np.median(v[mask]))
-            lo.append(np.percentile(v[mask], 25))
-            hi.append(np.percentile(v[mask], 75))
-        xs = np.array(xs)
-        ax.fill_between(xs, lo, hi, color="#5e7ce2", alpha=0.25, linewidth=0,
-                        label="IQR (p25–p75)")
-        ax.plot(xs, md, color="#f0f0f5", lw=1.8, marker="o", ms=4,
-                label="daily median")
+        dts = np.array([datetime.fromtimestamp(x) for x in s[fin]])
+        ax.scatter(dts, v[fin], s=3, c="#6a8cff", alpha=0.08, linewidths=0)
+        b = _bin_circadian(s, v)
+        if b is not None:
+            xs, md, lo, hi = b
+            ax.fill_between(xs, lo, hi, color="#6a8cff", alpha=0.22, linewidth=0,
+                            label="IQR (p25–p75)")
+            ax.plot(xs, md, color="#f0f0f5", lw=1.6, marker="o", ms=4,
+                    label="6 h median")
         ax.set_title(wt, color=_ed._TEXT, fontsize=10, loc="left")
         ax.tick_params(colors=_ed._MUTED, labelsize=8)
+        ax.set_ylabel(_pretty(feat), color="#c7d0ff", fontsize=9)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         for lab in ax.get_xticklabels():
             lab.set_rotation(35)
             lab.set_ha("right")
+        # stimulus P2P on a 2nd axis (window-independent, same on every panel)
+        if stim_binned is not None:
+            sx, smd, _slo, _shi = stim_binned
+            ax2 = ax.twinx()
+            ax2.plot(sx, smd, color="#e08a3c", lw=1.4, marker="s", ms=3,
+                     alpha=0.9, label="stim P2P")
+            ax2.set_ylabel("stim P2P (raw)", color="#e08a3c", fontsize=9)
+            ax2.tick_params(axis="y", colors="#e08a3c", labelsize=8)
         if i == 0:
-            leg = ax.legend(fontsize=8, frameon=False)
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = (ax2.get_legend_handles_labels()
+                      if stim_binned is not None else ([], []))
+            leg = ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False,
+                            loc="upper left")
             for t in leg.get_texts():
                 t.set_color(_ed._TEXT)
-    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_ed._pretty(feat)} · "
-                 f"metric OVER TIME (per-day median ± IQR, per window)",
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} · "
+                 f"OVER TIME (6 h circadian median ± IQR) · stim P2P overlaid",
                  color=_ed._TEXT, fontsize=12)
-    return _pkg._finish(fig, out, feat)
+    return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
+
+
+def _fig_circadian_means(circ, meta, out) -> str:
+    """Per 07:00-anchored day-cycle, the 4 circadian-bin MEAN response waveforms
+    (day-early→night-late), baseline-corrected + artifact-blanked. Panel 0 = the
+    whole-period aggregate; then one panel per cycle. Window-independent."""
+    tm = circ.get("time_ms")
+    if tm is None:
+        fig = plt.figure(facecolor=_ed._BG)
+        return _pkg._finish(fig, out)
+    tm = np.asarray(tm, dtype=float)
+    cycles = circ.get("cycles", {})
+    panels = [("whole period", circ.get("week"))] + \
+        [(c, cycles[c]) for c in sorted(cycles)]
+    art = np.abs(tm) <= 1.5
+    xm = (tm >= -20) & (tm <= 200)
+    ncol = 4
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.0 * nrow),
+                             facecolor=_ed._BG, squeeze=False)
+    for idx, (label, bins) in enumerate(panels):
+        ax = axes[idx // ncol][idx % ncol]
+        ax.set_facecolor(_ed._PANEL)
+        for b in range(4):
+            m = bins[b] if bins else None
+            if m is None:
+                continue
+            y = _ed._baseline(np.asarray(m, dtype=float), tm).copy()
+            y[art] = np.nan
+            ax.plot(tm[xm], y[xm], color=_CIRC_COLORS[b], lw=1.3,
+                    label=_CIRC_LABELS[b] if idx == 0 else None)
+        ax.set_title(label, color=_ed._TEXT, fontsize=9, loc="left")
+        ax.tick_params(colors=_ed._MUTED, labelsize=7)
+        ax.set_xlim(-20, 200)
+    for jj in range(len(panels), nrow * ncol):
+        axes[jj // ncol][jj % ncol].axis("off")
+    h, ls = axes[0][0].get_legend_handles_labels()
+    if h:
+        leg = fig.legend(h, ls, loc="upper right", ncol=4, fontsize=8,
+                         frameon=False)
+        for t in leg.get_texts():
+            t.set_color(_ed._TEXT)
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · circadian MEAN response "
+                 f"per 6 h bin (07:00-anchored day-cycles)",
+                 color=_ed._TEXT, fontsize=12)
+    return _pkg._finish(fig, out)
 
 
 def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
@@ -462,14 +638,18 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
     week as a per-day-means grid. ``n_days=1, include_week=False`` -> a single-day
     package (the daily email); the defaults -> the weekly package. Returns a
     manifest dict (also written as manifest.json + index.html)."""
-    features = [f for f in (features or _pkg.PACKAGE_FEATURES) if f in _ef.ALL_COLUMNS]
+    features = [f for f in (features or (_pkg.PACKAGE_FEATURES + HF_NAMES))
+                if f in _ef.ALL_COLUMNS or f in HF_NAMES]
     windows = windows or WINDOWS_MS
     wtags_windows = [(_win_tag(w), w) for w in windows]
+    # channel/file discovery reads the DEFAULT-window sidecars, which don't carry
+    # the HF columns -- discover with the sidecar-backed features only.
+    sidecar_feats = [f for f in features if f not in HF_NAMES] or features
     win_files, win_series = _pkg._period_series(animal, evoked_dir, end_day, n_days,
-                                                features)
+                                                sidecar_feats)
     if not win_files:
         return {"animal": animal, "empty": True, "reason": "no recordings"}
-    channel = _d.primary_channel(animal, win_series, features, channel_override)
+    channel = _d.primary_channel(animal, win_series, sidecar_feats, channel_override)
     if channel is None or channel not in win_series:
         return {"animal": animal, "empty": True, "reason": "no channel data"}
 
@@ -478,8 +658,8 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
     if progress:
         progress(f"recomputing {len(features)} features over {len(windows)} "
                  f"windows for {len(win_files)} recordings…")
-    series, ylim = windowed_values(win_files, animal, channel, features, windows,
-                                   week_key, progress)
+    series, ylim, stim, circ = windowed_values(win_files, animal, channel, features,
+                                               windows, week_key, progress)
 
     # band per (window, period, feature)
     info: dict = {}                                  # info[period][wtag][feat]
@@ -542,16 +722,25 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         if not per_win:
             continue
         tp = os.path.join(trend_dir, f"{feat}.png")
-        _fig_metric_trends(feat, per_win, {"animal": animal, "channel": channel},
-                           tp)
+        _fig_metric_trends(feat, per_win, stim.get(trend_src),
+                           {"animal": animal, "channel": channel}, tp)
         trends[feat] = os.path.relpath(tp, pkg).replace("\\", "/")
+
+    # Circadian mean-response waveforms (window-independent; one figure/package).
+    if progress:
+        progress("building circadian mean-response figure…")
+    circ_dir = os.path.join(pkg, "_circadian")
+    os.makedirs(circ_dir, exist_ok=True)
+    cp = os.path.join(circ_dir, "circadian_means.png")
+    _fig_circadian_means(circ, {"animal": animal, "channel": channel}, cp)
+    circadian_rel = os.path.relpath(cp, pkg).replace("\\", "/")
 
     manifest = {"animal": animal, "channel": channel, "week": labels[week_key],
                 "windows": [wt for wt, _w in wtags_windows],
                 "periods": order, "features": features,
                 "primary_periods": primary_periods,
-                "docs": {f: _ed.feature_doc(f) for f in features},
-                "trends": trends, "figures": figures}
+                "docs": {f: _doc(f) for f in features},
+                "trends": trends, "circadian": circadian_rel, "figures": figures}
     with open(os.path.join(pkg, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     _write_index(pkg, manifest, labels)
@@ -578,7 +767,8 @@ def _write_index(pkg, manifest, labels) -> None:
              "mean overlaid in white.</p>"]
     trends = manifest.get("trends") or {}
     if trends:
-        parts.append("<h2>① Metrics over time (per-day median ± IQR)</h2>")
+        parts.append("<h2>① Metrics over time (6 h circadian median ± IQR · "
+                     "stim P2P overlaid)</h2>")
         parts.append("<div style='display:flex;flex-wrap:wrap;gap:12px'>")
         for feat in feats:
             rel = trends.get(feat)
@@ -588,7 +778,12 @@ def _write_index(pkg, manifest, labels) -> None:
                          f"<a href='{rel}'><img src='{rel}' "
                          f"style='width:360px'></a></div>")
         parts.append("</div>")
-        parts.append("<h2>② Response “kinds” by decile</h2>")
+    circ = manifest.get("circadian")
+    if circ:
+        parts.append("<h2>② Circadian mean response (4 bins/day, 07:00-anchored)</h2>")
+        parts.append(f"<a href='{circ}'><img src='{circ}' "
+                     f"style='width:760px'></a>")
+    parts.append("<h2>③ Response “kinds” by decile</h2>")
     for wt in wins:
         parts.append(f"<h2>window {html.escape(wt)}</h2>")
         parts.append("<table><tr><th>period</th>"
@@ -645,6 +840,16 @@ def _stage_email(manifest, pkg, wins, staged):
             inline.append(dst)
             budget -= os.path.getsize(dst)
             trends.append((feat, cid))
+    circ_cid = None
+    crel = manifest.get("circadian")
+    if crel and os.path.isfile(os.path.join(pkg, crel)):
+        cid = "circadian_means.png"
+        dst = os.path.join(staged, cid)
+        shutil.copyfile(os.path.join(pkg, crel), dst)
+        if os.path.getsize(dst) <= budget:
+            inline.append(dst)
+            budget -= os.path.getsize(dst)
+            circ_cid = cid
     fig_by: dict = {}
     for f in manifest["figures"]:
         if f["period"] in periods and f["window"] in wins:
@@ -670,14 +875,14 @@ def _stage_email(manifest, pkg, wins, staged):
                 by_win.setdefault(wt, []).append((f["feature"], cid))
         if by_win:
             sections.append((period, by_win))
-    return inline, files, sections, trends
+    return inline, files, sections, trends, circ_cid
 
 
 def _period_label(manifest, period) -> str:
     return manifest["week"] if period == "week" else period
 
 
-def _email_html(manifest, sections, trends, cadence) -> str:
+def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
     browse = _browse_url(manifest)
     multiday = len(sections) > 1
     span = manifest["week"] if cadence == "weekly" else (
@@ -695,17 +900,22 @@ def _email_html(manifest, sections, trends, cadence) -> str:
         f"<br><span style='color:#888;font-size:12px'>{html.escape(browse)}</span>"
         f"</p>",
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"① Metrics over time — per-day median ± IQR</h3>"]
+        f"① Metrics over time — 6 h circadian median ± IQR, stim P2P overlaid</h3>"]
     for feat, cid in trends:
         parts.append(
             f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
-            f"color:#333'><b>{html.escape(_ed._pretty(feat))}</b></div>"
+            f"color:#333'><b>{html.escape(_pretty(feat))}</b></div>"
             f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
+    if circ_cid:
+        parts.append(
+            f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
+            f"② Circadian mean response — 4 bins/day (07:00-anchored)</h3>"
+            f"<img src='cid:{circ_cid}' style='max-width:1100px;width:100%'>")
     kind = ("per-day MEANS across the week" if cadence == "weekly"
             else "FULL-DENSITY (every trace)")
     parts.append(
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"② Response “kinds” by decile — {kind}</h3>")
+        f"③ Response “kinds” by decile — {kind}</h3>")
     for period, by_win in sections:
         if multiday:
             parts.append(f"<h3 style='{S};color:#e2a45e;margin-top:16px'>"
@@ -716,7 +926,7 @@ def _email_html(manifest, sections, trends, cadence) -> str:
             for feat, cid in items:
                 parts.append(
                     f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
-                    f"color:#333'>{html.escape(_ed._pretty(feat))}</div>"
+                    f"color:#333'>{html.escape(_pretty(feat))}</div>"
                     f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
     parts.append(f"<p style='{S};font-size:12px;color:#666'>📂 Full browsable "
                  f"package: <a href='{html.escape(browse)}'>{html.escape(browse)}"
@@ -750,8 +960,8 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
     # span all 3 windows; every window is in the browsable folder).
     ew = email_windows or (manifest["windows"] if weekly else ["2-100ms"])
     staged = tempfile.mkdtemp(prefix="evoked_win_mail_")
-    inline, files, sections, trends = _stage_email(manifest, manifest["pkg_dir"],
-                                                   ew, staged)
+    inline, files, sections, trends, circ_cid = _stage_email(
+        manifest, manifest["pkg_dir"], ew, staged)
     if dry_run:
         return {"sent": False, "dry_run": True, "manifest": manifest,
                 "inline": len(inline), "attach": len(files), "trends": len(trends)}
@@ -765,7 +975,7 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
         subject=f"QC evoked windowed {cadence} — {animal} · {span}",
         body=f"Evoked windowed {cadence} digest for {animal}. Metrics-over-time + "
              f"decile grids in the HTML body; full package: {_browse_url(manifest)}",
-        body_html=_email_html(manifest, sections, trends, cadence),
+        body_html=_email_html(manifest, sections, trends, circ_cid, cadence),
         recipients=recipients, subject_prefix=False,
         attachments=inline, file_attachments=files))
     return {"sent": sent, "animal": animal, "cadence": cadence,
