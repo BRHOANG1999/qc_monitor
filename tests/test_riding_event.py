@@ -1,0 +1,154 @@
+"""Plant-and-recover tests for the riding-event core.
+
+Run: pytest tests/test_riding_event.py -q
+
+Each test plants a known signal (a template + a subset of event-carrying epochs,
+or a continuous stream with events at known times) and asserts the pure
+primitives recover it, plus graceful degeneracy on empty/degenerate input.
+"""
+
+import os
+import sys
+from os.path import abspath, dirname, join
+
+import numpy as np
+
+_ROOT = abspath(join(dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.riding_event import primitives as p          # noqa: E402
+from src.riding_event import spectra as sp            # noqa: E402
+from src.riding_event import detect as det            # noqa: E402
+
+_FS = 20000.0
+_DT = 1000.0 / _FS
+
+
+def _time_ms():
+    return np.arange(-10.0, 100.0, _DT)
+
+
+def _template_wave(t_ms):
+    """A smooth stereotyped evoked response: a decaying deflection for t>0."""
+    tt = np.maximum(t_ms, 0.0)
+    return 5.0 * np.exp(-tt / 15.0) * np.cos(2 * np.pi * 40.0 * tt / 1000.0)
+
+
+def _make_epochs(n=120, event_idx=(10, 30, 55, 80), f0=137.0, amp=6.0, seed=0):
+    """n epochs = template + noise; the event epochs also carry an f0 burst over
+    5-40 ms. Returns (traces, time_ms, event_idx set)."""
+    rng = np.random.default_rng(seed)
+    t = _time_ms()
+    base = _template_wave(t)
+    traces = base[None, :] + rng.normal(0, 0.25, size=(n, t.size))
+    win = ((t >= 5.0) & (t <= 40.0)).astype(float)
+    burst = amp * np.sin(2 * np.pi * f0 * t / 1000.0) * win
+    for j in event_idx:
+        traces[j] += burst
+    return traces, t, set(event_idx)
+
+
+def test_robust_template_recovers_clean_shape():
+    traces, t, ev = _make_epochs()
+    post = (t >= 2.0) & (t <= 100.0)
+    template, keep = p.robust_template(traces, iters=2, k=4.0, win_mask=post)
+    base = _template_wave(t)
+    assert np.max(np.abs(template - base)) < 0.6, "template should recover base"
+    for j in ev:                                       # event epochs excluded
+        assert not keep[j], f"event epoch {j} should be dropped from the template"
+    assert keep.sum() >= traces.shape[0] - 2 * len(ev), "kept too few clean epochs"
+
+
+def test_flag_events_recovers_planted():
+    traces, t, ev = _make_epochs()
+    template, _ = p.robust_template(traces, iters=1, win_mask=(t >= 2) & (t <= 100))
+    resid = p.residuals(traces, template)
+    energy = p.event_energy(resid, t, win_ms=(2.0, 100.0), fs=_FS)
+    mask = p.flag_events(energy, k=4.0)
+    assert set(np.flatnonzero(mask)) == ev, "flagged set must equal planted events"
+
+
+def test_spectra_recovers_fundamental():
+    f0 = 137.0
+    traces, t, ev = _make_epochs(f0=f0)
+    template, keep = p.robust_template(traces, iters=1,
+                                       win_mask=(t >= 2) & (t <= 100))
+    resid = p.residuals(traces, template)
+    energy = p.event_energy(resid, t, win_ms=(2.0, 100.0), fs=_FS)
+    mask = p.flag_events(energy, k=4.0)
+    clean = (~mask) & keep
+    f, psd_ev, _ = sp.welch_psd(resid[mask], _FS, time_ms=t, win_ms=(2.0, 100.0))
+    _, psd_cl, _ = sp.welch_psd(resid[clean], _FS, time_ms=t, win_ms=(2.0, 100.0))
+    exc = sp.excess_db(psd_ev, psd_cl)
+    fund = sp.find_fundamental(f, exc, line_hz=sp.line_noise_freqs(_FS))
+    assert abs(fund["fundamental_hz"] - f0) < 20.0, "fundamental should be ~f0"
+    assert fund["peak_db"] > 6.0, "event group should show clear excess power"
+
+
+def test_rising_edge_align_locks_the_edge():
+    rng = np.random.default_rng(1)
+    fs = 2000.0
+    shape = np.concatenate([np.zeros(20), np.linspace(0, 5, 8),
+                            5 * np.exp(-np.arange(40) / 10.0)])
+    snips = []
+    for _ in range(60):
+        jit = int(rng.integers(-6, 7))
+        pad = np.zeros(30)
+        s = np.concatenate([pad, shape, pad])
+        s = np.roll(s, jit) + rng.normal(0, 0.05, size=s.size)
+        snips.append(s)
+    aligned, _fid = p.rising_edge_align(np.asarray(snips), fs, search_ms=30.0,
+                                        pre_ms=5.0, post_ms=15.0)
+    pre = max(1, int(round(5.0e-3 * fs)))
+    edges = np.argmax(np.diff(aligned, axis=1), axis=1)
+    assert aligned.shape[0] >= 55, "most snippets should survive alignment"
+    assert np.median(np.abs(edges - pre)) <= 1, "edges should lock near `pre`"
+
+
+def test_matched_filter_recovers_events():
+    rng = np.random.default_rng(2)
+    fs = 2000.0
+    n = int(20 * fs)
+    template = np.sin(2 * np.pi * 8.0 * np.arange(40) / fs) * \
+        np.hanning(40) * 5.0
+    signal = rng.normal(0, 0.5, size=n)
+    planted = np.arange(1000, n - 1000, 2200)
+    for loc in planted:
+        signal[loc:loc + template.size] += template
+    locs, scores, r = p.matched_filter_detect(signal, template, fs, thresh=0.6,
+                                               refractory_sec=0.3)
+    hit = sum(np.any(np.abs(locs - loc) <= 5) for loc in planted)
+    assert hit >= planted.size - 1, "matched filter should recover planted events"
+    assert locs.size <= planted.size + 2, "few false positives expected"
+
+
+def test_detect_candidates_finds_bursts():
+    rng = np.random.default_rng(3)
+    fs = 2000.0
+    n = int(30 * fs)
+    t = np.arange(n) / fs
+    signal = rng.normal(0, 0.3, size=n)
+    centers = np.arange(2 * int(fs), n - 2 * int(fs), 5 * int(fs))
+    for c in centers:
+        w = np.zeros(n)
+        seg = slice(c, c + int(0.2 * fs))
+        w[seg] = np.hanning(int(0.2 * fs))
+        signal += 4.0 * np.sin(2 * np.pi * 120.0 * t) * w
+    locs, env, thr = p.detect_candidates(signal, fs, band=(20.0, 200.0),
+                                         min_dist_sec=1.0, k=4.0)
+    for c in centers:
+        assert np.any(np.abs(locs - c) <= int(0.3 * fs)), "should detect each burst"
+
+
+def test_degenerate_inputs():
+    z = np.zeros((10, 200))
+    template, keep = p.robust_template(z, iters=1)
+    assert np.allclose(template, 0.0) and keep.all(), "zeros -> zero template"
+    energy = p.event_energy(p.residuals(z, template), np.arange(200) * _DT,
+                            win_ms=(0.0, 5.0), fs=_FS)
+    assert not p.flag_events(energy).any(), "no events in flat input"
+    r = p.matched_filter_series(np.zeros(100), np.zeros(20))
+    assert np.allclose(r, 0.0), "zero template -> zero correlation"
+    assert det.build_template(np.zeros(1000), _FS, np.array([1, 2])) == {}, \
+        "too few candidates -> empty template"
