@@ -561,8 +561,12 @@ def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
     sc = np.asarray(det.get("det_scores", []))
     if sc.size:
         ax2.hist(sc, bins=25, color=_ACCENT, alpha=0.85)
-    sub = "" if not prox else \
-        f"\n{prox['n_near']} near / {prox['n_far']} far of {prox['n_onsets']} onsets"
+    sub = ""
+    if prox and "enrichment" in prox:                # seizure-recording format
+        sub = (f"\n{prox['n_within_60s']} within ±60 s of onset "
+               f"({prox['enrichment']:.1f}× the overall rate)")
+    elif prox and "n_onsets" in prox:                # scored-onsets proximity
+        sub = f"\n{prox['n_near']} near / {prox['n_far']} far of {prox['n_onsets']} onsets"
     _lab(ax2, title=f"detection scores{sub}", xlabel="r at detection",
          ylabel="count")
     return _finish(fig, out_png)

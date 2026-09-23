@@ -159,7 +159,7 @@ def build(store, animal: str, *, out_dir: str, mode: str = "both",
                 onset = det_tgt.get("onset_sec")
                 prog(f"detecting on a SEIZURE recording "
                      f"({os.path.basename(det_tgt['file_path'])}, onset {onset:.0f}s, "
-                     f"R{det_tgt.get('racine')}) — the unambiguous spontaneous test")
+                     f"R{det_tgt.get('racine')}) -- the unambiguous spontaneous test")
             else:
                 prog("no scored-seizure recording on disk; using the Prong-A recording")
         _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog,
