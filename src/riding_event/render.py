@@ -77,22 +77,41 @@ def _examples(idx_mask, n: int) -> np.ndarray:
 
 # ---------------------------------------------------------------- Prong A --- #
 
-def fig_raw_overlay(res: dict, out_png: str, *, n_ex: int = 6) -> str:
-    """Median template + a few example event epochs + a few clean epochs."""
-    tm, tmpl = res["time_ms"], res["template"]
-    fig, ax = plt.subplots(figsize=(9.5, 5.2), facecolor=_BG)
+def fig_raw_overlay(res: dict, out_png: str, *, n_rows: int = 36) -> str:
+    """RIDGELINE of the event-flagged epochs: each event's post-stim waveform,
+    peak-normalized and stacked with a vertical offset (earliest at the bottom,
+    time-coloured), with the median template on top. Stacking makes each
+    individual event legible instead of a flat overlaid smear."""
+    tm = np.asarray(res["time_ms"])
+    lo, hi = res["flag_win_ms"][0], res["spec_win_ms"][1]
+    m = (tm >= lo) & (tm <= hi)
+    x = tm[m]
+    ev = np.flatnonzero(res["event_mask"])
+    if ev.size == 0:
+        return _empty(out_png, f"{res['animal']} {res['channel']}: no event epochs")
+    if ev.size > n_rows:
+        ev = ev[np.linspace(0, ev.size - 1, n_rows).astype(int)]
+    tr = res["traces"][np.ix_(ev, np.flatnonzero(m))]
+    norm = np.max(np.abs(tr), axis=1, keepdims=True)
+    tr = tr / np.where(norm > 0, norm, 1.0)          # peak-normalized shapes
+    gap = 1.25
+    cmap = plt.get_cmap("turbo")
+    fig, ax = plt.subplots(figsize=(9.5, 8.4), facecolor=_BG)
     _style(ax)
-    for j in _examples(res["clean_mask"], n_ex):
-        ax.plot(tm, res["traces"][j], color=_ACCENT, lw=0.5, alpha=0.35, zorder=1)
-    for j in _examples(res["event_mask"], n_ex):
-        ax.plot(tm, res["traces"][j], color=_EVENT, lw=0.7, alpha=0.6, zorder=2)
-    ax.plot(tm, tmpl, color=_TEXT, lw=2.2, zorder=3, label="median template")
-    ax.plot([], [], color=_EVENT, lw=1.2, label=f"event epochs (n={res['n_event']})")
-    ax.plot([], [], color=_ACCENT, lw=1.2, label=f"clean epochs (n={res['n_clean']})")
-    ax.axvline(0, color=_MUTED, lw=0.6, ls="--")
-    _lab(ax, title=f"{res['animal']} {res['channel']} — raw evoked epochs "
-                   f"(event rate {res['event_rate']*100:.1f}%)",
-         xlabel="time from stim (ms)", ylabel="LFP (µV)")
+    for i, row in enumerate(tr):
+        off = i * gap
+        c = cmap(0.05 + 0.9 * i / max(1, tr.shape[0] - 1))
+        ax.fill_between(x, off, row + off, color=c, alpha=0.18, linewidth=0)
+        ax.plot(x, row + off, color=c, lw=0.8)
+    tnorm = res["template"][m]
+    tnorm = tnorm / (np.max(np.abs(tnorm)) or 1.0)
+    top = tr.shape[0] * gap
+    ax.plot(x, tnorm + top, color=_TEXT, lw=2.0, label="median template")
+    ax.set_yticks([0, top])
+    ax.set_yticklabels(["earliest event", "latest / template"])
+    _lab(ax, title=f"{res['animal']} {res['channel']} — event-epoch ridgeline "
+                   f"({tr.shape[0]} of {res['n_event']} events, peak-normalized)",
+         xlabel="time from stim (ms)", ylabel="event (time order →)")
     _legend(ax, loc="upper right")
     return _finish(fig, out_png)
 
@@ -253,6 +272,9 @@ def fig_candidates(det: dict, out_png: str, *, animal="", channel="",
     if np.isfinite(det.get("cand_thr", np.nan)):
         ax.axhline(det["cand_thr"], color=_EVENT, lw=1.0, ls="--",
                    label="detection threshold")
+    if np.isfinite(det.get("cand_thr_hi", np.inf)):
+        ax.axhline(det["cand_thr_hi"], color="#ffd166", lw=1.0, ls=":",
+                   label="noise ceiling")
     inwin = locs[(locs >= a) & (locs < b)]
     if inwin.size:
         ax.plot(inwin / fs, env[inwin], "v", color=_EVENT, ms=6,
@@ -266,13 +288,18 @@ def fig_candidates(det: dict, out_png: str, *, animal="", channel="",
 
 def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
                   title_extra="") -> str:
-    """Rising-edge-aligned event snippets under the median template + the
-    snippet-to-template correlation distribution."""
+    """Event snippets under the median template + the snippet-to-template
+    correlation distribution. The reference frame follows ``tmpl['aligned_by']``:
+    'stim' (stim-locked events, x = time from stim, no edge marker) or
+    'rising_edge' (spontaneous events, x = time from rising edge at 0)."""
     if not tmpl or tmpl.get("template") is None:
         return _empty(out_png, f"{animal} {channel}: no template")
     aligned = np.asarray(tmpl["aligned"])
     template = np.asarray(tmpl["template"])
-    t = (np.arange(template.size) / fs) * 1000.0
+    by = tmpl.get("aligned_by", "rising_edge")
+    t0 = float(tmpl.get("t0_ms", 0.0))
+    t = t0 + (np.arange(template.size) / fs) * 1000.0
+    frame = "time from stim (ms)" if by == "stim" else "time from rising edge (ms)"
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.0, 4.4), facecolor=_BG,
                                    width_ratios=[3, 2])
     _style(ax1)
@@ -282,10 +309,10 @@ def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
     for j in show[np.linspace(0, show.size - 1, min(200, show.size)).astype(int)]:
         ax1.plot(t, aligned[j], color=_ACCENT, lw=0.4, alpha=0.15)
     ax1.plot(t, template, color=_TEXT, lw=2.2, label=f"template (n={tmpl['n']})")
-    ax1.axvline(t[np.argmax(np.diff(template))] if template.size > 1 else 0,
-                color=_EVENT, lw=0.8, ls="--", label="rising edge")
-    _lab(ax1, title=f"{animal} {channel} — rising-edge-aligned events {title_extra}",
-         xlabel="time from rising edge (ms)", ylabel="LFP (µV)")
+    if by != "stim":                               # rising-edge marker at t=0
+        ax1.axvline(0.0, color=_EVENT, lw=0.8, ls="--", label="rising edge")
+    _lab(ax1, title=f"{animal} {channel} — event template {title_extra}",
+         xlabel=frame, ylabel="LFP (µV)")
     _legend(ax1, loc="upper right")
     _style(ax2)
     corr = np.asarray(tmpl.get("corr", []))

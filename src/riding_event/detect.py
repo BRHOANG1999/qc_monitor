@@ -87,7 +87,10 @@ def build_template(signal, fs: float, locs, *, pre_ms: float = 5.0,
                                          pre_ms=pre_ms, post_ms=post_ms)
     if aligned.shape[0] < _MIN_TEMPLATE_SNIPS:
         return {}
-    return _refit(aligned, refit_iters, corr_keep)
+    d = _refit(aligned, refit_iters, corr_keep)
+    if d:                                          # rising-edge reference frame
+        d.update(aligned_by="rising_edge", t0_ms=-float(pre_ms), fs=float(fs))
+    return d
 
 
 def _refit(aligned, refit_iters: int, corr_keep: float) -> dict:
@@ -107,27 +110,31 @@ def _refit(aligned, refit_iters: int, corr_keep: float) -> dict:
             "kept": keep, "n": int(keep.sum())}
 
 
-def harvest_from_prongA(res_a: dict, *, search_ms: float = 10.0,
-                        pre_ms: float = 5.0, post_ms: float = 25.0) -> dict:
-    """Rising-edge-aligned template from Prong A's stim-locked event residuals —
-    artifact-free examples (the stim artifact was removed by template
-    subtraction). ``res_a`` is ``residual.analyze_recording``'s result. Returns
-    the same shape as ``build_template`` ({} when too few event epochs)."""
+def harvest_from_prongA(res_a: dict, *, win_ms=(2.0, 45.0)) -> dict:
+    """Template from Prong A's stim-locked event residuals — artifact-free
+    examples (the stim artifact was removed by template subtraction).
+
+    These events appear at a FIXED latency after the stimulus, so the stimulus
+    itself is the temporal reference: they are already stim-aligned and are NOT
+    rising-edge aligned (rising-edge alignment is only for SPONTANEOUS events that
+    have no stim reference -- see ``build_template``). The template is the median
+    of the stim-aligned event residuals over ``win_ms`` (post-stim ms), with a
+    correlation-gated robust refit. Returns ``build_template``'s shape, tagged
+    ``aligned_by='stim'`` ({} when too few event epochs)."""
     assert res_a and "resid" in res_a, "need a Prong-A result"
     ev = res_a["event_mask"]
     if int(ev.sum()) < _MIN_TEMPLATE_SNIPS:
         return {}
-    resid = res_a["resid"][ev]
-    time_ms = np.asarray(res_a["time_ms"], dtype=np.float64)
-    fs = float(res_a["fs"])
-    post = (time_ms >= res_a["flag_win_ms"][0]) & (time_ms <= res_a["flag_win_ms"][1])
-    if post.sum() < 4:
+    t = np.asarray(res_a["time_ms"], dtype=np.float64)
+    m = (t >= float(win_ms[0])) & (t <= float(win_ms[1]))
+    if int(m.sum()) < 4:
         return {}
-    aligned, _fid = _p.rising_edge_align(resid[:, post], fs, search_ms=search_ms,
-                                         pre_ms=pre_ms, post_ms=post_ms)
-    if aligned.shape[0] < _MIN_TEMPLATE_SNIPS:
-        return {}
-    return _refit(aligned, 2, 0.5)
+    snips = np.asarray(res_a["resid"])[ev][:, m]   # already stim-aligned
+    d = _refit(snips, 2, 0.3)                       # NO rising-edge alignment
+    if d:
+        d.update(aligned_by="stim", t0_ms=float(win_ms[0]),
+                 fs=float(res_a["fs"]))
+    return d
 
 
 def run_detector(signal, fs: float, *, band=(20.0, 200.0),
@@ -136,7 +143,7 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
                  search_ms: float = 10.0, thresh: float = 0.7,
                  refractory_sec: float = 0.05, template_override=None,
                  exclude_times_sec=None, exclude_pad_sec: float = 0.25,
-                 amp_gate: bool = True,
+                 amp_gate: bool = True, noise_k: float = 50.0,
                  artifact_ms=_p.DEFAULT_ARTIFACT_MS) -> dict:
     """End-to-end Prong B on one continuous channel: candidates -> template ->
     matched-filter detections, gated so the result is SELECTIVE for spontaneous
@@ -159,16 +166,17 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
             x, stim_s.astype(np.int64),
             pre=max(1, int(round(artifact_ms[0] * 1e-3 * fs))),
             post=max(1, int(round(artifact_ms[1] * 1e-3 * fs))))
-    locs, env, thr = _p.detect_candidates(x, fs, band=band,
-                                          min_dist_sec=min_dist_sec, k=k)
+    locs, env, thr, thr_hi = _p.detect_candidates(
+        x, fs, band=band, min_dist_sec=min_dist_sec, k=k, noise_k=noise_k)
     excl = _excluded_mask(locs, fs, exclude_times_sec, exclude_pad_sec)
     locs = locs[~excl]                             # stim pulses out of candidates
     tmpl = build_template(x, fs, locs, pre_ms=pre_ms, post_ms=post_ms,
                           search_ms=search_ms)
     out = {"fs": fs, "band": band, "cand_locs": locs, "env": env, "cand_thr": thr,
-           "template": tmpl, "det_locs": np.empty(0, dtype=np.int64),
-           "det_scores": np.empty(0), "r_series": np.empty(0), "thresh": thresh,
-           "template_source": None, "n_raw_detections": 0}
+           "cand_thr_hi": thr_hi, "template": tmpl,
+           "det_locs": np.empty(0, dtype=np.int64), "det_scores": np.empty(0),
+           "r_series": np.empty(0), "thresh": thresh, "template_source": None,
+           "n_raw_detections": 0}
     mf = np.asarray(template_override, dtype=np.float64) \
         if template_override is not None else None
     if mf is None and tmpl and tmpl.get("template") is not None:
@@ -180,9 +188,9 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
         det_locs, scores, r = _p.matched_filter_detect(
             x, mf, fs, thresh=thresh, refractory_sec=refractory_sec)
         out["n_raw_detections"] = int(det_locs.size)
-        det_locs, scores = _gate_detections(det_locs, scores, env, thr, mf.size, fs,
-                                            exclude_times_sec, exclude_pad_sec,
-                                            amp_gate)
+        det_locs, scores = _gate_detections(det_locs, scores, env, thr, thr_hi,
+                                            mf.size, fs, exclude_times_sec,
+                                            exclude_pad_sec, amp_gate)
         out.update(det_locs=det_locs, det_scores=scores, r_series=r)
     return out
 
@@ -207,11 +215,12 @@ def _excluded_mask(locs, fs: float, times_sec, pad_sec: float) -> np.ndarray:
     return nearest <= pad
 
 
-def _gate_detections(det_locs, scores, env, thr, w: int, fs: float,
+def _gate_detections(det_locs, scores, env, thr, thr_hi, w: int, fs: float,
                      times_sec, pad_sec: float, amp_gate: bool):
-    """Keep matched-filter detections that are a real HF burst (envelope over the
-    candidate threshold within the template span) AND not within ``pad_sec`` of a
-    stim time. Returns filtered ``(locs, scores)``."""
+    """Keep matched-filter detections that are a real HF burst -- envelope over
+    the candidate threshold AND below the ``thr_hi`` noise ceiling (a glitch that
+    dwarfs a real event is rejected) within the template span -- AND not within
+    ``pad_sec`` of a stim time. Returns filtered ``(locs, scores)``."""
     dl = np.asarray(det_locs, dtype=np.int64)
     sc = np.asarray(scores, dtype=np.float64)
     if dl.size == 0:
@@ -222,6 +231,8 @@ def _gate_detections(det_locs, scores, env, thr, w: int, fs: float,
         envmax = np.array([e[i:i + w].max() if i + 1 < e.size else 0.0
                            for i in dl])           # bounded: one slice per det
         keep &= envmax > thr
+        if np.isfinite(thr_hi):
+            keep &= envmax <= thr_hi               # reject giant-transient noise
     keep &= ~_excluded_mask(dl, fs, times_sec, pad_sec)
     return dl[keep], sc[keep]
 

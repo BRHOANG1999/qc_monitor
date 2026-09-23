@@ -57,8 +57,8 @@ def analyze_recording(evoked_path: str, animal: str, *,
                       flag_win_ms=DEFAULT_FLAG_WIN_MS,
                       spec_win_ms=DEFAULT_SPEC_WIN_MS,
                       template_iters: int = 1, k: float = 4.0,
-                      band=None, artifact_ms=_p.DEFAULT_ARTIFACT_MS
-                      ) -> dict | None:
+                      noise_k: float | None = None, band=None,
+                      artifact_ms=_p.DEFAULT_ARTIFACT_MS) -> dict | None:
     """Full Prong-A analysis for one ``*_evoked.mat`` + *animal*. Returns a result
     dict (see keys below) or None when the recording has no usable channel. The
     stim artifact ``[-artifact_ms[0], +artifact_ms[1]]`` ms is blanked
@@ -82,7 +82,7 @@ def analyze_recording(evoked_path: str, animal: str, *,
                                         win_mask=post)
     resid = _p.residuals(traces, template)
     energy = _p.event_energy(resid, time_ms, win_ms=flag_win_ms, fs=fs, band=band)
-    event_mask = _p.flag_events(energy, k=k)
+    event_mask = _p.flag_events(energy, k=k, noise_k=noise_k)
     clean_mask = (~event_mask) & keep            # kept = template's clean cohort
     return _assemble(evoked_path, animal, ch, traces, resid, time_ms, times, fs,
                      template, energy, event_mask, clean_mask, keep,
@@ -162,7 +162,7 @@ def event_prevalence(evoked_path: str, animal: str, *, max_epochs: int = 400,
     template, _keep = _p.robust_template(sub, iters=1, k=k, win_mask=post)
     energy = _p.event_energy(_p.residuals(sub, template), tms,
                              win_ms=flag_win_ms, fs=fs)
-    mask = _p.flag_events(energy, k=k)
+    mask = _p.flag_events(energy, k=k, noise_k=None)
     return {"path": evoked_path, "channel": ch, "n": int(sub.shape[0]),
             "n_event": int(mask.sum()),
             "event_rate": float(mask.sum()) / max(1, sub.shape[0])}

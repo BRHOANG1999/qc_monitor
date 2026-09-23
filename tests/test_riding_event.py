@@ -135,10 +135,33 @@ def test_detect_candidates_finds_bursts():
         seg = slice(c, c + int(0.2 * fs))
         w[seg] = np.hanning(int(0.2 * fs))
         signal += 4.0 * np.sin(2 * np.pi * 120.0 * t) * w
-    locs, env, thr = p.detect_candidates(signal, fs, band=(20.0, 200.0),
-                                         min_dist_sec=1.0, k=4.0)
+    locs, env, thr, thr_hi = p.detect_candidates(signal, fs, band=(20.0, 200.0),
+                                                 min_dist_sec=1.0, k=4.0)
     for c in centers:
         assert np.any(np.abs(locs - c) <= int(0.3 * fs)), "should detect each burst"
+
+
+def test_noise_threshold_rejects_giant_transient():
+    rng = np.random.default_rng(8)
+    fs = 2000.0
+    n = int(30 * fs)
+    t = np.arange(n) / fs
+    signal = rng.normal(0, 0.3, size=n)
+    centers = np.arange(2 * int(fs), n - 2 * int(fs), 6 * int(fs))
+    for c in centers:                                  # modest-amplitude events
+        w = np.zeros(n)
+        w[c:c + int(0.2 * fs)] = np.hanning(int(0.2 * fs))
+        signal += 0.6 * np.sin(2 * np.pi * 120.0 * t) * w
+    glitch = 10000                                      # between centers (not
+    signal[glitch:glitch + 4] += 400.0                  # near any real event)
+    lo_only, _, _, _ = p.detect_candidates(signal, fs, band=(20.0, 200.0),
+                                           min_dist_sec=1.0, k=4.0)
+    gated, _, _, thr_hi = p.detect_candidates(signal, fs, band=(20.0, 200.0),
+                                              min_dist_sec=1.0, k=4.0, noise_k=20.0)
+    assert np.any(np.abs(lo_only - glitch) <= int(0.3 * fs)), "glitch is a candidate"
+    assert not np.any(np.abs(gated - glitch) <= int(0.3 * fs)), "ceiling drops glitch"
+    for c in centers:                                  # real events survive
+        assert np.any(np.abs(gated - c) <= int(0.3 * fs)), "real event kept"
 
 
 def test_artifact_blanking_removes_spike_keeps_event():
@@ -181,7 +204,8 @@ def test_stim_blanking_and_amplitude_gate():
     stim_times = [planted[i] / fs for i in stim_idx]
     d = det.run_detector(signal, fs, band=(20.0, 200.0), min_dist_sec=0.3,
                          thresh=0.5, refractory_sec=0.3, template_override=template,
-                         exclude_times_sec=stim_times, exclude_pad_sec=0.15)
+                         exclude_times_sec=stim_times, exclude_pad_sec=0.15,
+                         noise_k=None)                  # isolate blanking + amp gate
     dl = np.asarray(d["det_locs"])
     for i in stim_idx:                                  # stim-coincident excluded
         assert not np.any(np.abs(dl - planted[i]) <= 200), "stim event not blanked"

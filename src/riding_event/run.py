@@ -20,6 +20,7 @@ import numpy as np
 
 from src.riding_event import detect as _det
 from src.riding_event import render as _r
+from src.riding_event import render_interactive as _ri
 from src.riding_event import residual as _res
 from src.utils.animal import split_animal_electrode
 
@@ -151,11 +152,15 @@ def _run_prong_a(target, animal, out_dir, summary, prog) -> dict | None:
         prog("  no usable channel; skipping Prong A")
         return None
     stem = os.path.join(out_dir, f"{_safe(animal)}_{_safe(res['channel'])}_A")
-    figs = [_r.fig_raw_overlay(res, stem + "_raw.png"),
+    figs = [_r.fig_raw_overlay(res, stem + "_ridgeline.png"),
             _r.fig_residual_erpimage(res, stem + "_erpimage.png"),
             _r.fig_density(res, stem + "_density.png"),
             _r.fig_spectral(res, stem + "_spectrum.png")]
     summary["figures"].extend(figs)
+    inspector = _ri.write_event_inspector(res, stem + "_inspector.html")
+    summary["figures"].append(inspector)
+    summary["interactive"] = inspector
+    prog(f"  interactive per-event inspector -> {os.path.basename(inspector)}")
     _write_epoch_csv(stem + "_epochs.csv", res)
     fund = res.get("fundamental", {})
     summary["prong_a"] = {

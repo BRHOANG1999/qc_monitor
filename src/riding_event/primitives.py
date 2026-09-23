@@ -176,17 +176,24 @@ def event_energy(resid, time_ms, *, win_ms=(2.0, 100.0), fs: float | None = None
     return np.sqrt(np.mean(w * w, axis=1))
 
 
-def flag_events(energy, *, k: float = 4.0) -> np.ndarray:
-    """Boolean event mask: epochs whose energy exceeds ``median + k*MAD`` (robust
-    to the events themselves). Returns all-False when nothing stands out."""
+def flag_events(energy, *, k: float = 4.0,
+                noise_k: float | None = None) -> np.ndarray:
+    """Boolean event mask: epochs whose energy is in the robust band
+    ``(median + k*MAD, median + noise_k*MAD]`` -- above the noise floor but below
+    the ``noise_k`` ceiling that rejects glitch/artifact epochs (a lone huge
+    deflection is noise, not the bounded riding event). ``noise_k=None`` = no
+    ceiling. All-False when nothing stands out."""
     e = np.asarray(energy, dtype=np.float64)
     assert e.ndim == 1, "energy must be 1-D"
     assert k > 0, "k must be positive"
     finite = e[np.isfinite(e)]
     if finite.size == 0:
         return np.zeros(e.shape[0], dtype=bool)
-    thr = float(np.median(finite)) + k * _mad(finite)
-    return np.isfinite(e) & (e > thr)
+    med, mad = float(np.median(finite)), _mad(finite)
+    mask = np.isfinite(e) & (e > med + k * mad)
+    if noise_k:
+        mask &= e <= med + float(noise_k) * mad
+    return mask
 
 
 # --------------------------------------------------------------------- #
@@ -195,16 +202,20 @@ def flag_events(energy, *, k: float = 4.0) -> np.ndarray:
 
 def detect_candidates(signal, fs: float, *, band=(20.0, 200.0),
                       min_dist_sec: float = 0.05, k: float = 4.0,
+                      noise_k: float | None = None,
                       smooth_ms: float = 5.0) -> tuple[np.ndarray, np.ndarray,
-                                                       float]:
+                                                       float, float]:
     """Candidate event sample indices on a continuous LFP *signal*.
 
     RAW band-limited amplitude envelope (``band_envelope(smooth=False)``) with a
-    short ``smooth_ms`` moving average -> robust height threshold
-    (``median + k*MAD``) -> ``peakseek`` with a min-distance refractory. Returns
-    ``(locs[samples], envelope, threshold)``. (The BHZ ``smooth=True`` low-pass is
-    ~0.2 Hz -- tuned for tens-of-seconds seizures -- and erases the short riding
-    event, so it is deliberately not used here.)"""
+    short ``smooth_ms`` moving average -> robust band ``median + k*MAD`` (lower)
+    to ``median + noise_k*MAD`` (upper) -> ``peakseek`` with a min-distance
+    refractory. The upper ``noise_k`` bound rejects implausibly large transients
+    (glitches / electrical artifacts) that dwarf a real event -- the physiological
+    riding event is a bounded-amplitude oscillation, a lone giant spike is noise.
+    Returns ``(locs[samples], envelope, thr_lo, thr_hi)`` (``thr_hi=inf`` when no
+    ceiling). (The BHZ ``smooth=True`` low-pass is ~0.2 Hz, tuned for
+    tens-of-seconds seizures, and erases the short event, so it is not used.)"""
     x = np.asarray(signal, dtype=np.float64)
     assert x.ndim == 1, "signal must be 1-D"
     assert fs and fs > 0, "fs must be positive"
@@ -215,11 +226,15 @@ def detect_candidates(signal, fs: float, *, band=(20.0, 200.0),
         env = uniform_filter1d(env, size=w, mode="nearest")
     finite = env[np.isfinite(env)]
     if finite.size == 0:
-        return np.empty(0, dtype=np.int64), env, float("nan")
-    thr = float(np.median(finite)) + k * _mad(finite)
+        return np.empty(0, dtype=np.int64), env, float("nan"), float("inf")
+    med, mad = float(np.median(finite)), _mad(finite)
+    thr = med + k * mad
+    thr_hi = med + float(noise_k) * mad if noise_k else float("inf")
     dist = max(1, int(round(float(min_dist_sec) * float(fs))))
     locs, _pks = peakseek(env, dist, minpeakh=thr)
-    return locs.astype(np.int64), env, thr
+    if np.isfinite(thr_hi) and locs.size:
+        locs = locs[env[locs] <= thr_hi]          # drop giant-transient noise
+    return locs.astype(np.int64), env, thr, thr_hi
 
 
 def snippets_around(signal, locs, *, pre: int, post: int) -> tuple[np.ndarray,
