@@ -141,6 +141,33 @@ def test_detect_candidates_finds_bursts():
         assert np.any(np.abs(locs - c) <= int(0.3 * fs)), "should detect each burst"
 
 
+def test_artifact_blanking_removes_spike_keeps_event():
+    t = _time_ms()
+    base = _template_wave(t)
+    rng = np.random.default_rng(7)
+    traces = base[None, :] + rng.normal(0, 0.2, size=(20, t.size))
+    art = (t >= -1.0) & (t <= 2.0)
+    traces[:, art] += 60.0                              # huge stim artifact
+    b = p.blank_artifact_epochs(traces, t, pre_ms=1.0, post_ms=2.0)
+    assert np.nanmax(np.abs(b[:, art])) < 8.0, "artifact should be interpolated out"
+    post = t > 3.0
+    assert np.allclose(b[:, post], traces[:, post]), "post-stim event untouched"
+
+    fs = 2000.0
+    n = int(10 * fs)
+    x = rng.normal(0, 0.3, size=n)
+    stim = np.arange(1000, n - 1000, 2000)
+    for s in stim:
+        x[s - 2:s + 4] += 90.0                          # artifact spikes
+    ev0 = stim[0] + 500
+    x[ev0:ev0 + 40] += 5.0
+    keep = x[ev0:ev0 + 40].copy()
+    xb = p.blank_artifact_continuous(x, stim, pre=2, post=4)
+    for s in stim:
+        assert abs(xb[s]) < 15.0, "continuous artifact should be interpolated out"
+    assert np.allclose(xb[ev0:ev0 + 40], keep), "distant event untouched"
+
+
 def test_stim_blanking_and_amplitude_gate():
     rng = np.random.default_rng(4)
     fs = 2000.0

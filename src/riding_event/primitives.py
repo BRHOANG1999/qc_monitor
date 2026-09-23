@@ -25,6 +25,71 @@ from src.utils.peakseek import peakseek
 _EPS = 1e-12
 _MAX_EPOCHS = 2_000_000          # NASA Rule 2: explicit per-epoch loop bound.
 _MAX_SNIPPETS = 2_000_000
+_MAX_STIMS = 5_000_000
+
+# Stim-artifact blank window (ms around each stimulus): the sharp deflection is
+# removed BEFORE any filter/envelope/spectrum/matched-filter so its broadband
+# energy and filter ringing can't leak into the post-stim analysis. Narrow so the
+# riding event (which starts a few ms after the stim) is preserved. Matches the
+# toolkit's -1..2 ms artifact window (peri_stim_artifact._ARTIFACT_MS).
+DEFAULT_ARTIFACT_MS = (1.0, 2.0)
+
+
+# --------------------------------------------------------------------- #
+#  Stim-artifact blanking (run FIRST, before any other analysis)
+# --------------------------------------------------------------------- #
+
+def blank_artifact_epochs(traces, time_ms, *, pre_ms: float = 1.0,
+                          post_ms: float = 2.0) -> np.ndarray:
+    """Linearly interpolate across the stim artifact ``[-pre_ms, +post_ms]`` (t=0
+    = stim) in every epoch, so the artifact never enters the template, residual,
+    spectra or any filtered feature. Returns a new ``[epochs x samples]`` array;
+    the post-stim event (starting a few ms out) is preserved. Falls back to NaN
+    when the window touches an epoch edge (no anchor to interpolate from)."""
+    a = np.array(traces, dtype=np.float64, copy=True)
+    t = np.asarray(time_ms, dtype=np.float64)
+    assert a.ndim == 2 and t.size == a.shape[1], "traces/time_ms shape mismatch"
+    assert pre_ms >= 0 and post_ms >= 0, "pre_ms/post_ms must be >= 0"
+    m = (t >= -abs(pre_ms)) & (t <= abs(post_ms))
+    idx = np.flatnonzero(m)
+    if idx.size == 0:
+        return a
+    i0, i1 = int(idx[0]), int(idx[-1])
+    lo, hi = i0 - 1, i1 + 1
+    if lo < 0 or hi >= t.size or t[hi] == t[lo]:
+        a[:, i0:i1 + 1] = np.nan                  # edge: can't anchor an interp
+        return a
+    frac = (t[i0:i1 + 1] - t[lo]) / (t[hi] - t[lo])
+    a[:, i0:i1 + 1] = (a[:, lo][:, None] * (1.0 - frac)[None, :]
+                       + a[:, hi][:, None] * frac[None, :])
+    return a
+
+
+def blank_artifact_continuous(signal, stim_samples, *, pre: int,
+                              post: int) -> np.ndarray:
+    """Linearly interpolate across the stim artifact (``[s-pre, s+post)`` samples)
+    at every stimulus *s* in a continuous 1-D *signal*, so the envelope, matched
+    filter and thresholds see no stim transients. Returns a new array; the
+    stim-evoked RESPONSE after the narrow blank is left intact (it is excluded
+    from detections separately, by the wider stim-time gate)."""
+    x = np.array(signal, dtype=np.float64, copy=True)
+    ss = np.asarray(stim_samples, dtype=np.int64)
+    assert x.ndim == 1, "signal must be 1-D"
+    assert pre >= 0 and post >= 1, "need pre >= 0, post >= 1"
+    n = x.shape[0]
+    cnt = 0
+    for s in ss:
+        assert cnt < _MAX_STIMS, "stim count exceeds bound"
+        cnt += 1
+        lo, hi = max(0, int(s) - pre), min(n, int(s) + post)
+        a, b = lo - 1, hi
+        if hi <= lo:
+            continue
+        if a >= 0 and b < n:
+            x[lo:hi] = np.interp(np.arange(lo, hi), [a, b], [x[a], x[b]])
+        else:
+            x[lo:hi] = np.nan
+    return x
 
 
 # --------------------------------------------------------------------- #

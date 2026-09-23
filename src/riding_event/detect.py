@@ -136,7 +136,8 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
                  search_ms: float = 10.0, thresh: float = 0.7,
                  refractory_sec: float = 0.05, template_override=None,
                  exclude_times_sec=None, exclude_pad_sec: float = 0.25,
-                 amp_gate: bool = True) -> dict:
+                 amp_gate: bool = True,
+                 artifact_ms=_p.DEFAULT_ARTIFACT_MS) -> dict:
     """End-to-end Prong B on one continuous channel: candidates -> template ->
     matched-filter detections, gated so the result is SELECTIVE for spontaneous
     events rather than re-finding stim responses on a chronicStim recording.
@@ -152,6 +153,12 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
     template is still built (and returned for the alignment figure)."""
     x = np.asarray(signal, dtype=np.float64)
     assert x.ndim == 1 and fs and fs > 0, "signal 1-D, fs > 0"
+    if exclude_times_sec is not None and len(exclude_times_sec):
+        stim_s = (np.asarray(exclude_times_sec, dtype=np.float64) * fs)
+        x = _p.blank_artifact_continuous(          # remove sharp artifact FIRST
+            x, stim_s.astype(np.int64),
+            pre=max(1, int(round(artifact_ms[0] * 1e-3 * fs))),
+            post=max(1, int(round(artifact_ms[1] * 1e-3 * fs))))
     locs, env, thr = _p.detect_candidates(x, fs, band=band,
                                           min_dist_sec=min_dist_sec, k=k)
     excl = _excluded_mask(locs, fs, exclude_times_sec, exclude_pad_sec)

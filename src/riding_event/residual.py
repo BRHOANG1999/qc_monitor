@@ -57,9 +57,12 @@ def analyze_recording(evoked_path: str, animal: str, *,
                       flag_win_ms=DEFAULT_FLAG_WIN_MS,
                       spec_win_ms=DEFAULT_SPEC_WIN_MS,
                       template_iters: int = 1, k: float = 4.0,
-                      band=None) -> dict | None:
+                      band=None, artifact_ms=_p.DEFAULT_ARTIFACT_MS
+                      ) -> dict | None:
     """Full Prong-A analysis for one ``*_evoked.mat`` + *animal*. Returns a result
-    dict (see keys below) or None when the recording has no usable channel."""
+    dict (see keys below) or None when the recording has no usable channel. The
+    stim artifact ``[-artifact_ms[0], +artifact_ms[1]]`` ms is blanked
+    (interpolated) FIRST, before the template / residual / spectra."""
     assert evoked_path and animal, "evoked_path and animal required"
     chans = read_file_evoked(evoked_path, only_animals=[animal])
     ch = pick_channel(chans, animal, prefer_channel)
@@ -71,6 +74,8 @@ def analyze_recording(evoked_path: str, animal: str, *,
     times = np.asarray(rec.get("times") or [], dtype=np.float64)
     assert traces.ndim == 2 and time_ms.size == traces.shape[1], "shape mismatch"
     fs = 1000.0 / float(np.mean(np.diff(time_ms)))
+    traces = _p.blank_artifact_epochs(traces, time_ms, pre_ms=artifact_ms[0],
+                                      post_ms=artifact_ms[1])
 
     post = (time_ms >= flag_win_ms[0]) & (time_ms <= flag_win_ms[1])
     template, keep = _p.robust_template(traces, iters=template_iters, k=k,
@@ -148,6 +153,8 @@ def event_prevalence(evoked_path: str, animal: str, *, max_epochs: int = 400,
         return miss
     tr = np.asarray(chans[ch]["traces"], dtype=np.float64)
     tms = np.asarray(chans[ch]["time_ms"], dtype=np.float64)
+    tr = _p.blank_artifact_epochs(tr, tms, pre_ms=_p.DEFAULT_ARTIFACT_MS[0],
+                                  post_ms=_p.DEFAULT_ARTIFACT_MS[1])
     step = max(1, tr.shape[0] // int(max_epochs))
     sub = tr[::step]
     fs = 1000.0 / float(np.mean(np.diff(tms)))
