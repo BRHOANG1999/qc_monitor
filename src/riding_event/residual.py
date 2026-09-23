@@ -24,8 +24,20 @@ logger = logging.getLogger("qc_monitor.riding_event.residual")
 # Post-stim windows (ms). Flagging uses the tight window where the event sits;
 # the spectrum uses a wider window for finer frequency resolution. Both start
 # past the artifact (>~2 ms) so the stim transient never dominates.
-DEFAULT_FLAG_WIN_MS = (2.0, 100.0)
+DEFAULT_FLAG_WIN_MS = (2.0, 180.0)         # wide: the ripple onsets 5-50 ms out
 DEFAULT_SPEC_WIN_MS = (2.0, 200.0)
+_DEFAULT_HF_BAND = (150.0, 800.0)          # fallback ripple band if no fundamental
+
+
+def _hf_band(f0: float, fs: float) -> tuple:
+    """The ripple band to flag on: centred on the discovered fundamental *f0*
+    (the event is a fast oscillation ~f0), else a sensible HF default. Always
+    high-pass enough (>=100 Hz) to reject the smooth low-frequency evoked
+    response, so only the HF ripple is scored."""
+    nyq = 0.49 * float(fs)
+    if f0 and np.isfinite(f0) and f0 > 0:
+        return (max(100.0, f0 * 0.6), min(f0 * 2.5, nyq))
+    return (_DEFAULT_HF_BAND[0], min(_DEFAULT_HF_BAND[1], nyq))
 
 
 def pick_channel(chans: dict, animal: str, prefer: str | None = None) -> str | None:
@@ -57,7 +69,8 @@ def analyze_recording(evoked_path: str, animal: str, *,
                       flag_win_ms=DEFAULT_FLAG_WIN_MS,
                       spec_win_ms=DEFAULT_SPEC_WIN_MS,
                       template_iters: int = 1, k: float = 4.0,
-                      noise_k: float | None = None, band=None,
+                      noise_k: float | None = None, flag_pct: float = 95.0,
+                      band=None,
                       artifact_ms=_p.DEFAULT_ARTIFACT_MS) -> dict | None:
     """Full Prong-A analysis for one ``*_evoked.mat`` + *animal*. Returns a result
     dict (see keys below) or None when the recording has no usable channel. The
@@ -81,17 +94,33 @@ def analyze_recording(evoked_path: str, animal: str, *,
     template, keep = _p.robust_template(traces, iters=template_iters, k=k,
                                         win_mask=post)
     resid = _p.residuals(traces, template)
-    energy = _p.event_energy(resid, time_ms, win_ms=flag_win_ms, fs=fs, band=band)
-    event_mask = _p.flag_events(energy, k=k, noise_k=noise_k)
+    # Pass 1: a broad provisional flag, only to find the ripple band from the
+    # event group's spectrum. Pass 2: the REAL flag on the high-frequency burst
+    # (the ripple), so a smooth-response wobble is not mistaken for an event.
+    e0 = _p.event_energy(resid, time_ms, win_ms=flag_win_ms, fs=fs, band=band)
+    mask0 = _p.flag_events(e0, k=k, noise_k=noise_k)
+    clean0 = (~mask0) & keep
+    if clean0.sum() < 1:
+        clean0 = keep
+    if band is not None:
+        hf_band = (float(band[0]), float(band[1]))
+    else:
+        sp0 = _spectra(traces, resid, template, time_ms, fs, spec_win_ms,
+                       mask0, clean0)
+        hf_band = _hf_band(sp0["fundamental"].get("fundamental_hz"), fs)
+    # HF-band RMS = sustained ripple power over the window: a smooth-response
+    # wobble has ~none, a transient blip is diluted, only a sustained ripple scores.
+    score = _p.event_energy(resid, time_ms, win_ms=flag_win_ms, fs=fs, band=hf_band)
+    event_mask = _p.flag_events(score, k=k, noise_k=noise_k, min_pct=flag_pct)
     clean_mask = (~event_mask) & keep            # kept = template's clean cohort
     return _assemble(evoked_path, animal, ch, traces, resid, time_ms, times, fs,
-                     template, energy, event_mask, clean_mask, keep,
-                     flag_win_ms, spec_win_ms)
+                     template, score, event_mask, clean_mask, keep,
+                     flag_win_ms, spec_win_ms, hf_band)
 
 
 def _assemble(path, animal, ch, traces, resid, time_ms, times, fs, template,
-              energy, event_mask, clean_mask, keep, flag_win_ms, spec_win_ms
-              ) -> dict:
+              energy, event_mask, clean_mask, keep, flag_win_ms, spec_win_ms,
+              hf_band=None) -> dict:
     """Package the arrays + the five-group spectral comparison."""
     if clean_mask.sum() < 1:                      # degenerate: nothing clean
         clean_mask = keep
@@ -101,7 +130,7 @@ def _assemble(path, animal, ch, traces, resid, time_ms, times, fs, template,
     return {"path": path, "animal": animal, "channel": ch, "fs": fs,
             "time_ms": time_ms, "times": times, "traces": traces,
             "template": template, "resid": resid, "energy": energy,
-            "event_mask": event_mask, "clean_mask": clean_mask,
+            "event_mask": event_mask, "clean_mask": clean_mask, "hf_band": hf_band,
             "event_rate": float(event_mask.sum()) / max(1, n), "n": int(n),
             "n_event": int(event_mask.sum()), "n_clean": int(clean_mask.sum()),
             "flag_win_ms": flag_win_ms, "spec_win_ms": spec_win_ms, **spectra}
@@ -160,9 +189,10 @@ def event_prevalence(evoked_path: str, animal: str, *, max_epochs: int = 400,
     fs = 1000.0 / float(np.mean(np.diff(tms)))
     post = (tms >= flag_win_ms[0]) & (tms <= flag_win_ms[1])
     template, _keep = _p.robust_template(sub, iters=1, k=k, win_mask=post)
-    energy = _p.event_energy(_p.residuals(sub, template), tms,
-                             win_ms=flag_win_ms, fs=fs)
-    mask = _p.flag_events(energy, k=k, noise_k=None)
+    hf_band = _hf_band(None, fs)                  # default ripple band for ranking
+    score = _p.event_energy(_p.residuals(sub, template), tms, win_ms=flag_win_ms,
+                            fs=fs, band=hf_band)
+    mask = _p.flag_events(score, k=k, noise_k=None)
     return {"path": evoked_path, "channel": ch, "n": int(sub.shape[0]),
             "n_event": int(mask.sum()),
             "event_rate": float(mask.sum()) / max(1, sub.shape[0])}

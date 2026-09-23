@@ -344,13 +344,15 @@ def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
     detections, and the detection-score histogram (with near/far-from-onset split
     when validation onsets are supplied)."""
     fs = float(det["fs"])
-    r = np.asarray(det.get("r_series", []))
+    r = _blank_near_stims(np.asarray(det.get("r_series", []), dtype=np.float64),
+                          fs, det.get("stim_times_sec"), det.get("excl_pad_sec"))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.4), facecolor=_BG,
                                    width_ratios=[3, 2])
     _style(ax1)
     if r.size:
         x, y, _d = _decim_envelope(r, fs, 8000, t_start=0.0)
-        ax1.plot(x, y, color=_ACCENT, lw=0.6, label="matched-filter r")
+        ax1.plot(x, y, color=_ACCENT, lw=0.6,
+                 label="matched-filter r (stim windows blanked)")
         ax1.axhline(det.get("thresh", 0.7), color=_EVENT, lw=1.0, ls="--",
                     label="threshold")
         dl = np.asarray(det.get("det_locs", []))
@@ -372,6 +374,27 @@ def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
 
 
 # ------------------------------------------------------------------ util --- #
+
+def _blank_near_stims(r, fs, stim_times_sec, pad_sec):
+    """NaN out the matched-filter r within ``pad_sec`` of each stim so the plot
+    shows only the INTER-STIM correlation (the stim-evoked responses, which the
+    template matches by construction, are excluded from detection anyway)."""
+    r = np.asarray(r, dtype=np.float64)
+    if r.size == 0 or stim_times_sec is None or not len(stim_times_sec) \
+            or not pad_sec:
+        return r
+    out = r.copy()
+    pad = max(1, int(round(float(pad_sec) * float(fs))))
+    n = out.size
+    ts = np.asarray(stim_times_sec, dtype=np.float64)
+    assert ts.size < 5_000_000, "stim count exceeds bound"   # NASA Rule 2
+    for s in ts:
+        i = int(round(float(s) * float(fs)))
+        lo, hi = max(0, i - pad), min(n, i + pad)
+        if hi > lo:
+            out[lo:hi] = np.nan
+    return out
+
 
 def _hex_rgb(h: str) -> tuple:
     h = h.lstrip("#")

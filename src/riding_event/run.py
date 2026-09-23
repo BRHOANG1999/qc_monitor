@@ -163,13 +163,17 @@ def _run_prong_a(target, animal, out_dir, summary, prog) -> dict | None:
     prog(f"  interactive per-event inspector -> {os.path.basename(inspector)}")
     _write_epoch_csv(stem + "_epochs.csv", res)
     fund = res.get("fundamental", {})
+    hf = res.get("hf_band")
     summary["prong_a"] = {
         "channel": res["channel"], "fs": res["fs"], "n": res["n"],
         "n_event": res["n_event"], "event_rate": res["event_rate"],
         "fundamental_hz": fund.get("fundamental_hz"),
-        "n_harmonics": fund.get("n_harmonics"), "excess_band": res.get("excess_band")}
-    prog(f"  event rate {res['event_rate']*100:.1f}%  fundamental "
-         f"{fund.get('fundamental_hz', float('nan')):.1f} Hz")
+        "n_harmonics": fund.get("n_harmonics"), "excess_band": res.get("excess_band"),
+        "hf_flag_band": [round(x, 1) for x in hf] if hf else None,
+        "flag_win_ms": list(res["flag_win_ms"])}
+    prog(f"  {res['n_event']} events ({res['event_rate']*100:.1f}%) on the HF "
+         f"ripple band {tuple(round(x) for x in hf) if hf else '?'} Hz; "
+         f"fundamental {fund.get('fundamental_hz', float('nan')):.1f} Hz")
     return res
 
 

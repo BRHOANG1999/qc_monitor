@@ -143,7 +143,8 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
                  search_ms: float = 10.0, thresh: float = 0.7,
                  refractory_sec: float = 0.05, template_override=None,
                  exclude_times_sec=None, exclude_pad_sec: float = 0.25,
-                 amp_gate: bool = True, noise_k: float = 50.0,
+                 amp_gate: bool = True, amp_gate_k: float = 8.0,
+                 noise_k: float = 50.0,
                  artifact_ms=_p.DEFAULT_ARTIFACT_MS) -> dict:
     """End-to-end Prong B on one continuous channel: candidates -> template ->
     matched-filter detections, gated so the result is SELECTIVE for spontaneous
@@ -172,11 +173,19 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
     locs = locs[~excl]                             # stim pulses out of candidates
     tmpl = build_template(x, fs, locs, pre_ms=pre_ms, post_ms=post_ms,
                           search_ms=search_ms)
+    # Amplitude gate uses a PROMINENCE threshold (median + amp_gate_k*MAD),
+    # higher than the candidate floor, so a detection must be a clearly-elevated
+    # burst -- not any HF wiggle just over the noise floor (the candidates just
+    # above the floor were nearly all noise).
+    efin = env[np.isfinite(env)]
+    amp_lo = (float(np.median(efin)) + amp_gate_k * _p._mad(efin)
+              if efin.size else float("inf"))
     out = {"fs": fs, "band": band, "cand_locs": locs, "env": env, "cand_thr": thr,
-           "cand_thr_hi": thr_hi, "template": tmpl,
+           "cand_thr_hi": thr_hi, "amp_lo": amp_lo, "template": tmpl,
            "det_locs": np.empty(0, dtype=np.int64), "det_scores": np.empty(0),
            "r_series": np.empty(0), "thresh": thresh, "template_source": None,
-           "n_raw_detections": 0}
+           "n_raw_detections": 0, "stim_times_sec": exclude_times_sec,
+           "excl_pad_sec": exclude_pad_sec}
     mf = np.asarray(template_override, dtype=np.float64) \
         if template_override is not None else None
     if mf is None and tmpl and tmpl.get("template") is not None:
@@ -188,7 +197,7 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
         det_locs, scores, r = _p.matched_filter_detect(
             x, mf, fs, thresh=thresh, refractory_sec=refractory_sec)
         out["n_raw_detections"] = int(det_locs.size)
-        det_locs, scores = _gate_detections(det_locs, scores, env, thr, thr_hi,
+        det_locs, scores = _gate_detections(det_locs, scores, env, amp_lo, thr_hi,
                                             mf.size, fs, exclude_times_sec,
                                             exclude_pad_sec, amp_gate)
         out.update(det_locs=det_locs, det_scores=scores, r_series=r)
@@ -215,22 +224,22 @@ def _excluded_mask(locs, fs: float, times_sec, pad_sec: float) -> np.ndarray:
     return nearest <= pad
 
 
-def _gate_detections(det_locs, scores, env, thr, thr_hi, w: int, fs: float,
+def _gate_detections(det_locs, scores, env, amp_lo, thr_hi, w: int, fs: float,
                      times_sec, pad_sec: float, amp_gate: bool):
     """Keep matched-filter detections that are a real HF burst -- envelope over
-    the candidate threshold AND below the ``thr_hi`` noise ceiling (a glitch that
-    dwarfs a real event is rejected) within the template span -- AND not within
-    ``pad_sec`` of a stim time. Returns filtered ``(locs, scores)``."""
+    the prominence threshold ``amp_lo`` AND below the ``thr_hi`` noise ceiling (a
+    glitch that dwarfs a real event is rejected) within the template span -- AND
+    not within ``pad_sec`` of a stim time. Returns filtered ``(locs, scores)``."""
     dl = np.asarray(det_locs, dtype=np.int64)
     sc = np.asarray(scores, dtype=np.float64)
     if dl.size == 0:
         return dl, sc
     keep = np.ones(dl.size, dtype=bool)
-    if amp_gate and np.isfinite(thr):
+    if amp_gate and np.isfinite(amp_lo):
         e = np.asarray(env, dtype=np.float64)
         envmax = np.array([e[i:i + w].max() if i + 1 < e.size else 0.0
                            for i in dl])           # bounded: one slice per det
-        keep &= envmax > thr
+        keep &= envmax > amp_lo
         if np.isfinite(thr_hi):
             keep &= envmax <= thr_hi               # reject giant-transient noise
     keep &= ~_excluded_mask(dl, fs, times_sec, pad_sec)

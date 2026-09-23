@@ -176,13 +176,15 @@ def event_energy(resid, time_ms, *, win_ms=(2.0, 100.0), fs: float | None = None
     return np.sqrt(np.mean(w * w, axis=1))
 
 
-def flag_events(energy, *, k: float = 4.0,
-                noise_k: float | None = None) -> np.ndarray:
-    """Boolean event mask: epochs whose energy is in the robust band
-    ``(median + k*MAD, median + noise_k*MAD]`` -- above the noise floor but below
-    the ``noise_k`` ceiling that rejects glitch/artifact epochs (a lone huge
-    deflection is noise, not the bounded riding event). ``noise_k=None`` = no
-    ceiling. All-False when nothing stands out."""
+def flag_events(energy, *, k: float = 4.0, noise_k: float | None = None,
+                min_pct: float | None = None) -> np.ndarray:
+    """Boolean event mask: epochs above the noise floor ``median + k*MAD`` and
+    below the ``noise_k`` ceiling (glitch rejection). When *min_pct* is given the
+    epoch must ALSO be at/above that percentile of the score — a selectivity cap
+    for a HEAVY-TAILED score (the ripple energy has a long tail, so MAD alone
+    flags far too many; the percentile isolates the prominent tail while the
+    noise-floor term still keeps a genuinely clean recording near-empty).
+    ``noise_k``/``min_pct`` None = that bound off. All-False when nothing stands out."""
     e = np.asarray(energy, dtype=np.float64)
     assert e.ndim == 1, "energy must be 1-D"
     assert k > 0, "k must be positive"
@@ -191,6 +193,8 @@ def flag_events(energy, *, k: float = 4.0,
         return np.zeros(e.shape[0], dtype=bool)
     med, mad = float(np.median(finite)), _mad(finite)
     mask = np.isfinite(e) & (e > med + k * mad)
+    if min_pct is not None:
+        mask &= e >= float(np.percentile(finite, float(min_pct)))
     if noise_k:
         mask &= e <= med + float(noise_k) * mad
     return mask
