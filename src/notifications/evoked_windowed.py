@@ -1,22 +1,20 @@
-"""Windowed, FULL-DENSITY evoked-response figure package.
+"""Windowed evoked-response figure package (decile SHAPES + trends).
 
-Extends the evoked package along two axes the operator asked for:
+1. MULTIPLE ANALYSIS WINDOWS (2-50, 2-100, 2-500 ms). The window is not a display
+   crop -- every feature is RE-MEASURED over each window (line-length, RMS, peak, HF
+   band power, ...), so a response's decile changes per window. Recomputed in-memory
+   from the raw traces (one read/file, reused across windows); nothing is filtered.
 
-1. MULTIPLE ANALYSIS WINDOWS (2-50, 2-100, 2-500, 2-1000 ms). The window is not a
-   display crop -- every feature is RE-MEASURED over each window (line-length, RMS,
-   peak, ... computed on that segment), so a response's decile changes per window.
-   Features are recomputed in-memory from the raw traces (one trace read per file,
-   reused across all windows); nothing is filtered or decimated.
+2. Per feature, per window: NORMALIZED metric-vs-stim over-time trends (robust z,
+   6 h circadian median, per response); a CIRCADIAN mean±SD response figure (4 bins/
+   day); and the decile "kinds" as clean SHAPE views -- a stacked ridgeline (mean±SD),
+   a peak-normalized overlay, and a per-decile mean±SD grid. No full-density overlay
+   (it was too busy and slow to render) -- every figure shows a mean WITH its spread.
 
-2. FULL-DENSITY grids. The per-decile grid draws EVERY trace, not a 30-sample, via
-   the streaming rasterizer in ``trace_density`` (fixed memory, individual lines,
-   lone outliers still visible above the smear).
-
-Memory/I-O shape: ONE values pass reads+recomputes every file once (the costly
-step) and fans each response's windowed feature values to its day + the week; then
-a per-period trace pass re-reads that period's traces (no recompute) to accumulate
-Welford mean/sd + a per-band density buffer, renders, and frees the buffers -- so
-peak memory is one period's buffers, independent of the trace count.
+Memory/I-O shape: ONE values pass reads+recomputes every file once and fans each
+response's windowed values to its day + the week; then a per-period trace pass
+re-reads that period's traces (no recompute) to accumulate Welford mean/SD per
+decile, renders, and frees -- peak memory independent of the trace count.
 
 CLI: ``python -m src.notifications.evoked_windowed --animal BCH111 --date 2026-09-20``
 """
@@ -37,7 +35,7 @@ import numpy as np                         # noqa: E402
 
 from src.notifications import evoked_digest as _ed       # noqa: E402
 from src.notifications import evoked_package as _pkg      # noqa: E402
-from src.notifications.trace_density import LineDensity, robust_ylim  # noqa: E402
+from src.notifications.trace_density import robust_ylim  # noqa: E402
 from src.evoked_figures import data as _d                # noqa: E402
 from src.periictal import passive as _passive            # noqa: E402
 from src.utils import evoked_features as _ef              # noqa: E402
@@ -47,9 +45,6 @@ from src.utils.evoked_output import read_feature_sidecar, read_file_evoked  # no
 # crop always keeps >=2 samples -- no silent full-trace fallback. Wide windows are
 # simply capped by the file's data extent (~+/-200 or +/-500 ms).
 WINDOWS_MS = [(2.0, 50.0), (2.0, 100.0), (2.0, 500.0)]
-
-_FD_W, _FD_H = 620, 360             # density raster (pixels); memory ~ W*H per band
-_A0 = 0.30                          # per-trace opacity the density reproduces
 
 # High-frequency band-power features (Σ PSD of the cropped window per response).
 # Added as FULL features (trends + decile grids) alongside the curated set.
@@ -203,10 +198,11 @@ def windowed_values(files, animal, channel, features, windows, week_key,
                             float(arr[j]) if arr is not None
                             and np.isfinite(arr[j]) else np.nan)
             extent[wt].append(_win_amp_extent(avg, time_ms, cfg))
+    def _pack(bins):
+        return [{"mean": rm.mean(), "sd": rm.sd()} for rm in bins]
     circ = {"time_ms": circ_time[0],
-            "cycles": {c: [rm.mean() for rm in bins]
-                       for c, bins in sorted(circ_cycles.items())},
-            "week": [rm.mean() for rm in circ_week]}
+            "cycles": {c: _pack(bins) for c, bins in sorted(circ_cycles.items())},
+            "week": _pack(circ_week)}
     return (_finalize_values(secs, vals, features), _finalize_ylim(extent),
             _finalize_stim(stim_secs, stim_p2p), circ)
 
@@ -263,26 +259,15 @@ def _finalize_ylim(extent) -> dict:
 
 
 # --------------------------------------------------------------------- #
-#  per-period render pass: Welford mean/sd + full-density per band
+#  per-period render pass: Welford mean/SD per decile (no full-density)
 # --------------------------------------------------------------------- #
-class _Accum:
-    """DAY strategy: per (window, feature) Welford mean/sd (all traces) + a
-    ``LineDensity`` per band (all traces, streamed -> full-density overlay)."""
-
-    def __init__(self, n_bands, xlim, ylim):
-        self.mean = _ed._BandAccum(n_bands)
-        self.dens = [LineDensity(xlim, ylim, _FD_W, _FD_H) for _ in range(n_bands)]
-
-    def add(self, band, trace, time_ms, tdec_x, tdec_y):
-        self.mean.add(band, trace, time_ms)
-        self.dens[band].add(tdec_x, tdec_y)
-
-
 class _RunMean:
-    """Streaming mean of a fixed-length vector (one day's mean trace in a band)."""
+    """Streaming mean + SD of a fixed-length vector (one bin's mean trace + spread).
+    We never plot a mean without its spread, so sum-of-squares is tracked too."""
 
     def __init__(self):
         self.sum = None
+        self.sumsq = None
         self.n = 0
 
     def add(self, v):
@@ -291,53 +276,31 @@ class _RunMean:
             return
         if self.sum is None:
             self.sum = np.zeros(v.size)
+            self.sumsq = np.zeros(v.size)
         if v.size != self.sum.size:
             return
         self.sum += v
+        self.sumsq += v * v
         self.n += 1
 
     def mean(self):
         return self.sum / self.n if self.n else None
 
-
-class _WeekAccum:
-    """WEEK strategy (NOT an all-trace overlay): per band, the MEAN trace of each
-    DAY -- so the week grid shows day-to-day drift within each decile -- plus the
-    week Welford mean/sd for the bands_sd figure."""
-
-    def __init__(self, n_bands):
-        self.mean = _ed._BandAccum(n_bands)
-        self.days = [defaultdict(_RunMean) for _ in range(n_bands)]
-
-    def add(self, band, day, trace, time_ms):
-        self.mean.add(band, trace, time_ms)
-        if day is not None:
-            self.days[band][day].add(trace)
-
-
-def _blank_baseline(trace, time_ms):
-    """Baseline-correct (mean over -50..-5 ms) and NaN the |t|<=1.5 ms artifact --
-    the same convention as the sampled overlays, so density and mean align."""
-    t = np.asarray(time_ms, dtype=float)
-    y = np.asarray(trace, dtype=float).copy()
-    base = (t >= -50) & (t <= -5)
-    if base.any():
-        y = y - np.nanmean(y[base])
-    y[np.abs(t) <= 1.5] = np.nan
-    return y
+    def sd(self):
+        if not self.n:
+            return None
+        m = self.sum / self.n
+        return np.sqrt(np.maximum(self.sumsq / self.n - m * m, 0.0))
 
 
 def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                    labels, pkg, is_week=False, progress=None) -> list:
-    """One trace pass over *period*'s files for ALL windows. DAY periods accumulate
-    a full-density overlay per band; the WEEK accumulates a per-day MEAN per band
-    (a different strategy). Render, free. Returns figure records."""
-    accs: dict = {}
-    for wt, w in wtags_windows:
-        for feat, info in info_pw[wt].items():
-            nb = info["n_bands"] + 1
-            accs[(wt, feat)] = (_WeekAccum(nb) if is_week
-                                else _Accum(nb, (w[0], w[1]), ylim[wt]))
+    """One trace pass over *period*'s files for ALL windows: per (window, feature)
+    accumulate a Welford MEAN + SD per decile (no full-density -- dropped), then
+    render the clean shape views (ridgeline, peak-normalized, per-decile mean±SD
+    grid), each showing spread. Render, free. Returns figure records."""
+    accs: dict = {(wt, feat): _ed._BandAccum(info["n_bands"] + 1)
+                  for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
     maps = {(wt, feat): info["band_of_ts"]
             for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
     for fp in files:
@@ -365,53 +328,35 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                 continue
             trace = traces[order[k]]
             key = _ed._ts_key(r)
-            dt = _d.parse_iso(r.get("abs_dt")) if r.get("abs_dt") else None
-            day = dt.date().isoformat() if dt else None
-            y = None if is_week else _blank_baseline(trace, time_ms)
             for (wt, feat), m in maps.items():
                 b = m.get(key, -1)
-                if b < 0:
-                    continue
-                if is_week:
-                    accs[(wt, feat)].add(b, day, trace, time_ms)
-                else:
-                    accs[(wt, feat)].add(b, trace, time_ms, time_ms, y)
+                if b >= 0:
+                    accs[(wt, feat)].add(b, trace, time_ms)
     # render
     figs = []
     for wt, w in wtags_windows:
         for feat, info in info_pw[wt].items():
-            acc = accs[(wt, feat)]
-            band_wf = acc.mean.result()
+            band_wf = accs[(wt, feat)].result()
             if not band_wf:
                 continue
             fdir = os.path.join(pkg, wt, _pkg._safe(period), feat)
             os.makedirs(fdir, exist_ok=True)
-            tm = acc.mean.time_ms
+            tm = accs[(wt, feat)].time_ms
             meta = {"animal": animal, "channel": channel,
                     "date": labels.get(period, period), "window": wt}
             if progress:
                 progress(f"{wt} · {period} · {feat}")
-            _pkg._fig_bands_sd(feat, meta, info, band_wf, tm,
-                               os.path.join(fdir, "bands_sd.png"))
-            if is_week:
-                grid = "deciles_grid_daymeans.png"
-                _fig_grid_week(feat, meta, info, acc, band_wf, tm, (w[0], w[1]),
-                               ylim[wt], os.path.join(fdir, grid))
-            else:
-                grid = "deciles_grid_fulldensity.png"
-                _fig_grid_fd(feat, meta, info, band_wf, acc.dens, tm,
-                             os.path.join(fdir, grid))
-            # Clean "shapes" views (the email headline): the decile MEANS stacked
-            # (ridgeline) and peak-normalized (shape without amplitude). The busy
-            # full-density grid stays on disk for the browsable folder.
             _fig_ridgeline(feat, meta, info, band_wf, tm, (w[0], w[1]),
                            os.path.join(fdir, "deciles_ridgeline.png"))
             _fig_normalized(feat, meta, info, band_wf, tm, (w[0], w[1]),
                             os.path.join(fdir, "deciles_normalized.png"))
+            _fig_decile_grid(feat, meta, info, band_wf, tm, (w[0], w[1]),
+                             ylim[wt], os.path.join(fdir, "deciles_grid.png"))
             figs.append({"period": period, "window": wt, "feature": feat,
                          "dir": os.path.relpath(fdir, pkg).replace("\\", "/"),
-                         "grid": grid, "ridgeline": "deciles_ridgeline.png",
+                         "ridgeline": "deciles_ridgeline.png",
                          "normalized": "deciles_normalized.png",
+                         "grid": "deciles_grid.png",
                          "n_zero": info.get("n_zero", 0)})
     return figs
 
@@ -420,8 +365,8 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
 #  clean "shapes" figures: stacked decile means (ridgeline) + normalized
 # --------------------------------------------------------------------- #
 def _decile_means(band_wf, info, tm, xlim):
-    """List of (b, baseline-corrected+blanked mean over [xlim]) for each populated
-    decile (0..n_bands-1). Window-cropped to xlim."""
+    """List of (b, mean, sd) per populated decile — mean baseline-corrected+blanked,
+    sd artifact-blanked (we never plot a mean without its spread). Cropped to xlim."""
     n_bands = info["n_bands"]
     art = np.abs(tm) <= 1.5
     xm = (tm >= xlim[0]) & (tm <= xlim[1])
@@ -432,7 +377,11 @@ def _decile_means(band_wf, info, tm, xlim):
             continue
         y = _ed._baseline(np.asarray(wf["mean"], dtype=float), tm).copy()
         y[art] = np.nan
-        out.append((b, y))
+        sd = None
+        if wf.get("sd") is not None:
+            sd = np.asarray(wf["sd"], dtype=float).copy()
+            sd[art] = np.nan
+        out.append((b, y, sd))
     return out, xm
 
 
@@ -445,31 +394,39 @@ def _fig_ridgeline(feat, meta, info, band_wf, tm, xlim, out) -> str:
     means, xm = _decile_means(band_wf, info, tm, xlim)
     if not means:
         return _pkg._finish(plt.figure(facecolor=_ed._BG), out)
-    allv = np.concatenate([m[xm][np.isfinite(m[xm])] for _b, m in means])
+    allv = np.concatenate([m[xm][np.isfinite(m[xm])] for _b, m, _sd in means])
     span = (np.percentile(allv, 99) - np.percentile(allv, 1)) if allv.size else 1.0
-    step = 0.6 * span if span > 0 else 1.0
-    fig, ax = plt.subplots(figsize=(9.0, 7.0), facecolor=_ed._BG)
+    step = 0.7 * span if span > 0 else 1.0
+    fig, ax = plt.subplots(figsize=(9.0, 7.5), facecolor=_ed._BG)
     ax.set_facecolor(_ed._PANEL)
     yticks, ylabels = [], []
-    for b, m in means:
+
+    def _row(b, m, sd, color, label):
         off = b * step
-        ax.plot(tm[xm], m[xm] + off, color=colors[b], lw=1.5)
+        if sd is not None:                        # ±1 SD ribbon (never mean-alone)
+            ax.fill_between(tm[xm], m[xm] + off - sd[xm], m[xm] + off + sd[xm],
+                            color=color, alpha=0.16, linewidth=0)
+        ax.plot(tm[xm], m[xm] + off, color=color, lw=1.5)
         yticks.append(off)
-        ylabels.append(_ed._band_label(b, edges, n_bands))
-    if band_wf.get(n_bands):                      # zero/pile band on top, red
+        ylabels.append(label)
+
+    for b, m, sd in means:
+        _row(b, m, sd, colors[b], _ed._band_label(b, edges, n_bands))
+    if band_wf.get(n_bands):                       # zero/pile band on top, red
         y = _ed._baseline(np.asarray(band_wf[n_bands]["mean"], float), tm).copy()
         y[np.abs(tm) <= 1.5] = np.nan
-        off = n_bands * step
-        ax.plot(tm[xm], y[xm] + off, color=_ed._ZCOLOR, lw=1.5)
-        yticks.append(off)
-        ylabels.append("zeros")
+        zsd = None
+        if band_wf[n_bands].get("sd") is not None:
+            zsd = np.asarray(band_wf[n_bands]["sd"], float).copy()
+            zsd[np.abs(tm) <= 1.5] = np.nan
+        _row(n_bands, y, zsd, _ed._ZCOLOR, "zeros")
     ax.set_yticks(yticks)
     ax.set_yticklabels(ylabels, fontsize=7)
     ax.tick_params(colors=_ed._MUTED, labelsize=8)
     ax.set_xlim(xlim)
     ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
     ax.set_title(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · decile MEAN shapes, stacked (low→high)",
+                 f"{_pretty(feat)} · decile MEAN ± 1 SD, stacked (low→high)",
                  color=_ed._TEXT, fontsize=11, loc="left")
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
@@ -484,16 +441,21 @@ def _fig_normalized(feat, meta, info, band_wf, tm, xlim, out) -> str:
         return _pkg._finish(plt.figure(facecolor=_ed._BG), out)
     fig, ax = plt.subplots(figsize=(9.0, 5.0), facecolor=_ed._BG)
     ax.set_facecolor(_ed._PANEL)
-    for b, m in means:
+    for b, m, sd in means:
         pk = np.nanmax(np.abs(m[xm]))
-        yn = m / pk if pk and np.isfinite(pk) else m
+        pk = pk if (pk and np.isfinite(pk)) else 1.0
+        yn = m / pk
+        if sd is not None:                        # faint ±1 SD (never mean-alone)
+            sn = sd / pk
+            ax.fill_between(tm[xm], (yn - sn)[xm], (yn + sn)[xm], color=colors[b],
+                            alpha=0.06, linewidth=0)
         ax.plot(tm[xm], yn[xm], color=colors[b], lw=1.2, alpha=0.9,
                 label=f"D{b + 1}")
     ax.axhline(0, color=_ed._MUTED, lw=0.5, alpha=0.4)
     ax.set_xlim(xlim)
     ax.tick_params(colors=_ed._MUTED, labelsize=8)
     ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
-    ax.set_ylabel("peak-normalized", color=_ed._TEXT, fontsize=10)
+    ax.set_ylabel("peak-normalized (±SD faint)", color=_ed._TEXT, fontsize=10)
     leg = ax.legend(fontsize=7, ncol=2, frameon=False, labelspacing=0.3,
                     loc="lower right")
     for t in leg.get_texts():
@@ -504,96 +466,42 @@ def _fig_normalized(feat, meta, info, band_wf, tm, xlim, out) -> str:
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
 
-# --------------------------------------------------------------------- #
-#  full-density grid figure
-# --------------------------------------------------------------------- #
-def _fd_panel(ax, dens: LineDensity, band_wf, b, tm, color, title, ylim) -> None:
-    ax.set_facecolor(_ed._PANEL)
-    d = dens.dens[b] if hasattr(dens, "dens") else dens
-    n = d.n
-    ax.imshow(d.rgba(color, a0=_A0), extent=d.extent(), origin="upper",
-              aspect="auto", interpolation="nearest", zorder=1)
-    wf = band_wf.get(b)
-    if wf:
-        mean = _ed._baseline(wf["mean"], tm)
-        mp = mean.copy(); mp[np.abs(tm) <= 1.5] = np.nan
-        ax.plot(tm, mp, color="#f0f0f5", lw=1.6, zorder=3)
-    ax.set_xlim(d.x0, d.x1)
-    ax.set_ylim(ylim)
-    ax.set_title(f"{title}  (n={n})", color=_ed._TEXT, fontsize=9, loc="left")
-
-
-def _fig_grid_week(feat, meta, info, wacc, band_wf, tm, xlim, ylim, out) -> str:
-    """WEEK grid (a different strategy than the all-trace overlay): per decile, the
-    MEAN trace of each DAY (turbo ramp early->late) + the week mean in white -- so
-    day-to-day drift within each band reads at a glance."""
+def _fig_decile_grid(feat, meta, info, band_wf, tm, xlim, ylim, out) -> str:
+    """One panel per decile: that decile's MEAN ± 1 SD response — the spread of the
+    responses inside the decile (n in the thousands, so SD not SEM). Colored
+    low→high, n annotated. Replaces the busy full-density overlay."""
     n_bands, edges = info["n_bands"], info["edges"]
-    days = sorted({d for b in range(n_bands) for d in wacc.days[b]})
-    cmap = plt.cm.turbo(np.linspace(0.10, 0.92, max(1, len(days))))
-    dcol = {d: cmap[i] for i, d in enumerate(days)}
+    colors = plt.cm.turbo(np.linspace(0.12, 0.92, n_bands))
     art = np.abs(tm) <= 1.5
+    xm = (tm >= xlim[0]) & (tm <= xlim[1])
     ncol = 5
     nrow = int(np.ceil(n_bands / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(4.0 * ncol, 3.0 * nrow),
                              facecolor=_ed._BG, squeeze=False)
-    seen: dict = {}
     for b in range(n_bands):
         ax = axes[b // ncol][b % ncol]
         ax.set_facecolor(_ed._PANEL)
-        for d in days:
-            rm = wacc.days[b].get(d)
-            if not rm or rm.n < 3:
-                continue
-            m = _ed._baseline(rm.mean(), tm).copy()
-            m[art] = np.nan
-            seen[d], = ax.plot(tm, m, color=dcol[d], lw=1.0, alpha=0.9)
         wf = band_wf.get(b)
         if wf:
-            wm = _ed._baseline(wf["mean"], tm).copy()
-            wm[art] = np.nan
-            seen["week"], = ax.plot(tm, wm, color="#f0f0f5", lw=2.2, zorder=5)
+            m = _ed._baseline(np.asarray(wf["mean"], dtype=float), tm).copy()
+            m[art] = np.nan
+            if wf.get("sd") is not None:
+                sd = np.asarray(wf["sd"], dtype=float).copy()
+                sd[art] = np.nan
+                ax.fill_between(tm[xm], (m - sd)[xm], (m + sd)[xm],
+                                color=colors[b], alpha=0.22, linewidth=0)
+            ax.plot(tm[xm], m[xm], color=colors[b], lw=1.6)
+            ax.set_title(f"{_ed._band_label(b, edges, n_bands)}  (n={wf.get('n', 0)})",
+                         color=_ed._TEXT, fontsize=9, loc="left")
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        ax.set_title(_ed._band_label(b, edges, n_bands), color=_ed._TEXT,
-                     fontsize=9, loc="left")
+        ax.tick_params(colors=_ed._MUTED, labelsize=7)
     for jj in range(n_bands, nrow * ncol):
         axes[jj // ncol][jj % ncol].axis("off")
-    order = [d for d in days if d in seen] + (["week"] if "week" in seen else [])
-    if order:
-        leg = fig.legend([seen[k] for k in order],
-                         [("week" if k == "week" else k[5:]) for k in order],
-                         loc="upper right", ncol=min(8, len(order)), fontsize=8,
-                         frameon=False)
-        for txt in leg.get_texts():
-            txt.set_color(_ed._TEXT)
     fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · per-decile DAILY MEANS across the week",
+                 f"{_pretty(feat)} · per-decile MEAN ± 1 SD",
                  color=_ed._TEXT, fontsize=12)
-    return _pkg._finish(fig, out, feat)
-
-
-def _fig_grid_fd(feat, meta, info, band_wf, dens_list, tm, out) -> str:
-    n_bands, edges = info["n_bands"], info["edges"]
-    ylim = (dens_list[0].y0, dens_list[0].y1)
-    # bright decile ramp (turbo, clipped off the near-black ends) -> reads on dark.
-    colors = plt.cm.turbo(np.linspace(0.12, 0.92, n_bands))[:, :3]
-    ncol = 5
-    nrow = int(np.ceil(n_bands / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.0 * ncol, 3.0 * nrow),
-                             facecolor=_ed._BG, squeeze=False)
-    for b in range(n_bands):
-        ax = axes[b // ncol][b % ncol]
-        _fd_panel(ax, dens_list[b], band_wf, b, tm, tuple(colors[b]),
-                  _ed._band_label(b, edges, n_bands), ylim)
-    if band_wf.get(n_bands):                    # the zero/pile band, if any
-        pass
-    for jj in range(n_bands, nrow * ncol):
-        axes[jj // ncol][jj % ncol].axis("off")
-    fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · per-decile FULL-DENSITY (every trace) "
-                 f"+ mean", color=_ed._TEXT, fontsize=12)
-    return _pkg._finish(fig, out, feat)
-
+    return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
 # --------------------------------------------------------------------- #
 #  package assembly
@@ -623,59 +531,84 @@ def _bin_circadian(secs, vals):
     return np.array(xs), np.array(md), np.array(lo), np.array(hi)
 
 
+def _robust_z(v):
+    """Robust z (median-centered, MAD-scaled) so a tiny-but-consistent drift is
+    visible on the SAME scale as the metric. Falls back to std, then to zeros for a
+    truly constant series."""
+    v = np.asarray(v, dtype=float)
+    fin = np.isfinite(v)
+    out = np.full(v.shape, np.nan)
+    if fin.sum() < 2:
+        return out
+    med = np.median(v[fin])
+    scale = 1.4826 * np.median(np.abs(v[fin] - med))
+    if scale <= 0:
+        scale = np.std(v[fin])
+    if scale <= 0:
+        out[fin] = 0.0
+        return out
+    out[fin] = (v[fin] - med) / scale
+    return out
+
+
 def _fig_metric_trends(feat, per_win, stim, meta, out) -> str:
-    """Track a feature OVER TIME at circadian (6 h) resolution: per window, the
-    per-bin median + IQR (4 points/day, light raw points behind), with the stimulus
-    peak-to-peak amplitude overlaid on a 2nd y-axis to check whether the metric's
-    swings track the stimulus. Built from the windowed values -- no trace reads."""
+    """Track a feature OVER TIME vs the STIMULUS, both NORMALIZED (robust z) onto one
+    axis so their trends are comparable regardless of absolute scale — the raw stim
+    P2P barely moves, but its z-trend reveals any real drift. Per window: each series
+    shows its per-response points (light) + the 6 h circadian median line."""
     import matplotlib.dates as mdates
     nwin = max(1, len(per_win))
-    fig, axes = plt.subplots(1, nwin, figsize=(5.6 * nwin, 4.2),
+    fig, axes = plt.subplots(1, nwin, figsize=(5.8 * nwin, 4.3),
                              facecolor=_ed._BG, squeeze=False)
-    stim_binned = _bin_circadian(stim["secs"], stim["p2p"]) if stim else None
+    have_stim = stim is not None and len(np.asarray(stim.get("secs", []))) > 1
     for i, (wt, secs, vals) in enumerate(per_win):
         ax = axes[0][i]
         ax.set_facecolor(_ed._PANEL)
         s = np.asarray(secs, dtype=float)
-        v = np.asarray(vals, dtype=float)
-        fin = np.isfinite(s) & np.isfinite(v)
+        vz = _robust_z(vals)
+        fin = np.isfinite(s) & np.isfinite(vz)
         if fin.sum() == 0:
             ax.set_title(f"{wt} — no data", color=_ed._MUTED, fontsize=10)
             continue
-        dts = np.array([datetime.fromtimestamp(x) for x in s[fin]])
-        ax.scatter(dts, v[fin], s=3, c="#6a8cff", alpha=0.08, linewidths=0)
-        b = _bin_circadian(s, v)
-        if b is not None:
-            xs, md, lo, hi = b
-            ax.fill_between(xs, lo, hi, color="#6a8cff", alpha=0.22, linewidth=0,
-                            label="IQR (p25–p75)")
-            ax.plot(xs, md, color="#f0f0f5", lw=1.6, marker="o", ms=4,
-                    label="6 h median")
+        mdts = np.array([datetime.fromtimestamp(x) for x in s[fin]])
+        ax.scatter(mdts, vz[fin], s=3, c="#6a8cff", alpha=0.06, linewidths=0)
+        bm = _bin_circadian(s, vz)
+        if bm is not None:
+            ax.plot(bm[0], bm[1], color="#c7d0ff", lw=1.8, marker="o", ms=4,
+                    label=f"{_pretty(feat)} (z)", zorder=4)
+        if have_stim:                              # stim P2P, same z-scale, per-response
+            ss = np.asarray(stim["secs"], dtype=float)
+            sz = _robust_z(stim["p2p"])
+            sfin = np.isfinite(ss) & np.isfinite(sz)
+            sdts = np.array([datetime.fromtimestamp(x) for x in ss[sfin]])
+            ax.scatter(sdts, sz[sfin], s=3, c="#e08a3c", alpha=0.05, linewidths=0)
+            bs = _bin_circadian(ss, sz)
+            if bs is not None:
+                ax.plot(bs[0], bs[1], color="#e08a3c", lw=1.8, marker="s", ms=3,
+                        label="stim P2P (z)", zorder=5)
+        ax.axhline(0, color=_ed._MUTED, lw=0.5, alpha=0.3)
+        # clip the y-view to the bulk so heavy-tailed outliers don't compress the
+        # trend lines (the median lines are the point); outliers run off-screen.
+        pooled = vz[fin]
+        if have_stim:
+            pooled = np.concatenate([pooled, sz[sfin]])
+        if pooled.size:
+            lo_y, hi_y = np.nanpercentile(pooled, [1, 99])
+            pad = 0.4 * (hi_y - lo_y) + 0.5
+            ax.set_ylim(lo_y - pad, hi_y + pad)
         ax.set_title(wt, color=_ed._TEXT, fontsize=10, loc="left")
+        ax.set_ylabel("robust z (per window)", color="#aaa", fontsize=9)
         ax.tick_params(colors=_ed._MUTED, labelsize=8)
-        ax.set_ylabel(_pretty(feat), color="#c7d0ff", fontsize=9)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         for lab in ax.get_xticklabels():
             lab.set_rotation(35)
             lab.set_ha("right")
-        # stimulus P2P on a 2nd axis (window-independent, same on every panel)
-        if stim_binned is not None:
-            sx, smd, _slo, _shi = stim_binned
-            ax2 = ax.twinx()
-            ax2.plot(sx, smd, color="#e08a3c", lw=1.4, marker="s", ms=3,
-                     alpha=0.9, label="stim P2P")
-            ax2.set_ylabel("stim P2P (raw)", color="#e08a3c", fontsize=9)
-            ax2.tick_params(axis="y", colors="#e08a3c", labelsize=8)
         if i == 0:
-            h1, l1 = ax.get_legend_handles_labels()
-            h2, l2 = (ax2.get_legend_handles_labels()
-                      if stim_binned is not None else ([], []))
-            leg = ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False,
-                            loc="upper left")
+            leg = ax.legend(fontsize=8, frameon=False, loc="upper left")
             for t in leg.get_texts():
                 t.set_color(_ed._TEXT)
-    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} · "
-                 f"OVER TIME (6 h circadian median ± IQR) · stim P2P overlaid",
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} vs stim "
+                 f"P2P · OVER TIME, NORMALIZED (robust z; 6 h median lines)",
                  color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
@@ -702,11 +635,16 @@ def _fig_circadian_means(circ, meta, out) -> str:
         ax = axes[idx // ncol][idx % ncol]
         ax.set_facecolor(_ed._PANEL)
         for b in range(4):
-            m = bins[b] if bins else None
-            if m is None:
+            rec = bins[b] if bins else None
+            if not rec or rec.get("mean") is None:
                 continue
-            y = _ed._baseline(np.asarray(m, dtype=float), tm).copy()
+            y = _ed._baseline(np.asarray(rec["mean"], dtype=float), tm).copy()
             y[art] = np.nan
+            if rec.get("sd") is not None:            # ±1 SD (never mean-alone)
+                sd = np.asarray(rec["sd"], dtype=float).copy()
+                sd[art] = np.nan
+                ax.fill_between(tm[xm], (y - sd)[xm], (y + sd)[xm],
+                                color=_CIRC_COLORS[b], alpha=0.12, linewidth=0)
             ax.plot(tm[xm], y[xm], color=_CIRC_COLORS[b], lw=1.3,
                     label=_CIRC_LABELS[b] if idx == 0 else None)
         ax.set_title(label, color=_ed._TEXT, fontsize=9, loc="left")
@@ -730,11 +668,12 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                            features=None, windows=None, n_bands=10,
                            channel_override=None, include_week=True, n_days=7,
                            progress=None) -> dict:
-    """Windowed + full-density package ending *end_day*. Renders each of the last
-    *n_days* days as a full-density (all-trace) grid, and (when *include_week*) the
-    week as a per-day-means grid. ``n_days=1, include_week=False`` -> a single-day
-    package (the daily email); the defaults -> the weekly package. Returns a
-    manifest dict (also written as manifest.json + index.html)."""
+    """Windowed decile-shapes package ending *end_day*. Renders, per (period,
+    window, feature): the ridgeline (mean±SD), peak-normalized overlay, and
+    per-decile mean±SD grid, plus the metric-vs-stim trends and circadian means.
+    ``n_days=2, include_week=False`` -> the daily package (last 2 days); the
+    defaults -> the weekly. Returns a manifest (also written as manifest.json +
+    index.html)."""
     features = [f for f in (features or (_pkg.PACKAGE_FEATURES + HF_NAMES))
                 if f in _ef.ALL_COLUMNS or f in HF_NAMES]
     windows = windows or WINDOWS_MS
@@ -858,7 +797,7 @@ def _write_index(pkg, manifest, labels) -> None:
              "a{color:#7aa2ff}.na{color:#555}img{display:block;width:230px;border:1px solid #2c2c40}"
              ".def{color:#9a9ab0;font-size:11px;max-width:34ch}</style>",
              f"<h1>{html.escape(manifest['animal'])} · {html.escape(manifest['channel'])}"
-             f" · windowed full-density · {html.escape(manifest['week'])}</h1>",
+             f" · windowed decile shapes · {html.escape(manifest['week'])}</h1>",
              "<p class='def'>Each feature is RE-MEASURED over each window (magnitudes "
              "&amp; deciles differ per window). Grids draw EVERY trace (full density); "
              "mean overlaid in white.</p>"]
@@ -895,14 +834,13 @@ def _write_index(pkg, manifest, labels) -> None:
                     row.append("<td class='na'>—</td>")
                     continue
                 d = f["dir"]
-                grid = f.get("grid", "deciles_grid_fulldensity.png")
+                grid = f.get("grid", "deciles_grid.png")
                 ridge = f.get("ridgeline", "deciles_ridgeline.png")
                 row.append(
                     f"<td><a href='{d}/{ridge}'>"
                     f"<img src='{d}/{ridge}'></a>"
                     f"<a href='{d}/deciles_normalized.png'>normalized</a> · "
-                    f"<a href='{d}/{grid}'>full-density</a> · "
-                    f"<a href='{d}/bands_sd.png'>mean±sd</a></td>")
+                    f"<a href='{d}/{grid}'>mean±SD grid</a></td>")
             parts.append("<tr>" + "".join(row) + "</tr>")
         parts.append("</table>")
     with open(os.path.join(pkg, "index.html"), "w", encoding="utf-8") as f:
@@ -954,15 +892,15 @@ def _stage_email(manifest, pkg, wins, staged):
     for f in manifest["figures"]:
         if f["period"] in periods and f["window"] in wins:
             fig_by.setdefault(f["period"], {}).setdefault(f["window"], []).append(f)
-    # Section ③ shows the CLEAN shapes: the stacked-means ridgeline + the
-    # peak-normalized overlay (the busy full-density grid stays folder-only).
+    # Section ③ shows the CLEAN shapes with spread: the stacked ridgeline (mean±SD),
+    # the peak-normalized overlay, and the per-decile mean±SD grid.
     sections = []
     for period in periods:
         by_win: dict = {}
         for wt in wins:
             for f in fig_by.get(period, {}).get(wt, []):
                 cids = {}
-                for kind in ("ridgeline", "normalized"):
+                for kind in ("ridgeline", "normalized", "grid"):
                     src = os.path.join(pkg, f["dir"], f.get(kind, ""))
                     if not f.get(kind) or not os.path.isfile(src):
                         continue
@@ -1018,7 +956,7 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
             f"<img src='cid:{circ_cid}' style='max-width:1100px;width:100%'>")
     parts.append(
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"③ Decile mean SHAPES — stacked (low→high) + peak-normalized</h3>"
+        f"③ Decile SHAPES — ridgeline (mean±SD) + peak-normalized + per-decile mean±SD grid</h3>"
         f"<p style='{S};font-size:12px;color:#666'>The 10 decile mean waveforms, "
         f"stacked so each shape is legible, and peak-normalized so shape reads "
         f"apart from amplitude. (Full-density all-trace grids are in the folder.)</p>")
@@ -1034,6 +972,9 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
                     f"<img src='cid:{cids[k]}' style='max-width:560px;width:49%;"
                     f"display:inline-block;vertical-align:top'>"
                     for k in ("ridgeline", "normalized") if k in cids)
+                if "grid" in cids:                 # per-decile mean±SD, full width
+                    imgs += (f"<img src='cid:{cids['grid']}' "
+                             f"style='max-width:1100px;width:100%'>")
                 parts.append(
                     f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
                     f"color:#333'>{html.escape(_pretty(feat))}</div>{imgs}</div>")
@@ -1102,7 +1043,7 @@ def _main(argv=None) -> int:
     ap.add_argument("--windows", default=None,
                     help="comma list like 2-50,2-100 (ms); default: the four")
     ap.add_argument("--cadence", choices=["daily", "weekly"], default="weekly",
-                    help="daily = single-day full-density; weekly = week day-means")
+                    help="daily = last 2 days; weekly = the 7-day week")
     ap.add_argument("--send", action="store_true",
                     help="also email the primary-period grids (else build only)")
     a = ap.parse_args(argv)

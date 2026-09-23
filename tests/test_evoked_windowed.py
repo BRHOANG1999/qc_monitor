@@ -136,3 +136,24 @@ def test_hf_names_pass_filter_and_have_labels():
         assert nm not in _ef.ALL_COLUMNS                       # not a real column
         assert (nm in _ef.ALL_COLUMNS) or (nm in ew.HF_NAMES)  # allowlisted
         assert "HF" in ew._doc(nm) and "Hz" in ew._pretty(nm)
+
+
+def test_robust_z_reveals_tiny_drift_and_flat_is_zero():
+    # a tiny-amplitude linear drift -> robust z spans a clearly visible range
+    v = 1e-8 * np.arange(200) + 0.89
+    z = ew._robust_z(v)
+    assert np.isfinite(z).all()
+    assert z.max() - z.min() > 2.0                 # tiny abs drift, visible in z
+    # a perfectly constant series -> zeros (no spurious amplification)
+    assert np.allclose(ew._robust_z(np.full(50, 3.0)), 0.0)
+    assert np.isnan(ew._robust_z([1.0])).all()     # <2 points
+
+
+def test_runmean_tracks_sd():
+    rm = ew._RunMean()
+    for row in ([0.0, 0.0], [2.0, 4.0], [4.0, 8.0]):
+        rm.add(np.array(row))
+    np.testing.assert_allclose(rm.mean(), [2.0, 4.0])
+    # population sd of [0,2,4]=1.632..., of [0,4,8]=3.265...
+    np.testing.assert_allclose(rm.sd(), [1.6329931, 3.2659863], rtol=1e-5)
+    assert ew._RunMean().sd() is None
