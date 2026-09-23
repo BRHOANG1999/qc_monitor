@@ -11,6 +11,7 @@ the memory-safe ``LineDensity`` rasterizer. ``savefig`` bakes the dark backgroun
 from __future__ import annotations
 
 import logging
+import os
 
 import matplotlib
 
@@ -60,9 +61,22 @@ def _legend(ax, **kw) -> None:
 
 
 def _finish(fig, out_png: str) -> str:
+    """Save + close. Writes to a PID-unique temp then atomically replaces the
+    target, so a target locked by a viewer / AV / stale handle warns-and-skips
+    instead of crashing a long run (a partial PNG is never left behind)."""
     fig.tight_layout()
-    fig.savefig(out_png, dpi=140, facecolor=_BG)
-    plt.close(fig)
+    tmp = f"{out_png}.{os.getpid()}.tmp.png"       # keep .png so format infers
+    try:
+        fig.savefig(tmp, dpi=140, facecolor=_BG, format="png")
+        os.replace(tmp, out_png)
+    except OSError as e:                          # locked target / transient FS
+        logger.warning("could not write %s: %s", out_png, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    finally:
+        plt.close(fig)
     return out_png
 
 
