@@ -100,9 +100,12 @@ def autopick(store, recs: list, animal: str, *, scan_files: int = 20,
 
 def build(store, animal: str, *, out_dir: str, mode: str = "both",
           recording: str | None = None, band=None, scan_files: int = 40,
+          flag_pct: float = 95.0, thresh: float = 0.7,
           progress=None) -> dict:
     """Render the requested prong(s) for *animal*. *recording* forces a specific
-    evoked path (skips auto-pick). Returns a summary dict."""
+    evoked path (skips auto-pick). *flag_pct* = Prong-A event selectivity (higher
+    = fewer, stronger ripple events); *thresh* = Prong-B matched-filter cutoff.
+    Returns a summary dict."""
     assert animal and out_dir, "animal and out_dir required"
     prog = progress or (lambda *_a: None)
     os.makedirs(out_dir, exist_ok=True)
@@ -114,9 +117,11 @@ def build(store, animal: str, *, out_dir: str, mode: str = "both",
                "git_sha": _git_sha(), "generated_at": None}
     res_a = None
     if mode in ("both", "residual"):
-        res_a = _run_prong_a(target, animal, out_dir, summary, prog)
+        res_a = _run_prong_a(target, animal, out_dir, summary, prog,
+                             flag_pct=flag_pct)
     if mode in ("both", "detect"):
-        _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog)
+        _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog,
+                     thresh=thresh)
     _write_manifest(out_dir, animal, summary)
     return summary
 
@@ -145,9 +150,10 @@ def _resolve_target(store, animal, recording, scan_files, prog) -> dict | None:
     return top
 
 
-def _run_prong_a(target, animal, out_dir, summary, prog) -> dict | None:
+def _run_prong_a(target, animal, out_dir, summary, prog, *,
+                 flag_pct: float = 95.0) -> dict | None:
     prog("Prong A: template subtraction + spectra...")
-    res = _res.analyze_recording(target["evoked_path"], animal)
+    res = _res.analyze_recording(target["evoked_path"], animal, flag_pct=flag_pct)
     if res is None:
         prog("  no usable channel; skipping Prong A")
         return None
@@ -177,7 +183,8 @@ def _run_prong_a(target, animal, out_dir, summary, prog) -> dict | None:
     return res
 
 
-def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog):
+def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
+                 thresh: float = 0.7):
     prog("Prong B: continuous detection + matched filter...")
     elec = split_animal_electrode(res_a["channel"])[1] if res_a else None
     use_band = _detect_band(band, res_a)
@@ -206,7 +213,7 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog):
          f"template={'stim-locked' if override is not None else 'continuous'}; "
          f"stim-blanked={blanked})...")
     det = _det.run_detector(signal, fs, band=use_band, template_override=override,
-                            exclude_times_sec=stim_times)
+                            exclude_times_sec=stim_times, thresh=thresh)
     prox = _validation(store, animal, target, det, fs)
     figs = [_r.fig_candidates(det, stem + "_candidates.png", animal=animal,
                               channel=ch),

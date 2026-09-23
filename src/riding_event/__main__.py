@@ -34,6 +34,11 @@ def _main(argv=None) -> int:
                     help="detection band (Hz); default = the Prong-A excess band")
     ap.add_argument("--scan-files", type=int, default=20,
                     help="how many newest recordings to probe when auto-picking")
+    ap.add_argument("--flag-pct", type=float, default=95.0,
+                    help="Prong-A event selectivity percentile (higher = fewer, "
+                         "stronger ripple events; default 95 = top 5%%)")
+    ap.add_argument("--thresh", type=float, default=0.7,
+                    help="Prong-B matched-filter correlation cutoff (default 0.7)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
 
@@ -45,7 +50,8 @@ def _main(argv=None) -> int:
                                        args.animal)
     summary = _run.build(store, args.animal, out_dir=out_dir, mode=args.mode,
                          recording=args.recording, band=args.band,
-                         scan_files=args.scan_files,
+                         scan_files=args.scan_files, flag_pct=args.flag_pct,
+                         thresh=args.thresh,
                          progress=lambda m: print("  ", m, flush=True))
     if summary.get("reason"):
         print(f"{args.animal}: {summary['reason']}")
