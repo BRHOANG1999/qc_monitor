@@ -551,16 +551,14 @@ def _robust_z(v):
     return out
 
 
-def _fig_metric_trends(feat, per_win, stim, meta, out) -> str:
-    """Track a feature OVER TIME vs the STIMULUS, both NORMALIZED (robust z) onto one
-    axis so their trends are comparable regardless of absolute scale — the raw stim
-    P2P barely moves, but its z-trend reveals any real drift. Per window: each series
-    shows its per-response points (light) + the 6 h circadian median line."""
+def _fig_metric_trends(feat, per_win, meta, out) -> str:
+    """Track a feature OVER TIME (robust-z, 6 h circadian median + per-response
+    scatter), per window. (Stimulus dependence is a separate feature-vs-stim figure
+    set, not overlaid here.)"""
     import matplotlib.dates as mdates
     nwin = max(1, len(per_win))
     fig, axes = plt.subplots(1, nwin, figsize=(5.8 * nwin, 4.3),
                              facecolor=_ed._BG, squeeze=False)
-    have_stim = stim is not None and len(np.asarray(stim.get("secs", []))) > 1
     for i, (wt, secs, vals) in enumerate(per_win):
         ax = axes[0][i]
         ax.set_facecolor(_ed._PANEL)
@@ -576,26 +574,12 @@ def _fig_metric_trends(feat, per_win, stim, meta, out) -> str:
         if bm is not None:
             ax.plot(bm[0], bm[1], color="#c7d0ff", lw=1.8, marker="o", ms=4,
                     label=f"{_pretty(feat)} (z)", zorder=4)
-        if have_stim:                              # stim P2P, same z-scale, per-response
-            ss = np.asarray(stim["secs"], dtype=float)
-            sz = _robust_z(stim["p2p"])
-            sfin = np.isfinite(ss) & np.isfinite(sz)
-            sdts = np.array([datetime.fromtimestamp(x) for x in ss[sfin]])
-            ax.scatter(sdts, sz[sfin], s=3, c="#e08a3c", alpha=0.05, linewidths=0)
-            bs = _bin_circadian(ss, sz)
-            if bs is not None:
-                ax.plot(bs[0], bs[1], color="#e08a3c", lw=1.8, marker="s", ms=3,
-                        label="stim P2P (z)", zorder=5)
         ax.axhline(0, color=_ed._MUTED, lw=0.5, alpha=0.3)
         # clip the y-view to the bulk so heavy-tailed outliers don't compress the
-        # trend lines (the median lines are the point); outliers run off-screen.
-        pooled = vz[fin]
-        if have_stim:
-            pooled = np.concatenate([pooled, sz[sfin]])
-        if pooled.size:
-            lo_y, hi_y = np.nanpercentile(pooled, [1, 99])
-            pad = 0.4 * (hi_y - lo_y) + 0.5
-            ax.set_ylim(lo_y - pad, hi_y + pad)
+        # trend line (the median line is the point); outliers run off-screen.
+        lo_y, hi_y = np.nanpercentile(vz[fin], [1, 99])
+        ax.set_ylim(lo_y - (0.4 * (hi_y - lo_y) + 0.5),
+                    hi_y + (0.4 * (hi_y - lo_y) + 0.5))
         ax.set_title(wt, color=_ed._TEXT, fontsize=10, loc="left")
         ax.set_ylabel("robust z (per window)", color="#aaa", fontsize=9)
         ax.tick_params(colors=_ed._MUTED, labelsize=8)
@@ -607,10 +591,138 @@ def _fig_metric_trends(feat, per_win, stim, meta, out) -> str:
             leg = ax.legend(fontsize=8, frameon=False, loc="upper left")
             for t in leg.get_texts():
                 t.set_color(_ed._TEXT)
-    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} vs stim "
-                 f"P2P · OVER TIME, NORMALIZED (robust z; 6 h median lines)",
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} · "
+                 f"OVER TIME (robust z; 6 h circadian median)",
                  color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
+
+
+# --------------------------------------------------------------------- #
+#  feature vs STIMULUS amplitude (dose-response) + correlation across metrics
+# --------------------------------------------------------------------- #
+def _align_stim(secs, stim):
+    """Stim P2P aligned to *secs* (same responses, matched by rounded timestamp)."""
+    if not stim:
+        return np.full(len(secs), np.nan)
+    m = {round(float(s), 3): float(p)
+         for s, p in zip(stim["secs"], stim["p2p"])}
+    return np.array([m.get(round(float(s), 3), np.nan) for s in secs])
+
+
+def _stim_span(x):
+    """(lo, hi, relative_range) of the finite stim values; rel = ptp / |median|."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return (float("nan"), float("nan"), 0.0)
+    lo, hi = float(np.min(x)), float(np.max(x))
+    rel = (hi - lo) / (abs(np.median(x)) + 1e-12)
+    return lo, hi, rel
+
+
+def _spearman(x, y):
+    """(rho, n) Spearman on the finite pairs; NaN when <10 pairs or the stim x is
+    effectively CONSTANT (relative range <1% -- can't measure a dose-response from
+    jitter, so report n/a rather than a spurious ~0)."""
+    from scipy.stats import rankdata
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if ok.sum() < 10 or _stim_span(x[ok])[2] < 0.01:
+        return float("nan"), int(ok.sum())
+    rx, ry = rankdata(x[ok]), rankdata(y[ok])
+    rx, ry = rx - rx.mean(), ry - ry.mean()
+    d = np.sqrt((rx @ rx) * (ry @ ry))
+    return (float(rx @ ry / d) if d > 0 else float("nan")), int(ok.sum())
+
+
+def stim_correlations(series, stim, features, wtags, period):
+    """Spearman rho of each feature vs stim P2P, per window. Returns
+    ``rho[feature][wtag]`` and the aligned per-response arrays for the scatter."""
+    rho: dict = {f: {} for f in features}
+    for wt in wtags:
+        ser = series.get(wt, {}).get(period)
+        if ser is None:
+            continue
+        x = _align_stim(ser["secs"], stim.get(period))
+        for f in features:
+            rho[f][wt], _ = _spearman(x, ser["metrics"][f])
+    return rho
+
+
+def _fig_stim_corr(rho, features, wtags, meta, out, note=""):
+    """Heatmap: feature × window Spearman rho (feature vs stim P2P) — the headline
+    'which metrics track stimulus amplitude', ranked by |rho| over windows."""
+    feats = sorted(features,
+                   key=lambda f: -np.nanmax([abs(rho[f].get(w, np.nan))
+                                             for w in wtags] or [0]))
+    Z = np.array([[rho[f].get(w, np.nan) for w in wtags] for f in feats])
+    fig, ax = plt.subplots(figsize=(1.6 * len(wtags) + 3, 0.42 * len(feats) + 2),
+                           facecolor=_ed._BG)
+    ax.set_facecolor(_ed._PANEL)
+    im = ax.imshow(Z, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(wtags)))
+    ax.set_xticklabels(wtags, fontsize=8)
+    ax.set_yticks(range(len(feats)))
+    ax.set_yticklabels([_pretty(f) for f in feats], fontsize=8)
+    ax.tick_params(colors=_ed._MUTED)
+    for r in range(len(feats)):
+        for c in range(len(wtags)):
+            v = Z[r, c]
+            if np.isfinite(v):
+                ax.text(c, r, f"{v:+.2f}", ha="center", va="center", fontsize=7,
+                        color="#111" if abs(v) > 0.5 else _ed._TEXT)
+    cb = fig.colorbar(im, ax=ax, fraction=0.06)
+    cb.set_label("Spearman ρ (feature vs stim P2P)", color=_ed._MUTED)
+    ax.set_title(f"{meta['animal']} · {meta['date']} · feature ↔ stim-amplitude "
+                 f"correlation", color=_ed._TEXT, fontsize=12)
+    if note:
+        ax.text(0.5, 1.055, note, transform=ax.transAxes, ha="center",
+                color=("#e06c6c" if "CONSTANT" in note else _ed._MUTED),
+                fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out, dpi=125, facecolor=_ed._BG)
+    plt.close(fig)
+    return out
+
+
+def _fig_stim_scatter(series, stim, features, wt, period, meta, out, note=""):
+    """Per feature: scatter y=feature vs x=stim P2P (one window), Spearman ρ + a
+    linear fit — the dose-response of each metric to stimulus amplitude."""
+    ser = series.get(wt, {}).get(period)
+    if ser is None:
+        return None
+    x = _align_stim(ser["secs"], stim.get(period))
+    ncol = 4
+    nrow = int(np.ceil(len(features) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 2.9 * nrow),
+                             facecolor=_ed._BG, squeeze=False)
+    for i, f in enumerate(features):
+        ax = axes[i // ncol][i % ncol]
+        ax.set_facecolor(_ed._PANEL)
+        y = np.asarray(ser["metrics"][f], dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        ax.scatter(x[ok], y[ok], s=4, c="#6a8cff", alpha=0.08, linewidths=0)
+        rho, n = _spearman(x, y)
+        if ok.sum() >= 2 and np.ptp(x[ok]) > 0:      # median trend per stim level
+            xs = np.unique(x[ok])
+            if xs.size <= 12:
+                med = [np.median(y[ok][x[ok] == xv]) for xv in xs]
+                ax.plot(xs, med, color="#f0f0f5", lw=1.4, marker="o", ms=3)
+        ax.set_title(f"{_pretty(f)}  ρ={rho:+.2f}" if np.isfinite(rho)
+                     else f"{_pretty(f)}  ρ=n/a", color=_ed._TEXT, fontsize=8,
+                     loc="left")
+        ax.tick_params(colors=_ed._MUTED, labelsize=6)
+    for j in range(len(features), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle(f"{meta['animal']} · {meta['date']} · {wt} · feature (y) vs stim "
+                 f"P2P (x)" + (f"   [{note}]" if note else ""),
+                 color=("#e06c6c" if "CONSTANT" in note else _ed._TEXT),
+                 fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(out, dpi=120, facecolor=_ed._BG)
+    plt.close(fig)
+    return out
 
 
 def _fig_circadian_means(circ, meta, out) -> str:
@@ -758,8 +870,8 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         if not per_win:
             continue
         tp = os.path.join(trend_dir, f"{feat}.png")
-        _fig_metric_trends(feat, per_win, stim.get(trend_src),
-                           {"animal": animal, "channel": channel}, tp)
+        _fig_metric_trends(feat, per_win, {"animal": animal, "channel": channel},
+                           tp)
         trends[feat] = os.path.relpath(tp, pkg).replace("\\", "/")
 
     # Circadian mean-response waveforms (window-independent; one figure/package).
@@ -771,12 +883,38 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
     _fig_circadian_means(circ, {"animal": animal, "channel": channel}, cp)
     circadian_rel = os.path.relpath(cp, pkg).replace("\\", "/")
 
+    # Feature vs STIMULUS amplitude: correlation heatmap (which metrics track stim)
+    # + per-window dose-response scatter grids. Built from the values (no reads).
+    if progress:
+        progress("building feature-vs-stim figures…")
+    stim_dir = os.path.join(pkg, "_stim")
+    os.makedirs(stim_dir, exist_ok=True)
+    wtags = [wt for wt, _w in wtags_windows]
+    smeta = {"animal": animal, "channel": channel, "date": week_label}
+    slo, shi, srel = _stim_span(np.asarray(
+        (stim.get(trend_src) or {}).get("p2p", []), dtype=float))
+    stim_note = (f"stim P2P {slo:.4g}–{shi:.4g} ({srel * 100:.1f}% range)"
+                 + (" — HELD ~CONSTANT: no dose-response" if srel < 0.01 else "")
+                 if np.isfinite(slo) else "no stim data")
+    rho = stim_correlations(series, stim, features, wtags, trend_src)
+    scp = os.path.join(stim_dir, "stim_corr.png")
+    _fig_stim_corr(rho, features, wtags, smeta, scp, stim_note)
+    stim_corr_rel = os.path.relpath(scp, pkg).replace("\\", "/")
+    stim_scatter: dict = {}
+    for wt in wtags:
+        sp = os.path.join(stim_dir, f"stim_scatter_{wt}.png")
+        if _fig_stim_scatter(series, stim, features, wt, trend_src, smeta, sp,
+                             stim_note):
+            stim_scatter[wt] = os.path.relpath(sp, pkg).replace("\\", "/")
+
     manifest = {"animal": animal, "channel": channel, "week": labels[week_key],
                 "windows": [wt for wt, _w in wtags_windows],
                 "periods": order, "features": features,
                 "primary_periods": primary_periods,
                 "docs": {f: _doc(f) for f in features},
-                "trends": trends, "circadian": circadian_rel, "figures": figures}
+                "trends": trends, "circadian": circadian_rel,
+                "stim_corr": stim_corr_rel, "stim_scatter": stim_scatter,
+                "figures": figures}
     with open(os.path.join(pkg, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     _write_index(pkg, manifest, labels)
@@ -803,8 +941,7 @@ def _write_index(pkg, manifest, labels) -> None:
              "mean overlaid in white.</p>"]
     trends = manifest.get("trends") or {}
     if trends:
-        parts.append("<h2>① Metrics over time (6 h circadian median ± IQR · "
-                     "stim P2P overlaid)</h2>")
+        parts.append("<h2>① Metrics over time (6 h circadian median ± IQR)</h2>")
         parts.append("<div style='display:flex;flex-wrap:wrap;gap:12px'>")
         for feat in feats:
             rel = trends.get(feat)
@@ -819,7 +956,17 @@ def _write_index(pkg, manifest, labels) -> None:
         parts.append("<h2>② Circadian mean response (4 bins/day, 07:00-anchored)</h2>")
         parts.append(f"<a href='{circ}'><img src='{circ}' "
                      f"style='width:760px'></a>")
-    parts.append("<h2>③ Response “kinds” by decile</h2>")
+    if manifest.get("stim_corr"):
+        parts.append("<h2>③ Feature ↔ stim amplitude (Spearman ρ · dose-response)</h2>")
+        parts.append(f"<a href='{manifest['stim_corr']}'>"
+                     f"<img src='{manifest['stim_corr']}' style='width:520px'></a>")
+        parts.append("<div style='display:flex;flex-wrap:wrap;gap:12px'>")
+        for wt, rel in (manifest.get("stim_scatter") or {}).items():
+            parts.append(f"<div><div class='def'>{html.escape(wt)}</div>"
+                         f"<a href='{rel}'><img src='{rel}' "
+                         f"style='width:360px'></a></div>")
+        parts.append("</div>")
+    parts.append("<h2>④ Response “kinds” by decile</h2>")
     for wt in wins:
         parts.append(f"<h2>window {html.escape(wt)}</h2>")
         parts.append("<table><tr><th>period</th>"
@@ -888,6 +1035,31 @@ def _stage_email(manifest, pkg, wins, staged):
             inline.append(dst)
             budget -= os.path.getsize(dst)
             circ_cid = cid
+
+    def _stage_one(rel, cid):
+        nonlocal budget
+        src = os.path.join(pkg, rel)
+        if not os.path.isfile(src):
+            return None
+        dst = os.path.join(staged, cid)
+        shutil.copyfile(src, dst)
+        sz = os.path.getsize(dst)
+        if sz > budget:
+            files.append(src)
+            return None
+        inline.append(dst)
+        budget -= sz
+        return cid
+
+    stim_cids = {"scatter": {}}
+    if manifest.get("stim_corr"):
+        stim_cids["corr"] = _stage_one(manifest["stim_corr"], "stim_corr.png")
+    for wt, rel in (manifest.get("stim_scatter") or {}).items():
+        if wt in wins:
+            c = _stage_one(rel, f"stim_scatter_{wt}.png".replace(":", "-"))
+            if c:
+                stim_cids["scatter"][wt] = c
+
     fig_by: dict = {}
     for f in manifest["figures"]:
         if f["period"] in periods and f["window"] in wins:
@@ -918,14 +1090,14 @@ def _stage_email(manifest, pkg, wins, staged):
                     by_win.setdefault(wt, []).append((f["feature"], cids))
         if by_win:
             sections.append((period, by_win))
-    return inline, files, sections, trends, circ_cid
+    return inline, files, sections, trends, circ_cid, stim_cids
 
 
 def _period_label(manifest, period) -> str:
     return manifest["week"] if period == "week" else period
 
 
-def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
+def _email_html(manifest, sections, trends, circ_cid, stim_cids, cadence) -> str:
     browse = _browse_url(manifest)
     multiday = len(sections) > 1
     span = manifest["week"] if cadence == "weekly" else (
@@ -943,7 +1115,7 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
         f"<br><span style='color:#888;font-size:12px'>{html.escape(browse)}</span>"
         f"</p>",
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"① Metrics over time — 6 h circadian median ± IQR, stim P2P overlaid</h3>"]
+        f"① Metrics over time — 6 h circadian median ± IQR</h3>"]
     for feat, cid in trends:
         parts.append(
             f"<div style='margin:4px 0 12px'><div style='{S};font-size:13px;"
@@ -954,9 +1126,19 @@ def _email_html(manifest, sections, trends, circ_cid, cadence) -> str:
             f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
             f"② Circadian mean response — 4 bins/day (07:00-anchored)</h3>"
             f"<img src='cid:{circ_cid}' style='max-width:1100px;width:100%'>")
+    if stim_cids.get("corr"):
+        parts.append(
+            f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
+            f"③ Feature ↔ stim amplitude — Spearman ρ + dose-response</h3>"
+            f"<img src='cid:{stim_cids['corr']}' style='max-width:640px;width:70%'>")
+        for wt, cid in stim_cids.get("scatter", {}).items():
+            parts.append(
+                f"<div style='margin:4px 0 12px'><div style='{S};font-size:12px;"
+                f"color:#666'>window {html.escape(wt)}</div>"
+                f"<img src='cid:{cid}' style='max-width:1100px;width:100%'></div>")
     parts.append(
         f"<h3 style='{S};border-bottom:2px solid #5e7ce2;padding-bottom:3px'>"
-        f"③ Decile SHAPES — ridgeline (mean±SD) + peak-normalized + per-decile mean±SD grid</h3>"
+        f"④ Decile SHAPES — ridgeline (mean±SD) + peak-normalized + per-decile mean±SD grid</h3>"
         f"<p style='{S};font-size:12px;color:#666'>The 10 decile mean waveforms, "
         f"stacked so each shape is legible, and peak-normalized so shape reads "
         f"apart from amplitude. (Full-density all-trace grids are in the folder.)</p>")
@@ -1010,7 +1192,7 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
     # span all 3 windows; every window is in the browsable folder).
     ew = email_windows or (manifest["windows"] if weekly else ["2-100ms"])
     staged = tempfile.mkdtemp(prefix="evoked_win_mail_")
-    inline, files, sections, trends, circ_cid = _stage_email(
+    inline, files, sections, trends, circ_cid, stim_cids = _stage_email(
         manifest, manifest["pkg_dir"], ew, staged)
     if dry_run:
         return {"sent": False, "dry_run": True, "manifest": manifest,
@@ -1025,7 +1207,8 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
         subject=f"QC evoked windowed {cadence} — {animal} · {span}",
         body=f"Evoked windowed {cadence} digest for {animal}. Metrics-over-time + "
              f"decile grids in the HTML body; full package: {_browse_url(manifest)}",
-        body_html=_email_html(manifest, sections, trends, circ_cid, cadence),
+        body_html=_email_html(manifest, sections, trends, circ_cid, stim_cids,
+                              cadence),
         recipients=recipients, subject_prefix=False,
         attachments=inline, file_attachments=files))
     return {"sent": sent, "animal": animal, "cadence": cadence,
