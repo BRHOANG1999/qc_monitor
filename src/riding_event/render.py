@@ -249,19 +249,41 @@ def _spectral_bottom(ax, res, f, keep, fmax) -> None:
     if np.isfinite(lo) and np.isfinite(hi):
         ax.axvspan(lo, hi, color=_ACCENT, alpha=0.12,
                    label=f"excess band {lo:.0f}–{hi:.0f} Hz")
-    fund = res.get("fundamental", {})
-    f0 = fund.get("fundamental_hz", float("nan"))
-    if np.isfinite(f0):
-        ax.axvline(f0, color=_TEXT, lw=1.0, ls="--",
-                   label=f"fundamental {f0:.0f} Hz")
-        for h in fund.get("harmonics", []):
-            if 1 < h["n"] and h["hz"] <= fmax:
-                ax.axvline(h["hz"], color=_TEXT, lw=0.6, ls=":", alpha=0.6)
     for ln in res.get("line_hz", []):
         if ln <= fmax:
             ax.axvline(ln, color=_MUTED, lw=0.5, ls=":", alpha=0.5)
+    # Label the (up to 2) most prominent excess-power peaks with their Hz, big.
+    for pk_hz, pk_db in _top_excess_peaks(f, exc, res, fmax, n=2):
+        ax.axvline(pk_hz, color=_TEXT, lw=1.2, ls="--")
+        ax.annotate(f"{pk_hz:.0f} Hz", xy=(pk_hz, pk_db), xytext=(6, 4),
+                    textcoords="offset points", color=_TEXT, fontsize=12,
+                    fontweight="bold")
     _lab(ax, xlabel="frequency (Hz)", ylabel="excess power (dB)")
     _legend(ax, loc="upper right")
+
+
+def _top_excess_peaks(f, exc, res, fmax, n=2):
+    """The *n* most prominent excess-power peaks (Hz, dB) in the excess band,
+    excluding mains-line bins — the event's rhythm(s) to label big."""
+    from scipy.signal import find_peaks
+    if exc.size != f.size:
+        return []
+    lo, hi = res.get("excess_band", (4.0, fmax))
+    lo = lo if np.isfinite(lo) else 4.0
+    hi = hi if np.isfinite(hi) else fmax
+    band = (f >= lo) & (f <= min(hi, fmax)) & np.isfinite(exc)
+    line = np.zeros(f.size, dtype=bool)
+    for ln in res.get("line_hz", []):
+        line |= np.abs(f - ln) <= 3.0
+    cand = band & ~line
+    if not cand.any():
+        return []
+    d = np.where(cand, exc, -np.inf)
+    idx, props = find_peaks(d, height=2.0, distance=max(1, int(f.size / 60)))
+    if idx.size == 0:
+        return []
+    top = idx[np.argsort(-props["peak_heights"])[:int(n)]]
+    return [(float(f[i]), float(exc[i])) for i in sorted(top)]
 
 
 # ---------------------------------------------------------------- Prong B --- #
@@ -274,9 +296,11 @@ def fig_candidates(det: dict, out_png: str, *, animal="", channel="",
     env = np.asarray(det["env"])
     if env.size == 0:
         return _empty(out_png, f"{animal} {channel}: no envelope")
-    locs = np.asarray(det["cand_locs"])
-    c0 = int(locs[0]) if locs.size else 0        # centre on the first candidate
+    # Centre on a DETECTION (a real event) in a window that has no noise-ceiling
+    # spike (the giant transient the user objected to), so the example is legible.
     half = int(example_sec * fs / 2)
+    dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
+    c0 = _clean_window_center(env, dl, det.get("cand_thr_hi", np.inf), half)
     a = max(0, c0 - half)
     b = min(env.size, c0 + half)
     x, y, _d = _decim_envelope(env[a:b], fs, 6000, t_start=a / fs)
@@ -289,10 +313,10 @@ def fig_candidates(det: dict, out_png: str, *, animal="", channel="",
     if np.isfinite(det.get("cand_thr_hi", np.inf)):
         ax.axhline(det["cand_thr_hi"], color="#ffd166", lw=1.0, ls=":",
                    label="noise ceiling")
-    inwin = locs[(locs >= a) & (locs < b)]
+    inwin = dl[(dl >= a) & (dl < b)]
     if inwin.size:
-        ax.plot(inwin / fs, env[inwin], "v", color=_EVENT, ms=6,
-                label=f"candidates (n={inwin.size})")
+        ax.plot(inwin / fs, env[np.clip(inwin, 0, env.size - 1)], "v",
+                color=_EVENT, ms=7, label=f"detections in window (n={inwin.size})")
     _lab(ax, title=f"{animal} {channel} — candidate events on continuous LFP "
                    f"({det['band'][0]:.0f}–{det['band'][1]:.0f} Hz envelope)",
          xlabel="time (s)", ylabel="envelope (µV)")
@@ -336,6 +360,57 @@ def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
     _lab(ax2, title="snippet–template correlation", xlabel="Pearson r",
          ylabel="count")
     return _finish(fig, out_png)
+
+
+def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal="",
+                        channel="", n: int = 12, pre_ms: float = 20.0,
+                        post_ms: float = 100.0) -> str:
+    """The actual LFP traces at the strongest matched-filter detections (a grid,
+    one per detection, aligned to the detection at t=0). Shows what the detector
+    fired on so it can be judged by eye -- the raw LFP (blue) with the band-passed
+    ripple (orange) overlaid."""
+    x = np.asarray(signal, dtype=np.float64)
+    dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
+    sc = np.asarray(det.get("det_scores", []), dtype=np.float64)
+    if dl.size == 0:
+        return _empty(out_png, f"{animal} {channel}: no detections")
+    order = np.argsort(-sc)[:int(n)]               # strongest first
+    sel = dl[order]
+    pre = max(1, int(round(pre_ms * 1e-3 * fs)))
+    post = max(1, int(round(post_ms * 1e-3 * fs)))
+    t = (np.arange(-pre, post) / fs) * 1000.0
+    band = det.get("band", (120.0, 990.0))
+    nrow = int(np.ceil(sel.size / 3))
+    fig, axes = plt.subplots(nrow, 3, figsize=(11.5, 2.0 * nrow + 0.6),
+                             facecolor=_BG, squeeze=False)
+    for ax in axes.flat:
+        _style(ax)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    for ax, loc, sco in zip(axes.flat, sel, sc[order]):
+        lo, hi = loc - pre, loc + post
+        if lo < 0 or hi > x.size:
+            continue
+        seg = x[lo:hi]
+        hf = _ef_bandpass(seg, fs, band)
+        ax.plot(t, seg, color=_ACCENT, lw=0.6)
+        ax.plot(t, hf, color=_EVENT, lw=0.7, alpha=0.8)
+        ax.axvline(0, color=_MUTED, lw=0.6, ls="--")
+        ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}", color=_TEXT, fontsize=8,
+                     loc="left")
+    fig.suptitle(f"{animal} {channel} — {sel.size} strongest detections "
+                 f"(blue = LFP, orange = {band[0]:.0f}-{band[1]:.0f} Hz; t=0 = "
+                 f"detection)", color=_TEXT, fontsize=11, x=0.02, ha="left")
+    return _finish(fig, out_png)
+
+
+def _ef_bandpass(seg, fs, band):
+    from src.utils import evoked_features as _ef
+    lo = max(1.0, float(band[0]))
+    hi = min(float(band[1]), 0.49 * float(fs))
+    if hi <= lo or seg.size < 20:
+        return np.zeros_like(seg)
+    return _ef._bandpass(seg[None, :], float(fs), lo, hi)[0]
 
 
 def fig_matched_filter(det: dict, out_png: str, *, animal="", channel="",
@@ -396,6 +471,23 @@ def _blank_near_stims(r, fs, stim_times_sec, pad_sec):
         if hi > lo:
             out[lo:hi] = np.nan
     return out
+
+
+def _clean_window_center(env, det_locs, thr_hi, half: int) -> int:
+    """A detection sample whose +/-half window contains no envelope point above the
+    noise ceiling (so the example window has no giant transient). Falls back to a
+    middle detection, else the signal centre."""
+    n = int(np.asarray(env).size)
+    dl = np.asarray(det_locs, dtype=np.int64) if det_locs is not None \
+        else np.empty(0, dtype=np.int64)
+    if dl.size == 0:
+        return n // 2
+    e = np.asarray(env, dtype=np.float64)
+    for c in dl:                                     # bounded by detection count
+        a, b = max(0, int(c) - half), min(n, int(c) + half)
+        if not np.isfinite(thr_hi) or bool(np.all(e[a:b] < thr_hi)):
+            return int(c)
+    return int(dl[dl.size // 2])
 
 
 def _bin_max(r, fs, nbins: int):

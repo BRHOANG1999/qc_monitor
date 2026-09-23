@@ -171,8 +171,12 @@ def run_detector(signal, fs: float, *, band=(20.0, 200.0),
         x, fs, band=band, min_dist_sec=min_dist_sec, k=k, noise_k=noise_k)
     excl = _excluded_mask(locs, fs, exclude_times_sec, exclude_pad_sec)
     locs = locs[~excl]                             # stim pulses out of candidates
-    tmpl = build_template(x, fs, locs, pre_ms=pre_ms, post_ms=post_ms,
-                          search_ms=search_ms)
+    # Build the self-bootstrapped continuous template ONLY when there is no
+    # Prong-A template to use -- on real data it was noise (not a ripple) and
+    # carried the stim artifact, so with a template_override we skip it.
+    tmpl = ({} if template_override is not None
+            else build_template(x, fs, locs, pre_ms=pre_ms, post_ms=post_ms,
+                                search_ms=search_ms))
     # Amplitude gate uses a PROMINENCE threshold (median + amp_gate_k*MAD),
     # higher than the candidate floor, so a detection must be a clearly-elevated
     # burst -- not any HF wiggle just over the noise floor (the candidates just

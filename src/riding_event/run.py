@@ -215,12 +215,15 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
     det = _det.run_detector(signal, fs, band=use_band, template_override=override,
                             exclude_times_sec=stim_times, thresh=thresh)
     prox = _validation(store, animal, target, det, fs)
-    figs = [_r.fig_candidates(det, stem + "_candidates.png", animal=animal,
-                              channel=ch),
-            _r.fig_alignment(det["template"], stem + "_template.png", fs=fs,
-                             animal=animal, channel=ch, title_extra="(continuous)"),
+    # No continuous self-template figure: we use Prong A's clean stim-locked
+    # template for the matched filter, and the self-bootstrapped continuous
+    # template was noise (not a ripple) + carried the artifact.
+    figs = [_r.fig_detected_events(signal, det, stem + "_detected.png", fs=fs,
+                                   animal=animal, channel=ch),
             _r.fig_matched_filter(det, stem + "_matched.png", animal=animal,
-                                  channel=ch, prox=prox)]
+                                  channel=ch, prox=prox),
+            _r.fig_candidates(det, stem + "_candidates.png", animal=animal,
+                              channel=ch)]
     summary["figures"].extend(figs)
     _write_detection_csv(stem + "_detections.csv", det, fs)
     summary["prong_b"] = {
@@ -228,7 +231,7 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
         "n_raw_detections": int(det.get("n_raw_detections", 0)),
         "n_detections": int(np.asarray(det["det_locs"]).size),
         "template_source": det.get("template_source"),
-        "template_n": det["template"].get("n") if det["template"] else 0,
+        "template_n": (det.get("template") or {}).get("n", 0),
         "proximity": prox}
     prog(f"  {int(det['cand_locs'].size)} spontaneous candidates -> "
          f"{int(det.get('n_raw_detections', 0))} shape matches -> "

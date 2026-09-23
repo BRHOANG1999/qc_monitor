@@ -24,7 +24,9 @@ logger = logging.getLogger("qc_monitor.riding_event.residual")
 # Post-stim windows (ms). Flagging uses the tight window where the event sits;
 # the spectrum uses a wider window for finer frequency resolution. Both start
 # past the artifact (>~2 ms) so the stim transient never dominates.
-DEFAULT_FLAG_WIN_MS = (2.0, 180.0)         # wide: the ripple onsets 5-50 ms out
+DEFAULT_FLAG_WIN_MS = (15.0, 180.0)        # start AFTER the evoked dip (~5-12 ms)
+#   so a smooth epoch's dip-mismatch HF isn't scored -- only a SUSTAINED ripple
+#   (which onsets ~10-50 ms and lasts tens of ms) carries HF power in this window.
 DEFAULT_SPEC_WIN_MS = (2.0, 200.0)
 _DEFAULT_HF_BAND = (150.0, 800.0)          # fallback ripple band if no fundamental
 
