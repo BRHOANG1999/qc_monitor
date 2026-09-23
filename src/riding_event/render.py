@@ -64,7 +64,10 @@ def _finish(fig, out_png: str) -> str:
     """Save + close. Writes to a PID-unique temp then atomically replaces the
     target, so a target locked by a viewer / AV / stale handle warns-and-skips
     instead of crashing a long run (a partial PNG is never left behind)."""
-    fig.tight_layout()
+    import warnings
+    with warnings.catch_warnings():                # gridspec + tight_layout warns
+        warnings.simplefilter("ignore")
+        fig.tight_layout()
     tmp = f"{out_png}.{os.getpid()}.tmp.png"       # keep .png so format infers
     try:
         fig.savefig(tmp, dpi=140, facecolor=_BG, format="png")
@@ -209,11 +212,35 @@ def fig_spectral(res: dict, out_png: str) -> str:
         return _empty(out_png, f"{res['animal']} {res['channel']}: no spectra")
     fmax = min(3000.0, 0.5 * res["fs"])
     keep = (f > 0) & (f <= fmax)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9.5, 8.0), facecolor=_BG,
-                                   sharex=True, height_ratios=[3, 2])
+    fig = plt.figure(figsize=(9.5, 10.2), facecolor=_BG)
+    gs = fig.add_gridspec(3, 1, height_ratios=[2, 3, 2], hspace=0.32)
+    ax0 = fig.add_subplot(gs[0])                     # traces feeding the PSD
+    ax1 = fig.add_subplot(gs[1])                     # PSDs
+    ax2 = fig.add_subplot(gs[2], sharex=ax1)         # excess (shares freq axis)
+    _spectral_traces(ax0, res)
     _spectral_top(ax1, res, f, keep, fmax)
     _spectral_bottom(ax2, res, f, keep, fmax)
     return _finish(fig, out_png)
+
+
+def _spectral_traces(ax, res) -> None:
+    """Top panel: a few event (orange) and clean (blue) example epochs with the
+    PSD analysis window shaded — what actually goes INTO the spectra below."""
+    _style(ax)
+    tm = np.asarray(res["time_ms"])
+    lo, hi = res["spec_win_ms"]
+    for j in _examples(res["clean_mask"], 4):
+        ax.plot(tm, res["traces"][j], color=_ACCENT, lw=0.5, alpha=0.45)
+    for j in _examples(res["event_mask"], 4):
+        ax.plot(tm, res["traces"][j], color=_EVENT, lw=0.7, alpha=0.8)
+    ax.axvspan(lo, hi, color=_TEXT, alpha=0.07)
+    ax.plot([], [], color=_EVENT, lw=1.4, label="event epochs")
+    ax.plot([], [], color=_ACCENT, lw=1.4, label="clean epochs")
+    ax.set_xlim(min(tm[0], -10.0), hi + 20.0)
+    _lab(ax, title=f"{res['animal']} {res['channel']} — example traces feeding the "
+                   f"PSD (shaded = {lo:.0f}-{hi:.0f} ms analysis window)",
+         xlabel="time from stim (ms)", ylabel="LFP (µV)")
+    _legend(ax, loc="upper right")
 
 
 def _spectral_top(ax, res, f, keep, fmax) -> None:
