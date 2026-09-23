@@ -114,6 +114,32 @@ def _win_cfg(w):
     return _passive.window_config(float(w[0]), float(w[1]))
 
 
+# Low-pass variants: features (and the displayed waveforms) are computed on the
+# LP-filtered signal over [start,end] ms, so the smoothed morphology is a parallel
+# set of figures alongside the raw windows. (tag, start_ms, end_ms, cutoff_hz)
+LP_VARIANTS = [("lp500", 2.0, 500.0, 500.0)]
+
+
+def _variants(windows):
+    """List of ``(tag, (start,end), cfg, lp_hz|None)``: the raw crop-only windows
+    plus the low-pass variants (a ~1 Hz high-pass removes DC drift)."""
+    out = [(_win_tag(w), (float(w[0]), float(w[1])), _win_cfg(w), None)
+           for w in windows]
+    for tag, s, e, hz in LP_VARIANTS:
+        cfg = _passive.window_config(s, e, bandpass=True, bp_low_hz=1.0,
+                                     bp_high_hz=float(hz))
+        out.append((tag, (s, e), cfg, float(hz)))
+    return out
+
+
+def _lp_traces(traces, fs, cfg):
+    """*traces* low-pass-filtered per *cfg* (identity when cfg has no bandpass)."""
+    if not getattr(cfg, "bandpass", False):
+        return traces
+    return _ef._bandpass(np.asarray(traces, dtype=float), float(fs),
+                         float(cfg.bp_low_hz), float(cfg.bp_high_hz))
+
+
 # --------------------------------------------------------------------- #
 #  values pass: windowed feature values per response, fanned to periods
 # --------------------------------------------------------------------- #
@@ -130,7 +156,8 @@ def windowed_values(files, animal, channel, features, windows, week_key,
     RESPONSE WAVEFORM per 07:00-anchored circadian bin. Returns
     ``(series, ylim, stim, circ)`` where ``stim[period] = {"secs","p2p"}`` and
     ``circ = {"time_ms", "cycles": {cyc: [mean×4]}, "week": [mean×4]}``."""
-    cfgs = {_win_tag(w): _win_cfg(w) for w in windows}
+    variants = _variants(windows)
+    cfgs = {tag: cfg for tag, _win, cfg, _lp in variants}
     want_wavelet = any(f in _ef.WAVELET_COLUMNS for f in features)
     hf_names = [f for f in features if f in HF_NAMES]
     secs: dict = defaultdict(lambda: defaultdict(list))
@@ -180,11 +207,15 @@ def windowed_values(files, animal, channel, features, windows, week_key,
             circ_week[b].add(traces[j])
         # window-DEPENDENT: features (incl. HF band powers merged in)
         for wt, cfg in cfgs.items():
+            # compute_all filters `avg` internally per cfg; avg_v is the same
+            # filtered signal for the HF periodogram + the y-extent so a LP variant
+            # is self-consistent (raw variant -> avg_v is avg).
             feats = _ef.compute_all(avg, time_ms, fs, expensive=False, cfg=cfg,
                                     include_wavelet=want_wavelet)
+            avg_v = _lp_traces(avg, fs, cfg)
             if hf_names:
                 feats = dict(feats)
-                feats.update(_hf_powers(_crop_window(avg, time_ms, cfg), fs))
+                feats.update(_hf_powers(_crop_window(avg_v, time_ms, cfg), fs))
             for j, dt in enumerate(dt_by_epoch):
                 if dt is None:
                     continue
@@ -197,7 +228,7 @@ def windowed_values(files, animal, channel, features, windows, week_key,
                         vals[wt][period][feat].append(
                             float(arr[j]) if arr is not None
                             and np.isfinite(arr[j]) else np.nan)
-            extent[wt].append(_win_amp_extent(avg, time_ms, cfg))
+            extent[wt].append(_win_amp_extent(avg_v, time_ms, cfg))
     def _pack(bins):
         return [{"mean": rm.mean(), "sd": rm.sd()} for rm in bins]
     circ = {"time_ms": circ_time[0],
@@ -294,11 +325,13 @@ class _RunMean:
 
 
 def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
-                   labels, pkg, is_week=False, progress=None) -> list:
-    """One trace pass over *period*'s files for ALL windows: per (window, feature)
-    accumulate a Welford MEAN + SD per decile (no full-density -- dropped), then
-    render the clean shape views (ridgeline, peak-normalized, per-decile mean±SD
-    grid), each showing spread. Render, free. Returns figure records."""
+                   labels, pkg, variant_cfg=None, is_week=False,
+                   progress=None) -> list:
+    """One trace pass over *period*'s files for ALL variants: per (variant, feature)
+    accumulate a Welford MEAN + SD per decile (LP variants accumulate the LP-FILTERED
+    trace so the displayed shapes are smoothed too), then render the clean shape
+    views (ridgeline, peak-normalized, per-decile mean±SD grid). Returns fig records."""
+    variant_cfg = variant_cfg or {}
     accs: dict = {(wt, feat): _ed._BandAccum(info["n_bands"] + 1)
                   for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
     maps = {(wt, feat): info["band_of_ts"]
@@ -312,9 +345,16 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
         if not ev or ev.get("traces") is None:
             continue
         times = np.asarray(ev["times"], dtype=float)
-        traces, time_ms = ev["traces"], np.asarray(ev["time_ms"], dtype=float)
+        traces, time_ms = np.asarray(ev["traces"], dtype=float), \
+            np.asarray(ev["time_ms"], dtype=float)
+        fs = _fs_of(time_ms)
         order = np.argsort(times)
         ts_sorted = times[order]
+        # per-variant trace matrix: LP variants get the filtered signal so their
+        # decile SHAPES are smoothed (raw variants reuse the untouched traces).
+        tr_by_tag = {wt: (_lp_traces(traces, fs, variant_cfg[wt][0])
+                          if variant_cfg.get(wt) and variant_cfg[wt][0].bandpass
+                          else traces) for wt, _w in wtags_windows}
         for r in rows:
             st = _d._nan(r.get("stim_time_sec"))
             if not np.isfinite(st):
@@ -326,12 +366,12 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
             k = min(cand, key=lambda k: abs(ts_sorted[k] - st))
             if abs(ts_sorted[k] - st) > _ed._MATCH_TOL_SEC:
                 continue
-            trace = traces[order[k]]
+            idx = order[k]
             key = _ed._ts_key(r)
             for (wt, feat), m in maps.items():
                 b = m.get(key, -1)
                 if b >= 0:
-                    accs[(wt, feat)].add(b, trace, time_ms)
+                    accs[(wt, feat)].add(b, tr_by_tag[wt][idx], time_ms)
     # render
     figs = []
     for wt, w in wtags_windows:
@@ -789,7 +829,9 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
     features = [f for f in (features or (_pkg.PACKAGE_FEATURES + HF_NAMES))
                 if f in _ef.ALL_COLUMNS or f in HF_NAMES]
     windows = windows or WINDOWS_MS
-    wtags_windows = [(_win_tag(w), w) for w in windows]
+    variants = _variants(windows)                    # raw windows + LP variants
+    wtags_windows = [(tag, win) for tag, win, _c, _l in variants]
+    variant_cfg = {tag: (cfg, lp) for tag, _w, cfg, lp in variants}
     # channel/file discovery reads the DEFAULT-window sidecars, which don't carry
     # the HF columns -- discover with the sidecar-backed features only.
     sidecar_feats = [f for f in features if f not in HF_NAMES] or features
@@ -846,7 +888,7 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         if progress:
             progress(f"rendering {period} ({len(pfiles)} recordings)…")
         figures += _render_period(pfiles, animal, channel, period, p_windows,
-                                  info_pw, ylim, labels, pkg,
+                                  info_pw, ylim, labels, pkg, variant_cfg,
                                   is_week=(period == week_key), progress=progress)
 
     # Metrics-over-time trends ALWAYS span the full window (the week_key series
