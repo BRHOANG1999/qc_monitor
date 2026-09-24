@@ -136,6 +136,14 @@ def evict(file_path: str) -> None:
         _od.pop(file_path, None)
 
 
+def clear() -> None:
+    """Drop ALL cached chunks, freeing their (multi-GB) signal matrices. Use in a
+    batch sweep that reads many recordings serially and must not accumulate the
+    per-process byte budget across them (each recording's signal is 0.3-4.7 GB)."""
+    with _lock:
+        _od.clear()
+
+
 def cache_info() -> dict:
     """Debug helper: paths currently cached, in LRU order (oldest first),
     plus the resident bytes vs the budget (the thing that actually matters)."""
