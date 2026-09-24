@@ -162,7 +162,7 @@ def _recording_stim_times(store, animal: str, file_id: int):
 def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
                        horizon_h: float = 6.0, post_h: float = 0.5,
                        bin_min: float = 10.0, thresh: float = 0.7,
-                       ripple_frac: float = 0.5, ripple_sust: float = 0.30,
+                       ripple_frac: float = 0.15, ripple_sust: float = 0.20,
                        progress=None) -> dict:
     """Ripple-rate trajectory for one seizure: bin the candidate, matched-filter,
     and RIPPLE-CONFIRMED matched-filter detections over ``[onset - horizon_h,
@@ -402,7 +402,8 @@ def _write_stats(animal: str, trajs: list) -> str:
 
 def _one_seizure(onset: float, animal: str, config_path: str, *,
                  horizon_h: float, post_h: float, bin_min: float,
-                 thresh: float) -> tuple:
+                 thresh: float, ripple_frac: float = 0.15,
+                 ripple_sust: float = 0.20) -> tuple:
     """Compute + write ONE seizure's trajectory. Opens its OWN Store so it can run
     in a separate process (the pool worker); prints progress with the onset tag."""
     import yaml
@@ -414,6 +415,7 @@ def _one_seizure(onset: float, animal: str, config_path: str, *,
     tmpl = ensure_template(store, animal)          # loads the cached template
     traj = seizure_trajectory(store, animal, onset, tmpl, horizon_h=horizon_h,
                               post_h=post_h, bin_min=bin_min, thresh=thresh,
+                              ripple_frac=ripple_frac, ripple_sust=ripple_sust,
                               progress=lambda m: print("  ", m, flush=True))
     out = os.path.join(_root(animal), "periictal", f"traj_{int(onset)}.csv")
     write_trajectory_csv(traj, out, racine=_racine_for_onset(store, animal, onset))
@@ -434,7 +436,8 @@ def _racine_for_onset(store, animal: str, onset: float):
 
 def run_batch(animal: str, onsets, config_path: str, *, jobs: int = 3,
               horizon_h: float = 6.0, post_h: float = 0.5, bin_min: float = 10.0,
-              thresh: float = 0.7) -> str | None:
+              thresh: float = 0.7, ripple_frac: float = 0.15,
+              ripple_sust: float = 0.20) -> str | None:
     """Compute several seizures' trajectories in a bounded PROCESS pool (true
     parallelism across seizures; each worker clears the chunk cache after every
     recording so peak memory ~= jobs recordings), then aggregate. Returns the
@@ -446,7 +449,8 @@ def run_batch(animal: str, onsets, config_path: str, *, jobs: int = 3,
           f"(horizon {horizon_h} h)...", flush=True)
     with ProcessPoolExecutor(max_workers=max(1, min(int(jobs), n))) as ex:
         futs = [ex.submit(_one_seizure, o, a, c, horizon_h=horizon_h,
-                          post_h=post_h, bin_min=bin_min, thresh=thresh)
+                          post_h=post_h, bin_min=bin_min, thresh=thresh,
+                          ripple_frac=ripple_frac, ripple_sust=ripple_sust)
                 for (o, a, c) in tasks]
         for i, fu in enumerate(futs):
             try:
@@ -481,6 +485,10 @@ def _main(argv=None) -> int:
     ap.add_argument("--post-h", type=float, default=0.5)
     ap.add_argument("--bin-min", type=float, default=10.0)
     ap.add_argument("--thresh", type=float, default=0.7)
+    ap.add_argument("--ripple-frac", type=float, default=0.15,
+                    help="ripple gate: min HF-band fraction (reject slow waves)")
+    ap.add_argument("--ripple-sust", type=float, default=0.20,
+                    help="ripple gate: min sustained-oscillation fraction")
     args = ap.parse_args(argv)
     if args.aggregate_only:
         print("aggregate ->", aggregate(args.animal))
@@ -489,7 +497,8 @@ def _main(argv=None) -> int:
         onsets = [float(x) for x in args.onsets.split(",") if x.strip()]
         run_batch(args.animal, onsets, args.config, jobs=args.jobs,
                   horizon_h=args.horizon_h, post_h=args.post_h,
-                  bin_min=args.bin_min, thresh=args.thresh)
+                  bin_min=args.bin_min, thresh=args.thresh,
+                  ripple_frac=args.ripple_frac, ripple_sust=args.ripple_sust)
         return 0
     assert args.onset_epoch is not None, "pass --onset-epoch or --onsets"
     with open(args.config, encoding="utf-8") as f:
@@ -499,6 +508,8 @@ def _main(argv=None) -> int:
     traj = seizure_trajectory(store, args.animal, args.onset_epoch, tmpl,
                               horizon_h=args.horizon_h, post_h=args.post_h,
                               bin_min=args.bin_min, thresh=args.thresh,
+                              ripple_frac=args.ripple_frac,
+                              ripple_sust=args.ripple_sust,
                               progress=lambda m: print("  ", m, flush=True))
     out = os.path.join(_root(args.animal), "periictal",
                        f"traj_{int(args.onset_epoch)}.csv")
