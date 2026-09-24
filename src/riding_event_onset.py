@@ -177,6 +177,60 @@ def fig_event_archetypes(R, tm, nmf, out):
     return out
 
 
+def fig_archetype_overlays(R, tm, nmf, out, *, n_per=20, seed=0):
+    """For EACH archetype, overlay ``n_per`` RAW event-residual traces whose
+    dominant NMF mixture is that archetype -- so the operator sees the actual
+    waveforms the prototype summarizes, not just the smooth prototype.
+
+    Each panel: up to ``n_per`` raw traces (faint, archetype color) + the mean of
+    that whole subset (bold) + the NMF prototype scaled to the subset (dashed
+    white) for reference. Titled with the archetype # and how many events it wins.
+    """
+    comps, Wt = nmf["components"], nmf["weights"]
+    k = comps.shape[0]
+    dom = np.argmax(Wt, axis=1)
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, k))
+    rng = np.random.default_rng(seed)
+    ncol = 2
+    nrow = int(np.ceil(k / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(13, 3.3 * nrow),
+                             facecolor=_BG, squeeze=False)
+    for c in range(k):
+        ax = axes[c // ncol][c % ncol]
+        _dark(ax)
+        idx = np.flatnonzero(dom == c)
+        n_win = idx.size
+        if n_win == 0:
+            ax.set_title(f"archetype {c + 1}: no events", color=_TEXT, fontsize=10)
+            continue
+        pick = idx if n_win <= n_per else rng.choice(idx, n_per, replace=False)
+        for i in pick:
+            ax.plot(tm, R[i], color=colors[c], lw=0.6, alpha=0.35)
+        subset_mean = R[idx].mean(axis=0)
+        ax.plot(tm, subset_mean, color=colors[c], lw=2.2,
+                label=f"subset mean (n={n_win})")
+        # prototype scaled to the subset mean's peak so shapes are comparable
+        proto = comps[c]
+        pk = np.max(np.abs(proto)) or 1.0
+        proto_s = proto / pk * np.max(np.abs(subset_mean))
+        ax.plot(tm, proto_s, color=_TEXT, lw=1.3, ls="--", alpha=0.8,
+                label="NMF prototype")
+        ax.axhline(0, color=_MUTED, lw=0.5, alpha=0.4)
+        ax.set_title(f"archetype {c + 1}  —  {len(pick)} of {n_win} raw traces",
+                     color=_TEXT, fontsize=10)
+        ax.set_xlabel("ms since stim", color=_MUTED, fontsize=9)
+        leg = ax.legend(fontsize=8, frameon=False, loc="upper right")
+        for t in leg.get_texts():
+            t.set_color(_TEXT)
+    for j in range(k, nrow * ncol):          # blank any unused panel
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle(f"Raw event residuals by dominant archetype  ({len(R)} events, "
+                 f"{n_per} shown/type)", color=_TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out, dpi=125, facecolor=_BG); plt.close(fig)
+    return out
+
+
 def fig_rate_vs_tto(all_tto, all_flag, window_sec, out):
     """Event RATE vs time-to-seizure-onset (onset at LEFT) with the interictal
     baseline -- the headline: does the riding event get more common pre-ictally?"""
@@ -240,6 +294,11 @@ def _main(argv=None) -> int:
     ap.add_argument("--nmf-k", type=int, default=4)
     ap.add_argument("--cap", type=int, default=8000)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--from-cache", action="store_true",
+                    help="reuse events.npz from a prior gather (fast re-render, "
+                         "no recording reads)")
+    ap.add_argument("--n-per", type=int, default=20,
+                    help="raw traces overlaid per archetype")
     a = ap.parse_args(argv)
     import yaml
     from src.db.store import Store
@@ -248,11 +307,24 @@ def _main(argv=None) -> int:
     end = datetime.fromisoformat(a.date) if a.date else datetime.now()
     out = a.out or os.path.join("data", "riding_event_onset")
     os.makedirs(out, exist_ok=True)
+    cache = os.path.join(out, "events.npz")
     prog = lambda m: print("  ", m)                          # noqa: E731
-    print("opening store (slow)…")
-    store = Store(cfg["database"]["path"])
-    R, tm, ev_tto, all_tto, all_flag, window_sec = gather_events(
-        store, a.animal, evoked_dir, end, a.days, cap=a.cap, progress=prog)
+    if a.from_cache and os.path.exists(cache):
+        print(f"loading cached events from {cache} (no recording reads)…")
+        z = np.load(cache, allow_pickle=False)
+        R, tm = z["R"], z["tm"]
+        ev_tto, all_tto = z["ev_tto"], z["all_tto"]
+        all_flag, window_sec = z["all_flag"], float(z["window_sec"])
+    else:
+        print("opening store (slow)…")
+        store = Store(cfg["database"]["path"])
+        R, tm, ev_tto, all_tto, all_flag, window_sec = gather_events(
+            store, a.animal, evoked_dir, end, a.days, cap=a.cap, progress=prog)
+        if R is not None and len(R) >= 20:
+            np.savez_compressed(
+                cache, R=R, tm=tm, ev_tto=ev_tto, all_tto=all_tto,
+                all_flag=all_flag, window_sec=np.float64(window_sec))
+            print("cached events ->", cache)
     n_all = len(all_flag)
     n_ev = int(all_flag.sum()) if n_all else 0
     n_pre = int(np.isfinite(all_tto).sum()) if n_all else 0
@@ -267,7 +339,9 @@ def _main(argv=None) -> int:
                          os.path.join(out, "rate_vs_onset.png"))
     p3 = fig_archetype_vs_tto(ev_tto, dom, a.nmf_k, window_sec,
                               os.path.join(out, "archetype_vs_onset.png"))
-    print("SAVED:", p1); print("SAVED:", p2); print("SAVED:", p3)
+    p4 = fig_archetype_overlays(R, tm, nmf, os.path.join(out, "archetype_overlays.png"),
+                                n_per=a.n_per)
+    print("SAVED:", p1); print("SAVED:", p2); print("SAVED:", p3); print("SAVED:", p4)
     return 0
 
 
