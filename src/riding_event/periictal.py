@@ -302,6 +302,55 @@ def _agg_panel(ax, trajs, key, xh, title, _r, plt) -> None:
         tx.set_color(_r._TEXT)
 
 
+def _one_seizure(onset: float, animal: str, config_path: str, *,
+                 horizon_h: float, post_h: float, bin_min: float,
+                 thresh: float) -> tuple:
+    """Compute + write ONE seizure's trajectory. Opens its OWN Store so it can run
+    in a separate process (the pool worker); prints progress with the onset tag."""
+    import yaml
+
+    from src.db.store import Store
+    with open(config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    store = Store(cfg["database"]["path"])
+    tmpl = ensure_template(store, animal)          # loads the cached template
+    traj = seizure_trajectory(store, animal, onset, tmpl, horizon_h=horizon_h,
+                              post_h=post_h, bin_min=bin_min, thresh=thresh,
+                              progress=lambda m: print("  ", m, flush=True))
+    out = os.path.join(_root(animal), "periictal", f"traj_{int(onset)}.csv")
+    write_trajectory_csv(traj, out)
+    print(f"seizure {int(onset)}: {traj['n_recs']} recordings -> {out}", flush=True)
+    return (onset, traj["n_recs"], out)
+
+
+def run_batch(animal: str, onsets, config_path: str, *, jobs: int = 3,
+              horizon_h: float = 6.0, post_h: float = 0.5, bin_min: float = 10.0,
+              thresh: float = 0.7) -> str | None:
+    """Compute several seizures' trajectories in a bounded PROCESS pool (true
+    parallelism across seizures; each worker clears the chunk cache after every
+    recording so peak memory ~= jobs recordings), then aggregate. Returns the
+    aggregate figure path."""
+    from concurrent.futures import ProcessPoolExecutor
+    tasks = [(float(o), animal, config_path) for o in onsets]
+    n = len(tasks)
+    print(f"running {n} seizures on {min(jobs, n)} workers "
+          f"(horizon {horizon_h} h)...", flush=True)
+    with ProcessPoolExecutor(max_workers=max(1, min(int(jobs), n))) as ex:
+        futs = [ex.submit(_one_seizure, o, a, c, horizon_h=horizon_h,
+                          post_h=post_h, bin_min=bin_min, thresh=thresh)
+                for (o, a, c) in tasks]
+        for i, fu in enumerate(futs):
+            try:
+                r = fu.result()
+                print(f"[{i+1}/{n}] done: seizure {int(r[0])} ({r[1]} recs)",
+                      flush=True)
+            except Exception as e:                 # noqa: BLE001 -- one bad seizure
+                print(f"[{i+1}/{n}] FAILED: {e}", flush=True)
+    fig = aggregate(animal)
+    print(f"aggregate figure -> {fig}", flush=True)
+    return fig
+
+
 def _main(argv=None) -> int:
     import argparse
 
@@ -309,15 +358,31 @@ def _main(argv=None) -> int:
 
     from src.db.store import Store
 
-    ap = argparse.ArgumentParser(description="Peri-ictal ripple-rate for one seizure")
+    ap = argparse.ArgumentParser(description="Peri-ictal ripple-rate")
     ap.add_argument("--config", default="config/config.yaml")
     ap.add_argument("--animal", default="BCH111")
-    ap.add_argument("--onset-epoch", type=float, required=True)
+    ap.add_argument("--onset-epoch", type=float, default=None,
+                    help="one seizure onset (absolute epoch)")
+    ap.add_argument("--onsets", default=None,
+                    help="comma-separated onsets -> parallel batch + aggregate")
+    ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--aggregate-only", action="store_true",
+                    help="just rebuild the aggregate figure from existing CSVs")
     ap.add_argument("--horizon-h", type=float, default=6.0)
     ap.add_argument("--post-h", type=float, default=0.5)
     ap.add_argument("--bin-min", type=float, default=10.0)
     ap.add_argument("--thresh", type=float, default=0.7)
     args = ap.parse_args(argv)
+    if args.aggregate_only:
+        print("aggregate ->", aggregate(args.animal))
+        return 0
+    if args.onsets:
+        onsets = [float(x) for x in args.onsets.split(",") if x.strip()]
+        run_batch(args.animal, onsets, args.config, jobs=args.jobs,
+                  horizon_h=args.horizon_h, post_h=args.post_h,
+                  bin_min=args.bin_min, thresh=args.thresh)
+        return 0
+    assert args.onset_epoch is not None, "pass --onset-epoch or --onsets"
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     store = Store(cfg["database"]["path"])
