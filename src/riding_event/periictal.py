@@ -218,7 +218,8 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
                        horizon_h: float = 7.0, post_h: float = 3.0,
                        bin_min: float = 10.0, thresh: float = 0.7,
                        phfo_frac: float = _PHFO_FRAC, phfo_prom: float = _PHFO_PROM,
-                       phfo_snr: float = _PHFO_SNR, exclude_gap_h: float = 1.0,
+                       phfo_snr: float = _PHFO_SNR, exclude_pre_h: float = 1.0,
+                       exclude_post_h: float = 3.0,
                        warmup_min: float = _WARMUP_MIN, progress=None) -> dict:
     """pHFO-rate trajectory for one seizure, binned by time-to-onset over
     ``[onset - horizon_h, onset + post_h]``. camp 1 (``phfo``) = ALL pHFOs =
@@ -229,8 +230,9 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
     alone. A detection is a pHFO by ``primitives.phfo_gate`` (HF-SNR >= *phfo_snr*
     OR (prom >= *phfo_prom* & frac >= *phfo_frac*)). The first *warmup_min* after
     each recording start is dropped (stim-habituation transients). CRITICAL: any bin
-    within +/- *exclude_gap_h* of ANOTHER scored seizure is NaN'd (a tight seizure
-    cluster otherwise contaminates each seizure's window with its neighbours). Per-
+    inside a neighbour's window ``[onset - exclude_pre_h, onset + exclude_post_h]``
+    is NaN'd (asymmetric -- a neighbour's pHFO contamination is mostly its post-ictal
+    surge), so a tight cluster doesn't contaminate this seizure's window. Per-
     bin counts + covered seconds + rates (events/min), NaN where uncovered/excluded.
     Recordings cached (thresholds re-tunable without re-reading)."""
     prog = progress or (lambda *_a: None)
@@ -274,7 +276,8 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
     # NEIGHBOUR-SEIZURE EXCLUSION: zero coverage (-> NaN rate) in any bin within
     # +/-exclude_gap_h of ANOTHER scored seizure onset, so a tight cluster's
     # neighbours don't contaminate this seizure's window (esp. its baseline).
-    cov = _exclude_neighbours(cov, centers, store, animal, onset_epoch, exclude_gap_h)
+    cov = _exclude_neighbours(cov, centers, store, animal, onset_epoch,
+                              exclude_pre_h, exclude_post_h)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
     phfo_ct, _ = np.histogram((phfo - onset_epoch) / 60.0, bins=edges)
@@ -304,28 +307,30 @@ def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
 
 
 def _exclude_neighbours(cov, centers, store, animal: str, onset_epoch: float,
-                        exclude_gap_h: float) -> np.ndarray:
-    """Zero coverage (-> NaN rate) in any bin within +/-*exclude_gap_h* hours of
-    ANOTHER scored seizure onset, so a tight seizure cluster's neighbours don't
-    contaminate this seizure's peri-ictal window. Returns the masked coverage."""
-    if not exclude_gap_h or exclude_gap_h <= 0:
+                        pre_gap_h: float, post_gap_h: float) -> np.ndarray:
+    """Zero coverage (-> NaN rate) in any bin inside ANOTHER scored seizure's
+    contaminating window ``[onset - pre_gap_h, onset + post_gap_h]`` -- ASYMMETRIC
+    because a seizure's pHFO contamination is mostly its POST-ictal surge (decays
+    over ~1-3 h), not its pre-ictal side. Keeps a tight cluster's neighbours out of
+    this seizure's window. Returns the masked coverage."""
+    if (not pre_gap_h and not post_gap_h) or (pre_gap_h <= 0 and post_gap_h <= 0):
         return cov
     from src.preictal.isi import scored_seizures
-    gap = float(exclude_gap_h) * 60.0
+    pre, post = float(pre_gap_h) * 60.0, float(post_gap_h) * 60.0
     excl = np.zeros(centers.size, dtype=bool)
     n = 0
     for z in scored_seizures(store, animal):       # bounded by scored count
         if abs(z.onset_epoch - onset_epoch) <= 60.0:   # this seizure itself
             continue
         o_rel = (z.onset_epoch - onset_epoch) / 60.0    # minutes rel to this onset
-        m = np.abs(centers - o_rel) <= gap
+        m = (centers >= o_rel - pre) & (centers <= o_rel + post)
         if m.any():
             excl |= m
             n += 1
     if n:
-        logger.info("seizure @%.0f: NaN'd %d bins overlapping %d neighbour "
-                    "seizure(s) (+/-%.1f h)", onset_epoch, int(excl.sum()), n,
-                    exclude_gap_h)
+        logger.info("seizure @%.0f: NaN'd %d bins in %d neighbour window(s) "
+                    "([-%.1f,+%.1f] h)", onset_epoch, int(excl.sum()), n,
+                    pre_gap_h, post_gap_h)
     return np.where(excl, 0.0, cov)
 
 
