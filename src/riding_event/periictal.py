@@ -23,9 +23,9 @@ import os
 
 import numpy as np
 
+from src.preictal.isi import parse_chunk_datetime
 from src.riding_event import detect as _det
 from src.utils import chunk_cache as _cc
-from src.utils.evoked_output import parse_recording_dt
 
 logger = logging.getLogger("qc_monitor.riding_event.periictal")
 
@@ -80,8 +80,8 @@ def animal_recordings(store, animal: str) -> list[dict]:
         conn.close()
     out = []
     for r in rows:
-        dt = parse_recording_dt(r["fp"]) or None
-        if dt is None:
+        dt = parse_chunk_datetime(r["dt"])         # from processed_files, NOT the
+        if dt is None:                             # raw path (no _evoked.mat suffix)
             continue
         dur = float(r["dur"]) if r["dur"] else 3600.0
         out.append({"file_id": int(r["id"]), "file_path": r["fp"],
