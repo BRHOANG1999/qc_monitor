@@ -215,12 +215,15 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
                        bin_min: float = 10.0, thresh: float = 0.7,
                        phfo_frac: float = _PHFO_FRAC, phfo_prom: float = _PHFO_PROM,
                        warmup_min: float = _WARMUP_MIN, progress=None) -> dict:
-    """pHFO-rate trajectory for one seizure: bin the candidate, matched-filter, and
-    pHFO-CONFIRMED matched-filter detections over ``[onset - horizon_h,
-    onset + post_h]`` by time-to-onset. A detection is a pHFO when its HF fraction
-    >= *phfo_frac* AND HF-envelope prominence >= *phfo_prom* (rejects LFDs /
-    low-frequency deflections). The first *warmup_min* after each recording start
-    is dropped (from events AND coverage) to remove stimulation-habituation
+    """pHFO-rate trajectory for one seizure, binned by time-to-onset over
+    ``[onset - horizon_h, onset + post_h]``. camp 1 (``phfo``) = ALL pHFOs =
+    SPONTANEOUS (continuous matched filter, outside the post-stim window) UNION
+    STIM-RIDING (Prong-A residual: the evoked response is subtracted, then the
+    residual's 0-100 ms window is scored, because the matched filter can't see a
+    pHFO buried under the response). camp 2 (``phfo_post``) = the stim-riding path
+    alone. A detection is a pHFO when HF fraction >= *phfo_frac* AND HF-envelope
+    prominence >= *phfo_prom* (rejects LFDs). The first *warmup_min* after each
+    recording start is dropped (events AND coverage) to remove stim-habituation
     transients. Per-bin counts + covered seconds + rates (events/min), NaN where
     uncovered. Recordings cached (thresholds re-tunable without re-reading)."""
     prog = progress or (lambda *_a: None)
@@ -230,7 +233,11 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
             if r["start_epoch"] < t_hi and r["start_epoch"] + r["duration"] > t_lo]
     assert len(recs) < _MAX_RECS, "too many recordings in the horizon"
     edges = np.arange(-horizon_h * 60.0, post_h * 60.0 + bin_min, bin_min)
-    cand_all, mf_all, phfo_all, post_all = [], [], [], []
+    # TWO-PATH camp 1 = ALL pHFOs: spontaneous (continuous matched filter, OUTSIDE
+    # the post-stim window) UNION stim-riding (Prong-A residual: evoked response
+    # subtracted, so the packet the matched filter can't see is recovered). camp 2
+    # = the stim-riding path alone (a subset of camp 1, disjoint region from spont).
+    cand_all, mf_all, spont_all, ride_all = [], [], [], []
     for i, r in enumerate(recs):
         prog(f"seizure@{onset_epoch:.0f}: rec {i+1}/{len(recs)} "
              f"{os.path.basename(r['file_path'])}")
@@ -239,18 +246,21 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
         mf_all.append(d["mf"])
         keep = np.isfinite(d["frac"]) & (d["frac"] >= phfo_frac) \
             & (d["prom"] >= phfo_prom)
-        phfo_all.append(d["mf"][keep] if d["mf"].size else np.empty(0))
-        # camp 2 = the stim-riding SUBSET of camp 1's pHFOs (0-100 ms post-stim)
-        keep_post = keep & np.asarray(d.get("post", np.zeros(keep.size, bool)))
-        post_all.append(d["mf"][keep_post] if d["mf"].size else np.empty(0))
+        not_post = ~np.asarray(d.get("post", np.zeros(keep.size, bool)))
+        spont = keep & not_post                    # spontaneous (between stims)
+        spont_all.append(d["mf"][spont] if d["mf"].size else np.empty(0))
+        ride, _stim = evoked_riding_recording(store, animal, r, band=tmpl["band"])
+        ride_all.append(ride)                      # stim-riding (residual detector)
     cand = _warmup_filter(np.concatenate(cand_all) if cand_all else np.empty(0),
                           recs, warmup_min)
     mf = _warmup_filter(np.concatenate(mf_all) if mf_all else np.empty(0),
                         recs, warmup_min)
-    phfo = _warmup_filter(np.concatenate(phfo_all) if phfo_all else np.empty(0),
-                          recs, warmup_min)
-    phfo_post = _warmup_filter(np.concatenate(post_all) if post_all else np.empty(0),
-                               recs, warmup_min)
+    spont = _warmup_filter(np.concatenate(spont_all) if spont_all else np.empty(0),
+                           recs, warmup_min)
+    phfo_post = _warmup_filter(np.concatenate(ride_all) if ride_all else np.empty(0),
+                               recs, warmup_min)          # camp 2 = stim-riding
+    phfo = (np.concatenate([spont, phfo_post])            # camp 1 = spont UNION ride
+            if (spont.size or phfo_post.size) else np.empty(0))
     cov = _coverage_seconds(_warmup_recs(recs, warmup_min), onset_epoch, edges)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
@@ -491,8 +501,9 @@ def aggregate(animal: str, out_png: str | None = None, *,
     axes[1].sharex(axes[0])
     axes[2].sharex(axes[0])
     lax.axis("off")
-    handles = _agg_panel(axes[0], trajs, "phfo_rate", xh, "pHFO matched-filter "
-                         "(LFDs rejected)", _r, "events / min", colors=colors)
+    handles = _agg_panel(axes[0], trajs, "phfo_rate", xh, "ALL pHFO "
+                         "(spontaneous + stim-riding, LFDs rejected)", _r,
+                         "events / min", colors=colors)
     st = (f"last hour vs -6..-4 h baseline:  {stats['median_fold']:.2f}× "
           f"(p={stats['p_wilcoxon']:.3g}, n={stats['n']})")
     axes[0].text(0.02, 0.84, st, transform=axes[0].transAxes, color="#ffd166",
@@ -643,19 +654,22 @@ _EVK_WIN_MS = (2.0, 100.0)      # post-artifact .. 100 ms post-stim (the riding 
 
 
 def _evk_cache_paths(animal: str, file_id: int) -> dict:
-    d = os.path.join(_root(animal), "evk_cache")     # "p" suffix = pHFO-gated (the
-    return {"flag": os.path.join(d, f"{file_id}_pflag.npy"),   # absolute frac+prom
-            "stim": os.path.join(d, f"{file_id}_pstim.npy")}   # gate, not percentile)
+    d = os.path.join(_root(animal), "evk_cache")      # "r" = evoked RESPONSE was
+    return {"flag": os.path.join(d, f"{file_id}_rflag.npy"),   # SUBTRACTED (Prong-A
+            "stim": os.path.join(d, f"{file_id}_rstim.npy")}   # residual) before scoring
 
 
 def evoked_riding_recording(store, animal: str, rec: dict, *,
                             win_ms=_EVK_WIN_MS, band=None) -> tuple:
-    """Absolute-epoch times of (flagged, all) stimuli for ONE recording: a stimulus
-    is 'flagged' when its 0-100 ms post-stim window carries a pHFO by the SAME
-    ABSOLUTE gate the continuous detector uses (``primitives.phfo_metrics_epochs``:
-    frac >= DEFAULT_PHFO_FRAC & prom >= DEFAULT_PHFO_PROM) -- NOT Prong-A's
-    per-recording 95th-percentile flag (which pins the flagged fraction ~5% by
-    construction and cannot show an absolute trend). Cached per file_id."""
+    """Absolute-epoch times of (stim-riding pHFO, all) stimuli for ONE recording.
+
+    The continuous matched filter CANNOT see pHFOs riding the evoked response (the
+    big stereotyped response masks the template correlation -- post-stim detections
+    sit at chance). So the riding pHFO is detected the Prong-A way: subtract the
+    per-recording robust-median evoked RESPONSE from each epoch, then score the
+    RESIDUAL's 0-100 ms window with the same absolute gate as camp 1
+    (``phfo_metrics_epochs``: frac >= DEFAULT_PHFO_FRAC & prom >= DEFAULT_PHFO_PROM).
+    Removing the response is what unmasks the packet. Cached per file_id."""
     p = _evk_cache_paths(animal, rec["file_id"])
     if all(os.path.exists(p[k]) for k in p):
         return np.load(p["flag"]), np.load(p["stim"])
@@ -684,7 +698,9 @@ def evoked_riding_recording(store, animal: str, rec: dict, *,
                                          pre_ms=_prim.DEFAULT_ARTIFACT_MS[0],
                                          post_ms=_prim.DEFAULT_ARTIFACT_MS[1])
     m = (time_ms >= float(win_ms[0])) & (time_ms <= float(win_ms[1]))
-    frac, prom = _prim.phfo_metrics_epochs(traces[:, m], fs, band)
+    template, _keep = _prim.robust_template(traces, iters=1, k=4.0, win_mask=m)
+    resid = _prim.residuals(traces, template)      # evoked RESPONSE removed
+    frac, prom = _prim.phfo_metrics_epochs(resid[:, m], fs, band)
     keep = (np.isfinite(frac) & (frac >= _PHFO_FRAC) & (prom >= _PHFO_PROM))
     n = int(min(times.size, keep.size))
     s0 = float(rec["start_epoch"])
@@ -902,11 +918,12 @@ def aggregate_camps(animal: str, out_png: str | None = None, *,
                             gridspec_kw={"height_ratios": [1, 1, 1, 0.34]})
     axes, lax = ax4[:3], ax4[3]
     lax.axis("off")
-    h1 = _agg_panel(axes[0], c, "phfo_rate", xh, "CAMP 1: ALL pHFO events "
-                    "(continuous LFP, LFDs rejected)", _r, "events / min",
-                    colors=colors)
-    _agg_panel(axes[1], c, "phfo_post_rate", xh, "CAMP 2: the stim-riding SUBSET "
-               "(pHFOs 0-100 ms after a stim)", _r, "events / min", colors=colors)
+    h1 = _agg_panel(axes[0], c, "phfo_rate", xh, "CAMP 1: ALL pHFO "
+                    "(spontaneous + stim-riding, LFDs rejected)", _r,
+                    "events / min", colors=colors)
+    _agg_panel(axes[1], c, "phfo_post_rate", xh, "CAMP 2: stim-riding pHFO "
+               "(Prong-A residual, 0-100 ms after a stim)", _r, "events / min",
+               colors=colors)
     _camp_compare(axes[2], c, xh, _r)
     axes[2].set_xlabel("hours to seizure onset (0 = onset)", color=_r._TEXT,
                        fontsize=10)
