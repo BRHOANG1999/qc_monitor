@@ -482,20 +482,18 @@ def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
 def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal="",
                         channel="", n: int = 12, pre_ms: float = 20.0,
                         post_ms: float = 100.0, onset_sec=None,
-                        frac=None, prom=None,
-                        phfo_frac: float = _p.DEFAULT_PHFO_FRAC,
-                        phfo_prom: float = _p.DEFAULT_PHFO_PROM) -> str:
+                        frac=None, prom=None, snr=None) -> str:
     """The actual LFP traces at matched-filter detections (a grid, one per
     detection, aligned to the detection at t=0). Shows what the detector fired on
     so it can be judged by eye -- raw LFP (blue) + band-passed HF trace (orange).
     With *onset_sec* (a seizure recording), shows the detections nearest the
     onset; else the strongest.
 
-    When ``frac``/``prom`` (per-detection pHFO metrics, aligned to
+    When ``frac``/``prom``/``snr`` (per-detection pHFO metrics, aligned to
     ``det['det_locs']``) are given, each panel is framed and labelled by the pHFO
-    GATE: green = pHFO (frac>=*phfo_frac* & prom>=*phfo_prom*), red = rejected LFD
-    (low-frequency deflection). This is what separates the real HF packets from the
-    slow DC-shift false positives."""
+    GATE (``primitives.phfo_gate``: HF-SNR OR (prom & frac)): green = pHFO, red =
+    rejected LFD. This is what separates the real HF packets from the slow DC-shift
+    false positives."""
     x = np.asarray(signal, dtype=np.float64)
     dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
     sc = np.asarray(det.get("det_scores", []), dtype=np.float64)
@@ -508,7 +506,9 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
     sel = dl[order]
     fr = np.asarray(frac, float)[order] if frac is not None else None
     pr = np.asarray(prom, float)[order] if prom is not None else None
-    gate_sel = _phfo_gate_mask(fr, pr, phfo_frac, phfo_prom)  # over SHOWN
+    sn = np.asarray(snr, float)[order] if snr is not None else None
+    gate_sel = (_p.phfo_gate(fr, pr, sn) if (fr is not None and pr is not None)
+                else None)                          # over SHOWN detections
     n_keep = int(gate_sel.sum()) if gate_sel is not None else -1
     pre = max(1, int(round(pre_ms * 1e-3 * fs)))
     post = max(1, int(round(post_ms * 1e-3 * fs)))
@@ -530,7 +530,7 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
         ax.plot(t, seg, color=_ACCENT, lw=0.6)
         ax.plot(t, hf, color=_EVENT, lw=0.7, alpha=0.8)
         ax.axvline(0, color=_MUTED, lw=0.6, ls="--")
-        _annotate_gate(ax, loc, fs, sco, fr, pr, i, phfo_frac, phfo_prom)
+        _annotate_gate(ax, loc, fs, sco, fr, pr, sn, i)
     which = (f"nearest the seizure onset ({onset_sec:.0f}s)"
              if onset_sec is not None else "strongest")
     gate_txt = (f" — pHFO-GATED: {n_keep} of {sel.size} pHFO (green), "
@@ -541,28 +541,20 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
     return _finish(fig, out_png)
 
 
-def _phfo_gate_mask(frac, prom, phfo_frac, phfo_prom):
-    """Boolean 'is a real pHFO' mask over detections, or None when metrics were
-    not supplied."""
-    if frac is None or prom is None:
-        return None
-    fr = np.asarray(frac, float)
-    pr = np.asarray(prom, float)
-    return np.isfinite(fr) & (fr >= float(phfo_frac)) & (pr >= float(phfo_prom))
-
-
-def _annotate_gate(ax, loc, fs, sco, fr, pr, i, phfo_frac, phfo_prom) -> None:
+def _annotate_gate(ax, loc, fs, sco, fr, pr, sn, i) -> None:
     """Per-panel title + coloured frame from the pHFO gate (green pHFO / red LFD);
-    plain title when no metrics were supplied."""
+    plain title when no metrics were supplied. Gate = ``primitives.phfo_gate``."""
     if fr is None or pr is None or i >= fr.size:
         ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}", color=_TEXT, fontsize=8,
                      loc="left")
         return
-    keep = np.isfinite(fr[i]) and fr[i] >= phfo_frac and pr[i] >= phfo_prom
+    si = float(sn[i]) if (sn is not None and i < sn.size) else float("nan")
+    keep = bool(_p.phfo_gate([fr[i]], [pr[i]], [si])[0])
     col = "#3ddc84" if keep else "#ff5d5d"
     tag = "pHFO" if keep else "LFD"
-    ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}  {tag}  f={fr[i]:.2f} p={pr[i]:.0f}",
-                 color=col, fontsize=8, loc="left")
+    sstr = f" s={si:.1f}" if np.isfinite(si) else ""
+    ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}  {tag}  f={fr[i]:.2f} p={pr[i]:.0f}"
+                 f"{sstr}", color=col, fontsize=8, loc="left")
     for sp in ax.spines.values():
         sp.set_color(col)
         sp.set_linewidth(1.8)

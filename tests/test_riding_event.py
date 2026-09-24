@@ -231,22 +231,40 @@ def test_stim_blanking_and_amplitude_gate():
 
 
 def test_phfo_metrics_separates_phfo_from_lfd():
-    """phfo_metrics must keep a tall multi-cycle HF packet (pHFO) and reject a
-    low-frequency deflection (LFD). The old 'sustained fraction' scored these
-    backwards; the discriminating metric is HF-envelope PROMINENCE (peak/median)."""
+    """phfo_gate must keep a HF packet (pHFO) and reject a low-frequency deflection
+    (LFD). Metrics: frac (HF fraction), prom (envelope peak/median), snr (event HF
+    RMS / pre-baseline HF RMS). Gate = SNR OR (prom & frac)."""
+    rng = np.random.default_rng(0)
     fs = 20000.0
+    n = 30000
+    sig = 0.02 * rng.standard_normal(n)         # small HF-containing noise floor
     w = 600
     t = np.arange(w) / fs
-    sig = np.zeros(20000)
     band = (150.0, 620.0)
-    sig[1000:1600] += 3.0 * np.sin(2 * np.pi * 250 * t) * np.hanning(w)  # pHFO packet
-    sig[3000:3600] += 3.0 * np.sin(2 * np.pi * 12 * t)                   # LFD (slow)
-    frac, prom = p.phfo_metrics(sig, np.array([1000, 3000]), fs, band)
-    gate = (np.isfinite(frac) & (frac >= p.DEFAULT_PHFO_FRAC)
-            & (prom >= p.DEFAULT_PHFO_PROM))
-    assert gate[0], "pHFO packet must pass (high HF fraction + prominence)"
+    slow = np.hanning(1200)                     # a smooth slow deflection (no edges)
+    sig[10000:10600] += 3.0 * np.sin(2 * np.pi * 250 * t) * np.hanning(w)  # pHFO
+    sig[19400:20600] += 3.0 * slow                                         # LFD
+    frac, prom, snr = p.phfo_metrics(sig, np.array([10000, 20000]), fs, band)
+    gate = p.phfo_gate(frac, prom, snr)
+    assert gate[0], "pHFO packet must pass (HF-SNR or prom+frac)"
     assert not gate[1], "LFD (low HF, flat envelope) must be rejected"
     assert prom[0] > prom[1], "the pHFO packet must be far more prominent"
+    assert snr[0] > snr[1], "the pHFO packet must have far higher HF-SNR"
+
+
+def test_phfo_metrics_epochs_snr():
+    """phfo_metrics_epochs on full epochs (t=0=stim): a HF packet in the post-stim
+    window with a quiet pre-stim baseline gives high SNR; a flat epoch does not."""
+    rng = np.random.default_rng(1)
+    fs = 20000.0
+    time_ms = np.arange(-150.0, 150.0, 1000.0 / fs)   # -150..150 ms
+    tt = np.zeros((2, time_ms.size)) + 0.02 * rng.standard_normal((2, time_ms.size))
+    band = (150.0, 620.0)
+    ev = (time_ms >= 20.0) & (time_ms <= 80.0)        # a post-stim packet on row 0
+    tp = time_ms[ev] / 1000.0
+    tt[0, ev] += 3.0 * np.sin(2 * np.pi * 250 * tp)
+    frac, prom, snr = p.phfo_metrics_epochs(tt, time_ms, fs, band)
+    assert snr[0] > 2.0 and snr[1] < 2.0, "packet epoch high SNR, flat epoch low"
 
 
 def test_degenerate_inputs():

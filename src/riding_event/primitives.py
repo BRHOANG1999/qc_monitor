@@ -293,26 +293,60 @@ def rising_edge_align(snippets, fs: float, *, search_ms: float = 10.0,
     return np.asarray(out), np.asarray(keep_fid, dtype=np.int64)
 
 
-# pHFO gate defaults (validated on a user-labelled 12-detection set: LFDs had
-# prom 2.7-3.8 & frac 0.07-0.16, pHFOs had prom 16-53 & frac 0.26-0.49).
-DEFAULT_PHFO_FRAC = 0.20         # min HF-band energy fraction
-DEFAULT_PHFO_PROM = 6.0          # min HF-envelope peak/median (packet prominence)
+# pHFO gate defaults. HF-SNR (event HF-RMS / baseline HF-RMS) is the primary
+# criterion -- it catches SUSTAINED bursts (prominence misses them: a long packet
+# keeps the median envelope high -> low prom) and slow-wave-RIDING packets (frac
+# misses them: the leftover slow component dilutes the HF fraction). OR'd with
+# prominence (+relaxed frac) for brief sharp packets. Validated on the labelled set:
+# LFDs sit at SNR~1 & prom~3; pHFOs at SNR>=2.5 or prom>6.
+DEFAULT_PHFO_SNR = 2.0           # min HF-band RMS(event) / RMS(baseline)
+DEFAULT_PHFO_PROM = 6.0          # min HF-envelope peak/median (brief-packet path)
+DEFAULT_PHFO_FRAC = 0.10         # min HF-band energy fraction (with the prom path)
+_PHFO_EVT_MS = (2.0, 120.0)      # SNR event window, relative to the reference
+_PHFO_BASE_MS = (-120.0, -20.0)  # SNR baseline window (pre-reference)
+_PHFO_GATE_MS = (2.0, 100.0)     # window frac/prom are measured over (epochs path)
+
+
+def phfo_gate(frac, prom, snr, *, snr_min: float = DEFAULT_PHFO_SNR,
+              prom_min: float = DEFAULT_PHFO_PROM,
+              frac_min: float = DEFAULT_PHFO_FRAC) -> np.ndarray:
+    """The pHFO DETECTION decision (boolean mask): HF-SNR >= *snr_min* OR
+    (prominence >= *prom_min* AND HF-fraction >= *frac_min*). The SNR term catches
+    sustained / slow-wave-riding bursts; the prom+frac term catches brief sharp
+    packets. Missing SNR (NaN, e.g. continuous windows with no baseline) falls back
+    to the prom+frac path."""
+    fr = np.asarray(frac, dtype=np.float64)
+    pr = np.asarray(prom, dtype=np.float64)
+    sn = np.asarray(snr, dtype=np.float64)
+    return ((np.isfinite(sn) & (sn >= float(snr_min)))
+            | (np.isfinite(pr) & (pr >= float(prom_min))
+               & np.isfinite(fr) & (fr >= float(frac_min))))
+
+
+def _hf_snr(x2d, fs: float, band, ev_mask, base_mask) -> np.ndarray:
+    """HF-band RMS over *ev_mask* columns / HF-band RMS over *base_mask* columns,
+    per row of the 2-D window matrix *x2d*. NaN when a mask is empty."""
+    lo = max(1.0, float(band[0]))
+    hi = min(float(band[1]), 0.49 * float(fs))
+    n = x2d.shape[0]
+    if hi <= lo or n == 0 or not ev_mask.any() or not base_mask.any():
+        return np.full(n, np.nan)
+    hf = _ef._bandpass(np.asarray(x2d, dtype=np.float64), float(fs), lo, hi)
+    ev = np.sqrt(np.mean(hf[:, ev_mask] ** 2, axis=1))
+    ba = np.sqrt(np.mean(hf[:, base_mask] ** 2, axis=1))
+    return ev / (ba + _EPS)
 
 
 def phfo_metrics(signal, locs, fs: float, band, *, pre_ms: float = 10.0,
-                 post_ms: float = 60.0) -> tuple:
-    """Per-detection pHFO confirmation: separate a real pHFO (a brief, TALL, multi-
-    cycle HF packet) from an LFD (low-frequency deflection -- a large slow swing
-    with only flat background HF). Over a window CENTRED on each detection
-    (``[-pre_ms, +post_ms]``) returns ``(hf_frac, prominence)``:
+                 post_ms: float = 60.0, evt_ms=_PHFO_EVT_MS,
+                 base_ms=_PHFO_BASE_MS) -> tuple:
+    """Per-detection pHFO metrics ``(hf_frac, prominence, hf_snr)``:
 
-    - ``hf_frac`` = HF-band RMS / broadband RMS -- the fraction of energy in the HF
-      band (an LFD is dominated by its slow swing, so this is low).
-    - ``prominence`` = peak HF envelope / median HF envelope -- how far the HF
-      packet stands out of background. THE discriminating metric: an LFD's flat
-      envelope gives ~3, a pHFO packet gives >15. (The old 'sustained fraction'
-      was backwards -- a sharp packet spends little of the window above half its
-      own tall peak, so it scored LOW while flat LFDs scored high.)
+    - ``hf_frac`` = HF-band RMS / broadband RMS over ``[-pre_ms, +post_ms]``.
+    - ``prominence`` = peak HF envelope / median HF envelope (brief-packet cue).
+    - ``hf_snr`` = HF-band RMS in ``evt_ms`` / HF-band RMS in ``base_ms`` (both
+      relative to the detection *loc*) -- the robust cue that also catches SUSTAINED
+      bursts and slow-wave-riding packets. See ``phfo_gate`` for the decision.
 
     NaN for windows that run off an edge. Vectorised over detections."""
     from scipy.signal import hilbert
@@ -324,51 +358,67 @@ def phfo_metrics(signal, locs, fs: float, band, *, pre_ms: float = 10.0,
     post = max(1, int(round(post_ms * 1e-3 * fs)))
     frac = np.full(loc.size, np.nan)
     prom = np.full(loc.size, np.nan)
-    ok = (loc - pre >= 0) & (loc + post <= x.size)
-    if not ok.any():
-        return frac, prom
-    idx = (loc[ok] - pre)[:, None] + np.arange(pre + post)[None, :]
-    win = x[idx]
+    snr = np.full(loc.size, np.nan)
     lo = max(1.0, float(band[0]))
     hi = min(float(band[1]), 0.49 * float(fs))
     if hi <= lo:
-        return frac, prom
-    hf = _ef._bandpass(win, float(fs), lo, hi)
-    env = np.abs(hilbert(hf, axis=1))
-    hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
-    tot = np.sqrt(np.mean((win - win.mean(axis=1, keepdims=True)) ** 2, axis=1))
-    med = np.median(env, axis=1)
-    frac[ok] = hf_rms / (tot + _EPS)
-    prom[ok] = np.max(env, axis=1) / (med + _EPS)
-    return frac, prom
+        return frac, prom, snr
+    ok = (loc - pre >= 0) & (loc + post <= x.size)
+    if ok.any():
+        idx = (loc[ok] - pre)[:, None] + np.arange(pre + post)[None, :]
+        win = x[idx]
+        hf = _ef._bandpass(win, float(fs), lo, hi)
+        env = np.abs(hilbert(hf, axis=1))
+        hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
+        tot = np.sqrt(np.mean((win - win.mean(axis=1, keepdims=True)) ** 2, axis=1))
+        frac[ok] = hf_rms / (tot + _EPS)
+        prom[ok] = np.max(env, axis=1) / (np.median(env, axis=1) + _EPS)
+    # HF-SNR: event vs a local pre-baseline window (both relative to loc)
+    b0 = int(round(base_ms[0] * 1e-3 * fs))
+    e1 = int(round(evt_ms[1] * 1e-3 * fs))
+    span = e1 - b0
+    ok2 = (loc + b0 >= 0) & (loc + b0 + span <= x.size)
+    if ok2.any() and span > 4:
+        idx2 = (loc[ok2] + b0)[:, None] + np.arange(span)[None, :]
+        tw = (np.arange(span) + b0) / float(fs) * 1000.0   # ms relative to loc
+        evm = (tw >= evt_ms[0]) & (tw <= evt_ms[1])
+        bam = (tw >= base_ms[0]) & (tw <= base_ms[1])
+        snr[ok2] = _hf_snr(x[idx2], fs, band, evm, bam)
+    return frac, prom, snr
 
 
-def phfo_metrics_epochs(win_traces, fs: float, band) -> tuple:
-    """The SAME absolute pHFO metric as ``phfo_metrics``, but for pre-windowed
-    epochs: *win_traces* is ``[epochs x W]`` already sliced to the window of
-    interest (e.g. the 0-100 ms post-stim window of each evoked epoch). Returns
-    ``(hf_frac, prominence)`` per epoch. Use this to score stim-locked epochs with
-    the same absolute criterion the continuous detector uses -- NOT a per-recording
-    percentile (which pins the flagged fraction by construction)."""
+def phfo_metrics_epochs(traces, time_ms, fs: float, band, *,
+                        gate_ms=_PHFO_GATE_MS, evt_ms=_PHFO_EVT_MS,
+                        base_ms=_PHFO_BASE_MS) -> tuple:
+    """Per-epoch pHFO metrics ``(hf_frac, prominence, hf_snr)`` on FULL epochs
+    ``[epochs x T]`` with ``time_ms`` (t=0 = stim): frac/prom over *gate_ms*, and
+    hf_snr = HF-RMS in the post-stim *evt_ms* window / HF-RMS in the PRE-stim
+    *base_ms* window (the stim-locked baseline). Pass the RESIDUAL (evoked response
+    subtracted) so only the riding packet remains. Same decision via ``phfo_gate``."""
     from scipy.signal import hilbert
-    x = np.asarray(win_traces, dtype=np.float64)
-    assert x.ndim == 2, "win_traces must be [epochs x W]"
+    x = np.asarray(traces, dtype=np.float64)
+    t = np.asarray(time_ms, dtype=np.float64)
+    assert x.ndim == 2, "traces must be [epochs x T]"
     assert fs and fs > 0, "fs must be positive"
     e = x.shape[0]
     frac = np.full(e, np.nan)
     prom = np.full(e, np.nan)
     lo = max(1.0, float(band[0]))
     hi = min(float(band[1]), 0.49 * float(fs))
-    if hi <= lo or x.shape[1] < 8 or e == 0:
-        return frac, prom
-    hf = _ef._bandpass(x, float(fs), lo, hi)
+    gm = (t >= gate_ms[0]) & (t <= gate_ms[1])
+    if hi <= lo or e == 0 or not gm.any():
+        return frac, prom, np.full(e, np.nan)
+    g = x[:, gm]
+    hf = _ef._bandpass(g, float(fs), lo, hi)
     env = np.abs(hilbert(hf, axis=1))
     hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
-    tot = np.sqrt(np.mean((x - x.mean(axis=1, keepdims=True)) ** 2, axis=1))
-    med = np.median(env, axis=1)
+    tot = np.sqrt(np.mean((g - g.mean(axis=1, keepdims=True)) ** 2, axis=1))
     frac = hf_rms / (tot + _EPS)
-    prom = np.max(env, axis=1) / (med + _EPS)
-    return frac, prom
+    prom = np.max(env, axis=1) / (np.median(env, axis=1) + _EPS)
+    evm = (t >= evt_ms[0]) & (t <= evt_ms[1])
+    bam = (t >= base_ms[0]) & (t <= base_ms[1])
+    snr = _hf_snr(x, fs, band, evm, bam)
+    return frac, prom, snr
 
 
 def matched_filter_series(signal, template) -> np.ndarray:

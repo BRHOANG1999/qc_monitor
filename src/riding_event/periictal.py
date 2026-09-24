@@ -34,6 +34,7 @@ _MAX_RECS = 200          # NASA Rule 2: bound the per-seizure recording scan.
 _SEC_H = 3600.0
 _PHFO_FRAC = _prim.DEFAULT_PHFO_FRAC     # pHFO gate: min HF-band energy fraction
 _PHFO_PROM = _prim.DEFAULT_PHFO_PROM     # pHFO gate: min HF-envelope prominence
+_PHFO_SNR = _prim.DEFAULT_PHFO_SNR       # pHFO gate: min HF-SNR (event/baseline)
 _STIM_PAD_SEC = 0.003     # exclude detections only within +/-3 ms of a stim (the
 #   artifact region; the artifact itself is interpolated over -1/+2 ms). NOT the old
 #   250 ms exclusion -- camp 1 must count ALL pHFOs, including the stim-riding ones.
@@ -125,6 +126,7 @@ def _det_cache_paths(animal: str, file_id: int) -> dict:
             "mf": os.path.join(d, f"{file_id}_mf.npy"),
             "frac": os.path.join(d, f"{file_id}_frac.npy"),
             "prom": os.path.join(d, f"{file_id}_prom.npy"),
+            "snr": os.path.join(d, f"{file_id}_snr.npy"),    # HF-SNR (gate primary)
             "post": os.path.join(d, f"{file_id}_post.npy")}   # stim-riding mask
 
 
@@ -142,11 +144,11 @@ def detect_recording(store, animal: str, rec: dict, tmpl: dict, *,
     if all(os.path.exists(p[k]) for k in p):
         return {"cand": np.load(p["cand"]), "mf": np.load(p["mf"]),
                 "frac": np.load(p["frac"]), "prom": np.load(p["prom"]),
-                "post": np.load(p["post"])}
+                "snr": np.load(p["snr"]), "post": np.load(p["post"])}
     stim_times = _recording_stim_times(store, animal, rec["file_id"])
     loaded = _det.load_channel(rec["file_path"], animal)
     if loaded is None:
-        return _save_det(p, *([np.empty(0)] * 4), np.empty(0, dtype=bool))
+        return _save_det(p, *([np.empty(0)] * 5), np.empty(0, dtype=bool))
     signal, fs, _ch = loaded
     try:
         d = _det.run_detector(signal, fs, band=tmpl["band"],
@@ -155,7 +157,7 @@ def detect_recording(store, animal: str, rec: dict, tmpl: dict, *,
                               exclude_pad_sec=_STIM_PAD_SEC, thresh=thresh)
         det_locs = np.asarray(d["det_locs"], dtype=np.int64)
         from src.riding_event import primitives as _p
-        frac, prom = _p.phfo_metrics(signal, det_locs, fs, tmpl["band"])
+        frac, prom, snr = _p.phfo_metrics(signal, det_locs, fs, tmpl["band"])
     finally:
         del signal
         _cc.clear()                                # free the multi-GB chunk
@@ -163,7 +165,7 @@ def detect_recording(store, animal: str, rec: dict, tmpl: dict, *,
     s0 = rec["start_epoch"]
     cand = s0 + np.asarray(d["cand_locs"], dtype=np.float64) / fs
     mf = s0 + det_locs.astype(np.float64) / fs
-    return _save_det(p, cand, mf, frac, prom, post)
+    return _save_det(p, cand, mf, frac, prom, snr, post)
 
 
 def _stim_riding_mask(det_locs, fs: float, stim_times, post_ms: float) -> np.ndarray:
@@ -182,14 +184,16 @@ def _stim_riding_mask(det_locs, fs: float, stim_times, post_ms: float) -> np.nda
     return (lat > 0.0) & (lat <= post_ms * 1e-3)
 
 
-def _save_det(p: dict, cand, mf, frac, prom, post) -> dict:
+def _save_det(p: dict, cand, mf, frac, prom, snr, post) -> dict:
     os.makedirs(os.path.dirname(p["cand"]), exist_ok=True)
     np.save(p["cand"], cand)
     np.save(p["mf"], mf)
     np.save(p["frac"], frac)
     np.save(p["prom"], prom)
+    np.save(p["snr"], snr)
     np.save(p["post"], np.asarray(post, dtype=bool))
-    return {"cand": cand, "mf": mf, "frac": frac, "prom": prom, "post": post}
+    return {"cand": cand, "mf": mf, "frac": frac, "prom": prom, "snr": snr,
+            "post": post}
 
 
 def _recording_stim_times(store, animal: str, file_id: int):
@@ -211,9 +215,10 @@ def _recording_stim_times(store, animal: str, file_id: int):
 
 
 def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
-                       horizon_h: float = 6.0, post_h: float = 3.0,
+                       horizon_h: float = 7.0, post_h: float = 3.0,
                        bin_min: float = 10.0, thresh: float = 0.7,
                        phfo_frac: float = _PHFO_FRAC, phfo_prom: float = _PHFO_PROM,
+                       phfo_snr: float = _PHFO_SNR, exclude_gap_h: float = 1.0,
                        warmup_min: float = _WARMUP_MIN, progress=None) -> dict:
     """pHFO-rate trajectory for one seizure, binned by time-to-onset over
     ``[onset - horizon_h, onset + post_h]``. camp 1 (``phfo``) = ALL pHFOs =
@@ -221,11 +226,13 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
     STIM-RIDING (Prong-A residual: the evoked response is subtracted, then the
     residual's 0-100 ms window is scored, because the matched filter can't see a
     pHFO buried under the response). camp 2 (``phfo_post``) = the stim-riding path
-    alone. A detection is a pHFO when HF fraction >= *phfo_frac* AND HF-envelope
-    prominence >= *phfo_prom* (rejects LFDs). The first *warmup_min* after each
-    recording start is dropped (events AND coverage) to remove stim-habituation
-    transients. Per-bin counts + covered seconds + rates (events/min), NaN where
-    uncovered. Recordings cached (thresholds re-tunable without re-reading)."""
+    alone. A detection is a pHFO by ``primitives.phfo_gate`` (HF-SNR >= *phfo_snr*
+    OR (prom >= *phfo_prom* & frac >= *phfo_frac*)). The first *warmup_min* after
+    each recording start is dropped (stim-habituation transients). CRITICAL: any bin
+    within +/- *exclude_gap_h* of ANOTHER scored seizure is NaN'd (a tight seizure
+    cluster otherwise contaminates each seizure's window with its neighbours). Per-
+    bin counts + covered seconds + rates (events/min), NaN where uncovered/excluded.
+    Recordings cached (thresholds re-tunable without re-reading)."""
     prog = progress or (lambda *_a: None)
     t_lo = onset_epoch - horizon_h * _SEC_H
     t_hi = onset_epoch + post_h * _SEC_H
@@ -244,8 +251,9 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
         d = detect_recording(store, animal, r, tmpl, thresh=thresh)
         cand_all.append(d["cand"])
         mf_all.append(d["mf"])
-        keep = np.isfinite(d["frac"]) & (d["frac"] >= phfo_frac) \
-            & (d["prom"] >= phfo_prom)
+        keep = _prim.phfo_gate(d["frac"], d["prom"], d.get("snr"),
+                               snr_min=phfo_snr, prom_min=phfo_prom,
+                               frac_min=phfo_frac)
         not_post = ~np.asarray(d.get("post", np.zeros(keep.size, bool)))
         spont = keep & not_post                    # spontaneous (between stims)
         spont_all.append(d["mf"][spont] if d["mf"].size else np.empty(0))
@@ -262,6 +270,11 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
     phfo = (np.concatenate([spont, phfo_post])            # camp 1 = spont UNION ride
             if (spont.size or phfo_post.size) else np.empty(0))
     cov = _coverage_seconds(_warmup_recs(recs, warmup_min), onset_epoch, edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    # NEIGHBOUR-SEIZURE EXCLUSION: zero coverage (-> NaN rate) in any bin within
+    # +/-exclude_gap_h of ANOTHER scored seizure onset, so a tight cluster's
+    # neighbours don't contaminate this seizure's window (esp. its baseline).
+    cov = _exclude_neighbours(cov, centers, store, animal, onset_epoch, exclude_gap_h)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
     phfo_ct, _ = np.histogram((phfo - onset_epoch) / 60.0, bins=edges)
@@ -270,7 +283,6 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
         r_of = lambda ct: np.where(cov > 0, ct / (cov / 60.0), np.nan)
         cand_rate, mf_rate = r_of(cand_ct), r_of(mf_ct)
         phfo_rate, phfo_post_rate = r_of(phfo_ct), r_of(post_ct)
-    centers = 0.5 * (edges[:-1] + edges[1:])
     return {"onset_epoch": onset_epoch, "centers_min": centers,
             "cand_count": cand_ct, "mf_count": mf_ct, "phfo_count": phfo_ct,
             "phfo_post_count": post_ct, "cover_sec": cov, "cand_rate": cand_rate,
@@ -289,6 +301,32 @@ def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
         hi = np.minimum(edges[1:], b)
         cov += np.maximum(0.0, hi - lo) * 60.0
     return cov
+
+
+def _exclude_neighbours(cov, centers, store, animal: str, onset_epoch: float,
+                        exclude_gap_h: float) -> np.ndarray:
+    """Zero coverage (-> NaN rate) in any bin within +/-*exclude_gap_h* hours of
+    ANOTHER scored seizure onset, so a tight seizure cluster's neighbours don't
+    contaminate this seizure's peri-ictal window. Returns the masked coverage."""
+    if not exclude_gap_h or exclude_gap_h <= 0:
+        return cov
+    from src.preictal.isi import scored_seizures
+    gap = float(exclude_gap_h) * 60.0
+    excl = np.zeros(centers.size, dtype=bool)
+    n = 0
+    for z in scored_seizures(store, animal):       # bounded by scored count
+        if abs(z.onset_epoch - onset_epoch) <= 60.0:   # this seizure itself
+            continue
+        o_rel = (z.onset_epoch - onset_epoch) / 60.0    # minutes rel to this onset
+        m = np.abs(centers - o_rel) <= gap
+        if m.any():
+            excl |= m
+            n += 1
+    if n:
+        logger.info("seizure @%.0f: NaN'd %d bins overlapping %d neighbour "
+                    "seizure(s) (+/-%.1f h)", onset_epoch, int(excl.sum()), n,
+                    exclude_gap_h)
+    return np.where(excl, 0.0, cov)
 
 
 def _warmup_filter(times, recs, warmup_min: float):
@@ -654,9 +692,9 @@ _EVK_WIN_MS = (2.0, 100.0)      # post-artifact .. 100 ms post-stim (the riding 
 
 
 def _evk_cache_paths(animal: str, file_id: int) -> dict:
-    d = os.path.join(_root(animal), "evk_cache")      # "r" = evoked RESPONSE was
-    return {"flag": os.path.join(d, f"{file_id}_rflag.npy"),   # SUBTRACTED (Prong-A
-            "stim": os.path.join(d, f"{file_id}_rstim.npy")}   # residual) before scoring
+    d = os.path.join(_root(animal), "evk_cache")      # "s" = SNR-gated residual
+    return {"flag": os.path.join(d, f"{file_id}_sflag.npy"),   # (evoked response
+            "stim": os.path.join(d, f"{file_id}_sstim.npy")}   # subtracted first)
 
 
 def evoked_riding_recording(store, animal: str, rec: dict, *,
@@ -700,8 +738,9 @@ def evoked_riding_recording(store, animal: str, rec: dict, *,
     m = (time_ms >= float(win_ms[0])) & (time_ms <= float(win_ms[1]))
     template, _keep = _prim.robust_template(traces, iters=1, k=4.0, win_mask=m)
     resid = _prim.residuals(traces, template)      # evoked RESPONSE removed
-    frac, prom = _prim.phfo_metrics_epochs(resid[:, m], fs, band)
-    keep = (np.isfinite(frac) & (frac >= _PHFO_FRAC) & (prom >= _PHFO_PROM))
+    frac, prom, snr = _prim.phfo_metrics_epochs(resid, time_ms, fs, band,
+                                                gate_ms=win_ms)
+    keep = _prim.phfo_gate(frac, prom, snr)        # HF-SNR OR (prom & frac)
     n = int(min(times.size, keep.size))
     s0 = float(rec["start_epoch"])
     stim = s0 + times[:n]
