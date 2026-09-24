@@ -214,6 +214,9 @@ def _main(argv=None) -> int:
     ap.add_argument("--animal", default="BCH111")
     ap.add_argument("--since", default="2026-09-14",
                     help="only seizures with onset on/after this date (hard boundary)")
+    ap.add_argument("--lead-gap-h", type=float, default=6.0,
+                    help="cluster-leader filter: drop any seizure with a prior "
+                         "seizure within this many hours (0 = keep all)")
     ap.add_argument("--pre-h", type=float, default=2.0)
     ap.add_argument("--post-h", type=float, default=1.0)
     ap.add_argument("--zoom-min", type=float, default=2.0)
@@ -222,13 +225,21 @@ def _main(argv=None) -> int:
     a = ap.parse_args(argv)
     import yaml
     from src.db.store import Store
-    from src.preictal.isi import scored_seizures
+    from src.preictal.isi import scored_seizures, leading_seizures
     cfg = yaml.safe_load(open(a.config, encoding="utf-8"))
     store = Store(cfg["database"]["path"])
     cut = _dt.datetime.fromisoformat(a.since).timestamp()
     szs = sorted((s for s in scored_seizures(store, a.animal)
                   if s.onset_epoch >= cut), key=lambda s: s.onset_epoch)
     print(f"{len(szs)} scored seizures >= {a.since}", flush=True)
+    if a.lead_gap_h > 0:
+        kept = leading_seizures(szs, a.lead_gap_h * _SEC_H)
+        dropped = [s for s in szs if s not in kept]
+        for s in dropped:
+            print(f"  dropped follower (within {a.lead_gap_h:g}h of a prior "
+                  f"seizure): {_sz_label(s.onset_epoch, s.racine)}", flush=True)
+        szs = kept
+        print(f"{len(szs)} cluster-leading seizures kept", flush=True)
     if not szs:
         print("no seizures in window"); return 1
     print("building pHFO template…", flush=True)

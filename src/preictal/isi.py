@@ -213,6 +213,32 @@ def inter_seizure_intervals(seizures: list[Seizure]) -> list[float | None]:
     return isi
 
 
+def leading_mask(onsets, min_gap_sec: float) -> list[bool]:
+    """Boolean keep-mask marking the cluster-LEADING seizures: a seizure is a
+    leader unless another seizure onset falls within *min_gap_sec* immediately
+    before it (i.e. its pre-onset baseline window would overlap a prior seizure).
+    Chaining from each seizure's actual predecessor collapses a whole run of
+    closely-spaced seizures to its first member. *onsets* is any iterable of
+    onset epochs (seconds); the returned mask is in the SAME order as *onsets*."""
+    assert min_gap_sec > 0, "min_gap_sec must be > 0"
+    xs = list(onsets)
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    keep = [True] * len(xs)
+    prev = None
+    for i in order:                                    # bounded by len(onsets)
+        if prev is not None and (xs[i] - prev) < min_gap_sec:
+            keep[i] = False
+        prev = xs[i]
+    return keep
+
+
+def leading_seizures(seizures: list[Seizure], min_gap_sec: float) -> list[Seizure]:
+    """Filter *seizures* (objects with ``.onset_epoch``) to the cluster leaders --
+    see :func:`leading_mask`. Preserves input order."""
+    mask = leading_mask([s.onset_epoch for s in seizures], min_gap_sec)
+    return [s for s, k in zip(seizures, mask) if k]
+
+
 def lookback_ceilings(seizures: list[Seizure], post_ictal_buffer_sec: float,
                        max_lookback_sec: float | None = None
                        ) -> list[float | None]:

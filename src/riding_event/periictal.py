@@ -363,7 +363,8 @@ def periictal_stats(trajs: list, key: str = "phfo_rate", *,
 
 
 def aggregate(animal: str, out_png: str | None = None, *,
-              coarse_min: float = 30.0) -> str | None:
+              coarse_min: float = 30.0, min_gap_h: float | None = None,
+              trajs_override: list | None = None) -> str | None:
     """Individual + averaged peri-ictal pHFO-rate figure (dark-themed): three
     panels (pHFO rate, the same baseline-normalized, HF-envelope candidates for
     contrast). Each seizure is a distinctly COLOURED trajectory (legend below) so
@@ -371,9 +372,20 @@ def aggregate(animal: str, out_png: str | None = None, *,
     SEM (bold white). Bins are averaged into *coarse_min* windows (default 30 min);
     the horizon runs from pre-onset through the post-onset tail. Returns the figure
     path (None when no trajectories)."""
-    trajs_raw = load_trajectories(animal)
+    trajs_raw = (trajs_override if trajs_override is not None
+                 else load_trajectories(animal))
     if not trajs_raw:
         return None
+    if min_gap_h and min_gap_h > 0:                    # cluster-leaders only
+        from src.preictal.isi import leading_mask
+        mask = leading_mask([t["onset_epoch"] for t in trajs_raw],
+                            min_gap_h * _SEC_H)
+        kept = [t for t, k in zip(trajs_raw, mask) if k]
+        for t, k in zip(trajs_raw, mask):
+            if not k:
+                logger.info("aggregate: dropped follower seizure @%.0f (within %.1fh "
+                            "of a prior seizure)", t["onset_epoch"], min_gap_h)
+        trajs_raw = kept or trajs_raw
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
