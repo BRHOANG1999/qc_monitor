@@ -343,6 +343,34 @@ def phfo_metrics(signal, locs, fs: float, band, *, pre_ms: float = 10.0,
     return frac, prom
 
 
+def phfo_metrics_epochs(win_traces, fs: float, band) -> tuple:
+    """The SAME absolute pHFO metric as ``phfo_metrics``, but for pre-windowed
+    epochs: *win_traces* is ``[epochs x W]`` already sliced to the window of
+    interest (e.g. the 0-100 ms post-stim window of each evoked epoch). Returns
+    ``(hf_frac, prominence)`` per epoch. Use this to score stim-locked epochs with
+    the same absolute criterion the continuous detector uses -- NOT a per-recording
+    percentile (which pins the flagged fraction by construction)."""
+    from scipy.signal import hilbert
+    x = np.asarray(win_traces, dtype=np.float64)
+    assert x.ndim == 2, "win_traces must be [epochs x W]"
+    assert fs and fs > 0, "fs must be positive"
+    e = x.shape[0]
+    frac = np.full(e, np.nan)
+    prom = np.full(e, np.nan)
+    lo = max(1.0, float(band[0]))
+    hi = min(float(band[1]), 0.49 * float(fs))
+    if hi <= lo or x.shape[1] < 8 or e == 0:
+        return frac, prom
+    hf = _ef._bandpass(x, float(fs), lo, hi)
+    env = np.abs(hilbert(hf, axis=1))
+    hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
+    tot = np.sqrt(np.mean((x - x.mean(axis=1, keepdims=True)) ** 2, axis=1))
+    med = np.median(env, axis=1)
+    frac = hf_rms / (tot + _EPS)
+    prom = np.max(env, axis=1) / (med + _EPS)
+    return frac, prom
+
+
 def matched_filter_series(signal, template) -> np.ndarray:
     """Normalized cross-correlation (per-lag Pearson r) of *template* against a
     continuous *signal*, computed in O(n log n) via an FFT convolution for the

@@ -538,46 +538,62 @@ def _write_stats(animal: str, trajs: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Camp 2: riding events in the 0-100 ms post-stim window (from the evoked .mat,
-# via Prong A). The complement to camp 1 (all pHFO events, LFDs rejected,
-# from the continuous LFP). Cached per file_id so the union of horizons is read
-# once.
+# Camp 2: pHFOs in the 0-100 ms post-stim window (from the evoked .mat), scored by
+# the SAME ABSOLUTE gate as camp 1 (frac + prominence per epoch), NOT a percentile.
+# The complement to camp 1 (all pHFO events, LFDs rejected, from the continuous
+# LFP). Cached per file_id so the union of horizons is read once.
 # ---------------------------------------------------------------------------
 _EVK_WIN_MS = (2.0, 100.0)      # post-artifact .. 100 ms post-stim (the riding event)
 
 
 def _evk_cache_paths(animal: str, file_id: int) -> dict:
-    d = os.path.join(_root(animal), "evk_cache")
-    return {"flag": os.path.join(d, f"{file_id}_flag.npy"),
-            "stim": os.path.join(d, f"{file_id}_stim.npy")}
+    d = os.path.join(_root(animal), "evk_cache")     # "p" suffix = pHFO-gated (the
+    return {"flag": os.path.join(d, f"{file_id}_pflag.npy"),   # absolute frac+prom
+            "stim": os.path.join(d, f"{file_id}_pstim.npy")}   # gate, not percentile)
 
 
 def evoked_riding_recording(store, animal: str, rec: dict, *,
-                            win_ms=_EVK_WIN_MS) -> tuple:
+                            win_ms=_EVK_WIN_MS, band=None) -> tuple:
     """Absolute-epoch times of (flagged, all) stimuli for ONE recording: a stimulus
-    is 'flagged' when its 0-100 ms post-stim window carries a riding event (Prong A
-    on the evoked .mat, flag window restricted to *win_ms*). Cached per file_id."""
+    is 'flagged' when its 0-100 ms post-stim window carries a pHFO by the SAME
+    ABSOLUTE gate the continuous detector uses (``primitives.phfo_metrics_epochs``:
+    frac >= DEFAULT_PHFO_FRAC & prom >= DEFAULT_PHFO_PROM) -- NOT Prong-A's
+    per-recording 95th-percentile flag (which pins the flagged fraction ~5% by
+    construction and cannot show an absolute trend). Cached per file_id."""
     p = _evk_cache_paths(animal, rec["file_id"])
     if all(os.path.exists(p[k]) for k in p):
         return np.load(p["flag"]), np.load(p["stim"])
     from src.riding_event import residual as _res
+    from src.utils.evoked_output import read_file_evoked
     ep = store.evoked_output_path_for_file(int(rec["file_id"]))
     if not (ep and os.path.exists(ep)):
         return _save_evk(p, np.empty(0), np.empty(0))
+    if band is None:
+        band = ensure_template(store, animal)["band"]
     try:
-        res = _res.analyze_recording(ep, animal, flag_win_ms=win_ms)
+        chans = read_file_evoked(ep, only_animals=[animal])
+        ch = _res.pick_channel(chans, animal)
     except Exception:                              # noqa: BLE001 -- bad file, skip
-        res = None
-    if res is None or res.get("times") is None:
+        ch = None
+    if ch is None:
         return _save_evk(p, np.empty(0), np.empty(0))
-    times = np.asarray(res["times"], dtype=np.float64)
-    mask = np.asarray(res["event_mask"], dtype=bool)
-    n = int(min(times.size, mask.size))
-    if n == 0:
+    r = chans[ch]
+    traces = np.asarray(r["traces"], dtype=np.float64)
+    time_ms = np.asarray(r["time_ms"], dtype=np.float64)
+    times = np.asarray(r.get("times") or [], dtype=np.float64)
+    if traces.ndim != 2 or times.size == 0:
         return _save_evk(p, np.empty(0), np.empty(0))
+    fs = 1000.0 / float(np.mean(np.diff(time_ms)))
+    traces = _prim.blank_artifact_epochs(traces, time_ms,
+                                         pre_ms=_prim.DEFAULT_ARTIFACT_MS[0],
+                                         post_ms=_prim.DEFAULT_ARTIFACT_MS[1])
+    m = (time_ms >= float(win_ms[0])) & (time_ms <= float(win_ms[1]))
+    frac, prom = _prim.phfo_metrics_epochs(traces[:, m], fs, band)
+    keep = (np.isfinite(frac) & (frac >= _PHFO_FRAC) & (prom >= _PHFO_PROM))
+    n = int(min(times.size, keep.size))
     s0 = float(rec["start_epoch"])
     stim = s0 + times[:n]
-    flag = s0 + times[:n][mask[:n]]
+    flag = s0 + times[:n][keep[:n]]
     return _save_evk(p, flag, stim)
 
 
