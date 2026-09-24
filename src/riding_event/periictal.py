@@ -32,6 +32,24 @@ logger = logging.getLogger("qc_monitor.riding_event.periictal")
 _MAX_RECS = 200          # NASA Rule 2: bound the per-seizure recording scan.
 _SEC_H = 3600.0
 
+# Bright qualitative palette (reads on the #26263a panel); one colour per seizure.
+_SZ_COLORS = ("#5e7ce2", "#2dd4bf", "#f4d35e", "#c084fc", "#4ade80",
+              "#f472b6", "#38bdf8", "#fb923c", "#a3e635", "#e5484d")
+
+
+def _sz_label(traj: dict) -> str:
+    """Legend label for a seizure: local onset time + Racine grade."""
+    import datetime
+    dt = datetime.datetime.fromtimestamp(float(traj["onset_epoch"]))
+    rac = traj.get("racine")
+    tag = ""
+    if rac not in (None, ""):
+        try:
+            tag = f"  ·  R{int(rac)}"
+        except (TypeError, ValueError):
+            tag = f"  ·  R{rac}"
+    return dt.strftime("%b %d  %H:%M") + tag
+
 
 def _root(animal: str) -> str:
     return os.path.join("data", "derivatives", "riding_event", animal)
@@ -247,6 +265,7 @@ def load_trajectories(animal: str) -> list[dict]:
     for p in sorted(glob.glob(os.path.join(_root(animal), "periictal",
                                            "traj_*.csv"))):
         cen, cr, mr, rr, onset, rac = [], [], [], [], None, None
+        cc, mc, rc, cov = [], [], [], []           # counts + coverage (for rebin)
         with open(p, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 onset = float(row["onset_epoch"])
@@ -255,11 +274,49 @@ def load_trajectories(animal: str) -> list[dict]:
                 cr.append(float(row["cand_rate_per_min"] or "nan"))
                 mr.append(float(row["mf_rate_per_min"] or "nan"))
                 rr.append(float(row.get("rip_rate_per_min") or "nan"))
+                cc.append(float(row.get("cand_count") or 0))
+                mc.append(float(row.get("mf_count") or 0))
+                rc.append(float(row.get("rip_count") or 0))
+                cov.append(float(row.get("cover_sec") or 0))
         if cen:
             out.append({"onset_epoch": onset, "racine": rac,
                         "centers_min": np.asarray(cen), "cand_rate": np.asarray(cr),
                         "mf_rate": np.asarray(mr), "rip_rate": np.asarray(rr),
+                        "cand_count": np.asarray(cc), "mf_count": np.asarray(mc),
+                        "rip_count": np.asarray(rc), "cover_sec": np.asarray(cov),
                         "path": p})
+    return out
+
+
+def _rebin(traj: dict, coarse_min: float) -> dict:
+    """Re-bin a fine-binned trajectory into *coarse_min* windows EXACTLY: counts
+    and covered-seconds are additive, so a coarse rate = summed counts / summed
+    covered minutes (NaN where no sub-bin had coverage). This is coverage-weighted
+    -- averaging the per-bin RATES would mis-weight low-coverage bins. Returns a
+    traj-shaped dict on the coarse grid; passes through when already coarse."""
+    fc = np.asarray(traj["centers_min"], dtype=np.float64)
+    if fc.size < 2 or "cover_sec" not in traj:
+        return traj
+    w = float(np.median(np.diff(fc)))
+    edges = np.concatenate([fc - w / 2.0, [fc[-1] + w / 2.0]])
+    cedges = np.arange(float(edges[0]), float(edges[-1]) + coarse_min, coarse_min)
+    if cedges.size < 2:
+        return traj
+    idx = np.clip(np.searchsorted(cedges, fc, side="right") - 1, 0, cedges.size - 2)
+    nb = cedges.size - 1
+    out = {"onset_epoch": traj["onset_epoch"], "racine": traj.get("racine"),
+           "path": traj.get("path"),
+           "centers_min": 0.5 * (cedges[:-1] + cedges[1:])}
+    cov = np.zeros(nb)
+    np.add.at(cov, idx, np.nan_to_num(traj["cover_sec"]))
+    out["cover_sec"] = cov
+    for ck, rk in (("cand_count", "cand_rate"), ("mf_count", "mf_rate"),
+                   ("rip_count", "rip_rate")):
+        ct = np.zeros(nb)
+        np.add.at(ct, idx, np.nan_to_num(traj[ck]))
+        out[ck] = ct
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out[rk] = np.where(cov > 0, ct / (cov / 60.0), np.nan)
     return out
 
 
@@ -276,8 +333,8 @@ def periictal_stats(trajs: list, key: str = "rip_rate", *,
         y = t.get(key)
         if y is None or y.size != ref.size:
             continue
-        b = np.nanmean(y[base_m])
-        l = np.nanmean(y[last_m])
+        b = _safe_mean(y, base_m)
+        l = _safe_mean(y, last_m)
         if np.isfinite(b) and np.isfinite(l):
             base.append(b)
             last.append(l)
@@ -302,68 +359,141 @@ def periictal_stats(trajs: list, key: str = "rip_rate", *,
     return out
 
 
-def aggregate(animal: str, out_png: str | None = None) -> str | None:
-    """Individual + averaged peri-ictal ripple-rate figure (dark-themed): two
-    panels (HF candidate rate, matched-filter rate), each with every seizure's
-    trajectory (faint) + the across-seizure mean +/- SEM (bold), x = hours to
-    onset. Returns the figure path (None when no trajectories)."""
-    trajs = load_trajectories(animal)
-    if not trajs:
+def aggregate(animal: str, out_png: str | None = None, *,
+              coarse_min: float = 30.0) -> str | None:
+    """Individual + averaged peri-ictal ripple-rate figure (dark-themed): three
+    panels (ripple-confirmed rate, the same baseline-normalized, HF-envelope
+    candidates for contrast). Each seizure is a distinctly COLOURED trajectory
+    (legend below) so you can see which seizures drive the trend, over the
+    across-seizure mean +/- SEM (bold white). Bins are averaged into *coarse_min*
+    windows (default 30 min). Returns the figure path (None when no trajectories)."""
+    trajs_raw = load_trajectories(animal)
+    if not trajs_raw:
         return None
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from src.riding_event import render as _r
+    trajs = [_rebin(t, coarse_min) for t in trajs_raw]
     ref = trajs[0]["centers_min"]
     xh = ref / 60.0
+    hh = abs(xh[0]) + coarse_min / 120.0           # first bin's LEADING edge, in h
     out_png = out_png or os.path.join(_root(animal), "periictal",
                                       f"{animal}_periictal_ripplerate.png")
     stats = periictal_stats(trajs, "rip_rate")
     _write_stats(animal, trajs)
-    fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.4), facecolor=_r._BG,
-                             sharex=True)
-    _agg_panel(axes[0], trajs, "rip_rate", xh, "ripple-confirmed matched-filter "
-               "(slow waves rejected)", _r, "events / min")
+    _print_per_seizure_folds(trajs, "rip_rate")
+    colors = _SZ_COLORS
+    fig, ax4 = plt.subplots(4, 1, figsize=(11.0, 12.8), facecolor=_r._BG,
+                            gridspec_kw={"height_ratios": [1, 1, 1, 0.34]})
+    axes, lax = ax4[:3], ax4[3]
+    axes[1].sharex(axes[0])
+    axes[2].sharex(axes[0])
+    lax.axis("off")
+    handles = _agg_panel(axes[0], trajs, "rip_rate", xh, "ripple-confirmed "
+                         "matched-filter (all events, slow waves rejected)", _r,
+                         "events / min", colors=colors)
     st = (f"last hour vs -6..-4 h baseline:  {stats['median_fold']:.2f}× "
           f"(p={stats['p_wilcoxon']:.3g}, n={stats['n']})")
-    axes[0].text(0.02, 0.94, st, transform=axes[0].transAxes, color="#ffd166",
+    axes[0].text(0.02, 0.84, st, transform=axes[0].transAxes, color="#ffd166",
                  fontsize=10, fontweight="bold", va="top")
     _agg_panel(axes[1], trajs, "rip_rate", xh, "ripple-confirmed, baseline-"
                "normalized (each ÷ its -6..-4 h mean)", _r, "× baseline",
-               normalize=True)
+               normalize=True, colors=colors)
     axes[1].axhline(1.0, color=_r._MUTED, lw=0.8, ls=":")
     _agg_panel(axes[2], trajs, "cand_rate", xh, "HF-envelope candidates "
-               "(non-specific, for contrast)", _r, "events / min")
+               "(non-specific, for contrast)", _r, "events / min", colors=colors)
     axes[2].set_xlabel("hours to seizure onset (0 = onset)", color=_r._TEXT,
                        fontsize=10)
-    fig.suptitle(f"{animal} — peri-ictal ripple rate, {abs(xh[0]):.0f} h before "
-                 f"onset ({len(trajs)} seizures)", color=_r._TEXT, fontsize=12,
-                 x=0.02, ha="left")
+    for a in (axes[0], axes[1]):
+        plt.setp(a.get_xticklabels(), visible=False)
+    valid = [(h, _sz_label(t)) for h, t in zip(handles, trajs) if h is not None]
+    leg = lax.legend([h for h, _ in valid], [l for _, l in valid], loc="center",
+                     ncol=min(4, max(1, len(valid))), frameon=False, fontsize=8.5,
+                     title=f"seizure onset time  ·  Racine  ({len(valid)} seizures, "
+                     f"{int(coarse_min)}-min bins)", handlelength=1.8,
+                     columnspacing=1.6)
+    if leg:
+        leg.get_title().set_color(_r._TEXT)
+        for tx in leg.get_texts():
+            tx.set_color(_r._TEXT)
+    fig.suptitle(f"{animal} — peri-ictal ripple rate, {hh:.0f} h before onset "
+                 f"({len(trajs)} seizures, {int(coarse_min)}-min bins)",
+                 color=_r._TEXT, fontsize=12, x=0.02, ha="left")
     return _r._finish(fig, out_png)
+
+
+def _safe_mean(y, mask) -> float:
+    """np.nanmean over *mask* without the all-NaN 'empty slice' warning."""
+    v = np.asarray(y)[mask]
+    v = v[np.isfinite(v)]
+    return float(v.mean()) if v.size else np.nan
+
+
+def _sz_label_ascii(traj: dict) -> str:
+    """ASCII-only seizure label for the console (no mojibake on a cp1252 shell)."""
+    import datetime
+    dt = datetime.datetime.fromtimestamp(float(traj["onset_epoch"]))
+    rac = traj.get("racine")
+    tag = f" R{rac}" if rac not in (None, "") else ""
+    return dt.strftime("%b %d %H:%M") + tag
+
+
+def _print_per_seizure_folds(trajs: list, key: str = "rip_rate") -> None:
+    """Progress readout: each seizure's last-hour / (-6..-4 h) baseline fold, so a
+    'not significant, but a few seizures ripple often' pattern is visible."""
+    ref = trajs[0]["centers_min"] / 60.0
+    base_m = (ref <= -4.0) & (ref >= -6.0)
+    last_m = ref >= -1.0
+    rows = []
+    for t in trajs:
+        y = t.get(key)
+        if y is None or y.size != ref.size:
+            continue
+        b = _safe_mean(y, base_m)
+        l = _safe_mean(y, last_m)
+        fold = l / b if (np.isfinite(b) and b > 0) else np.nan
+        rows.append((_sz_label_ascii(t), b, l, fold))
+    rows.sort(key=lambda r: (-r[3] if np.isfinite(r[3]) else 1e9))
+    print(f"per-seizure last-hour vs baseline fold ({key}):", flush=True)
+    for lab, b, l, fold in rows:
+        fs = f"{fold:5.2f}x" if np.isfinite(fold) else "  n/a"
+        print(f"  {lab:>18}   base={b:6.2f}  last={l:6.2f}  fold={fs}", flush=True)
 
 
 def _baseline(y, xh) -> float:
     m = (xh <= -4.0) & (xh >= -6.0)
-    b = np.nanmean(y[m]) if m.any() else np.nan
+    b = _safe_mean(y, m) if m.any() else np.nan
     return b if (np.isfinite(b) and b > 0) else np.nan
 
 
-def _agg_panel(ax, trajs, key, xh, title, _r, ylabel, *, normalize=False) -> None:
+def _agg_panel(ax, trajs, key, xh, title, _r, ylabel, *, normalize=False,
+               colors=None) -> list:
+    """Draw one panel: each seizure a distinctly coloured line (+ dot markers),
+    the across-seizure mean +/- SEM in bold white on top. Returns the per-seizure
+    line handles (index-aligned to *trajs*, None where a seizure had no data on
+    this grid) so the caller can build one shared legend."""
     import warnings
+    from matplotlib import patheffects as pe
     ax.set_facecolor(_r._PANEL)
     ax.tick_params(colors=_r._MUTED, labelsize=8)
     for sp in ax.spines.values():
         sp.set_color(_r._SPINE)
     ax.grid(True, alpha=0.15, color=_r._MUTED)
     mat = np.full((len(trajs), xh.size), np.nan)
+    handles = []
     for i, t in enumerate(trajs):
         y = t.get(key)
         if y is None or y.size != xh.size:
+            handles.append(None)
             continue
         if normalize:
             b = _baseline(y, xh)
             y = y / b if np.isfinite(b) else np.full_like(y, np.nan)
-        ax.plot(xh, y, color=_r._ACCENT, lw=0.7, alpha=0.28)
+        c = colors[i % len(colors)] if colors else _r._ACCENT
+        ln, = ax.plot(xh, y, color=c, lw=1.3, alpha=0.9, marker="o",
+                      markersize=3.0, solid_capstyle="round")
+        handles.append(ln)
         mat[i] = y
     n = np.sum(np.isfinite(mat), axis=0)
     with warnings.catch_warnings():                # all-NaN (gap) columns warn
@@ -373,15 +503,17 @@ def _agg_panel(ax, trajs, key, xh, title, _r, ylabel, *, normalize=False) -> Non
     sem = np.where(n >= 2, sd / np.sqrt(np.maximum(n, 1)), np.nan)
     ok = n >= 2
     ax.fill_between(xh, np.where(ok, mean - sem, np.nan),
-                    np.where(ok, mean + sem, np.nan), color=_r._EVENT, alpha=0.2)
-    ax.plot(xh, np.where(n >= 1, mean, np.nan), color=_r._EVENT, lw=2.4,
+                    np.where(ok, mean + sem, np.nan), color=_r._MUTED, alpha=0.22)
+    ax.plot(xh, np.where(n >= 1, mean, np.nan), color="#ffffff", lw=2.8, zorder=6,
+            path_effects=[pe.Stroke(linewidth=4.6, foreground=_r._BG), pe.Normal()],
             label=f"mean ± SEM (n≤{len(trajs)})")
-    ax.axvline(0.0, color="#ff3b3b", lw=1.4, label="seizure onset")
+    ax.axvline(0.0, color="#ff3b3b", lw=1.4, zorder=5, label="seizure onset")
     ax.set_title(title, color=_r._TEXT, fontsize=11, loc="left")
     ax.set_ylabel(ylabel, color=_r._TEXT, fontsize=10)
     leg = ax.legend(frameon=False, fontsize=8, loc="upper left")
     for tx in leg.get_texts():
         tx.set_color(_r._TEXT)
+    return handles
 
 
 def _write_stats(animal: str, trajs: list) -> str:
