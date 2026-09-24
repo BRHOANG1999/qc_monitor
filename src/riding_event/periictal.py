@@ -34,6 +34,8 @@ _MAX_RECS = 200          # NASA Rule 2: bound the per-seizure recording scan.
 _SEC_H = 3600.0
 _PHFO_FRAC = _prim.DEFAULT_PHFO_FRAC     # pHFO gate: min HF-band energy fraction
 _PHFO_PROM = _prim.DEFAULT_PHFO_PROM     # pHFO gate: min HF-envelope prominence
+_WARMUP_MIN = 5.0                        # drop the first N min after each recording
+                                         # (re)start: stimulation-habituation transient
 
 # Bright qualitative palette (reads on the #26263a panel); one colour per seizure.
 _SZ_COLORS = ("#5e7ce2", "#2dd4bf", "#f4d35e", "#c084fc", "#4ade80",
@@ -184,14 +186,15 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
                        horizon_h: float = 6.0, post_h: float = 3.0,
                        bin_min: float = 10.0, thresh: float = 0.7,
                        phfo_frac: float = _PHFO_FRAC, phfo_prom: float = _PHFO_PROM,
-                       progress=None) -> dict:
+                       warmup_min: float = _WARMUP_MIN, progress=None) -> dict:
     """pHFO-rate trajectory for one seizure: bin the candidate, matched-filter, and
     pHFO-CONFIRMED matched-filter detections over ``[onset - horizon_h,
     onset + post_h]`` by time-to-onset. A detection is a pHFO when its HF fraction
     >= *phfo_frac* AND HF-envelope prominence >= *phfo_prom* (rejects LFDs /
-    low-frequency deflections). Per-bin counts + covered seconds + rates
-    (events/min), NaN where uncovered. Recordings cached (thresholds re-tunable
-    without re-reading)."""
+    low-frequency deflections). The first *warmup_min* after each recording start
+    is dropped (from events AND coverage) to remove stimulation-habituation
+    transients. Per-bin counts + covered seconds + rates (events/min), NaN where
+    uncovered. Recordings cached (thresholds re-tunable without re-reading)."""
     prog = progress or (lambda *_a: None)
     t_lo = onset_epoch - horizon_h * _SEC_H
     t_hi = onset_epoch + post_h * _SEC_H
@@ -209,10 +212,13 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
         keep = np.isfinite(d["frac"]) & (d["frac"] >= phfo_frac) \
             & (d["prom"] >= phfo_prom)
         phfo_all.append(d["mf"][keep] if d["mf"].size else np.empty(0))
-    cand = np.concatenate(cand_all) if cand_all else np.empty(0)
-    mf = np.concatenate(mf_all) if mf_all else np.empty(0)
-    phfo = np.concatenate(phfo_all) if phfo_all else np.empty(0)
-    cov = _coverage_seconds(recs, onset_epoch, edges)
+    cand = _warmup_filter(np.concatenate(cand_all) if cand_all else np.empty(0),
+                          recs, warmup_min)
+    mf = _warmup_filter(np.concatenate(mf_all) if mf_all else np.empty(0),
+                        recs, warmup_min)
+    phfo = _warmup_filter(np.concatenate(phfo_all) if phfo_all else np.empty(0),
+                          recs, warmup_min)
+    cov = _coverage_seconds(_warmup_recs(recs, warmup_min), onset_epoch, edges)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
     phfo_ct, _ = np.histogram((phfo - onset_epoch) / 60.0, bins=edges)
@@ -237,6 +243,35 @@ def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
         hi = np.minimum(edges[1:], b)
         cov += np.maximum(0.0, hi - lo) * 60.0
     return cov
+
+
+def _warmup_filter(times, recs, warmup_min: float):
+    """Drop event/stim *times* (absolute epochs) that fall within the first
+    ``warmup_min`` minutes after any recording's start -- these are the post-
+    (re)start stimulation-habituation transients (strong evoked pHFO burst that
+    decays), NOT peri-ictal biology. Returns the surviving times."""
+    if warmup_min <= 0:
+        return times
+    t = np.asarray(times, dtype=np.float64)
+    if not t.size:
+        return t
+    keep = np.ones(t.size, dtype=bool)
+    w = warmup_min * 60.0
+    for r in recs:                                 # bounded by _MAX_RECS
+        s = float(r["start_epoch"])
+        keep &= ~((t >= s) & (t < s + w))
+    return t[keep]
+
+
+def _warmup_recs(recs, warmup_min: float):
+    """Recordings with the first ``warmup_min`` trimmed off the front, so coverage
+    excludes the same window the events were dropped from (dropping events but not
+    coverage would wrongly deflate the rate)."""
+    if warmup_min <= 0:
+        return recs
+    w = warmup_min * 60.0
+    return [{**r, "start_epoch": r["start_epoch"] + w,
+             "duration": max(0.0, r["duration"] - w)} for r in recs]
 
 
 def write_trajectory_csv(traj: dict, path: str, racine=None) -> str:
@@ -619,10 +654,13 @@ def _save_evk(p: dict, flag, stim) -> tuple:
 def seizure_evoked_trajectory(store, animal: str, onset_epoch: float, *,
                               horizon_h: float = 6.0, post_h: float = 0.5,
                               bin_min: float = 10.0, win_ms=_EVK_WIN_MS,
+                              warmup_min: float = _WARMUP_MIN,
                               progress=None) -> dict:
     """Camp-2 trajectory for one seizure: bin the riding-event stimuli over the
     pre-onset horizon into a RATE (events/min) and a FRACTION (flagged / all
-    stimuli). Recordings cached per file_id (evoked .mat), NaN where uncovered."""
+    stimuli). The first *warmup_min* after each recording start is dropped (from
+    flagged AND all stimuli, so the fraction stays honest) to remove stimulation-
+    habituation transients. Recordings cached per file_id, NaN where uncovered."""
     prog = progress or (lambda *_a: None)
     t_lo = onset_epoch - horizon_h * _SEC_H
     t_hi = onset_epoch + post_h * _SEC_H
@@ -637,9 +675,11 @@ def seizure_evoked_trajectory(store, animal: str, onset_epoch: float, *,
         flag, stim = evoked_riding_recording(store, animal, r, win_ms=win_ms)
         flag_all.append(flag)
         stim_all.append(stim)
-    flag = np.concatenate(flag_all) if flag_all else np.empty(0)
-    stim = np.concatenate(stim_all) if stim_all else np.empty(0)
-    cov = _coverage_seconds(recs, onset_epoch, edges)
+    flag = _warmup_filter(np.concatenate(flag_all) if flag_all else np.empty(0),
+                          recs, warmup_min)
+    stim = _warmup_filter(np.concatenate(stim_all) if stim_all else np.empty(0),
+                          recs, warmup_min)
+    cov = _coverage_seconds(_warmup_recs(recs, warmup_min), onset_epoch, edges)
     flag_ct, _ = np.histogram((flag - onset_epoch) / 60.0, bins=edges)
     stim_ct, _ = np.histogram((stim - onset_epoch) / 60.0, bins=edges)
     with np.errstate(divide="ignore", invalid="ignore"):
