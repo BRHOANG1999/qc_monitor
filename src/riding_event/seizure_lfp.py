@@ -37,9 +37,30 @@ from src.utils import chunk_cache as _cc                     # noqa: E402
 _SEC_H = 3600.0
 
 
+def _blank_stim(signal, fs, stim_sec, *, pre_ms, post_ms):
+    """Set NaN in ``signal`` over [t-pre_ms, t+post_ms] around each stim time
+    (seconds into the recording), so the stim artifact never enters the envelope.
+    In-place; returns the count blanked."""
+    if stim_sec is None:
+        return 0
+    st = np.asarray(stim_sec, dtype=float)
+    st = st[np.isfinite(st)]
+    if not st.size:
+        return 0
+    n = signal.size
+    a = np.clip(((st - pre_ms / 1000.0) * fs).astype(np.int64), 0, n)
+    b = np.clip(((st + post_ms / 1000.0) * fs).astype(np.int64), 0, n)
+    m = min(st.size, 500000)                           # NASA Rule 2: bound the loop
+    for k in range(m):
+        if b[k] > a[k]:
+            signal[a[k]:b[k]] = np.nan
+    return int(m)
+
+
 def _decimate_minmax(seg, fs, t0_min, *, px_per_min):
-    """Min/max envelope of ``seg`` in fixed pixel bins. Returns
-    (t_center_min, lo, hi). Bounded number of bins (NASA Rule 2/3)."""
+    """NaN-aware min/max envelope of ``seg`` in fixed pixel bins. Returns
+    (t_center_min, lo, hi); a bin that is entirely NaN (e.g. all stim-blanked)
+    stays NaN. Bounded number of bins (NASA Rule 2/3)."""
     n = seg.size
     dur_min = n / fs / 60.0
     nb = int(max(1, min(20000, round(dur_min * px_per_min))))
@@ -51,15 +72,16 @@ def _decimate_minmax(seg, fs, t0_min, *, px_per_min):
         a, b = edges[k], edges[k + 1]
         if b > a:
             s = seg[a:b]
-            lo[k] = float(np.min(s))
-            hi[k] = float(np.max(s))
+            if np.any(np.isfinite(s)):
+                lo[k] = float(np.nanmin(s))
+                hi[k] = float(np.nanmax(s))
         tc[k] = t0_min + (0.5 * (a + b) / fs / 60.0)
     return tc, lo, hi
 
 
 def gather_seizure_lfp(store, animal, onset_epoch, tmpl, *, pre_h=2.0, post_h=1.0,
                        zoom_min=2.0, thresh=0.7, wide_ppm=6.0, zoom_ppm=3000.0,
-                       progress=None):
+                       blank_pre_ms=1.0, blank_post_ms=12.0, progress=None):
     """Continuous LFP + pHFO detections around one seizure onset.
 
     Returns a dict with the wide envelope (``env_t`` minutes rel onset, ``env_lo``,
@@ -92,6 +114,10 @@ def gather_seizure_lfp(store, animal, onset_epoch, tmpl, *, pre_h=2.0, post_h=1.
             continue
         signal, fs, ch = loaded
         ch_name = ch_name or ch
+        signal = np.asarray(signal, dtype=np.float32)
+        nblank = _blank_stim(signal, fs, _pe._recording_stim_times(
+            store, animal, r["file_id"]), pre_ms=blank_pre_ms, post_ms=blank_post_ms)
+        prog(f"   blanked {nblank} stim pulses")
         try:
             ts = r["start_epoch"]
             n = signal.size
@@ -220,6 +246,10 @@ def _main(argv=None) -> int:
     ap.add_argument("--pre-h", type=float, default=2.0)
     ap.add_argument("--post-h", type=float, default=1.0)
     ap.add_argument("--zoom-min", type=float, default=2.0)
+    ap.add_argument("--blank-pre-ms", type=float, default=1.0,
+                    help="stim-blank window before each stim pulse")
+    ap.add_argument("--blank-post-ms", type=float, default=12.0,
+                    help="stim-blank window after each stim pulse (0 = no blanking)")
     ap.add_argument("--thresh", type=float, default=0.7)
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
@@ -250,6 +280,7 @@ def _main(argv=None) -> int:
         print(f"[{k + 1}/{len(szs)}] {_sz_label(s.onset_epoch, s.racine)}", flush=True)
         g = gather_seizure_lfp(store, a.animal, s.onset_epoch, tmpl, pre_h=a.pre_h,
                                post_h=a.post_h, zoom_min=a.zoom_min, thresh=a.thresh,
+                               blank_pre_ms=a.blank_pre_ms, blank_post_ms=a.blank_post_ms,
                                progress=prog)
         gathers.append(g)
         labels.append(_sz_label(s.onset_epoch, s.racine))
