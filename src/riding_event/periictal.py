@@ -34,6 +34,11 @@ _MAX_RECS = 200          # NASA Rule 2: bound the per-seizure recording scan.
 _SEC_H = 3600.0
 _PHFO_FRAC = _prim.DEFAULT_PHFO_FRAC     # pHFO gate: min HF-band energy fraction
 _PHFO_PROM = _prim.DEFAULT_PHFO_PROM     # pHFO gate: min HF-envelope prominence
+_STIM_PAD_SEC = 0.003     # exclude detections only within +/-3 ms of a stim (the
+#   artifact region; the artifact itself is interpolated over -1/+2 ms). NOT the old
+#   250 ms exclusion -- camp 1 must count ALL pHFOs, including the stim-riding ones.
+_POST_MS = 100.0          # a detection is "stim-riding" (camp 2) if it lands within
+#   this many ms AFTER a stim; camp 2 is the post-stim SUBSET of camp 1's detections.
 _WARMUP_MIN = 5.0                        # drop the first N min after each recording
                                          # (re)start: stimulation-habituation transient
 
@@ -119,49 +124,72 @@ def _det_cache_paths(animal: str, file_id: int) -> dict:
     return {"cand": os.path.join(d, f"{file_id}_cand.npy"),
             "mf": os.path.join(d, f"{file_id}_mf.npy"),
             "frac": os.path.join(d, f"{file_id}_frac.npy"),
-            "prom": os.path.join(d, f"{file_id}_prom.npy")}
+            "prom": os.path.join(d, f"{file_id}_prom.npy"),
+            "post": os.path.join(d, f"{file_id}_post.npy")}   # stim-riding mask
 
 
 def detect_recording(store, animal: str, rec: dict, tmpl: dict, *,
                      thresh: float = 0.7) -> dict:
     """One recording's detections as absolute epochs: HF-envelope ``candidates``,
-    matched-filter ``mf`` detections, and per-mf-detection pHFO metrics (``frac``,
-    ``prom`` from ``primitives.phfo_metrics``) so a pHFO gate can reject LFDs
-    (low-frequency deflections) later WITHOUT re-reading. Cached per file_id (all
-    four arrays); the chunk cache is cleared after the read so memory doesn't
-    accumulate across a serial sweep."""
+    matched-filter ``mf`` detections (ALL of them -- only the +/-3 ms stim-artifact
+    region is excluded, NOT the old 250 ms, so camp 1 counts every pHFO including
+    the stim-riding ones), per-mf-detection pHFO metrics (``frac``, ``prom`` from
+    ``primitives.phfo_metrics``) for the LFD-rejecting gate, and ``post`` -- a
+    boolean per mf detection, True when it lands within ``_POST_MS`` ms AFTER a stim
+    (the stim-riding SUBSET = camp 2). Cached per file_id; the chunk cache is
+    cleared after the read so memory doesn't accumulate across a serial sweep."""
     p = _det_cache_paths(animal, rec["file_id"])
     if all(os.path.exists(p[k]) for k in p):
         return {"cand": np.load(p["cand"]), "mf": np.load(p["mf"]),
-                "frac": np.load(p["frac"]), "prom": np.load(p["prom"])}
+                "frac": np.load(p["frac"]), "prom": np.load(p["prom"]),
+                "post": np.load(p["post"])}
     stim_times = _recording_stim_times(store, animal, rec["file_id"])
     loaded = _det.load_channel(rec["file_path"], animal)
     if loaded is None:
-        return _save_det(p, np.empty(0), np.empty(0), np.empty(0), np.empty(0))
+        return _save_det(p, *([np.empty(0)] * 4), np.empty(0, dtype=bool))
     signal, fs, _ch = loaded
     try:
         d = _det.run_detector(signal, fs, band=tmpl["band"],
                               template_override=tmpl["template"],
-                              exclude_times_sec=stim_times, thresh=thresh)
+                              exclude_times_sec=stim_times,
+                              exclude_pad_sec=_STIM_PAD_SEC, thresh=thresh)
         det_locs = np.asarray(d["det_locs"], dtype=np.int64)
         from src.riding_event import primitives as _p
         frac, prom = _p.phfo_metrics(signal, det_locs, fs, tmpl["band"])
     finally:
         del signal
         _cc.clear()                                # free the multi-GB chunk
+    post = _stim_riding_mask(det_locs, fs, stim_times, _POST_MS)
     s0 = rec["start_epoch"]
     cand = s0 + np.asarray(d["cand_locs"], dtype=np.float64) / fs
     mf = s0 + det_locs.astype(np.float64) / fs
-    return _save_det(p, cand, mf, frac, prom)
+    return _save_det(p, cand, mf, frac, prom, post)
 
 
-def _save_det(p: dict, cand, mf, frac, prom) -> dict:
+def _stim_riding_mask(det_locs, fs: float, stim_times, post_ms: float) -> np.ndarray:
+    """Boolean per detection: True when the detection falls within (0, post_ms] ms
+    AFTER its most-recent stim (the stim-riding / evoked subset). All-False when no
+    stim times are available (can't classify)."""
+    dl = np.asarray(det_locs, dtype=np.int64)
+    if dl.size == 0 or stim_times is None or len(stim_times) == 0:
+        return np.zeros(dl.size, dtype=bool)
+    st = np.sort(np.asarray(stim_times, dtype=np.float64))
+    det_sec = dl.astype(np.float64) / float(fs)
+    j = np.searchsorted(st, det_sec, side="right") - 1   # index of previous stim
+    lat = np.full(det_sec.size, np.inf)
+    ok = j >= 0
+    lat[ok] = det_sec[ok] - st[j[ok]]
+    return (lat > 0.0) & (lat <= post_ms * 1e-3)
+
+
+def _save_det(p: dict, cand, mf, frac, prom, post) -> dict:
     os.makedirs(os.path.dirname(p["cand"]), exist_ok=True)
     np.save(p["cand"], cand)
     np.save(p["mf"], mf)
     np.save(p["frac"], frac)
     np.save(p["prom"], prom)
-    return {"cand": cand, "mf": mf, "frac": frac, "prom": prom}
+    np.save(p["post"], np.asarray(post, dtype=bool))
+    return {"cand": cand, "mf": mf, "frac": frac, "prom": prom, "post": post}
 
 
 def _recording_stim_times(store, animal: str, file_id: int):
@@ -202,7 +230,7 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
             if r["start_epoch"] < t_hi and r["start_epoch"] + r["duration"] > t_lo]
     assert len(recs) < _MAX_RECS, "too many recordings in the horizon"
     edges = np.arange(-horizon_h * 60.0, post_h * 60.0 + bin_min, bin_min)
-    cand_all, mf_all, phfo_all = [], [], []
+    cand_all, mf_all, phfo_all, post_all = [], [], [], []
     for i, r in enumerate(recs):
         prog(f"seizure@{onset_epoch:.0f}: rec {i+1}/{len(recs)} "
              f"{os.path.basename(r['file_path'])}")
@@ -212,25 +240,33 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
         keep = np.isfinite(d["frac"]) & (d["frac"] >= phfo_frac) \
             & (d["prom"] >= phfo_prom)
         phfo_all.append(d["mf"][keep] if d["mf"].size else np.empty(0))
+        # camp 2 = the stim-riding SUBSET of camp 1's pHFOs (0-100 ms post-stim)
+        keep_post = keep & np.asarray(d.get("post", np.zeros(keep.size, bool)))
+        post_all.append(d["mf"][keep_post] if d["mf"].size else np.empty(0))
     cand = _warmup_filter(np.concatenate(cand_all) if cand_all else np.empty(0),
                           recs, warmup_min)
     mf = _warmup_filter(np.concatenate(mf_all) if mf_all else np.empty(0),
                         recs, warmup_min)
     phfo = _warmup_filter(np.concatenate(phfo_all) if phfo_all else np.empty(0),
                           recs, warmup_min)
+    phfo_post = _warmup_filter(np.concatenate(post_all) if post_all else np.empty(0),
+                               recs, warmup_min)
     cov = _coverage_seconds(_warmup_recs(recs, warmup_min), onset_epoch, edges)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
     phfo_ct, _ = np.histogram((phfo - onset_epoch) / 60.0, bins=edges)
+    post_ct, _ = np.histogram((phfo_post - onset_epoch) / 60.0, bins=edges)
     with np.errstate(divide="ignore", invalid="ignore"):
         r_of = lambda ct: np.where(cov > 0, ct / (cov / 60.0), np.nan)
-        cand_rate, mf_rate, phfo_rate = r_of(cand_ct), r_of(mf_ct), r_of(phfo_ct)
+        cand_rate, mf_rate = r_of(cand_ct), r_of(mf_ct)
+        phfo_rate, phfo_post_rate = r_of(phfo_ct), r_of(post_ct)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return {"onset_epoch": onset_epoch, "centers_min": centers,
             "cand_count": cand_ct, "mf_count": mf_ct, "phfo_count": phfo_ct,
-            "cover_sec": cov, "cand_rate": cand_rate, "mf_rate": mf_rate,
-            "phfo_rate": phfo_rate, "n_recs": len(recs), "horizon_h": horizon_h,
-            "bin_min": bin_min}
+            "phfo_post_count": post_ct, "cover_sec": cov, "cand_rate": cand_rate,
+            "mf_rate": mf_rate, "phfo_rate": phfo_rate,
+            "phfo_post_rate": phfo_post_rate, "n_recs": len(recs),
+            "horizon_h": horizon_h, "bin_min": bin_min}
 
 
 def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
@@ -280,16 +316,22 @@ def write_trajectory_csv(traj: dict, path: str, racine=None) -> str:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["onset_epoch", "racine", "center_min", "cand_count",
-                    "mf_count", "phfo_count", "cover_sec", "cand_rate_per_min",
-                    "mf_rate_per_min", "phfo_rate_per_min"])
+                    "mf_count", "phfo_count", "phfo_post_count", "cover_sec",
+                    "cand_rate_per_min", "mf_rate_per_min", "phfo_rate_per_min",
+                    "phfo_post_rate_per_min"])
+        post_ct = traj.get("phfo_post_count")
+        post_rate = traj.get("phfo_post_rate")
         for i in range(traj["centers_min"].size):
             w.writerow([f"{traj['onset_epoch']:.0f}",
                         "" if racine is None else int(racine),
                         f"{traj['centers_min'][i]:.1f}",
                         int(traj["cand_count"][i]), int(traj["mf_count"][i]),
-                        int(traj["phfo_count"][i]), f"{traj['cover_sec'][i]:.1f}",
+                        int(traj["phfo_count"][i]),
+                        int(post_ct[i]) if post_ct is not None else 0,
+                        f"{traj['cover_sec'][i]:.1f}",
                         f"{traj['cand_rate'][i]:.5g}", f"{traj['mf_rate'][i]:.5g}",
-                        f"{traj['phfo_rate'][i]:.5g}"])
+                        f"{traj['phfo_rate'][i]:.5g}",
+                        f"{post_rate[i]:.5g}" if post_rate is not None else ""])
     return path
 
 
@@ -304,6 +346,7 @@ def load_trajectories(animal: str) -> list[dict]:
                                            "traj_*.csv"))):
         cen, cr, mr, rr, onset, rac = [], [], [], [], None, None
         cc, mc, rc, cov = [], [], [], []           # counts + coverage (for rebin)
+        pr, pc = [], []                            # camp-2 post-stim subset
         with open(p, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 onset = float(row["onset_epoch"])
@@ -312,17 +355,20 @@ def load_trajectories(animal: str) -> list[dict]:
                 cr.append(float(row["cand_rate_per_min"] or "nan"))
                 mr.append(float(row["mf_rate_per_min"] or "nan"))
                 rr.append(float(row.get("phfo_rate_per_min") or "nan"))
+                pr.append(float(row.get("phfo_post_rate_per_min") or "nan"))
                 cc.append(float(row.get("cand_count") or 0))
                 mc.append(float(row.get("mf_count") or 0))
                 rc.append(float(row.get("phfo_count") or 0))
+                pc.append(float(row.get("phfo_post_count") or 0))
                 cov.append(float(row.get("cover_sec") or 0))
         if cen:
             out.append({"onset_epoch": onset, "racine": rac,
                         "centers_min": np.asarray(cen), "cand_rate": np.asarray(cr),
                         "mf_rate": np.asarray(mr), "phfo_rate": np.asarray(rr),
+                        "phfo_post_rate": np.asarray(pr),
                         "cand_count": np.asarray(cc), "mf_count": np.asarray(mc),
-                        "phfo_count": np.asarray(rc), "cover_sec": np.asarray(cov),
-                        "path": p})
+                        "phfo_count": np.asarray(rc), "phfo_post_count": np.asarray(pc),
+                        "cover_sec": np.asarray(cov), "path": p})
     return out
 
 
@@ -348,8 +394,11 @@ def _rebin(traj: dict, coarse_min: float) -> dict:
     cov = np.zeros(nb)
     np.add.at(cov, idx, np.nan_to_num(traj["cover_sec"]))
     out["cover_sec"] = cov
-    for ck, rk in (("cand_count", "cand_rate"), ("mf_count", "mf_rate"),
-                   ("phfo_count", "phfo_rate")):
+    pairs = [("cand_count", "cand_rate"), ("mf_count", "mf_rate"),
+             ("phfo_count", "phfo_rate"), ("phfo_post_count", "phfo_post_rate")]
+    for ck, rk in pairs:
+        if ck not in traj:
+            continue
         ct = np.zeros(nb)
         np.add.at(ct, idx, np.nan_to_num(traj[ck]))
         out[ck] = ct
@@ -824,21 +873,28 @@ def compute_evoked_camp(animal: str, config_path: str, *, jobs: int = 4,
 
 
 def aggregate_camps(animal: str, out_png: str | None = None, *,
-                    coarse_min: float = 30.0) -> str | None:
-    """Two-camp comparison figure: camp 1 (all pHFO events, LFDs rejected,
-    continuous) vs camp 2 (riding events in the 0-100 ms post-stim window). Panels:
-    camp-1 per-seizure rate, camp-2 per-seizure rate, and the two camps' baseline-
-    normalized MEANS overlaid with each camp's last-hour-vs-baseline stats."""
-    t1, t2 = load_trajectories(animal), load_evk_trajectories(animal)
-    if not t1 or not t2:
+                    coarse_min: float = 30.0, min_gap_h: float | None = None
+                    ) -> str | None:
+    """Two-camp comparison figure, BOTH camps from the same continuous detections:
+    camp 1 = ALL pHFO events (LFDs rejected); camp 2 = the STIM-RIDING SUBSET of
+    camp 1 (pHFOs landing 0-100 ms after a stim, so camp 2 <= camp 1 in every bin).
+    Panels: camp-1 per-seizure rate, camp-2 per-seizure rate, and the two camps'
+    baseline-normalized MEANS overlaid with each camp's last-hour-vs-baseline
+    stats. min_gap_h drops follower seizures within that gap (cluster-leaders)."""
+    trajs_raw = load_trajectories(animal)
+    if not trajs_raw or "phfo_post_rate" not in (trajs_raw[0] or {}):
         return None
+    if min_gap_h and min_gap_h > 0:
+        from src.preictal.isi import leading_mask
+        mask = leading_mask([t["onset_epoch"] for t in trajs_raw],
+                            min_gap_h * _SEC_H)
+        trajs_raw = [t for t, k in zip(trajs_raw, mask) if k] or trajs_raw
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from src.riding_event import render as _r
-    c1 = [_rebin(t, coarse_min) for t in t1]
-    c2 = [_rebin_evk(t, coarse_min) for t in t2]
-    xh, xh2 = c1[0]["centers_min"] / 60.0, c2[0]["centers_min"] / 60.0
+    c = [_rebin(t, coarse_min) for t in trajs_raw]
+    xh = c[0]["centers_min"] / 60.0
     out_png = out_png or os.path.join(_root(animal), "periictal",
                                       f"{animal}_periictal_camps.png")
     colors = _SZ_COLORS
@@ -846,17 +902,17 @@ def aggregate_camps(animal: str, out_png: str | None = None, *,
                             gridspec_kw={"height_ratios": [1, 1, 1, 0.34]})
     axes, lax = ax4[:3], ax4[3]
     lax.axis("off")
-    h1 = _agg_panel(axes[0], c1, "phfo_rate", xh, "CAMP 1: all pHFO events "
+    h1 = _agg_panel(axes[0], c, "phfo_rate", xh, "CAMP 1: ALL pHFO events "
                     "(continuous LFP, LFDs rejected)", _r, "events / min",
                     colors=colors)
-    _agg_panel(axes[1], c2, "ride_rate", xh2, "CAMP 2: riding events in the "
-               "0-100 ms window after each stim", _r, "events / min", colors=colors)
-    _camp_compare(axes[2], c1, c2, xh, xh2, _r)
+    _agg_panel(axes[1], c, "phfo_post_rate", xh, "CAMP 2: the stim-riding SUBSET "
+               "(pHFOs 0-100 ms after a stim)", _r, "events / min", colors=colors)
+    _camp_compare(axes[2], c, xh, _r)
     axes[2].set_xlabel("hours to seizure onset (0 = onset)", color=_r._TEXT,
                        fontsize=10)
     for a in (axes[0], axes[1]):
         plt.setp(a.get_xticklabels(), visible=False)
-    valid = [(h, _sz_label(t)) for h, t in zip(h1, c1) if h is not None]
+    valid = [(h, _sz_label(t)) for h, t in zip(h1, c) if h is not None]
     leg = lax.legend([h for h, _ in valid], [l for _, l in valid], loc="center",
                      ncol=min(4, max(1, len(valid))), frameon=False, fontsize=8.5,
                      title=f"seizure onset time  ·  Racine  ({len(valid)} seizures, "
@@ -865,16 +921,16 @@ def aggregate_camps(animal: str, out_png: str | None = None, *,
         leg.get_title().set_color(_r._TEXT)
         for tx in leg.get_texts():
             tx.set_color(_r._TEXT)
-    fig.suptitle(f"{animal} — two-camp peri-ictal comparison ({len(c1)} seizures, "
-                 f"{int(coarse_min)}-min bins)", color=_r._TEXT, fontsize=12,
-                 x=0.02, ha="left")
+    fig.suptitle(f"{animal} — two-camp peri-ictal comparison ({len(c)} seizures, "
+                 f"{int(coarse_min)}-min bins; camp 2 ⊂ camp 1)",
+                 color=_r._TEXT, fontsize=12, x=0.02, ha="left")
     return _r._finish(fig, out_png)
 
 
-def _camp_compare(ax, c1, c2, xh, xh2, _r) -> None:
+def _camp_compare(ax, c, xh, _r) -> None:
     """Panel 3: the two camps' baseline-normalized across-seizure means overlaid,
-    each with its last-hour-vs-baseline fold + Wilcoxon p (which camp trends
-    harder / is more significant)."""
+    each with its last-hour-vs-baseline fold + Wilcoxon p. Both camps share the
+    same grid (camp 2 is a subset of camp 1)."""
     import warnings
     ax.set_facecolor(_r._PANEL)
     ax.tick_params(colors=_r._MUTED, labelsize=8)
@@ -882,8 +938,8 @@ def _camp_compare(ax, c1, c2, xh, xh2, _r) -> None:
         sp.set_color(_r._SPINE)
     ax.grid(True, alpha=0.15, color=_r._MUTED)
     ax.axhline(1.0, color=_r._MUTED, lw=0.8, ls=":")
-    specs = [("CAMP 1 (all pHFO)", c1, "phfo_rate", xh, _r._ACCENT),
-             ("CAMP 2 (0-100 ms post-stim)", c2, "ride_rate", xh2, _r._EVENT)]
+    specs = [("CAMP 1 (all pHFO)", c, "phfo_rate", xh, _r._ACCENT),
+             ("CAMP 2 (stim-riding)", c, "phfo_post_rate", xh, _r._EVENT)]
     for name, trajs, key, x, col in specs:
         mat = np.full((len(trajs), x.size), np.nan)
         for i, t in enumerate(trajs):
