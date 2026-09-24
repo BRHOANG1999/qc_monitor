@@ -90,47 +90,55 @@ def animal_recordings(store, animal: str) -> list[dict]:
     return out
 
 
-def _det_cache_paths(animal: str, file_id: int) -> tuple:
+def _det_cache_paths(animal: str, file_id: int) -> dict:
     d = os.path.join(_root(animal), "det_cache")
-    return (os.path.join(d, f"{file_id}_cand.npy"),
-            os.path.join(d, f"{file_id}_mf.npy"))
+    return {"cand": os.path.join(d, f"{file_id}_cand.npy"),
+            "mf": os.path.join(d, f"{file_id}_mf.npy"),
+            "frac": os.path.join(d, f"{file_id}_frac.npy"),
+            "sust": os.path.join(d, f"{file_id}_sust.npy")}
 
 
 def detect_recording(store, animal: str, rec: dict, tmpl: dict, *,
-                     thresh: float = 0.7) -> tuple:
-    """(candidate_epochs, mf_epochs) — absolute epochs of the HF-envelope ripple
-    candidates and the matched-filter detections in one recording. Cached to disk
-    per file_id; the chunk cache is cleared after the read so memory doesn't
+                     thresh: float = 0.7) -> dict:
+    """One recording's detections as absolute epochs: HF-envelope ripple
+    ``candidates``, matched-filter ``mf`` detections, and per-mf-detection ripple
+    metrics (``frac``, ``sust`` from ``primitives.ripple_metrics``) so a ripple
+    gate can reject slow waves later WITHOUT re-reading. Cached per file_id (all
+    four arrays); the chunk cache is cleared after the read so memory doesn't
     accumulate across a serial sweep."""
-    cand_p, mf_p = _det_cache_paths(animal, rec["file_id"])
-    if os.path.exists(cand_p) and os.path.exists(mf_p):
-        return np.load(cand_p), np.load(mf_p)
+    p = _det_cache_paths(animal, rec["file_id"])
+    if all(os.path.exists(p[k]) for k in p):
+        return {"cand": np.load(p["cand"]), "mf": np.load(p["mf"]),
+                "frac": np.load(p["frac"]), "sust": np.load(p["sust"])}
     stim_times = _recording_stim_times(store, animal, rec["file_id"])
     loaded = _det.load_channel(rec["file_path"], animal)
     if loaded is None:
-        _save_empty(cand_p, mf_p)
-        return np.empty(0), np.empty(0)
+        return _save_det(p, np.empty(0), np.empty(0), np.empty(0), np.empty(0))
     signal, fs, _ch = loaded
     try:
         d = _det.run_detector(signal, fs, band=tmpl["band"],
                               template_override=tmpl["template"],
                               exclude_times_sec=stim_times, thresh=thresh)
+        det_locs = np.asarray(d["det_locs"], dtype=np.int64)
+        w = int(np.asarray(tmpl["template"]).size)
+        from src.riding_event import primitives as _p
+        frac, sust = _p.ripple_metrics(signal, det_locs, fs, tmpl["band"], w)
     finally:
         del signal
         _cc.clear()                                # free the multi-GB chunk
     s0 = rec["start_epoch"]
     cand = s0 + np.asarray(d["cand_locs"], dtype=np.float64) / fs
-    mf = s0 + np.asarray(d["det_locs"], dtype=np.float64) / fs
-    os.makedirs(os.path.dirname(cand_p), exist_ok=True)
-    np.save(cand_p, cand)
-    np.save(mf_p, mf)
-    return cand, mf
+    mf = s0 + det_locs.astype(np.float64) / fs
+    return _save_det(p, cand, mf, frac, sust)
 
 
-def _save_empty(cand_p, mf_p) -> None:
-    os.makedirs(os.path.dirname(cand_p), exist_ok=True)
-    np.save(cand_p, np.empty(0))
-    np.save(mf_p, np.empty(0))
+def _save_det(p: dict, cand, mf, frac, sust) -> dict:
+    os.makedirs(os.path.dirname(p["cand"]), exist_ok=True)
+    np.save(p["cand"], cand)
+    np.save(p["mf"], mf)
+    np.save(p["frac"], frac)
+    np.save(p["sust"], sust)
+    return {"cand": cand, "mf": mf, "frac": frac, "sust": sust}
 
 
 def _recording_stim_times(store, animal: str, file_id: int):
@@ -154,12 +162,15 @@ def _recording_stim_times(store, animal: str, file_id: int):
 def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
                        horizon_h: float = 6.0, post_h: float = 0.5,
                        bin_min: float = 10.0, thresh: float = 0.7,
+                       ripple_frac: float = 0.5, ripple_sust: float = 0.30,
                        progress=None) -> dict:
-    """Ripple-rate trajectory for one seizure: bin the candidate + matched-filter
-    detections over ``[onset - horizon_h, onset + post_h]`` by time-to-onset.
-    Returns per-bin counts, per-bin covered seconds, and rates (events/min), with
-    NaN where no recording covers the bin. Detects each overlapping recording
-    (cached)."""
+    """Ripple-rate trajectory for one seizure: bin the candidate, matched-filter,
+    and RIPPLE-CONFIRMED matched-filter detections over ``[onset - horizon_h,
+    onset + post_h]`` by time-to-onset. A detection is ripple-confirmed when its
+    HF fraction >= *ripple_frac* AND sustained fraction >= *ripple_sust* (rejects
+    slow waves / lone transients). Per-bin counts + covered seconds + rates
+    (events/min), NaN where uncovered. Recordings cached (thresholds re-tunable
+    without re-reading)."""
     prog = progress or (lambda *_a: None)
     t_lo = onset_epoch - horizon_h * _SEC_H
     t_hi = onset_epoch + post_h * _SEC_H
@@ -167,26 +178,32 @@ def seizure_trajectory(store, animal: str, onset_epoch: float, tmpl: dict, *,
             if r["start_epoch"] < t_hi and r["start_epoch"] + r["duration"] > t_lo]
     assert len(recs) < _MAX_RECS, "too many recordings in the horizon"
     edges = np.arange(-horizon_h * 60.0, post_h * 60.0 + bin_min, bin_min)
-    cand_all, mf_all = [], []
+    cand_all, mf_all, rip_all = [], [], []
     for i, r in enumerate(recs):
         prog(f"seizure@{onset_epoch:.0f}: rec {i+1}/{len(recs)} "
              f"{os.path.basename(r['file_path'])}")
-        c, m = detect_recording(store, animal, r, tmpl, thresh=thresh)
-        cand_all.append(c)
-        mf_all.append(m)
-    cand = (np.concatenate(cand_all) if cand_all else np.empty(0))
-    mf = (np.concatenate(mf_all) if mf_all else np.empty(0))
+        d = detect_recording(store, animal, r, tmpl, thresh=thresh)
+        cand_all.append(d["cand"])
+        mf_all.append(d["mf"])
+        rip = np.isfinite(d["frac"]) & (d["frac"] >= ripple_frac) \
+            & (d["sust"] >= ripple_sust)
+        rip_all.append(d["mf"][rip] if d["mf"].size else np.empty(0))
+    cand = np.concatenate(cand_all) if cand_all else np.empty(0)
+    mf = np.concatenate(mf_all) if mf_all else np.empty(0)
+    ripe = np.concatenate(rip_all) if rip_all else np.empty(0)
     cov = _coverage_seconds(recs, onset_epoch, edges)
     cand_ct, _ = np.histogram((cand - onset_epoch) / 60.0, bins=edges)
     mf_ct, _ = np.histogram((mf - onset_epoch) / 60.0, bins=edges)
+    rip_ct, _ = np.histogram((ripe - onset_epoch) / 60.0, bins=edges)
     with np.errstate(divide="ignore", invalid="ignore"):
-        cand_rate = np.where(cov > 0, cand_ct / (cov / 60.0), np.nan)
-        mf_rate = np.where(cov > 0, mf_ct / (cov / 60.0), np.nan)
+        r_of = lambda ct: np.where(cov > 0, ct / (cov / 60.0), np.nan)
+        cand_rate, mf_rate, rip_rate = r_of(cand_ct), r_of(mf_ct), r_of(rip_ct)
     centers = 0.5 * (edges[:-1] + edges[1:])
     return {"onset_epoch": onset_epoch, "centers_min": centers,
-            "cand_count": cand_ct, "mf_count": mf_ct, "cover_sec": cov,
-            "cand_rate": cand_rate, "mf_rate": mf_rate, "n_recs": len(recs),
-            "horizon_h": horizon_h, "bin_min": bin_min}
+            "cand_count": cand_ct, "mf_count": mf_ct, "rip_count": rip_ct,
+            "cover_sec": cov, "cand_rate": cand_rate, "mf_rate": mf_rate,
+            "rip_rate": rip_rate, "n_recs": len(recs), "horizon_h": horizon_h,
+            "bin_min": bin_min}
 
 
 def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
@@ -201,41 +218,87 @@ def _coverage_seconds(recs, onset_epoch, edges) -> np.ndarray:
     return cov
 
 
-def write_trajectory_csv(traj: dict, path: str) -> str:
+def write_trajectory_csv(traj: dict, path: str, racine=None) -> str:
     import csv
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["onset_epoch", "center_min", "cand_count", "mf_count",
-                    "cover_sec", "cand_rate_per_min", "mf_rate_per_min"])
+        w.writerow(["onset_epoch", "racine", "center_min", "cand_count",
+                    "mf_count", "rip_count", "cover_sec", "cand_rate_per_min",
+                    "mf_rate_per_min", "rip_rate_per_min"])
         for i in range(traj["centers_min"].size):
             w.writerow([f"{traj['onset_epoch']:.0f}",
+                        "" if racine is None else int(racine),
                         f"{traj['centers_min'][i]:.1f}",
                         int(traj["cand_count"][i]), int(traj["mf_count"][i]),
-                        f"{traj['cover_sec'][i]:.1f}",
-                        f"{traj['cand_rate'][i]:.5g}", f"{traj['mf_rate'][i]:.5g}"])
+                        int(traj["rip_count"][i]), f"{traj['cover_sec'][i]:.1f}",
+                        f"{traj['cand_rate'][i]:.5g}", f"{traj['mf_rate'][i]:.5g}",
+                        f"{traj['rip_rate'][i]:.5g}"])
     return path
 
 
 def load_trajectories(animal: str) -> list[dict]:
     """Every per-seizure trajectory CSV under ``<root>/periictal/``, as dicts with
-    ``centers_min``, ``cand_rate``, ``mf_rate`` (NaN where uncovered)."""
+    ``centers_min`` + ``cand_rate``/``mf_rate``/``rip_rate`` (NaN where uncovered)
+    + ``racine``."""
     import csv
     import glob
     out = []
     for p in sorted(glob.glob(os.path.join(_root(animal), "periictal",
                                            "traj_*.csv"))):
-        cen, cr, mr, onset = [], [], [], None
+        cen, cr, mr, rr, onset, rac = [], [], [], [], None, None
         with open(p, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 onset = float(row["onset_epoch"])
+                rac = row.get("racine") or None
                 cen.append(float(row["center_min"]))
                 cr.append(float(row["cand_rate_per_min"] or "nan"))
                 mr.append(float(row["mf_rate_per_min"] or "nan"))
+                rr.append(float(row.get("rip_rate_per_min") or "nan"))
         if cen:
-            out.append({"onset_epoch": onset, "centers_min": np.asarray(cen),
-                        "cand_rate": np.asarray(cr), "mf_rate": np.asarray(mr),
+            out.append({"onset_epoch": onset, "racine": rac,
+                        "centers_min": np.asarray(cen), "cand_rate": np.asarray(cr),
+                        "mf_rate": np.asarray(mr), "rip_rate": np.asarray(rr),
                         "path": p})
+    return out
+
+
+def periictal_stats(trajs: list, key: str = "rip_rate", *,
+                    baseline_h=(6.0, 4.0), last_h: float = 1.0) -> dict:
+    """Per-seizure baseline (``baseline_h`` hours before onset) vs last-hour rate
+    of *key*, a Wilcoxon paired test that the last hour exceeds baseline, and the
+    median fold-change. baseline_h=(6,4) = the -6..-4 h window."""
+    ref = trajs[0]["centers_min"] / 60.0
+    base_m = (ref <= -baseline_h[1]) & (ref >= -baseline_h[0])
+    last_m = ref >= -last_h
+    base, last, rac = [], [], []
+    for t in trajs:
+        y = t.get(key)
+        if y is None or y.size != ref.size:
+            continue
+        b = np.nanmean(y[base_m])
+        l = np.nanmean(y[last_m])
+        if np.isfinite(b) and np.isfinite(l):
+            base.append(b)
+            last.append(l)
+            rac.append(t.get("racine"))
+    base, last = np.asarray(base), np.asarray(last)
+    out = {"n": int(base.size), "baseline_mean": float(np.mean(base)) if base.size else np.nan,
+           "lasthour_mean": float(np.mean(last)) if last.size else np.nan,
+           "median_fold": float(np.median(last / np.where(base > 0, base, np.nan)))
+           if base.size else np.nan, "p_wilcoxon": np.nan, "per_racine": {}}
+    if base.size >= 5:
+        try:
+            from scipy.stats import wilcoxon
+            out["p_wilcoxon"] = float(wilcoxon(last, base, alternative="greater").pvalue)
+        except Exception:                            # noqa: BLE001
+            pass
+    for g in sorted(set(r for r in rac if r)):
+        m = np.array([r == g for r in rac])
+        if m.sum():
+            out["per_racine"][g] = {"n": int(m.sum()),
+                                    "median_fold": float(np.median(
+                                        last[m] / np.where(base[m] > 0, base[m], np.nan)))}
     return out
 
 
@@ -255,22 +318,38 @@ def aggregate(animal: str, out_png: str | None = None) -> str | None:
     xh = ref / 60.0
     out_png = out_png or os.path.join(_root(animal), "periictal",
                                       f"{animal}_periictal_ripplerate.png")
-    fig, axes = plt.subplots(2, 1, figsize=(10.5, 8.6), facecolor=_r._BG,
+    stats = periictal_stats(trajs, "rip_rate")
+    _write_stats(animal, trajs)
+    fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.4), facecolor=_r._BG,
                              sharex=True)
-    for ax, key, title in [(axes[0], "cand_rate",
-                            "HF-envelope ripple candidates (ripple-band, stim-blanked)"),
-                           (axes[1], "mf_rate",
-                            "matched-filter detections (template-correlated)")]:
-        _agg_panel(ax, trajs, key, xh, title, _r, plt)
-    axes[1].set_xlabel("hours to seizure onset (0 = onset)", color=_r._TEXT,
+    _agg_panel(axes[0], trajs, "rip_rate", xh, "ripple-confirmed matched-filter "
+               "(slow waves rejected)", _r, "events / min")
+    st = (f"last hour vs -6..-4 h baseline:  {stats['median_fold']:.2f}× "
+          f"(p={stats['p_wilcoxon']:.3g}, n={stats['n']})")
+    axes[0].text(0.02, 0.94, st, transform=axes[0].transAxes, color="#ffd166",
+                 fontsize=10, fontweight="bold", va="top")
+    _agg_panel(axes[1], trajs, "rip_rate", xh, "ripple-confirmed, baseline-"
+               "normalized (each ÷ its -6..-4 h mean)", _r, "× baseline",
+               normalize=True)
+    axes[1].axhline(1.0, color=_r._MUTED, lw=0.8, ls=":")
+    _agg_panel(axes[2], trajs, "cand_rate", xh, "HF-envelope candidates "
+               "(non-specific, for contrast)", _r, "events / min")
+    axes[2].set_xlabel("hours to seizure onset (0 = onset)", color=_r._TEXT,
                        fontsize=10)
-    fig.suptitle(f"{animal} — peri-ictal ripple rate over "
-                 f"{abs(xh[0]):.0f} h before onset ({len(trajs)} seizures)",
-                 color=_r._TEXT, fontsize=12, x=0.02, ha="left")
+    fig.suptitle(f"{animal} — peri-ictal ripple rate, {abs(xh[0]):.0f} h before "
+                 f"onset ({len(trajs)} seizures)", color=_r._TEXT, fontsize=12,
+                 x=0.02, ha="left")
     return _r._finish(fig, out_png)
 
 
-def _agg_panel(ax, trajs, key, xh, title, _r, plt) -> None:
+def _baseline(y, xh) -> float:
+    m = (xh <= -4.0) & (xh >= -6.0)
+    b = np.nanmean(y[m]) if m.any() else np.nan
+    return b if (np.isfinite(b) and b > 0) else np.nan
+
+
+def _agg_panel(ax, trajs, key, xh, title, _r, ylabel, *, normalize=False) -> None:
+    import warnings
     ax.set_facecolor(_r._PANEL)
     ax.tick_params(colors=_r._MUTED, labelsize=8)
     for sp in ax.spines.values():
@@ -278,11 +357,14 @@ def _agg_panel(ax, trajs, key, xh, title, _r, plt) -> None:
     ax.grid(True, alpha=0.15, color=_r._MUTED)
     mat = np.full((len(trajs), xh.size), np.nan)
     for i, t in enumerate(trajs):
-        y = t[key]
-        if y.size == xh.size:
-            ax.plot(xh, y, color=_r._ACCENT, lw=0.7, alpha=0.28)
-            mat[i] = y
-    import warnings
+        y = t.get(key)
+        if y is None or y.size != xh.size:
+            continue
+        if normalize:
+            b = _baseline(y, xh)
+            y = y / b if np.isfinite(b) else np.full_like(y, np.nan)
+        ax.plot(xh, y, color=_r._ACCENT, lw=0.7, alpha=0.28)
+        mat[i] = y
     n = np.sum(np.isfinite(mat), axis=0)
     with warnings.catch_warnings():                # all-NaN (gap) columns warn
         warnings.simplefilter("ignore")
@@ -296,10 +378,26 @@ def _agg_panel(ax, trajs, key, xh, title, _r, plt) -> None:
             label=f"mean ± SEM (n≤{len(trajs)})")
     ax.axvline(0.0, color="#ff3b3b", lw=1.4, label="seizure onset")
     ax.set_title(title, color=_r._TEXT, fontsize=11, loc="left")
-    ax.set_ylabel("events / min", color=_r._TEXT, fontsize=10)
+    ax.set_ylabel(ylabel, color=_r._TEXT, fontsize=10)
     leg = ax.legend(frameon=False, fontsize=8, loc="upper left")
     for tx in leg.get_texts():
         tx.set_color(_r._TEXT)
+
+
+def _write_stats(animal: str, trajs: list) -> str:
+    """Per-metric baseline-vs-last-hour stats to a CSV next to the figure."""
+    import csv
+    path = os.path.join(_root(animal), "periictal", f"{animal}_periictal_stats.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "n", "baseline_mean_per_min", "lasthour_mean_per_min",
+                    "median_fold", "p_wilcoxon_greater", "per_racine"])
+        for key in ("rip_rate", "mf_rate", "cand_rate"):
+            s = periictal_stats(trajs, key)
+            w.writerow([key, s["n"], f"{s['baseline_mean']:.4g}",
+                        f"{s['lasthour_mean']:.4g}", f"{s['median_fold']:.3g}",
+                        f"{s['p_wilcoxon']:.3g}", s["per_racine"]])
+    return path
 
 
 def _one_seizure(onset: float, animal: str, config_path: str, *,
@@ -318,9 +416,20 @@ def _one_seizure(onset: float, animal: str, config_path: str, *,
                               post_h=post_h, bin_min=bin_min, thresh=thresh,
                               progress=lambda m: print("  ", m, flush=True))
     out = os.path.join(_root(animal), "periictal", f"traj_{int(onset)}.csv")
-    write_trajectory_csv(traj, out)
+    write_trajectory_csv(traj, out, racine=_racine_for_onset(store, animal, onset))
     print(f"seizure {int(onset)}: {traj['n_recs']} recordings -> {out}", flush=True)
     return (onset, traj["n_recs"], out)
+
+
+def _racine_for_onset(store, animal: str, onset: float):
+    """Racine grade of the scored seizure at *onset* (nearest within 2 s)."""
+    from src.preictal.isi import scored_seizures
+    best, bd = None, 2.0
+    for z in scored_seizures(store, animal):
+        d = abs(z.onset_epoch - onset)
+        if d < bd:
+            best, bd = z.racine, d
+    return best
 
 
 def run_batch(animal: str, onsets, config_path: str, *, jobs: int = 3,
@@ -393,7 +502,9 @@ def _main(argv=None) -> int:
                               progress=lambda m: print("  ", m, flush=True))
     out = os.path.join(_root(args.animal), "periictal",
                        f"traj_{int(args.onset_epoch)}.csv")
-    write_trajectory_csv(traj, out)
+    write_trajectory_csv(traj, out,
+                         racine=_racine_for_onset(store, args.animal,
+                                                  args.onset_epoch))
     print(f"seizure {int(args.onset_epoch)}: {traj['n_recs']} recordings -> {out}")
     return 0
 

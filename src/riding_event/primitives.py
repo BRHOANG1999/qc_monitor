@@ -293,6 +293,39 @@ def rising_edge_align(snippets, fs: float, *, search_ms: float = 10.0,
     return np.asarray(out), np.asarray(keep_fid, dtype=np.int64)
 
 
+def ripple_metrics(signal, locs, fs: float, band, w: int) -> tuple:
+    """Per-detection ripple confirmation, to separate a real ripple (sustained HF
+    oscillation) from a slow wave (little HF) or a lone sharp transient (HF but
+    not sustained). For each detection window ``[loc, loc+w]`` returns
+    ``(hf_frac, sustain)``: ``hf_frac`` = HF-band RMS / broadband RMS (ripple-band
+    energy fraction), ``sustain`` = fraction of the window where the HF envelope
+    exceeds half its own peak (how sustained the oscillation is). NaN for windows
+    that run off an edge. Vectorised over detections."""
+    from scipy.signal import hilbert
+    x = np.asarray(signal, dtype=np.float64)
+    loc = np.asarray(locs, dtype=np.int64)
+    assert x.ndim == 1 and fs and fs > 0, "signal 1-D, fs > 0"
+    frac = np.full(loc.size, np.nan)
+    sust = np.full(loc.size, np.nan)
+    ok = (loc >= 0) & (loc + int(w) <= x.size)
+    if not ok.any():
+        return frac, sust
+    idx = loc[ok][:, None] + np.arange(int(w))[None, :]
+    win = x[idx]
+    lo = max(1.0, float(band[0]))
+    hi = min(float(band[1]), 0.49 * float(fs))
+    if hi <= lo:
+        return frac, sust
+    hf = _ef._bandpass(win, float(fs), lo, hi)
+    env = np.abs(hilbert(hf, axis=1))
+    hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
+    tot = np.sqrt(np.mean((win - win.mean(axis=1, keepdims=True)) ** 2, axis=1))
+    frac[ok] = hf_rms / (tot + _EPS)
+    peak = np.max(env, axis=1, keepdims=True)
+    sust[ok] = np.mean(env > 0.5 * np.where(peak > 0, peak, 1.0), axis=1)
+    return frac, sust
+
+
 def matched_filter_series(signal, template) -> np.ndarray:
     """Normalized cross-correlation (per-lag Pearson r) of *template* against a
     continuous *signal*, computed in O(n log n) via an FFT convolution for the

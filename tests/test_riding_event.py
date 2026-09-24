@@ -230,6 +230,23 @@ def test_stim_blanking_and_amplitude_gate():
     assert hit >= len(spont) - 1, "spontaneous events should survive the gate"
 
 
+def test_ripple_metrics_rejects_slow_and_transient():
+    fs = 20000.0
+    w = 600                                          # 30 ms window
+    t = np.arange(w) / fs
+    sig = np.zeros(20000)
+    band = (150.0, 620.0)
+    sig[1000:1600] += 3.0 * np.sin(2 * np.pi * 250 * t) * np.hanning(w)  # ripple
+    sig[3000:3600] += 3.0 * np.sin(2 * np.pi * 12 * t)                   # slow wave
+    sig[5000:5603] = 0.0
+    sig[5300:5303] += 8.0                                                # lone spike
+    frac, sust = p.ripple_metrics(sig, np.array([1000, 3000, 5000]), fs, band, w)
+    gate = np.isfinite(frac) & (frac >= 0.5) & (sust >= 0.3)
+    assert gate[0], "ripple must pass"
+    assert not gate[1], "slow wave (low HF fraction) must be rejected"
+    assert not gate[2], "lone transient (not sustained) must be rejected"
+
+
 def test_degenerate_inputs():
     z = np.zeros((10, 200))
     template, keep = p.robust_template(z, iters=1)
