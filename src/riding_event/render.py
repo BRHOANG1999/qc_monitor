@@ -422,6 +422,13 @@ def fig_candidates(det: dict, out_png: str, *, animal="", channel="",
     if np.isfinite(det.get("cand_thr_hi", np.inf)):
         ax.axhline(det["cand_thr_hi"], color="#ffd166", lw=1.0, ls=":",
                    label="noise ceiling")
+    st = det.get("stim_times_sec")                   # mark stims: the periodic
+    if st is not None and len(st):                   # peaks ARE the stim artifacts
+        sv = np.asarray(st, dtype=np.float64)
+        sv = sv[(sv >= a / fs) & (sv <= b / fs)]
+        for i, s in enumerate(sv):
+            ax.axvline(s, color="#ff3b3b", lw=0.6, ls=":", alpha=0.5,
+                       label="stim (artifact)" if i == 0 else None)
     inwin = dl[(dl >= a) & (dl < b)]
     if inwin.size:
         ax.plot(inwin / fs, env[np.clip(inwin, 0, env.size - 1)], "v",
