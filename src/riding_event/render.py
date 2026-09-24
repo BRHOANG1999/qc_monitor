@@ -22,6 +22,7 @@ import numpy as np                       # noqa: E402
 
 from src.periictal.erpimage import decimate_rows  # noqa: E402
 from src.notifications.trace_density import LineDensity, robust_ylim  # noqa: E402
+from src.riding_event import primitives as _p  # noqa: E402
 from src.utils.decimate import envelope as _decim_envelope  # noqa: E402
 
 logger = logging.getLogger("qc_monitor.riding_event.render")
@@ -480,12 +481,21 @@ def fig_alignment(tmpl: dict, out_png: str, *, fs: float, animal="", channel="",
 
 def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal="",
                         channel="", n: int = 12, pre_ms: float = 20.0,
-                        post_ms: float = 100.0, onset_sec=None) -> str:
+                        post_ms: float = 100.0, onset_sec=None,
+                        frac=None, prom=None,
+                        phfo_frac: float = _p.DEFAULT_PHFO_FRAC,
+                        phfo_prom: float = _p.DEFAULT_PHFO_PROM) -> str:
     """The actual LFP traces at matched-filter detections (a grid, one per
     detection, aligned to the detection at t=0). Shows what the detector fired on
-    so it can be judged by eye -- raw LFP (blue) + band-passed ripple (orange).
+    so it can be judged by eye -- raw LFP (blue) + band-passed HF trace (orange).
     With *onset_sec* (a seizure recording), shows the detections nearest the
-    onset; else the strongest."""
+    onset; else the strongest.
+
+    When ``frac``/``prom`` (per-detection pHFO metrics, aligned to
+    ``det['det_locs']``) are given, each panel is framed and labelled by the pHFO
+    GATE: green = pHFO (frac>=*phfo_frac* & prom>=*phfo_prom*), red = rejected LFD
+    (low-frequency deflection). This is what separates the real HF packets from the
+    slow DC-shift false positives."""
     x = np.asarray(signal, dtype=np.float64)
     dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
     sc = np.asarray(det.get("det_scores", []), dtype=np.float64)
@@ -496,18 +506,22 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
     else:
         order = np.argsort(-sc)[:int(n)]            # strongest first
     sel = dl[order]
+    fr = np.asarray(frac, float)[order] if frac is not None else None
+    pr = np.asarray(prom, float)[order] if prom is not None else None
+    gate_sel = _phfo_gate_mask(fr, pr, phfo_frac, phfo_prom)  # over SHOWN
+    n_keep = int(gate_sel.sum()) if gate_sel is not None else -1
     pre = max(1, int(round(pre_ms * 1e-3 * fs)))
     post = max(1, int(round(post_ms * 1e-3 * fs)))
     t = (np.arange(-pre, post) / fs) * 1000.0
     band = det.get("band", (120.0, 990.0))
     nrow = int(np.ceil(sel.size / 3))
-    fig, axes = plt.subplots(nrow, 3, figsize=(11.5, 2.0 * nrow + 0.6),
+    fig, axes = plt.subplots(nrow, 3, figsize=(11.5, 2.15 * nrow + 0.6),
                              facecolor=_BG, squeeze=False)
     for ax in axes.flat:
         _style(ax)
         ax.set_xticks([])
         ax.set_yticks([])
-    for ax, loc, sco in zip(axes.flat, sel, sc[order]):
+    for i, (ax, loc, sco) in enumerate(zip(axes.flat, sel, sc[order])):
         lo, hi = loc - pre, loc + post
         if lo < 0 or hi > x.size:
             continue
@@ -516,14 +530,42 @@ def fig_detected_events(signal, det: dict, out_png: str, *, fs: float, animal=""
         ax.plot(t, seg, color=_ACCENT, lw=0.6)
         ax.plot(t, hf, color=_EVENT, lw=0.7, alpha=0.8)
         ax.axvline(0, color=_MUTED, lw=0.6, ls="--")
-        ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}", color=_TEXT, fontsize=8,
-                     loc="left")
+        _annotate_gate(ax, loc, fs, sco, fr, pr, i, phfo_frac, phfo_prom)
     which = (f"nearest the seizure onset ({onset_sec:.0f}s)"
              if onset_sec is not None else "strongest")
-    fig.suptitle(f"{animal} {channel} — {sel.size} detections {which} "
+    gate_txt = (f" — pHFO-GATED: {n_keep} of {sel.size} pHFO (green), "
+                f"{sel.size - n_keep} LFD rejected (red)" if n_keep >= 0 else "")
+    fig.suptitle(f"{animal} {channel} — {sel.size} detections {which}{gate_txt}\n"
                  f"(blue = LFP, orange = {band[0]:.0f}-{band[1]:.0f} Hz; t=0 = "
-                 f"detection)", color=_TEXT, fontsize=11, x=0.02, ha="left")
+                 f"detection)", color=_TEXT, fontsize=10.5, x=0.02, ha="left")
     return _finish(fig, out_png)
+
+
+def _phfo_gate_mask(frac, prom, phfo_frac, phfo_prom):
+    """Boolean 'is a real pHFO' mask over detections, or None when metrics were
+    not supplied."""
+    if frac is None or prom is None:
+        return None
+    fr = np.asarray(frac, float)
+    pr = np.asarray(prom, float)
+    return np.isfinite(fr) & (fr >= float(phfo_frac)) & (pr >= float(phfo_prom))
+
+
+def _annotate_gate(ax, loc, fs, sco, fr, pr, i, phfo_frac, phfo_prom) -> None:
+    """Per-panel title + coloured frame from the pHFO gate (green pHFO / red LFD);
+    plain title when no metrics were supplied."""
+    if fr is None or pr is None or i >= fr.size:
+        ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}", color=_TEXT, fontsize=8,
+                     loc="left")
+        return
+    keep = np.isfinite(fr[i]) and fr[i] >= phfo_frac and pr[i] >= phfo_prom
+    col = "#3ddc84" if keep else "#ff5d5d"
+    tag = "pHFO" if keep else "LFD"
+    ax.set_title(f"{loc/fs:.1f}s  r={sco:.2f}  {tag}  f={fr[i]:.2f} p={pr[i]:.0f}",
+                 color=col, fontsize=8, loc="left")
+    for sp in ax.spines.values():
+        sp.set_color(col)
+        sp.set_linewidth(1.8)
 
 
 def _ef_bandpass(seg, fs, band):

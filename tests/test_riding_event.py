@@ -230,21 +230,23 @@ def test_stim_blanking_and_amplitude_gate():
     assert hit >= len(spont) - 1, "spontaneous events should survive the gate"
 
 
-def test_ripple_metrics_rejects_slow_and_transient():
+def test_phfo_metrics_separates_phfo_from_lfd():
+    """phfo_metrics must keep a tall multi-cycle HF packet (pHFO) and reject a
+    low-frequency deflection (LFD). The old 'sustained fraction' scored these
+    backwards; the discriminating metric is HF-envelope PROMINENCE (peak/median)."""
     fs = 20000.0
-    w = 600                                          # 30 ms window
+    w = 600
     t = np.arange(w) / fs
     sig = np.zeros(20000)
     band = (150.0, 620.0)
-    sig[1000:1600] += 3.0 * np.sin(2 * np.pi * 250 * t) * np.hanning(w)  # ripple
-    sig[3000:3600] += 3.0 * np.sin(2 * np.pi * 12 * t)                   # slow wave
-    sig[5000:5603] = 0.0
-    sig[5300:5303] += 8.0                                                # lone spike
-    frac, sust = p.ripple_metrics(sig, np.array([1000, 3000, 5000]), fs, band, w)
-    gate = np.isfinite(frac) & (frac >= 0.5) & (sust >= 0.3)
-    assert gate[0], "ripple must pass"
-    assert not gate[1], "slow wave (low HF fraction) must be rejected"
-    assert not gate[2], "lone transient (not sustained) must be rejected"
+    sig[1000:1600] += 3.0 * np.sin(2 * np.pi * 250 * t) * np.hanning(w)  # pHFO packet
+    sig[3000:3600] += 3.0 * np.sin(2 * np.pi * 12 * t)                   # LFD (slow)
+    frac, prom = p.phfo_metrics(sig, np.array([1000, 3000]), fs, band)
+    gate = (np.isfinite(frac) & (frac >= p.DEFAULT_PHFO_FRAC)
+            & (prom >= p.DEFAULT_PHFO_PROM))
+    assert gate[0], "pHFO packet must pass (high HF fraction + prominence)"
+    assert not gate[1], "LFD (low HF, flat envelope) must be rejected"
+    assert prom[0] > prom[1], "the pHFO packet must be far more prominent"
 
 
 def test_degenerate_inputs():

@@ -260,6 +260,7 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
                                       if onset_sec else "") + ")...")
     det = _det.run_detector(signal, fs, band=use_band, template_override=override,
                             exclude_times_sec=stim_times, thresh=thresh)
+    _add_phfo_metrics(det, signal, fs, use_band, override)   # gate: reject LFDs
     prox = _validation(store, animal, target, det, fs)
     if onset_sec is not None:                       # detections near the seizure
         dsec = np.asarray(det.get("det_locs", []), float) / fs
@@ -273,7 +274,8 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
              f"({rate_in:.3f}/s vs {base:.3f}/s overall = "
              f"{prox['enrichment']:.1f}x enrichment)")
     figs = [_r.fig_detected_events(signal, det, stem + "_detected.png", fs=fs,
-                                   animal=animal, channel=ch, onset_sec=onset_sec),
+                                   animal=animal, channel=ch, onset_sec=onset_sec,
+                                   frac=det.get("frac"), prom=det.get("prom")),
             _r.fig_matched_filter(det, stem + "_matched.png", animal=animal,
                                   channel=ch, prox=prox, onset_sec=onset_sec),
             _r.fig_candidates(det, stem + "_candidates.png", animal=animal,
@@ -284,6 +286,7 @@ def _run_prong_b(store, target, animal, out_dir, summary, res_a, band, prog, *,
         "channel": ch, "band": use_band, "n_candidates": int(det["cand_locs"].size),
         "n_raw_detections": int(det.get("n_raw_detections", 0)),
         "n_detections": int(np.asarray(det["det_locs"]).size),
+        "n_phfo_confirmed": int(det.get("n_phfo_confirmed", -1)),
         "template_source": det.get("template_source"),
         "template_n": (det.get("template") or {}).get("n", 0),
         "proximity": prox}
@@ -340,14 +343,45 @@ def _write_epoch_csv(path: str, res: dict) -> None:
                         int(bool(res["event_mask"][j]))])
 
 
+def _add_phfo_metrics(det: dict, signal, fs: float, band, override,
+                      phfo_frac: float = None, phfo_prom: float = None) -> None:
+    """Attach per-detection pHFO metrics (``frac``/``prom`` from
+    ``primitives.phfo_metrics``) + a ``phfo_keep`` gate mask to *det*, so the LFD
+    (low-frequency deflection) false positives are separable from real pHFO
+    packets. No extra read -- reuses the already-loaded *signal*. No-op when there
+    are no detections."""
+    from src.riding_event import primitives as _p
+    ff = _p.DEFAULT_PHFO_FRAC if phfo_frac is None else phfo_frac
+    pp = _p.DEFAULT_PHFO_PROM if phfo_prom is None else phfo_prom
+    dl = np.asarray(det.get("det_locs", []), dtype=np.int64)
+    if dl.size == 0:
+        det["frac"], det["prom"] = np.empty(0), np.empty(0)
+        det["n_phfo_confirmed"] = 0
+        return
+    frac, prom = _p.phfo_metrics(np.asarray(signal, float), dl, fs, band)
+    det["frac"], det["prom"] = frac, prom
+    keep = np.isfinite(frac) & (frac >= ff) & (prom >= pp)
+    det["phfo_keep"] = keep
+    det["n_phfo_confirmed"] = int(keep.sum())
+
+
 def _write_detection_csv(path: str, det: dict, fs: float) -> None:
     locs = np.asarray(det.get("det_locs", []))
     scores = np.asarray(det.get("det_scores", []))
+    frac = np.asarray(det.get("frac", []), float)
+    prom = np.asarray(det.get("prom", []), float)
+    keep = np.asarray(det.get("phfo_keep", []), bool)
+    has = frac.size == locs.size and prom.size == locs.size
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["sample", "time_sec", "score"])
+        w.writerow(["sample", "time_sec", "score", "hf_frac", "hf_prominence",
+                    "phfo_confirmed"])
         for i in range(locs.size):
-            w.writerow([int(locs[i]), f"{locs[i]/fs:.6f}", f"{scores[i]:.4f}"])
+            fr = f"{frac[i]:.4f}" if has else ""
+            pr = f"{prom[i]:.3f}" if has else ""
+            kp = int(keep[i]) if (has and keep.size == locs.size) else ""
+            w.writerow([int(locs[i]), f"{locs[i]/fs:.6f}", f"{scores[i]:.4f}",
+                        fr, pr, kp])
 
 
 def _write_manifest(out_dir: str, animal: str, summary: dict) -> None:

@@ -293,37 +293,54 @@ def rising_edge_align(snippets, fs: float, *, search_ms: float = 10.0,
     return np.asarray(out), np.asarray(keep_fid, dtype=np.int64)
 
 
-def ripple_metrics(signal, locs, fs: float, band, w: int) -> tuple:
-    """Per-detection ripple confirmation, to separate a real ripple (sustained HF
-    oscillation) from a slow wave (little HF) or a lone sharp transient (HF but
-    not sustained). For each detection window ``[loc, loc+w]`` returns
-    ``(hf_frac, sustain)``: ``hf_frac`` = HF-band RMS / broadband RMS (ripple-band
-    energy fraction), ``sustain`` = fraction of the window where the HF envelope
-    exceeds half its own peak (how sustained the oscillation is). NaN for windows
-    that run off an edge. Vectorised over detections."""
+# pHFO gate defaults (validated on a user-labelled 12-detection set: LFDs had
+# prom 2.7-3.8 & frac 0.07-0.16, pHFOs had prom 16-53 & frac 0.26-0.49).
+DEFAULT_PHFO_FRAC = 0.20         # min HF-band energy fraction
+DEFAULT_PHFO_PROM = 6.0          # min HF-envelope peak/median (packet prominence)
+
+
+def phfo_metrics(signal, locs, fs: float, band, *, pre_ms: float = 10.0,
+                 post_ms: float = 60.0) -> tuple:
+    """Per-detection pHFO confirmation: separate a real pHFO (a brief, TALL, multi-
+    cycle HF packet) from an LFD (low-frequency deflection -- a large slow swing
+    with only flat background HF). Over a window CENTRED on each detection
+    (``[-pre_ms, +post_ms]``) returns ``(hf_frac, prominence)``:
+
+    - ``hf_frac`` = HF-band RMS / broadband RMS -- the fraction of energy in the HF
+      band (an LFD is dominated by its slow swing, so this is low).
+    - ``prominence`` = peak HF envelope / median HF envelope -- how far the HF
+      packet stands out of background. THE discriminating metric: an LFD's flat
+      envelope gives ~3, a pHFO packet gives >15. (The old 'sustained fraction'
+      was backwards -- a sharp packet spends little of the window above half its
+      own tall peak, so it scored LOW while flat LFDs scored high.)
+
+    NaN for windows that run off an edge. Vectorised over detections."""
     from scipy.signal import hilbert
     x = np.asarray(signal, dtype=np.float64)
     loc = np.asarray(locs, dtype=np.int64)
     assert x.ndim == 1 and fs and fs > 0, "signal 1-D, fs > 0"
+    assert loc.ndim == 1, "locs must be 1-D"
+    pre = max(1, int(round(pre_ms * 1e-3 * fs)))
+    post = max(1, int(round(post_ms * 1e-3 * fs)))
     frac = np.full(loc.size, np.nan)
-    sust = np.full(loc.size, np.nan)
-    ok = (loc >= 0) & (loc + int(w) <= x.size)
+    prom = np.full(loc.size, np.nan)
+    ok = (loc - pre >= 0) & (loc + post <= x.size)
     if not ok.any():
-        return frac, sust
-    idx = loc[ok][:, None] + np.arange(int(w))[None, :]
+        return frac, prom
+    idx = (loc[ok] - pre)[:, None] + np.arange(pre + post)[None, :]
     win = x[idx]
     lo = max(1.0, float(band[0]))
     hi = min(float(band[1]), 0.49 * float(fs))
     if hi <= lo:
-        return frac, sust
+        return frac, prom
     hf = _ef._bandpass(win, float(fs), lo, hi)
     env = np.abs(hilbert(hf, axis=1))
     hf_rms = np.sqrt(np.mean(hf * hf, axis=1))
     tot = np.sqrt(np.mean((win - win.mean(axis=1, keepdims=True)) ** 2, axis=1))
+    med = np.median(env, axis=1)
     frac[ok] = hf_rms / (tot + _EPS)
-    peak = np.max(env, axis=1, keepdims=True)
-    sust[ok] = np.mean(env > 0.5 * np.where(peak > 0, peak, 1.0), axis=1)
-    return frac, sust
+    prom[ok] = np.max(env, axis=1) / (med + _EPS)
+    return frac, prom
 
 
 def matched_filter_series(signal, template) -> np.ndarray:
