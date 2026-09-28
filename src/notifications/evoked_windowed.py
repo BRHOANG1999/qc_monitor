@@ -35,7 +35,7 @@ import numpy as np                         # noqa: E402
 
 from src.notifications import evoked_digest as _ed       # noqa: E402
 from src.notifications import evoked_package as _pkg      # noqa: E402
-from src.notifications.trace_density import robust_ylim  # noqa: E402
+from src.notifications.trace_density import LineDensity, robust_ylim  # noqa: E402
 from src.evoked_figures import data as _d                # noqa: E402
 from src.periictal import passive as _passive            # noqa: E402
 from src.utils import evoked_features as _ef              # noqa: E402
@@ -336,6 +336,14 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                   for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
     maps = {(wt, feat): info["band_of_ts"]
             for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
+    # per-HOUR matrix (daily only): every raw trace (density) + hourly mean, on the
+    # widest window's scale. Piggybacks this trace pass (no extra file reads).
+    hourly = hmeta = None
+    if not is_week and wtags_windows:
+        dwt, dw = max(wtags_windows, key=lambda x: (x[1][1] - x[1][0]))
+        hourly = _HourGrid((max(2.0, dw[0]), dw[1]), ylim.get(dwt, (-1.0, 1.0)))
+        hmeta = {"animal": animal, "channel": channel,
+                 "date": labels.get(period, period), "window": dwt}
     for fp in files:
         rows = [r for r in (read_feature_sidecar(fp, animal) or [])
                 if r.get("channel") == channel]
@@ -348,6 +356,10 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
         traces, time_ms = np.asarray(ev["traces"], dtype=float), \
             np.asarray(ev["time_ms"], dtype=float)
         fs = _fs_of(time_ms)
+        if hourly is not None:                        # every epoch -> this file's hour
+            fhr = _file_hour(fp)
+            for e in range(traces.shape[0]):
+                hourly.add(fhr, traces[e], time_ms)
         order = np.argsort(times)
         ts_sorted = times[order]
         # per-variant trace matrix: LP variants get the filtered signal so their
@@ -398,6 +410,14 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                          "normalized": "deciles_normalized.png",
                          "grid": "deciles_grid.png",
                          "n_zero": info.get("n_zero", 0)})
+    if hourly is not None and hourly.dens:
+        mdir = os.path.join(pkg, "_hourly", _pkg._safe(period))
+        os.makedirs(mdir, exist_ok=True)
+        if _fig_hourly_matrix(hourly, hmeta, os.path.join(mdir, "hourly_matrix.png")):
+            figs.append({"period": period, "window": hmeta["window"],
+                         "feature": "_hourly",
+                         "dir": os.path.relpath(mdir, pkg).replace("\\", "/"),
+                         "hourly_matrix": "hourly_matrix.png"})
     return figs
 
 
@@ -542,6 +562,98 @@ def _fig_decile_grid(feat, meta, info, band_wf, tm, xlim, ylim, out) -> str:
                  f"{_pretty(feat)} · per-decile MEAN ± 1 SD",
                  color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
+
+
+# --------------------------------------------------------------------- #
+#  per-HOUR matrix: every trace (density) overlaid on that hour's mean
+# --------------------------------------------------------------------- #
+class _HourGrid:
+    """Per-hour accumulator for the hourly matrix: one memory-safe LineDensity
+    (every trace of that hour) + a Welford mean, keyed by hour-of-day. Traces are
+    baseline-corrected; the density blanks the +/-1.5 ms stim artifact (NaN breaks
+    the stroke) while the mean keeps a finite vector (blanked at plot time)."""
+
+    def __init__(self, xlim, ylim):
+        self.xlim, self.ylim = xlim, ylim
+        self.dens: dict = {}
+        self.mean: dict = {}
+        self.tm = None
+
+    def add(self, hour, trace, time_ms) -> None:
+        """Add one trace to the given clock *hour* (0-23). The caller supplies the
+        hour from the recording's chunk_datetime -- ``read_file_evoked`` times are
+        seconds INTO the recording, not absolute epochs, so they can't be used."""
+        if hour is None:
+            return
+        hr = int(hour)
+        y = _ed._baseline(np.asarray(trace, dtype=float), time_ms)
+        if not np.all(np.isfinite(y)):
+            return
+        if hr not in self.dens:
+            self.dens[hr] = LineDensity(self.xlim, self.ylim)
+            self.mean[hr] = _RunMean()
+        yd = y.copy()
+        yd[np.abs(np.asarray(time_ms)) <= 1.5] = np.nan   # blank artifact for density
+        self.dens[hr].add(time_ms, yd)
+        self.mean[hr].add(y)
+        self.tm = np.asarray(time_ms, dtype=float)
+
+
+_CHUNK_DT_RE = None
+
+
+def _file_hour(fp):
+    """Clock hour (0-23) parsed from a recording filename's ``__YYYY_MM_DD__HH_MM_SS``
+    stamp; None when it can't be parsed."""
+    global _CHUNK_DT_RE
+    if _CHUNK_DT_RE is None:
+        import re
+        _CHUNK_DT_RE = re.compile(r"__\d{4}_\d{2}_\d{2}__(\d{2})_\d{2}_\d{2}")
+    m = _CHUNK_DT_RE.search(os.path.basename(str(fp)))
+    return int(m.group(1)) if m else None
+
+
+def _fig_hourly_matrix(hg, meta, out) -> str | None:
+    """Matrix (one panel per recording hour) of the raw evoked response: every
+    trace as a memory-safe density cloud with that hour's MEAN overlaid (white).
+    Common x/y scale across panels so hours are directly comparable."""
+    hours = sorted(hg.dens)
+    if not hours or hg.tm is None:
+        return None
+    tm = hg.tm
+    xlim, ylim = hg.xlim, hg.ylim
+    art = np.abs(tm) <= 1.5
+    xm = (tm >= xlim[0]) & (tm <= xlim[1])
+    accent = (0.37, 0.49, 0.89)                       # ~ #5e7ce2
+    ncol = 6
+    nrow = int(np.ceil(len(hours) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.1 * ncol, 2.3 * nrow),
+                             facecolor=_ed._BG, squeeze=False)
+    for i, hr in enumerate(hours):
+        ax = axes[i // ncol][i % ncol]
+        ax.set_facecolor(_ed._PANEL)
+        dens = hg.dens[hr]
+        # low per-trace opacity: with ~1000s of traces/hr a high a0 saturates the
+        # band into a flat blob; ~0.04 keeps a readable dark->bright density gradient
+        # while lone outlier strokes still register.
+        ax.imshow(dens.rgba(accent, a0=0.04), extent=dens.extent(),
+                  origin="upper", aspect="auto", interpolation="nearest")
+        m = hg.mean[hr].mean()
+        if m is not None:
+            m = _ed._baseline(m, tm).copy()
+            m[art] = np.nan
+            ax.plot(tm[xm], m[xm], color="#ffffff", lw=1.4)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title(f"{hr:02d}:00  n={dens.n}", color=_ed._TEXT, fontsize=8,
+                     loc="left")
+        ax.tick_params(colors=_ed._MUTED, labelsize=6)
+    for jj in range(len(hours), nrow * ncol):
+        axes[jj // ncol][jj % ncol].axis("off")
+    fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · per-HOUR "
+                 f"evoked: every trace (density) + hourly mean", color=_ed._TEXT,
+                 fontsize=12)
+    return _pkg._finish(fig, out, None)
 
 # --------------------------------------------------------------------- #
 #  package assembly
