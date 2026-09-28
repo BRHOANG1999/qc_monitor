@@ -185,3 +185,66 @@ def test_neighbor_flagged_only_stays_in_pool(tmp_path):
     nxt = s.neighbor_queue_file(current_file_id=2, animal_ids=[_A],
                                 user_email=email, direction=1, flagged_only=True)
     assert nxt == 3, "flagged advance must stay in the flagged subset"
+
+
+# ===================================================================== #
+#  Poor-lighting cleanup pool
+# ===================================================================== #
+
+def test_poor_lighting_pool_lists_light_1_files(tmp_path):
+    s = _store(tmp_path)
+    email = "r@lab"
+    # File 2 has a poor-light event, file 3 a good-light one, file 4 no light.
+    s.mark_review(2, email, "has_events",
+                  markers=[{"EO_sec": 5, "light": 1}], animal_id=_A)
+    s.mark_review(3, email, "has_events",
+                  markers=[{"EO_sec": 5, "light": 2}], animal_id=_A)
+    s.mark_review(4, email, "has_events", markers=[{"EO_sec": 5}], animal_id=_A)
+    poor = s.files_with_poor_lighting(_A)
+    assert {r["file_id"] for r in poor} == {2}
+    assert all("chunk_datetime" in r and "session_dir" in r for r in poor)
+
+
+def test_flip_poor_lighting_removes_from_pool(tmp_path):
+    s = _store(tmp_path)
+    email = "r@lab"
+    for fid in (2, 3):
+        s.mark_review(fid, email, "needs_scoring",
+                      markers=[{"EO_sec": 5, "light": 1},
+                               {"EO_sec": 9, "light": 1}], animal_id=_A)
+    assert {r["file_id"] for r in s.files_with_poor_lighting(_A)} == {2, 3}
+    flipped = s.flip_poor_lighting_to_good(2, _A)
+    assert flipped == 2                     # both events flipped
+    # File 2 leaves the pool; status is preserved (still needs_scoring).
+    assert {r["file_id"] for r in s.files_with_poor_lighting(_A)} == {3}
+    latest = s.get_review_state(2, animal_id=_A)
+    assert latest["status"] == "needs_scoring"
+    import json as _j
+    assert all(e["light"] == 2 for e in _j.loads(latest["markers_json"]))
+
+
+def test_flip_poor_lighting_noop_when_none(tmp_path):
+    s = _store(tmp_path)
+    s.mark_review(2, "r@lab", "has_events",
+                  markers=[{"EO_sec": 5, "light": 2}], animal_id=_A)
+    assert s.flip_poor_lighting_to_good(2, _A) == 0
+
+
+def test_fetch_queue_by_mode_poor_lighting(tmp_path):
+    from src.dashboard.tabs.video import _fetch_queue_by_mode
+    s = _store(tmp_path)
+    s.mark_review(3, "r@lab", "pending_pi_review",
+                  markers=[{"EO_sec": 5, "light": 1}], animal_id=_A)
+    rows = _fetch_queue_by_mode(s, "poor_lighting", [_A], "r@lab", None, 100)
+    assert {r["id"] for r in rows} == {3}
+
+
+def test_next_poor_lighting_advances_by_date(tmp_path):
+    from src.dashboard.tabs.video import _next_poor_lighting
+    s = _store(tmp_path)
+    for fid in (2, 3, 4):
+        s.mark_review(fid, "r@lab", "has_events",
+                      markers=[{"EO_sec": 5, "light": 1}], animal_id=_A)
+    # After (conceptually) flipping file 2, the next poor file by date is 3.
+    _sd, nxt = _next_poor_lighting(s, [_A], 2)
+    assert nxt == 3

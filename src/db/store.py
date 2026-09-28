@@ -3700,6 +3700,108 @@ class Store:
                 out.append(d)
         return out
 
+    def files_with_poor_lighting(self, animal_id: str) -> list[dict]:
+        """Files whose LATEST review_state for *animal_id* has any event marked
+        POOR lighting (event ``light`` == 1) in markers_json -- the cleanup pool
+        for fixing over-applied 'poor lighting' labels. Same shape as
+        ``files_needing_scoring_for_animal``, oldest first. Status-agnostic (a
+        poor-light mark survives on any scored/submitted row)."""
+        from src.utils.animal import (
+            split_animal_electrode, is_animal_channel,
+        )
+        if not animal_id:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT pf.id AS file_id, pf.session_dir,
+                          pf.file_path, pf.chunk_datetime,
+                          pf.duration_sec, rs.markers_json,
+                          sc.channel_names AS channel_names
+                   FROM processed_files pf
+                   JOIN session_config sc
+                     ON sc.session_dir = pf.session_dir
+                   JOIN review_state rs ON rs.file_id = pf.id
+                   WHERE sc.channel_names LIKE ?
+                     AND rs.animal_id = ?
+                     AND rs.markers_json IS NOT NULL
+                     AND rs.markers_json LIKE '%"light"%'
+                     AND rs.id = (
+                       SELECT MAX(rs2.id) FROM review_state rs2
+                       WHERE rs2.file_id = pf.id
+                         AND rs2.animal_id = ?)
+                   ORDER BY pf.chunk_datetime ASC""",
+                (f'%"{animal_id}%', animal_id, animal_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        session_match: dict[str, bool] = {}
+        for r in rows:
+            sdir = r["session_dir"]
+            match = session_match.get(sdir)
+            if match is None:
+                match = False
+                try:
+                    names = json.loads(r["channel_names"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    names = []
+                for n in names:
+                    if isinstance(n, str) and is_animal_channel(n):
+                        a, _ = split_animal_electrode(n)
+                        if a == animal_id:
+                            match = True
+                            break
+                session_match[sdir] = match
+            if not match:
+                continue
+            try:
+                evs = json.loads(r["markers_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                evs = []
+            if isinstance(evs, list) and any(
+                    isinstance(e, dict) and e.get("light") == 1 for e in evs):
+                d = dict(r)
+                d.pop("channel_names", None)
+                out.append(d)
+        return out
+
+    def flip_poor_lighting_to_good(self, file_id: int,
+                                     animal_id: str) -> int:
+        """On the LATEST review_state row for (file, animal), flip every event's
+        lighting from POOR (1) to GOOD (2) in markers_json, IN PLACE (status
+        unchanged). Returns the number of events changed. Backs the poor-lighting
+        cleanup pool's one-key correction."""
+        assert animal_id, "animal_id required"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT id, markers_json FROM review_state
+                   WHERE file_id = ? AND animal_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (int(file_id), animal_id)).fetchone()
+            if not row or not row["markers_json"]:
+                return 0
+            try:
+                evs = json.loads(row["markers_json"])
+            except (json.JSONDecodeError, TypeError):
+                return 0
+            if not isinstance(evs, list):
+                return 0
+            n = 0
+            for e in evs:
+                if isinstance(e, dict) and e.get("light") == 1:
+                    e["light"] = 2
+                    n += 1
+            if n:
+                conn.execute(
+                    "UPDATE review_state SET markers_json = ? WHERE id = ?",
+                    (json.dumps(evs), int(row["id"])))
+                conn.commit()
+            return n
+        finally:
+            conn.close()
+
     def all_files_for_animal(self, animal_id: str,
                              limit: int = 100000) -> list[dict]:
         """EVERY video recording for *animal_id*, regardless of review state

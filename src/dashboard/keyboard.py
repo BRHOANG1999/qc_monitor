@@ -95,6 +95,9 @@ SHORTCUTS: tuple[Shortcut, ...] = (
               "Undo the last decision (8 s window)", "Decision"),
     Shortcut("r", "revert",
               "Reopen the current file's review", "Decision"),
+    Shortcut("g", "lighting_ok",
+              "Lighting OK -> Good + next (only in the Poor-lighting pool)",
+              "Decision"),
     # Markers on the LFP
     Shortcut("m", "drop_marker",
               "Drop a marker at the video's current time",

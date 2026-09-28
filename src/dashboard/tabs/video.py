@@ -441,6 +441,10 @@ _QUEUE_MODES = [
               "onsets for {a})",
      "empty_ok": "No recordings awaiting more onsets for {a}.",
      "empty": "No recordings awaiting more onsets for {a}."},
+    {"value": "poor_lighting", "label": "🔆 Poor lighting",
+     "title": "🔆 Poor lighting ({n} files marked poor for {a})",
+     "empty_ok": "No poor-lighting recordings for {a}.",
+     "empty": "No poor-lighting recordings for {a}."},
 ]
 _QUEUE_MODE_BY_VALUE = {m["value"]: m for m in _QUEUE_MODES}
 
@@ -456,6 +460,9 @@ _POOL_LIST_HEADER = {
                       "Files you submitted with an onset (EO) + Racine but "
                       "still missing some landmarks — open one to add the "
                       "rest."),
+    "poor_lighting": ("🔆 Poor lighting",
+                      "Files marked 'poor lighting' — open one to verify, then "
+                      "hit 'Lighting OK → Good' to flip it and advance."),
 }
 
 # review_state statuses whose markers_json still holds live, un-finalised
@@ -544,6 +551,11 @@ def _fetch_queue_by_mode(store, mode, animal_ids, email, floor, limit):
     if mode == "needs_scoring":
         rows = store.files_needing_scoring_for_animal(animal_ids[0])
         # Normalize file_id -> id so the carousel's row["id"] works uniformly.
+        for r in rows:
+            r.setdefault("id", r.get("file_id"))
+        return rows
+    if mode == "poor_lighting":
+        rows = store.files_with_poor_lighting(animal_ids[0])
         for r in rows:
             r.setdefault("id", r.get("file_id"))
         return rows
@@ -863,6 +875,29 @@ def _resolve_next_in_queue(store: Store,
         return (None, None)
     sd = _session_dir_for_file(store, int(next_file_id))
     return (sd, int(next_file_id))
+
+
+def _next_poor_lighting(store: Store, animal_ids: list[str],
+                          current_file_id: int) -> tuple[str | None, int | None]:
+    """``(session_dir, file_id)`` of the next poor-lighting file AFTER the current
+    one by date, or ``(None, None)`` when the pool is empty. The just-flipped file
+    is already excluded (it no longer has a ``light==1`` event)."""
+    if not animal_ids:
+        return (None, None)
+    rows = store.files_with_poor_lighting(animal_ids[0])
+    if not rows:
+        return (None, None)
+    cur_dt = (store._file_chunk_datetime(int(current_file_id))
+              if current_file_id else None)
+    pick = None
+    if cur_dt:
+        for r in rows:                              # rows are oldest-first
+            if (r.get("chunk_datetime") or "") > cur_dt:
+                pick = r
+                break
+    pick = pick or rows[0]
+    return (pick.get("session_dir"),
+            int(pick.get("id") or pick.get("file_id")))
 
 
 def _channel_options(store: Store, session_dir: str | None,
@@ -3846,6 +3881,19 @@ def layout(store: Store, bridge: dict | None = None):
                         style={"padding": "10px 26px",
                                "fontSize": "14px", "fontWeight": "700",
                                "marginRight": "10px"}),
+                    # Poor-lighting cleanup: flip this file's POOR (1) lighting
+                    # marks to GOOD (2) in place and advance to the next
+                    # poor-lighting file. For the "🔆 Poor lighting" pool where
+                    # an undergrad over-applied the label.
+                    button(
+                        "🔆 Lighting OK → Good",
+                        "video-lighting-ok-btn",
+                        variant="secondary",
+                        title="Mark this recording's lighting GOOD (flip its "
+                              "'poor' events to good) and jump to the next "
+                              "poor-lighting file.",
+                        style={"padding": "10px 18px", "fontSize": "13px",
+                               "fontWeight": "600", "marginRight": "10px"}),
                     dcc.Loading(
                         id="video-review-status-loading",
                         custom_spinner=_loading_icon(small=True),
@@ -4505,6 +4553,16 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                 badge_color = "#f0b429"
             elif mode == "flagged":
                 badge, badge_color = "🚩 detector flagged", "#f0b429"
+            elif mode == "poor_lighting":
+                try:
+                    _evs = json.loads(r.get("markers_json") or "[]")
+                    n_poor = sum(1 for e in _evs
+                                 if isinstance(e, dict) and e.get("light") == 1)
+                except (json.JSONDecodeError, TypeError):
+                    n_poor = 0
+                badge = (f"🔆 {n_poor} poor-light event"
+                         f"{'' if n_poor == 1 else 's'}")
+                badge_color = "#f0b429"
             else:
                 badge, badge_color = "", "#888"
             fname = os.path.basename(r.get("file_path") or "")
@@ -6300,6 +6358,54 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return (badge, [], None, "",
                 next_session, next_file, undo_payload, no_update, [], None,
                 _req_file(next_session, next_file))
+
+    # ---- Poor-lighting cleanup: flip POOR -> GOOD + advance ---- #
+    @app.callback(
+        Output("video-review-status", "children", allow_duplicate=True),
+        Output("video-session-dropdown", "value", allow_duplicate=True),
+        Output("video-file-dropdown", "value", allow_duplicate=True),
+        Output("video-requested-file", "data", allow_duplicate=True),
+        Input("video-lighting-ok-btn", "n_clicks"),
+        Input("kbd-event", "data"),
+        State("video-file-dropdown", "value"),
+        State("video-queue-animal", "value"),
+        State("video-queue-mode", "value"),
+        prevent_initial_call=True,
+    )
+    def _flip_lighting_ok(n_clicks, kbd, file_id, animal_value, queue_mode):
+        trig = callback_context.triggered_id
+        if trig == "kbd-event":
+            # The 'g' hotkey only acts in the Poor-lighting pool, so an accidental
+            # keypress while reviewing normally can't flip + yank away.
+            if not (kbd and kbd.get("action") == "lighting_ok"
+                    and queue_mode == "poor_lighting"):
+                return no_update, no_update, no_update, no_update
+        elif not n_clicks:                          # button path
+            return no_update, no_update, no_update, no_update
+        if not file_id:
+            return no_update, no_update, no_update, no_update
+        # Lighting is filed under the pool's animal (the picker), not the
+        # displayed LFP channel -- so the fix works without the brain channel
+        # selected.
+        animal_ids = _animal_ids_from_picker(animal_value)
+        if not animal_ids:
+            return ("Pick an animal first — lighting is filed per animal.",
+                    no_update, no_update, no_update)
+        animal = animal_ids[0]
+        try:
+            n = store.flip_poor_lighting_to_good(int(file_id), animal)
+        except Exception as e:                      # noqa: BLE001 -- surface
+            logger.warning("flip lighting failed: %s", e)
+            return (f"Lighting flip failed: {e}",
+                    no_update, no_update, no_update)
+        msg = (f"Flipped {n} event{'' if n == 1 else 's'} to Good lighting."
+               if n else "No poor-lighting events on this file.")
+        nxt_sd, nxt_fid = _next_poor_lighting(store, animal_ids, int(file_id))
+        if nxt_fid is None:
+            return (msg + "  🎉 No more poor-lighting files.",
+                    no_update, no_update, no_update)
+        return (msg + "  → next poor-lighting file.",
+                nxt_sd, nxt_fid, _req_file(nxt_sd, nxt_fid))
 
     # DEPRECATED / UNWIRED: the "EEG onset -> CSV + flag" button was removed
     # in the single-Submit redesign -- Submit now routes scored-but-incomplete
