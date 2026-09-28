@@ -121,3 +121,67 @@ def test_fetch_queue_by_mode_no_animal(tmp_path):
     from src.dashboard.tabs.video import _fetch_queue_by_mode
     s = _store(tmp_path)
     assert _fetch_queue_by_mode(s, "queue", [], "r@lab", None, 100) == []
+
+
+# ===================================================================== #
+#  neighbor_queue_file: advance by chunk_datetime, not the queue head
+# ===================================================================== #
+
+def test_neighbor_advances_by_date_when_current_left_queue(tmp_path):
+    """A manually-picked MID-queue file, once finalised (out of the queue),
+    advances to the next file BY DATE -- not the oldest queue head (the Sept-2
+    snap-back bug)."""
+    s = _store(tmp_path)              # files 1..4 dated Jul 1..4
+    email = "r@lab"
+    # Finalise file 2 -> it leaves the queue; queue is now {1, 3, 4}.
+    s.mark_review(2, email, "has_events", markers=[], animal_id=_A)
+    nxt = s.neighbor_queue_file(current_file_id=2, animal_ids=[_A],
+                                user_email=email, direction=1)
+    assert nxt == 3, "should go to the next-by-date file (Jul 3), not head (1)"
+    prev = s.neighbor_queue_file(current_file_id=2, animal_ids=[_A],
+                                 user_email=email, direction=-1)
+    assert prev == 1, "backwards should land on the last-earlier file (Jul 1)"
+
+
+def test_neighbor_none_when_nothing_later(tmp_path):
+    """Finalising the newest file has nothing later -> None (no wrap to head)."""
+    s = _store(tmp_path)
+    email = "r@lab"
+    s.mark_review(4, email, "has_events", markers=[], animal_id=_A)
+    assert s.neighbor_queue_file(current_file_id=4, animal_ids=[_A],
+                                 user_email=email, direction=1) is None
+
+
+def test_neighbor_head_fallback_when_datetime_unknown(tmp_path):
+    """A current file with no known chunk_datetime (e.g. absent) still falls
+    back to head/tail so the reviewer is never stuck."""
+    s = _store(tmp_path)
+    email = "r@lab"
+    assert s.neighbor_queue_file(current_file_id=999, animal_ids=[_A],
+                                 user_email=email, direction=1) == 1
+    assert s.neighbor_queue_file(current_file_id=999, animal_ids=[_A],
+                                 user_email=email, direction=-1) == 4
+
+
+def test_neighbor_in_queue_is_index_step(tmp_path):
+    """When the current file is still in the queue, it's a plain +/-1 step."""
+    s = _store(tmp_path)
+    email = "r@lab"
+    assert s.neighbor_queue_file(current_file_id=1, animal_ids=[_A],
+                                 user_email=email, direction=1) == 2
+    assert s.neighbor_queue_file(current_file_id=3, animal_ids=[_A],
+                                 user_email=email, direction=-1) == 2
+
+
+def test_neighbor_flagged_only_stays_in_pool(tmp_path):
+    """Pool-aware advance: in the flagged pool, advancing skips unflagged files."""
+    s = _store(tmp_path)
+    email = "r@lab"
+    for fid in (2, 3):
+        s.insert_review_event(fid, "auto-filter@system", "auto_filter_flag",
+                              {}, animal_id=_A)
+    # Finalise flagged file 2 -> flagged pool now {3}; next flagged after Jul 2.
+    s.mark_review(2, email, "has_events", markers=[], animal_id=_A)
+    nxt = s.neighbor_queue_file(current_file_id=2, animal_ids=[_A],
+                                user_email=email, direction=1, flagged_only=True)
+    assert nxt == 3, "flagged advance must stay in the flagged subset"

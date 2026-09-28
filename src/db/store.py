@@ -5905,33 +5905,67 @@ class Store:
         finally:
             conn.close()
 
+    def _file_chunk_datetime(self, file_id: int) -> str | None:
+        """The ISO ``chunk_datetime`` of one processed file, or ``None``."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT chunk_datetime FROM processed_files WHERE id = ?",
+                (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        return row["chunk_datetime"] if row and row["chunk_datetime"] else None
+
     def neighbor_queue_file(self, *, current_file_id: int | None,
                               animal_ids: list[str],
                               user_email: str,
                               direction: int,
                               since_iso: str | None = None,
                               limit: int = 100,
+                              flagged_only: bool = False,
                               ) -> int | None:
         """File id +/- one slot from ``current_file_id`` in the
         FIFO queue. Returns ``None`` when there's nowhere to go.
 
         Powers ``J`` / ``K`` queue cycling and the auto-advance
-        after ``N``-mark-done. If ``current_file_id`` isn't in
-        the queue (e.g. it was just finalised), we return the
-        queue head for direction=+1 / the queue tail for -1, so
-        the reviewer never gets stuck.
+        after ``N``-mark-done / Submit. ``flagged_only`` narrows to
+        the "Flag (has events)" pool so advancing stays in the pool
+        the reviewer is working.
+
+        If ``current_file_id`` isn't in the queue (e.g. it was just
+        finalised and left the queue), we advance by ``chunk_datetime``
+        RELATIVE to it -- the first queued file dated AFTER it for +1,
+        the last dated BEFORE it for -1 -- so a manually-picked
+        mid-queue file goes to the genuine next-by-date file rather
+        than snapping back to the oldest queue head. We fall back to
+        head/tail ONLY when the current file's datetime is unknown, so
+        the reviewer still never gets stuck.
         """
         assert direction in (-1, 1), "direction must be -1 or +1"
         assert isinstance(animal_ids, list), "animal_ids list"
         rows = self.get_review_queue(
             animal_ids, user_email,
-            limit=limit, since_iso=since_iso,
+            limit=limit, since_iso=since_iso, flagged_only=flagged_only,
         )
         if not rows:
             return None
         ids = [int(r["id"]) for r in rows]
         if current_file_id is None or int(current_file_id) not in ids:
-            return ids[0] if direction == 1 else ids[-1]
+            # Queue is ordered by chunk_datetime ASC (get_review_queue).
+            cur_dt = (self._file_chunk_datetime(int(current_file_id))
+                      if current_file_id is not None else None)
+            if cur_dt is None:
+                return ids[0] if direction == 1 else ids[-1]
+            dts = [r["chunk_datetime"] for r in rows]
+            if direction == 1:
+                for i, d in enumerate(dts):        # first strictly later
+                    if d and d > cur_dt:
+                        return ids[i]
+                return None
+            for i in range(len(dts) - 1, -1, -1):  # last strictly earlier
+                if dts[i] and dts[i] < cur_dt:
+                    return ids[i]
+            return None
         idx = ids.index(int(current_file_id))
         new_idx = idx + direction
         if new_idx < 0 or new_idx >= len(ids):

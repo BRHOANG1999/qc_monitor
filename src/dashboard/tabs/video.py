@@ -807,6 +807,7 @@ def _resolve_next_in_queue(store: Store,
                              *,
                              queue_limit: int = 100,
                              direction: int = 1,
+                             queue_mode: str | None = None,
                              ) -> tuple[str | None, int | None]:
     """Return ``(session_dir, file_id)`` of the next/prev queue
     entry, or ``(None, None)`` if there's nothing to advance to.
@@ -814,7 +815,8 @@ def _resolve_next_in_queue(store: Store,
     Wraps ``store.neighbor_queue_file`` with the dropdown-value
     parsing and the session_dir lookup so the auto-advance,
     Undo, and the J/K cycle paths can all share one source of
-    truth.
+    truth. ``queue_mode`` ("flagged" narrows to the Flag pool) keeps
+    the advance inside the pool the reviewer is working.
     """
     assert direction in (-1, 1), "direction must be -1 or 1"
     animal_ids = _animal_ids_from_picker(animal_value)
@@ -828,6 +830,7 @@ def _resolve_next_in_queue(store: Store,
         direction=direction,
         since_iso=floor,
         limit=queue_limit,
+        flagged_only=(queue_mode == "flagged"),
     )
     if next_file_id is None:
         return (None, None)
@@ -4784,9 +4787,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         Input("kbd-event", "data"),
         State("video-file-dropdown", "value"),
         State("video-queue-animal", "value"),
+        State("video-queue-mode", "value"),
         prevent_initial_call=True,
     )
-    def _hotkey_queue_cycle(ev, current_file_id, animal_value):
+    def _hotkey_queue_cycle(ev, current_file_id, animal_value, queue_mode):
         if not ev or ev.get("action") not in ("next", "prev"):
             return no_update, no_update, no_update
         direction = 1 if ev["action"] == "next" else -1
@@ -4795,6 +4799,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             store, animal_value,
             int(current_file_id) if current_file_id else 0,
             email, queue_limit=queue_limit, direction=direction,
+            queue_mode=queue_mode,
         )
         if new_file_id is None:
             return no_update, no_update, no_update
@@ -6109,13 +6114,14 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         State("video-ma-auc-threshold-input", "value"),
         State("video-auc-window-input", "value"),
         State("video-events-current-key", "data"),
+        State("video-queue-mode", "value"),
         prevent_initial_call=True,
     )
     def _save_review(n_clicks, file_id, decision, markers, note,
                       animal_value, events, channel,
                       pools_view, pool_cursor,
                       cutoff, auc_threshold, auc_window,
-                      current_key):
+                      current_key, queue_mode):
         nop = (no_update,) * 11
         if not n_clicks or not file_id:
             return ("Pick a recording first." if n_clicks
@@ -6255,7 +6261,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                     _req_file(p_session, p_file))
         next_session, next_file = _resolve_next_in_queue(
             store, animal_value, int(file_id), email,
-            queue_limit=queue_limit,
+            queue_limit=queue_limit, queue_mode=queue_mode,
         )
         # If we found a next file, push it; otherwise leave the
         # dropdowns alone so the reviewer sees the queue empty
