@@ -486,6 +486,33 @@ def restorable_drafts(latest) -> list:
     return drafts if isinstance(drafts, list) else []
 
 
+def onsets_for_open(latest) -> list:
+    """Onsets to load into the editor store when a recording is OPENED.
+
+    Prefer a resumable draft (``restorable_drafts``); otherwise fall back to any
+    onsets already saved in ``markers_json`` so the red onset line still renders
+    for a file whose status is outside the draft-bearing set -- e.g. a
+    ``pi_flagged`` file the PI sent back for re-review, or a pending/finalised row
+    opened from the day list. Without this the live onset painter (which draws
+    from the events store) sees ``[]`` and ERASES the onsets the build-time
+    ``_inject_landmarks`` drew, leaving the line blank.
+
+    Display-only: the autosave 'skip on submitted' guard (``upsert_scoring_draft``)
+    and the Submit scope guard (``_events_scope_matches``) keep this from
+    re-persisting or re-submitting finalised work.
+    """
+    evs = restorable_drafts(latest)
+    if evs:
+        return evs
+    if not latest or not latest.get("markers_json"):
+        return []
+    try:
+        saved = json.loads(latest["markers_json"])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return saved if isinstance(saved, list) else []
+
+
 def _events_scope_matches(current_key, file_id, animal) -> bool:
     """True when the live ``video-events-store`` is scoped to (file_id, animal).
 
@@ -4944,7 +4971,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
                                                  animal_id=animal)
             except Exception:
                 latest = None
-            new_events = restorable_drafts(latest)
+            new_events = onsets_for_open(latest)
         return new_events, by_animal, new_key
 
     # ---- Autosave: durable draft persistence (score-loss safety net) --- #

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.dashboard.tabs.video import (  # noqa: E402
     restorable_drafts,
+    onsets_for_open,
     _events_scope_matches,
 )
 from src.db.store import Store  # noqa: E402
@@ -104,6 +105,37 @@ def test_get_review_state_breaks_updated_at_ties_by_newest_id(tmp_path):
     latest = s.get_review_state(fid, animal_id=animal)
     assert latest is not None and latest["id"] == 4468
     assert restorable_drafts(latest) == _ONSET
+
+
+# ----------------------------- onsets_for_open: DISPLAY on any status ------ #
+#
+# The red onset line reads from the events store. restorable_drafts returns []
+# for non-draft statuses, so opening a re-review file (pi_flagged sent back) or a
+# pending/finalised row from the day list painted a BLANK line even though the
+# onsets were on disk. onsets_for_open falls back to markers_json for display.
+
+def test_open_restores_draft_status_same_as_restorable():
+    assert onsets_for_open(_row("needs_scoring", _ONSET)) == _ONSET
+    assert onsets_for_open(_row("abandoned", _ONSET)) == _ONSET
+
+
+def test_open_shows_onsets_for_re_review_and_finalised_statuses():
+    """The bug: these statuses restore [] as *drafts*, but their saved onsets
+    must still DISPLAY (red line) when the file is opened."""
+    for st in ("pi_flagged", "pending_pi_review", "pi_approved", "has_events"):
+        assert onsets_for_open(_row(st, _ONSET)) == _ONSET, st
+        # ...and the underlying draft-restore still refuses to resurrect them
+        # as editable drafts (unchanged behavior).
+        if st != "pi_flagged":
+            assert restorable_drafts(_row(st, _ONSET)) == [], st
+
+
+def test_open_empty_or_malformed_is_safe():
+    assert onsets_for_open(None) == []
+    assert onsets_for_open({}) == []
+    assert onsets_for_open(_row("has_events", [])) == []
+    assert onsets_for_open({"status": "has_events",
+                            "markers_json": "{not json"}) == []
 
 
 # ------------------------- cross-file replication guard (scope matching) --- #
