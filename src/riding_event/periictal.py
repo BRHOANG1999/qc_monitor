@@ -425,12 +425,15 @@ def load_trajectories(animal: str) -> list[dict]:
     return out
 
 
-def _rebin(traj: dict, coarse_min: float) -> dict:
+def _rebin(traj: dict, coarse_min: float, min_cov_frac: float = 0.5) -> dict:
     """Re-bin a fine-binned trajectory into *coarse_min* windows EXACTLY: counts
     and covered-seconds are additive, so a coarse rate = summed counts / summed
-    covered minutes (NaN where no sub-bin had coverage). This is coverage-weighted
-    -- averaging the per-bin RATES would mis-weight low-coverage bins. Returns a
-    traj-shaped dict on the coarse grid; passes through when already coarse."""
+    covered minutes. This is coverage-weighted -- averaging the per-bin RATES would
+    mis-weight low-coverage bins. A coarse bin covered less than *min_cov_frac* of
+    its full width is NaN'd: otherwise a bin left ~1/3 covered by the neighbour-
+    exclusion (or a recording edge) divides a real burst by a sliver of time and
+    shows a misleading spike at full-bin prominence. Passes through when already
+    coarse."""
     fc = np.asarray(traj["centers_min"], dtype=np.float64)
     if fc.size < 2 or "cover_sec" not in traj:
         return traj
@@ -447,6 +450,7 @@ def _rebin(traj: dict, coarse_min: float) -> dict:
     cov = np.zeros(nb)
     np.add.at(cov, idx, np.nan_to_num(traj["cover_sec"]))
     out["cover_sec"] = cov
+    ok = cov >= float(min_cov_frac) * coarse_min * 60.0   # enough of the bin covered
     pairs = [("cand_count", "cand_rate"), ("mf_count", "mf_rate"),
              ("phfo_count", "phfo_rate"), ("phfo_post_count", "phfo_post_rate")]
     for ck, rk in pairs:
@@ -456,7 +460,7 @@ def _rebin(traj: dict, coarse_min: float) -> dict:
         np.add.at(ct, idx, np.nan_to_num(traj[ck]))
         out[ck] = ct
         with np.errstate(divide="ignore", invalid="ignore"):
-            out[rk] = np.where(cov > 0, ct / (cov / 60.0), np.nan)
+            out[rk] = np.where(ok, ct / (cov / 60.0), np.nan)
     return out
 
 
