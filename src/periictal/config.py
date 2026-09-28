@@ -68,7 +68,9 @@ SLIDING_N_WINDOWS = 12
 SLIDING_BAND_LO_SEC = 3600.0       # windows start no closer than 1 h to onset
 SLIDING_BAND_HI_SEC = 21600.0      # ... and no further than 6 h before onset
 SLIDING_WIDTH_SEC = 1800.0         # 30-min windows, matching the preictal width
-SLIDING_POSTICTAL_GUARD_SEC = 3600.0   # keep windows >= 1 h after the prev seizure
+SLIDING_POSTICTAL_GUARD_SEC = 7200.0   # a window is interictal only >= 2 h after
+#   the previous seizure (the operator's rule: the first 2 h post-seizure is NOT
+#   interictal). Was 1 h; raised to 2 h.
 SLIDING_MIN_N = 20                 # min finite stimuli per class to score a window
 
 # --- Matrix-build speedup: near-seizure file prefilter ---------------------

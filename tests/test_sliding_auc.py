@@ -62,6 +62,22 @@ def test_valid_offset_mask_guard():
     assert int(m.sum()) == int((off <= 4600 + 1e-6).sum()) == 1
 
 
+def test_default_guard_is_two_hours_post_seizure():
+    """The operator's rule: a window is interictal only >= 2 h after the previous
+    seizure. Pins the config default and the boundary."""
+    from src.periictal import config as cfg
+    assert cfg.SLIDING_POSTICTAL_GUARD_SEC == 7200.0
+    isi, width = 6 * 3600.0, cfg.SLIDING_WIDTH_SEC
+    # An offset whose far edge sits T hours after the previous seizure.
+    def off_for_post(t_h):
+        return isi - width - t_h * 3600.0
+    offs = np.array([off_for_post(t) for t in (1.0, 1.9, 2.1, 3.0)])
+    # Default guard (2 h): the 1.0 h and 1.9 h windows are excluded; >=2 h kept.
+    assert list(sa.valid_offset_mask(offs, isi)) == [False, False, True, True]
+    # The old 1 h guard would have wrongly admitted the 1.9 h-post window.
+    assert bool(sa.valid_offset_mask(offs, isi, postictal_guard=3600.0)[1]) is True
+
+
 def test_signal_vs_null_auc():
     full = _make_full()
     res = sa.sliding_window_auc(full, ["signal", "null"], min_n=20)
