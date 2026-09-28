@@ -334,6 +334,7 @@ def _hour_overlay(day_traces, day_mean_d, wins, base, tag, d,
 
 
 _ZSS_SAT_RATIO = 0.3       # Z_ss < ratio * Rₐ = saturated (amp railed) -> drop
+_ZSS_MIN_DAY_N = 3         # a day with fewer valid Z_ss rows gives a wild mean -> NaN
 
 
 def _zss_valid_rows(imp_rows) -> list:
@@ -380,8 +381,25 @@ def _zss_pct_change(imp_rows) -> dict | None:
             x.append(datetime.strptime(h, "%Y_%m_%d__%H"))
         except ValueError:
             x.append(None)
+    # per-DAY series (far less noisy than hourly): daily mean Z_ss + day-over-day %
+    # change. A day with < _ZSS_MIN_DAY_N valid rows is None (a 1-2 sample day gives
+    # a wild mean -- the source of the biggest %-swings in the hourly view).
+    days = sorted(byd)
+    dz = [float(np.mean(byd[d])) if len(byd[d]) >= _ZSS_MIN_DAY_N else None
+          for d in days]
+    pct_dod = [None]
+    for i in range(1, len(dz)):
+        prev = next((dz[j] for j in range(i - 1, -1, -1) if dz[j] is not None), None)
+        pct_dod.append(_pct(dz[i], prev) if (dz[i] is not None and prev) else None)
+    xday = []
+    for d in days:
+        try:
+            xday.append(datetime.strptime(d, "%Y_%m_%d").replace(hour=12))
+        except ValueError:
+            xday.append(None)
     return {"x": x, "hz": hz, "pct_hoh": pct_hoh, "pct_day": pct_day,
-            "pct_week": pct_week, "week_mean": week_mean}
+            "pct_week": pct_week, "week_mean": week_mean,
+            "xday": xday, "dz": dz, "pct_dod": pct_dod}
 
 
 def _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week):
@@ -392,8 +410,9 @@ def _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week):
         return None
     return _fig.plot_zss_pct_change(
         d["x"], d["hz"], d["pct_hoh"], d["pct_day"], d["pct_week"],
-        d["week_mean"], f"{animal} {channel} — Z_ss % change by hour ({week})",
-        os.path.join(base, f"{tag}_zss_pct.png"))
+        d["week_mean"], f"{animal} {channel} — Z_ss % change ({week})",
+        os.path.join(base, f"{tag}_zss_pct.png"),
+        xday=d.get("xday"), dz=d.get("dz"), pct_dod=d.get("pct_dod"))
 
 
 def _process_channel(store, animal, channel, traces, imp_rows, p, work,
