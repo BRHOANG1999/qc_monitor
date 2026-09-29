@@ -310,6 +310,62 @@ def test_perfile_figs_overlay_renders(monkeypatch, tmp_path):
     assert len(figs) == 4                        # 2 recordings x 2 windows
 
 
+class _FakeGains:
+    """AmplifierGains stand-in: file_id-independent, returns a gain by session tag."""
+    def __init__(self, mapping):
+        self._m = mapping                      # session-basename substring -> gain
+
+    def resolve(self, session_name, file_basename, channel_name, animal_id="",
+                electrode=""):
+        for key, g in self._m.items():
+            if key in session_name or key in file_basename:
+                return g
+        return None
+
+
+def _gtrace(fid, session, base_amp):
+    t = _trace(fid, "2026_08_24", 0.0)
+    t["session_dir"] = session
+    t["file_path"] = f"{session}/{session}_{fid}.mat"
+    t["stim_trace"] = [base_amp] * 60
+    t["evoked_trace"] = [base_amp * 0.5] * 60
+    return t
+
+
+def test_apply_gain_divides_by_resolved_gain():
+    # Two recordings at nominal gains 300 then 150; raw amplitudes were scaled by
+    # gain, so after correction both should read the SAME input-referred amplitude.
+    traces = [_gtrace(1, "sessA_g300", 300.0), _gtrace(2, "sessB_g150", 150.0)]
+    gains = _FakeGains({"g300": 300.0, "g150": 150.0})
+    gain_by_file, stats = m._apply_gain(traces, gains, _ANIMAL, _CH)
+    assert stats["corrected"] == 2 and stats["uncorrected"] == 0
+    assert stats["gains"] == {300.0, 150.0}
+    assert gain_by_file == {1: 300.0, 2: 150.0}
+    assert traces[0]["stim_trace"][0] == pytest.approx(1.0)      # 300/300
+    assert traces[1]["stim_trace"][0] == pytest.approx(1.0)      # 150/150
+    assert traces[0]["evoked_trace"][0] == pytest.approx(0.5)
+
+
+def test_apply_gain_counts_unresolved_and_none():
+    traces = [_gtrace(1, "sessA_g300", 300.0), _gtrace(2, "unknown", 150.0)]
+    gains = _FakeGains({"g300": 300.0})
+    gain_by_file, stats = m._apply_gain(traces, gains, _ANIMAL, _CH)
+    assert stats["corrected"] == 1 and stats["uncorrected"] == 1
+    assert gain_by_file == {1: 300.0}
+    assert traces[1]["stim_trace"][0] == pytest.approx(150.0)    # left raw
+    # gains=None -> nothing corrected
+    t2 = [_gtrace(1, "sessA_g300", 300.0)]
+    _gbf, st = m._apply_gain(t2, None, _ANIMAL, _CH)
+    assert st["corrected"] == 0 and st["uncorrected"] == 1
+
+
+def test_gain_epochs_divides_or_noops():
+    ep = [{"evoked_trace": [300.0, 600.0], "time_ms": [0.0, 0.1]}]
+    out = m._gain_epochs(ep, 300.0)
+    assert out[0]["evoked_trace"] == pytest.approx([1.0, 2.0])
+    assert m._gain_epochs(ep, None) is ep                        # no-op passthrough
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

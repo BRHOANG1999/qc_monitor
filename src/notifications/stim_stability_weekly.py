@@ -43,6 +43,7 @@ from src.notifications import stim_figures as _fig
 from src.notifications.evoked_weekly import _peak_amplitude
 from src.utils import drive_upload as _drive
 from src.utils import sheets_write as _sw
+from src.utils.amplifier_records import load_amplifier_gains
 from src.utils.animal import split_animal_electrode
 from src.utils.evoked_output import read_file_evoked
 from src.utils.sheets import _resolve_sa_path
@@ -141,6 +142,38 @@ def _magnitude_pairs(traces: list[dict], artifact_win, evoked_win
     return xs, ys, days
 
 
+def _apply_gain(traces: list[dict], gains, animal: str, channel: str
+                ) -> tuple[dict, dict]:
+    """Divide each file's stim + evoked mean traces by that recording's amplifier
+    gain (File_Records) IN PLACE, so a mid-experiment gain change (e.g. BCH111
+    300->150) is not read as a real ~2x amplitude step. Impedance metrics (Rₐ, Z_ss,
+    V_ss) are already gain-corrected upstream in the store, so only the raw traces
+    need this. Returns ``(gain_by_file, stats)`` where gain_by_file maps file_id ->
+    gain (for the .mat per-epoch overlays) and stats counts corrected/uncorrected."""
+    gain_by_file: dict = {}
+    stats = {"corrected": 0, "uncorrected": 0, "gains": set()}
+    if gains is None:
+        stats["uncorrected"] = len(traces)
+        return gain_by_file, stats
+    electrode = split_animal_electrode(channel)[1] if channel else ""
+    for t in traces:
+        g = gains.resolve(os.path.basename(str(t.get("session_dir", "") or "")),
+                          os.path.basename(str(t.get("file_path", "") or "")),
+                          channel, animal, electrode)
+        if g and g > 0:
+            inv = 1.0 / float(g)
+            t["stim_trace"] = [v * inv for v in (t.get("stim_trace") or [])]
+            t["evoked_trace"] = [v * inv for v in (t.get("evoked_trace") or [])]
+            fid = t.get("file_id")
+            if fid is not None:
+                gain_by_file[fid] = float(g)
+            stats["corrected"] += 1
+            stats["gains"].add(float(g))
+        else:
+            stats["uncorrected"] += 1
+    return gain_by_file, stats
+
+
 def _crop(time_ms, y, win) -> tuple:
     """Restrict a (time_ms, y) trace to the *win* = (x0, x1) ms window so the
     stim-pulse figures show the pulse, not the full +/-500 ms record. Falls back
@@ -159,7 +192,7 @@ _WIN_LABEL = {"artifact": "stim artifact", "evoked": "evoked response"}
 
 
 def _lfp_figs(tm, y, base, name, title, wins, sem=None, color=None,
-              overlay=None) -> dict:
+              overlay=None, ylabel="LFP amplitude") -> dict:
     """The LFP trace at each window -> {window_key: png path}. Both windows are
     of the SAME LFP (mean_trace): 'artifact' and 'evoked'. Averaged figures pass
     *sem* for a shaded mean +/- SEM band; *color* tints the line+band (the daily
@@ -173,7 +206,7 @@ def _lfp_figs(tm, y, base, name, title, wins, sem=None, color=None,
         ov = ([_crop(tm, o, win)[1] for o in overlay] if overlay else None)
         pth = os.path.join(base, f"{name}_{wkey}.png")
         lbl = f"{title} · {_WIN_LABEL[wkey]} ({win[0]:g} to {win[1]:g} ms)"
-        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel="LFP amplitude", sem=cs,
+        if _fig.plot_stim_trace(ct, cy, lbl, pth, ylabel=ylabel, sem=cs,
                                 color=color or _fig._ACCENT, overlay=ov):
             out[wkey] = pth
     return out
@@ -269,17 +302,32 @@ def _recording_epochs(store, file_id, animal, channel) -> list[dict]:
              "time_ms": tm_list} for i in idx]
 
 
-def _perfile_figs(store, perfile_src, animal, channel, base, wins) -> list:
+def _gain_epochs(epochs: list[dict], gain: float | None) -> list[dict]:
+    """Divide each .mat epoch's evoked_trace by *gain* so the per-recording overlays
+    match the gain-corrected DB averages (the .mat epochs are raw amplifier output).
+    No-op when gain is missing."""
+    if not gain or gain <= 0:
+        return epochs
+    inv = 1.0 / float(gain)
+    return [{**e, "evoked_trace": [v * inv for v in (e.get("evoked_trace") or [])]}
+            for e in epochs]
+
+
+def _perfile_figs(store, perfile_src, animal, channel, base, wins, *,
+                  gain_by_file: dict | None = None,
+                  ylabel: str = "LFP amplitude") -> list:
     """Per-recording LFP figures. Each figure overlays that ONE recording's own
     epochs (its stimulus repetitions, read from the ``*_evoked.mat``) thin +
     transparent under their rising-edge-aligned mean -- a per-recording mean is
     itself an average over epochs, so it gets its constituents like every other
     average. Falls back to the DB per-recording mean alone when the .mat is
-    unavailable."""
+    unavailable. The .mat epochs are gain-corrected per file to match the DB means."""
+    gain_by_file = gain_by_file or {}
     out = []
     for t in perfile_src:
         name = f"file_{_safe(t['chunk_datetime'])}"
         epochs = _recording_epochs(store, t.get("file_id"), animal, channel)
+        epochs = _gain_epochs(epochs, gain_by_file.get(t.get("file_id")))
         etm = emean = esem = None
         eov = []
         if epochs:
@@ -289,12 +337,13 @@ def _perfile_figs(store, perfile_src, animal, channel, base, wins) -> list:
             figs = _lfp_figs(
                 etm, emean, base, name,
                 f"{animal} {channel} — single recording {t['chunk_datetime']} "
-                f"(mean + {len(eov)} epochs)", wins, sem=esem, overlay=eov)
+                f"(mean + {len(eov)} epochs)", wins, sem=esem, overlay=eov,
+                ylabel=ylabel)
         else:
             figs = _lfp_figs(
                 t["time_ms"], t["evoked_trace"], base, name,
                 f"{animal} {channel} — single recording {t['chunk_datetime']}",
-                wins)
+                wins, ylabel=ylabel)
         out += list(figs.values())
     return out
 
@@ -416,12 +465,21 @@ def _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week):
 
 
 def _process_channel(store, animal, channel, traces, imp_rows, p, work,
-                     week, start, end) -> dict | None:
+                     week, start, end, *, gain_by_file: dict | None = None,
+                     gain_stats: dict | None = None) -> dict | None:
     """Render every PNG + scalars for one channel: two LFP windows per level
     (stim-artifact + evoked), a per-window daily overlay under the weekly average,
-    the impedance trend (full + this-week), and the day-coloured LFP correlation."""
+    the impedance trend (full + this-week), and the day-coloured LFP correlation.
+
+    When *gain_stats* shows the traces were gain-corrected, the LFP amplitude axes
+    and the correlation title say so (the traces passed in are already divided by
+    each recording's amplifier gain; *gain_by_file* also gain-corrects the .mat
+    per-epoch overlays)."""
     if not traces:
         return None
+    corrected = bool(gain_stats and gain_stats.get("corrected"))
+    amp_label = "LFP amplitude (gain-corrected)" if corrected else "LFP amplitude"
+    corr_note = " (gain-corrected)" if corrected else ""
     base = os.path.join(work, _safe(animal), _safe(channel))
     os.makedirs(base, exist_ok=True)
     tag = f"{_safe(animal)}_{_safe(channel)}"
@@ -440,7 +498,8 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
     perfile_src = (days[max(days)] if p.perfile_span == "last_day" and days
                    else traces)
     # Per file: 2 LFP figs, each overlaying that recording's own epochs.
-    perfile = _perfile_figs(store, perfile_src, animal, channel, base, wins)
+    perfile = _perfile_figs(store, perfile_src, animal, channel, base, wins,
+                            gain_by_file=gain_by_file, ylabel=amp_label)
     daily = []
     for d in sdays:                                        # per day: avg + traces
         tm, mean, sem, dtraces = day_mean[d]
@@ -448,7 +507,7 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
             tm, mean, base, f"day_{_safe(d)}",
             f"{animal} {channel} — daily average LFP {d} "
             f"(mean + {len(dtraces)} recordings)", wins,
-            sem=sem, color=day_color[d], overlay=dtraces).values())
+            sem=sem, color=day_color[d], overlay=dtraces, ylabel=amp_label).values())
         daily += _hour_overlay(days[d], day_mean[d], wins, base, tag, d,
                                animal, channel)
     tmw, yw, semw, wtraces = align_average_with_traces(   # weekly
@@ -457,7 +516,8 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
     weekly = _lfp_figs(
         tmw, yw, base, f"{tag}_weekly",
         f"{animal} {channel} — weekly average LFP, {week} "
-        f"(mean + {len(wtraces)} recordings)", wins, sem=semw, overlay=wtraces)
+        f"(mean + {len(wtraces)} recordings)", wins, sem=semw, overlay=wtraces,
+        ylabel=amp_label)
     over = _overlays(traces, day_mean, sdays, wins, day_color, base, tag,
                      animal, channel)
     imp, imp_week = _metric_figs(
@@ -478,7 +538,7 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
     zss_pct = _zss_pct_change_fig(imp_rows, base, tag, animal, channel, week)
     xs, ys, dys = _magnitude_pairs(traces, p.artifact_window, p.evoked_window)
     corr = _fig.plot_stim_vs_evoked(
-        xs, ys, f"{animal} {channel} — stim-artifact vs evoked magnitude",
+        xs, ys, f"{animal} {channel} — stim-artifact vs evoked magnitude{corr_note}",
         os.path.join(base, f"{tag}_correlation.png"), days=dys,
         day_color=day_color, stim_win=p.artifact_window,
         evoked_win=tuple(p.evoked_window))
@@ -504,6 +564,9 @@ def _process_channel(store, animal, channel, traces, imp_rows, p, work,
         "png_zss_pct": zss_pct,
         "png_corr": corr["png"],
         "perfile": perfile, "daily": daily,
+        "gain_corrected": corrected,
+        "gains": sorted(gain_stats["gains"]) if gain_stats else [],
+        "gain_uncorrected": (gain_stats.get("uncorrected", 0) if gain_stats else 0),
         "urls": {}, "folder_link": "",
     }
 
@@ -730,12 +793,21 @@ def _email_text(today, span, results, label="weekly") -> str:
              _SUMMARY, "", _BATTERY_TIP, "",
              f"{len(results)} stimulated channel(s):"]
     for r in results:
+        gtag = ""
+        if r.get("gain_corrected"):
+            gset = r.get("gains") or []
+            gtag = (f" [gain-corrected: {'/'.join(f'{g:g}' for g in gset)}]"
+                    if gset else " [gain-corrected]")
         lines.append(f"  {r['animal']} {r['channel']}: Ra={_num(r['ra'], '.1f')} kΩ "
                      f"Δ={_num(r['ra_drift'], '+.0f')}% "
                      f"Z_ss={_num(r.get('zss'), '.3f')} kΩ "
                      f"Δ={_num(r.get('zss_drift'), '+.0f')}% "
                      f"corr r={_num(r['corr'].get('r'), '.2f')} "
-                     f"p={_num(r['corr'].get('p'), '.1e')} n={r['n_files']}")
+                     f"p={_num(r['corr'].get('p'), '.1e')} n={r['n_files']}{gtag}")
+    if any(r.get("gain_corrected") for r in results):
+        lines += ["", "LFP amplitudes are divided by each recording's amplifier gain "
+                  "(File_Records), so a mid-experiment gain change does not read as an "
+                  "amplitude step. Rₐ/Z_ss/V_ss were already gain-corrected."]
     return "\n".join(lines)
 
 
@@ -784,6 +856,13 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
     channels = [c for c in sorted(store.active_impedance_channel_keys())
                 if not _excluded(c[0], p.exclude)]
     imp_series = store.impedance_series_by_channel(exclude=p.exclude)
+    # Per-recording amplifier gain (File_Records) -> divide stim/evoked traces so a
+    # mid-experiment gain change is not read as an amplitude step. None only on a
+    # hard config error; an empty AmplifierGains just leaves traces uncorrected.
+    gains = load_amplifier_gains(config)
+    if gains is None:
+        logger.warning("amplifier gains unavailable (config); stim traces "
+                       "will NOT be gain-corrected")
     work = out_dir or tempfile.mkdtemp(prefix="stimstab_")
 
     drive = week_folder = None
@@ -805,12 +884,17 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
             drive = week_folder = None
 
     rows, results = [], []
+    gain_totals = {"corrected": 0, "uncorrected": 0}
     for animal, channel in channels:
         traces = store.channel_stim_evoked_traces_in_range(
             animal, channel, start_date, end_date)
+        gain_by_file, gstats = _apply_gain(traces, gains, animal, channel)
+        gain_totals["corrected"] += gstats["corrected"]
+        gain_totals["uncorrected"] += gstats["uncorrected"]
         res = _process_channel(store, animal, channel, traces,
                                imp_series.get((animal, channel), []), p, work,
-                               week, start_date, end_date)
+                               week, start_date, end_date,
+                               gain_by_file=gain_by_file, gain_stats=gstats)
         if res is None:
             continue
         if drive is not None and week_folder is not None:
@@ -849,9 +933,12 @@ def send_stim_stability_weekly(today: date, config: dict, store: Store,
 
     if not dry_run and out_dir is None:
         shutil.rmtree(work, ignore_errors=True)
+    logger.info("Stim-stability %s gain-correction: %d traces corrected, %d "
+                "uncorrected", label, gain_totals["corrected"],
+                gain_totals["uncorrected"])
     return {"sent": sent, "channels": len(results), "recipients": len(recipients),
             "sheet": sheet_res, "week": week, "work_dir": work,
-            "dry_run": dry_run,
+            "dry_run": dry_run, "gain": gain_totals,
             "rows": rows if dry_run else None}
 
 

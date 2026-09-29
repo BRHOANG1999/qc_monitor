@@ -2497,9 +2497,11 @@ class Store:
 
         Same dominant-charge + valid-access-resistance restriction as
         ``channel_traces_in_range`` (only the consistent stimStability protocol).
-        Each dict: ``{file_id, chunk_datetime, time_ms, stim_trace, evoked_trace,
-        charge_nc}``. Rows whose stim trace is NULL or whose JSON won't parse are
-        dropped. *start_date*/*end_date* are ``YYYY-MM-DD`` (end inclusive)."""
+        Each dict: ``{file_id, chunk_datetime, session_dir, file_path, time_ms,
+        stim_trace, evoked_trace, charge_nc}`` (session_dir/file_path let the caller
+        resolve the per-recording amplifier gain). Rows whose stim trace is NULL or
+        whose JSON won't parse are dropped. *start_date*/*end_date* are ``YYYY-MM-DD``
+        (end inclusive)."""
         assert animal_id and channel_name, "animal_id and channel_name required"
         assert start_date and end_date, "start_date and end_date required"
         lo = f"{start_date.replace('-', '_')}__00_00_00"
@@ -2510,7 +2512,8 @@ class Store:
             if charge is None:
                 return []
             rows = conn.execute(
-                """SELECT pf.chunk_datetime, ew.file_id, ew.time_axis_ms,
+                """SELECT pf.chunk_datetime, pf.session_dir, pf.file_path,
+                          ew.file_id, ew.time_axis_ms,
                           ew.stim_mean_trace, ew.mean_trace, ci.charge_nc
                    FROM evoked_waveforms ew
                    JOIN processed_files pf ON pf.id = ew.file_id
@@ -2535,6 +2538,8 @@ class Store:
                 out.append({
                     "file_id": int(r["file_id"]),
                     "chunk_datetime": r["chunk_datetime"] or "",
+                    "session_dir": r["session_dir"] or "",
+                    "file_path": r["file_path"] or "",
                     "time_ms": json.loads(r["time_axis_ms"]),
                     "stim_trace": json.loads(r["stim_mean_trace"]),
                     "evoked_trace": json.loads(r["mean_trace"]),
