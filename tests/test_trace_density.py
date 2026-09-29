@@ -85,3 +85,27 @@ def test_robust_ylim():
     assert y0 < 0 < y1
     assert y1 < 1.6                            # the 1-in-501 outlier doesn't set the axis
     assert robust_ylim(np.empty((0, 2))) == (-1.0, 1.0)
+
+
+def test_column_quantiles_recovers_a_known_spread():
+    # Flat traces at fixed levels -> a column's deciles must bracket those levels.
+    ld = LineDensity((0, 10), (-1, 1), width=40, height=400)
+    t = np.linspace(0, 10, 60)
+    levels = np.linspace(-0.8, 0.8, 100)       # uniform spread of flat traces
+    for lv in levels:
+        ld.add(t, np.full_like(t, lv))
+    q, xc = ld.column_quantiles([0.1, 0.5, 0.9])
+    assert q.shape == (3, 40) and xc.shape == (40,)
+    col = 20                                    # any interior column
+    lo, mid, hi = q[0, col], q[1, col], q[2, col]
+    assert lo < mid < hi                        # deciles ordered
+    assert abs(mid) < 0.1                       # median near 0 for a symmetric spread
+    assert lo < -0.4 < 0.4 < hi                 # 10th/90th out in the tails
+
+
+def test_column_quantiles_empty_column_is_nan():
+    ld = LineDensity((0, 10), (-1, 1), width=20, height=100)
+    ld.add(np.linspace(0, 4, 30), np.zeros(30))   # only the left half gets ink
+    q, xc = ld.column_quantiles([0.5])
+    assert np.isnan(q[0, -1])                       # the untouched right column -> NaN
+    assert np.isfinite(q[0, 2])

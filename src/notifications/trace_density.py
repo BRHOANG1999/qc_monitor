@@ -85,6 +85,37 @@ class LineDensity:
         """(x0, x1, y0, y1) for ``imshow(extent=...)`` with ``origin='upper'``."""
         return (self.x0, self.x1, self.y0, self.y1)
 
+    def column_quantiles(self, qs):
+        """Per-column amplitude quantiles of the rasterized cloud -> decile envelopes
+        laid over the density. *qs* is a list of cumulative fractions in (0,1);
+        returns (len(qs), W) of y-values (NaN for empty columns) and the column
+        x-centres (W,). Derived from the occupancy buffer (memory-safe, no traces
+        held): counts per (row,col) approximate the trace-value histogram of each
+        time column, so these are density deciles -- exact where traces are locally
+        flat, slightly middle-biased where a trace is steep within one column."""
+        qs = np.atleast_1d(np.asarray(qs, dtype=np.float64))
+        assert qs.ndim == 1 and qs.size >= 1, "qs must be a non-empty 1-D list"
+        assert np.all((qs > 0.0) & (qs < 1.0)), "quantiles must be in (0, 1)"
+        c = self.counts()                                  # (H, W); row 0 = top (y1)
+        tot = c.sum(axis=0)                                # (W,)
+        out = np.full((qs.size, self.W), np.nan, dtype=np.float64)
+        xc = self.x0 + (np.arange(self.W) + 0.5) / self.W * (self.x1 - self.x0)
+        if not np.any(tot > 0):
+            return out, xc
+        # CDF from the BOTTOM up (low y -> high y) so quantile q = value with fraction
+        # q of the mass below it: q=0.1 -> low amplitude, q=0.9 -> high amplitude.
+        frac = np.cumsum(c[::-1, :], axis=0) / np.where(tot > 0, tot, 1.0)
+        rows = np.arange(self.H, dtype=np.float64)
+        y_of_row = self.y1 - rows / max(1, self.H - 1) * (self.y1 - self.y0)
+        for qi in range(qs.size):
+            ge = frac >= qs[qi]                            # first crossing from bottom
+            k = np.argmax(ge, axis=0)                      # rows counted up from bottom
+            ok = (tot > 0) & ge.any(axis=0)
+            yv = y_of_row[self.H - 1 - k]
+            yv[~ok] = np.nan
+            out[qi] = yv
+        return out, xc
+
 
 def robust_ylim(lo_hi_samples, pad: float = 0.08):
     """Symmetric-ish y-range from streamed per-trace (min, max) robust extrema.

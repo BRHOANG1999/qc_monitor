@@ -39,6 +39,9 @@ from src.notifications.trace_density import LineDensity, robust_ylim  # noqa: E4
 from src.evoked_figures import data as _d                # noqa: E402
 from src.periictal import passive as _passive            # noqa: E402
 from src.utils import evoked_features as _ef              # noqa: E402
+from src.utils.amplifier_records import (                # noqa: E402
+    load_amplifier_gains, resolve_gain)
+from src.utils.animal import split_animal_electrode      # noqa: E402
 from src.utils.evoked_output import read_feature_sidecar, read_file_evoked  # noqa: E402
 
 # (start, end) ms. All start at 2 ms (just past the 1 ms artifact guard), so the
@@ -114,10 +117,24 @@ def _win_cfg(w):
     return _passive.window_config(float(w[0]), float(w[1]))
 
 
+def _win_pretty(wt) -> str:
+    """Human window label for figure titles. A raw window tag ("2-50ms") is shown
+    with an en-dash; a LP variant tag ("lp500") is expanded to spell out BOTH the
+    ms window AND the Hz cutoff so the two numbers are never confused."""
+    for tag, s, e, hz in LP_VARIANTS:
+        if wt == tag:
+            return (f"{int(round(s))}–{int(round(e))} ms window "
+                    f"· ≤{int(round(hz))} Hz low-pass")
+    return str(wt).replace("-", "–")
+
+
 # Low-pass variants: features (and the displayed waveforms) are computed on the
 # LP-filtered signal over [start,end] ms, so the smoothed morphology is a parallel
 # set of figures alongside the raw windows. (tag, start_ms, end_ms, cutoff_hz)
-LP_VARIANTS = [("lp500", 2.0, 500.0, 500.0)]
+# NOTE the two numbers are different axes: the WINDOW is the 2-50 ms post-stim crop
+# (early evoked morphology); 500 is the low-pass CUTOFF in Hz (removes >500 Hz HF so
+# the slow shape is legible). "500" is never a millisecond bound.
+LP_VARIANTS = [("lp500", 2.0, 50.0, 500.0)]
 
 
 def _variants(windows):
@@ -141,6 +158,39 @@ def _lp_traces(traces, fs, cfg):
 
 
 # --------------------------------------------------------------------- #
+#  amplifier-gain awareness: recorded evoked voltage = gain x input voltage.
+#  A mid-experiment gain change (e.g. 300 -> 150) otherwise looks like a real
+#  step in EVERY amplitude feature, so we divide traces (and the recorded stim
+#  P2P) by each recording's gain to get INPUT-REFERRED amplitudes.
+# --------------------------------------------------------------------- #
+def _raw_base(fp) -> str:
+    """Raw-recording base name (the File_Records "EEG File" key) for an evoked
+    file: the .mat basename minus the ``.mat`` and the ``_evoked`` tag, keeping
+    the trailing recorder timestamp so per-file / per-session gain resolves."""
+    b = os.path.basename(str(fp))
+    if b.lower().endswith(".mat"):
+        b = b[:-4]
+    if b.lower().endswith("_evoked"):
+        b = b[:-len("_evoked")]
+    return b
+
+
+def _file_gain(gains, fp, animal, channel):
+    """Amplifier gain for one (recording, channel), or None when unresolved / no
+    gains loaded (caller then leaves the trace uncorrected)."""
+    if gains is None:
+        return None
+    rb = _raw_base(fp)
+    _a, elec = split_animal_electrode(channel)
+    g = resolve_gain(gains, rb, rb, channel, animal or (_a or ""), elec or "")
+    try:
+        g = float(g)
+    except (TypeError, ValueError):
+        return None
+    return g if g > 0 else None
+
+
+# --------------------------------------------------------------------- #
 #  values pass: windowed feature values per response, fanned to periods
 # --------------------------------------------------------------------- #
 def _fs_of(time_ms) -> float:
@@ -149,13 +199,16 @@ def _fs_of(time_ms) -> float:
 
 
 def windowed_values(files, animal, channel, features, windows, week_key,
-                    progress=None) -> tuple:
+                    progress=None, gains=None) -> tuple:
     """ONE trace pass. Per response: recompute *features* (incl. HF band powers)
     over each window and fan (timestamp, value) to its DAY + the WEEK; track the
     stimulus peak-to-peak amplitude (window-independent); and accumulate the mean
-    RESPONSE WAVEFORM per 07:00-anchored circadian bin. Returns
-    ``(series, ylim, stim, circ)`` where ``stim[period] = {"secs","p2p"}`` and
-    ``circ = {"time_ms", "cycles": {cyc: [mean×4]}, "week": [mean×4]}``."""
+    RESPONSE WAVEFORM per 07:00-anchored circadian bin. Traces + stim P2P are
+    divided by each recording's amplifier gain (when *gains* resolves one) so a
+    mid-experiment gain change is not read as a real amplitude step. Returns
+    ``(series, ylim, stim, circ, gain_info)`` where ``stim[period]={"secs","p2p"}``,
+    ``circ={"time_ms","cycles":{cyc:[mean×4]},"week":[mean×4]}`` and ``gain_info``
+    counts files corrected vs. left uncorrected."""
     variants = _variants(windows)
     cfgs = {tag: cfg for tag, _win, cfg, _lp in variants}
     want_wavelet = any(f in _ef.WAVELET_COLUMNS for f in features)
@@ -168,6 +221,7 @@ def windowed_values(files, animal, channel, features, windows, week_key,
     circ_cycles: dict = defaultdict(lambda: [_RunMean() for _ in range(4)])
     circ_week = [_RunMean() for _ in range(4)]
     circ_time = [None]
+    gain_info = {"corrected": 0, "uncorrected": 0, "gains": set()}
     n_files = len(files)
     for i, fp in enumerate(files):
         if progress and i % 5 == 0:
@@ -185,6 +239,15 @@ def windowed_values(files, animal, channel, features, windows, week_key,
         s_peak = np.asarray(ev.get("stim_peak") or [], dtype=float)
         s_trough = np.asarray(ev.get("stim_trough") or [], dtype=float)
         fs = _fs_of(time_ms)
+        g = _file_gain(gains, fp, animal, channel)   # input-refer amplitudes
+        if g:
+            traces = traces / g
+            s_peak = s_peak / g if s_peak.size else s_peak
+            s_trough = s_trough / g if s_trough.size else s_trough
+            gain_info["corrected"] += 1
+            gain_info["gains"].add(round(g, 4))
+        else:
+            gain_info["uncorrected"] += 1
         avg = _ef.trial_moving_average(traces)
         if circ_time[0] is None:
             circ_time[0] = time_ms
@@ -234,8 +297,9 @@ def windowed_values(files, animal, channel, features, windows, week_key,
     circ = {"time_ms": circ_time[0],
             "cycles": {c: _pack(bins) for c, bins in sorted(circ_cycles.items())},
             "week": _pack(circ_week)}
+    gain_info["gains"] = sorted(gain_info["gains"])
     return (_finalize_values(secs, vals, features), _finalize_ylim(extent),
-            _finalize_stim(stim_secs, stim_p2p), circ)
+            _finalize_stim(stim_secs, stim_p2p), circ, gain_info)
 
 
 def _finalize_stim(stim_secs, stim_p2p) -> dict:
@@ -326,11 +390,13 @@ class _RunMean:
 
 def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
                    labels, pkg, variant_cfg=None, is_week=False,
-                   progress=None) -> list:
+                   progress=None, gains=None) -> list:
     """One trace pass over *period*'s files for ALL variants: per (variant, feature)
     accumulate a Welford MEAN + SD per decile (LP variants accumulate the LP-FILTERED
     trace so the displayed shapes are smoothed too), then render the clean shape
-    views (ridgeline, peak-normalized, per-decile mean±SD grid). Returns fig records."""
+    views (ridgeline, peak-normalized, per-decile mean±SD grid). Traces are divided
+    by each recording's amplifier gain (matching the values pass) so the decile
+    shapes stay input-referred across a gain change. Returns fig records."""
     variant_cfg = variant_cfg or {}
     accs: dict = {(wt, feat): _ed._BandAccum(info["n_bands"] + 1)
                   for wt, _w in wtags_windows for feat, info in info_pw[wt].items()}
@@ -341,7 +407,10 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
     hourly = hmeta = None
     if not is_week and wtags_windows:
         dwt, dw = max(wtags_windows, key=lambda x: (x[1][1] - x[1][0]))
-        hourly = _HourGrid((max(2.0, dw[0]), dw[1]), ylim.get(dwt, (-1.0, 1.0)))
+        # pad the density BUFFER's y-range (not just the axis) so deep troughs are not
+        # clamped to the edge (a false clip line) -- gives head + floor room too.
+        hourly = _HourGrid((max(2.0, dw[0]), dw[1]),
+                           _pad_ylim(ylim.get(dwt, (-1.0, 1.0))))
         hmeta = {"animal": animal, "channel": channel,
                  "date": labels.get(period, period), "window": dwt}
     for fp in files:
@@ -356,6 +425,9 @@ def _render_period(files, animal, channel, period, wtags_windows, info_pw, ylim,
         traces, time_ms = np.asarray(ev["traces"], dtype=float), \
             np.asarray(ev["time_ms"], dtype=float)
         fs = _fs_of(time_ms)
+        g = _file_gain(gains, fp, animal, channel)    # input-refer (match values pass)
+        if g:
+            traces = traces / g
         if hourly is not None:                        # every epoch -> this file's hour
             fhr = _file_hour(fp)
             for e in range(traces.shape[0]):
@@ -485,8 +557,8 @@ def _fig_ridgeline(feat, meta, info, band_wf, tm, xlim, out) -> str:
     ax.tick_params(colors=_ed._MUTED, labelsize=8)
     ax.set_xlim(xlim)
     ax.set_xlabel("ms since stim (artifact blanked)", color=_ed._TEXT, fontsize=10)
-    ax.set_title(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · decile MEAN ± 1 SD, stacked (low→high)",
+    ax.set_title(f"{meta['animal']} · {meta['date']} · {_win_pretty(meta['window'])}"
+                 f" · {_pretty(feat)} · decile MEAN ± 1 SD, stacked (low→high)",
                  color=_ed._TEXT, fontsize=11, loc="left")
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
@@ -520,8 +592,8 @@ def _fig_normalized(feat, meta, info, band_wf, tm, xlim, out) -> str:
                     loc="lower right")
     for t in leg.get_texts():
         t.set_color(_ed._TEXT)
-    ax.set_title(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · decile means PEAK-NORMALIZED (shape only)",
+    ax.set_title(f"{meta['animal']} · {meta['date']} · {_win_pretty(meta['window'])}"
+                 f" · {_pretty(feat)} · decile means PEAK-NORMALIZED (shape only)",
                  color=_ed._TEXT, fontsize=11, loc="left")
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
@@ -558,8 +630,8 @@ def _fig_decile_grid(feat, meta, info, band_wf, tm, xlim, ylim, out) -> str:
         ax.tick_params(colors=_ed._MUTED, labelsize=7)
     for jj in range(n_bands, nrow * ncol):
         axes[jj // ncol][jj % ncol].axis("off")
-    fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · "
-                 f"{_pretty(feat)} · per-decile MEAN ± 1 SD",
+    fig.suptitle(f"{meta['animal']} · {meta['date']} · {_win_pretty(meta['window'])}"
+                 f" · {_pretty(feat)} · per-decile MEAN ± 1 SD",
                  color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
@@ -613,47 +685,94 @@ def _file_hour(fp):
     return int(m.group(1)) if m else None
 
 
+# decile envelopes drawn on every hour panel (10th..90th pct of the cloud).
+_HOURLY_DECILES = np.arange(1, 10) / 10.0                  # 0.1 .. 0.9
+
+
+def _pad_ylim(ylim, frac=0.32):
+    """Widen a (lo, hi) view by *frac* of its span on EACH side -- head room above
+    and floor room below so the cloud + decile envelopes are not jammed to the edges."""
+    lo, hi = float(ylim[0]), float(ylim[1])
+    span = hi - lo if hi > lo else 1.0
+    return (lo - frac * span, hi + frac * span)
+
+
+def _draw_hour_panel(ax, hg, hr, tm, xlim, ylim, dcolors) -> None:
+    """One hour's panel: density cloud + turbo decile envelopes + white hourly mean."""
+    art = np.abs(tm) <= 1.5
+    xm = (tm >= xlim[0]) & (tm <= xlim[1])
+    ax.set_facecolor(_ed._PANEL)
+    dens = hg.dens[hr]
+    # low per-trace opacity: with ~1000s of traces/hr a high a0 saturates the band
+    # into a flat blob; ~0.04 keeps a readable dark->bright gradient while lone
+    # outlier strokes still register.
+    ax.imshow(dens.rgba((0.37, 0.49, 0.89), a0=0.04), extent=dens.extent(),
+              origin="upper", aspect="auto", interpolation="nearest")
+    dq, xc = dens.column_quantiles(_HOURLY_DECILES)   # each decile as a turbo line
+    cmask = np.abs(xc) > 1.5                           # blank the artifact column
+    for di in range(_HOURLY_DECILES.size):
+        yq = dq[di].copy()
+        yq[~cmask] = np.nan
+        ax.plot(xc, yq, color=dcolors[di], lw=0.7, alpha=0.85)
+    m = hg.mean[hr].mean()
+    if m is not None:
+        m = _ed._baseline(m, tm).copy()
+        m[art] = np.nan
+        ax.plot(tm[xm], m[xm], color="#ffffff", lw=1.4)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_title(f"{hr:02d}:00  n={dens.n}", color=_ed._TEXT, fontsize=8, loc="left")
+    ax.tick_params(colors=_ed._MUTED, labelsize=6)
+
+
+def _decile_colorbar(fig, cax, dcolors, label) -> None:
+    """Discrete 10th..90th-percentile colourbar (turbo low->high) in axes *cax*."""
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    pcts = (_HOURLY_DECILES * 100).astype(int)
+    sm = ScalarMappable(norm=BoundaryNorm(np.arange(5, 100, 10), pcts.size),
+                        cmap=ListedColormap(dcolors))
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label(label, color=_ed._MUTED, fontsize=8)
+    cb.set_ticks([int(pcts[0]), int(pcts[-1])])
+    cb.set_ticklabels([f"{int(pcts[0])}th", f"{int(pcts[-1])}th"])
+    cb.ax.tick_params(colors=_ed._MUTED, labelsize=7)
+
+
 def _fig_hourly_matrix(hg, meta, out) -> str | None:
     """Matrix (one panel per recording hour) of the raw evoked response: every
-    trace as a memory-safe density cloud with that hour's MEAN overlaid (white).
-    Common x/y scale across panels so hours are directly comparable."""
+    trace as a memory-safe density cloud, that hour's MEAN overlaid (white), and the
+    cloud's DECILE envelopes (10th..90th pct, turbo low->high) drawn on top so the
+    within-hour spread is quantified. Common padded x/y scale across panels."""
     hours = sorted(hg.dens)
     if not hours or hg.tm is None:
         return None
-    tm = hg.tm
-    xlim, ylim = hg.xlim, hg.ylim
-    art = np.abs(tm) <= 1.5
-    xm = (tm >= xlim[0]) & (tm <= xlim[1])
-    accent = (0.37, 0.49, 0.89)                       # ~ #5e7ce2
+    assert hg.ylim[1] > hg.ylim[0], "hourly grid needs an increasing y-range"
+    dcolors = plt.cm.turbo(np.linspace(0.12, 0.92, _HOURLY_DECILES.size))
     ncol = 6
     nrow = int(np.ceil(len(hours) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(3.1 * ncol, 2.3 * nrow),
                              facecolor=_ed._BG, squeeze=False)
     for i, hr in enumerate(hours):
-        ax = axes[i // ncol][i % ncol]
-        ax.set_facecolor(_ed._PANEL)
-        dens = hg.dens[hr]
-        # low per-trace opacity: with ~1000s of traces/hr a high a0 saturates the
-        # band into a flat blob; ~0.04 keeps a readable dark->bright density gradient
-        # while lone outlier strokes still register.
-        ax.imshow(dens.rgba(accent, a0=0.04), extent=dens.extent(),
-                  origin="upper", aspect="auto", interpolation="nearest")
-        m = hg.mean[hr].mean()
-        if m is not None:
-            m = _ed._baseline(m, tm).copy()
-            m[art] = np.nan
-            ax.plot(tm[xm], m[xm], color="#ffffff", lw=1.4)
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-        ax.set_title(f"{hr:02d}:00  n={dens.n}", color=_ed._TEXT, fontsize=8,
-                     loc="left")
-        ax.tick_params(colors=_ed._MUTED, labelsize=6)
+        _draw_hour_panel(axes[i // ncol][i % ncol], hg, hr, hg.tm, hg.xlim,
+                         hg.ylim, dcolors)
     for jj in range(len(hours), nrow * ncol):
         axes[jj // ncol][jj % ncol].axis("off")
-    fig.suptitle(f"{meta['animal']} · {meta['date']} · {meta['window']} · per-HOUR "
-                 f"evoked: every trace (density) + hourly mean", color=_ed._TEXT,
-                 fontsize=12)
-    return _pkg._finish(fig, out, None)
+    for ax in fig.axes:
+        for sp in ax.spines.values():
+            sp.set_color("#3a3a52")
+    fig.suptitle(f"{meta['animal']} · {meta['date']} · {_win_pretty(meta['window'])}"
+                 f" · per-HOUR evoked: every trace (density) + hourly mean (white) + "
+                 f"cloud deciles", color=_ed._TEXT, fontsize=12)
+    # own layout (tight_layout clobbers a steal-colourbar): reserve a right margin and
+    # put the decile colourbar in a dedicated axes there.
+    fig.subplots_adjust(left=0.035, right=0.9, top=0.93, bottom=0.055,
+                        hspace=0.45, wspace=0.28)
+    _decile_colorbar(fig, fig.add_axes([0.925, 0.3, 0.01, 0.4]), dcolors,
+                     "cloud percentile (low → high)")
+    fig.savefig(out, dpi=125, facecolor=_ed._BG)
+    plt.close(fig)
+    return out
 
 # --------------------------------------------------------------------- #
 #  package assembly
@@ -703,36 +822,67 @@ def _robust_z(v):
     return out
 
 
+def _scatter_by_decile(ax, mdts, vz_fin, bands_fin, nb):
+    """Scatter the over-time points COLORED BY DECILE (turbo low->high; the boundary
+    pile-up band in red). Falls back to one blue colour when no band info is given.
+    Returns True when it coloured by decile."""
+    if bands_fin is None or nb is None:
+        ax.scatter(mdts, vz_fin, s=4, c="#6a8cff", alpha=0.08, linewidths=0)
+        return False
+    colors = plt.cm.turbo(np.linspace(0.12, 0.92, int(nb)))
+    for b in range(int(nb)):                               # low->high deciles
+        sel = bands_fin == b
+        if np.any(sel):
+            ax.scatter(mdts[sel], vz_fin[sel], s=4, color=colors[b],
+                       alpha=0.20, linewidths=0)
+    sel = bands_fin == int(nb)                             # boundary pile-up group
+    if np.any(sel):
+        ax.scatter(mdts[sel], vz_fin[sel], s=4, color=_ed._ZCOLOR,
+                   alpha=0.25, linewidths=0)
+    return True
+
+
 def _fig_metric_trends(feat, per_win, meta, out) -> str:
     """Track a feature OVER TIME (robust-z, 6 h circadian median + per-response
-    scatter), per window. (Stimulus dependence is a separate feature-vs-stim figure
-    set, not overlaid here.)"""
+    scatter COLORED BY DECILE so the shift of the response population over the week
+    is visible), per window. (Stimulus dependence is a separate feature-vs-stim
+    figure set, not overlaid here.) *per_win* items: ``(wt, secs, vals, band_info)``
+    where band_info is the ``compute_bands`` dict (or None) aligned to secs/vals."""
     import matplotlib.dates as mdates
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import BoundaryNorm, ListedColormap
     nwin = max(1, len(per_win))
     fig, axes = plt.subplots(1, nwin, figsize=(5.8 * nwin, 4.3),
                              facecolor=_ed._BG, squeeze=False)
-    for i, (wt, secs, vals) in enumerate(per_win):
+    colored, nb_seen = False, None
+    for i, (wt, secs, vals, binfo) in enumerate(per_win):
         ax = axes[0][i]
         ax.set_facecolor(_ed._PANEL)
         s = np.asarray(secs, dtype=float)
         vz = _robust_z(vals)
         fin = np.isfinite(s) & np.isfinite(vz)
         if fin.sum() == 0:
-            ax.set_title(f"{wt} — no data", color=_ed._MUTED, fontsize=10)
+            ax.set_title(f"{_win_pretty(wt)} — no data", color=_ed._MUTED, fontsize=10)
             continue
         mdts = np.array([datetime.fromtimestamp(x) for x in s[fin]])
-        ax.scatter(mdts, vz[fin], s=3, c="#6a8cff", alpha=0.06, linewidths=0)
+        bands = nb = None
+        if binfo is not None and binfo.get("bands") is not None:
+            ba = np.asarray(binfo["bands"], dtype=int)
+            if ba.size == vz.size:
+                bands, nb = ba[fin], int(binfo.get("n_bands", 10))
+        if _scatter_by_decile(ax, mdts, vz[fin], bands, nb):
+            colored, nb_seen = True, nb
         bm = _bin_circadian(s, vz)
         if bm is not None:
-            ax.plot(bm[0], bm[1], color="#c7d0ff", lw=1.8, marker="o", ms=4,
-                    label=f"{_pretty(feat)} (z)", zorder=4)
+            ax.plot(bm[0], bm[1], color="#ffffff", lw=1.8, marker="o", ms=4,
+                    label=f"{_pretty(feat)} (z)", zorder=5)
         ax.axhline(0, color=_ed._MUTED, lw=0.5, alpha=0.3)
         # clip the y-view to the bulk so heavy-tailed outliers don't compress the
         # trend line (the median line is the point); outliers run off-screen.
         lo_y, hi_y = np.nanpercentile(vz[fin], [1, 99])
         ax.set_ylim(lo_y - (0.4 * (hi_y - lo_y) + 0.5),
                     hi_y + (0.4 * (hi_y - lo_y) + 0.5))
-        ax.set_title(wt, color=_ed._TEXT, fontsize=10, loc="left")
+        ax.set_title(_win_pretty(wt), color=_ed._TEXT, fontsize=10, loc="left")
         ax.set_ylabel("robust z (per window)", color="#aaa", fontsize=9)
         ax.tick_params(colors=_ed._MUTED, labelsize=8)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
@@ -743,9 +893,19 @@ def _fig_metric_trends(feat, per_win, meta, out) -> str:
             leg = ax.legend(fontsize=8, frameon=False, loc="upper left")
             for t in leg.get_texts():
                 t.set_color(_ed._TEXT)
-    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} · "
-                 f"OVER TIME (robust z; 6 h circadian median)",
-                 color=_ed._TEXT, fontsize=12)
+    if colored and nb_seen:                               # shared decile colourbar
+        # exact decile colours (same truncated turbo as the scatter) as discrete bands
+        cmap = ListedColormap(plt.cm.turbo(np.linspace(0.12, 0.92, nb_seen)))
+        norm = BoundaryNorm(np.arange(0.5, nb_seen + 1.5), nb_seen)
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        cb = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.03, pad=0.01)
+        cb.set_label("response decile (low → high)", color=_ed._MUTED, fontsize=8)
+        cb.set_ticks([1, nb_seen])
+        cb.set_ticklabels(["D1", f"D{nb_seen}"])
+        cb.ax.tick_params(colors=_ed._MUTED, labelsize=7)
+    fig.suptitle(f"{meta['animal']} · {meta['channel']} · {_pretty(feat)} · OVER "
+                 f"TIME (robust z, gain-corrected; points colored by decile; 6 h "
+                 f"median)", color=_ed._TEXT, fontsize=12)
     return _pkg._finish(fig, out, feat if feat not in _HF_DOCS else None)
 
 
@@ -931,15 +1091,22 @@ def _fig_circadian_means(circ, meta, out) -> str:
 def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                            features=None, windows=None, n_bands=10,
                            channel_override=None, include_week=True, n_days=7,
-                           progress=None) -> dict:
+                           progress=None, config=None, gains=None) -> dict:
     """Windowed decile-shapes package ending *end_day*. Renders, per (period,
     window, feature): the ridgeline (mean±SD), peak-normalized overlay, and
     per-decile mean±SD grid, plus the metric-vs-stim trends and circadian means.
     ``n_days=2, include_week=False`` -> the daily package (last 2 days); the
-    defaults -> the weekly. Returns a manifest (also written as manifest.json +
+    defaults -> the weekly. Amplitude features are GAIN-CORRECTED (÷ each
+    recording's amplifier gain from File_Records) so a mid-experiment gain change
+    is not read as a real step; pass *gains* (an AmplifierGains) directly, or
+    *config* to load them. Returns a manifest (also written as manifest.json +
     index.html)."""
     features = [f for f in (features or (_pkg.PACKAGE_FEATURES + HF_NAMES))
                 if f in _ef.ALL_COLUMNS or f in HF_NAMES]
+    if gains is None and config is not None:
+        if progress:
+            progress("loading amplifier gains (File_Records)…")
+        gains = load_amplifier_gains(config)
     windows = windows or WINDOWS_MS
     variants = _variants(windows)                    # raw windows + LP variants
     wtags_windows = [(tag, win) for tag, win, _c, _l in variants]
@@ -960,8 +1127,13 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
     if progress:
         progress(f"recomputing {len(features)} features over {len(windows)} "
                  f"windows for {len(win_files)} recordings…")
-    series, ylim, stim, circ = windowed_values(win_files, animal, channel, features,
-                                               windows, week_key, progress)
+    series, ylim, stim, circ, gain_info = windowed_values(
+        win_files, animal, channel, features, windows, week_key, progress, gains)
+    if progress:
+        gl = gain_info.get("gains") or []
+        progress(f"gain-corrected {gain_info['corrected']}/"
+                 f"{gain_info['corrected'] + gain_info['uncorrected']} recordings "
+                 f"(gains seen: {gl or 'none'})")
 
     # band per (window, period, feature)
     info: dict = {}                                  # info[period][wtag][feat]
@@ -1001,7 +1173,8 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
             progress(f"rendering {period} ({len(pfiles)} recordings)…")
         figures += _render_period(pfiles, animal, channel, period, p_windows,
                                   info_pw, ylim, labels, pkg, variant_cfg,
-                                  is_week=(period == week_key), progress=progress)
+                                  is_week=(period == week_key), progress=progress,
+                                  gains=gains)
 
     # Metrics-over-time trends ALWAYS span the full window (the week_key series
     # holds every response over n_days) -- cheap, no trace reads. One figure per
@@ -1020,7 +1193,8 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
         for wt, _w in wtags_windows:
             ser = series.get(wt, {}).get(trend_src)
             if ser is not None:
-                per_win.append((wt, ser["secs"], ser["metrics"][feat]))
+                binfo = info.get(trend_src, {}).get(wt, {}).get(feat)
+                per_win.append((wt, ser["secs"], ser["metrics"][feat], binfo))
         if not per_win:
             continue
         tp = os.path.join(trend_dir, f"{feat}.png")
@@ -1068,7 +1242,7 @@ def build_windowed_package(animal, evoked_dir, end_day, out_root, *,
                 "docs": {f: _doc(f) for f in features},
                 "trends": trends, "circadian": circadian_rel,
                 "stim_corr": stim_corr_rel, "stim_scatter": stim_scatter,
-                "figures": figures}
+                "gain": gain_info, "figures": figures}
     with open(os.path.join(pkg, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     _write_index(pkg, manifest, labels)
@@ -1336,7 +1510,7 @@ def send_windowed_email(animal, evoked_dir, end_day, config, emailer, *,
     n_days = 7 if weekly else int(daily_days or 2)
     manifest = build_windowed_package(
         animal, evoked_dir, end_day, out_root, features=features, windows=windows,
-        include_week=weekly, n_days=n_days, progress=progress)
+        include_week=weekly, n_days=n_days, progress=progress, config=config)
     if manifest.get("empty"):
         return {"sent": False, "reason": manifest.get("reason", "no data"),
                 "animal": animal}
@@ -1405,7 +1579,7 @@ def _main(argv=None) -> int:
                                      evoked_dir=evoked_dir, out_root=out,
                                      features=feats, windows=windows,
                                      include_week=weekly, n_days=7 if weekly else 1,
-                                     progress=prog)
+                                     progress=prog, config=cfg)
     print("RESULT:", {k: v for k, v in res.items()
                       if k not in ("figures", "docs", "manifest")})
     return 0

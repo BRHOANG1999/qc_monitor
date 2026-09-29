@@ -75,6 +75,51 @@ def test_default_windows():
     assert all(w[0] == 2.0 for w in ew.WINDOWS_MS)
 
 
+def test_lp500_variant_window_is_2_to_50ms():
+    # the low-pass-500 variant crops the 2-50 ms window (500 is the Hz cutoff, not ms)
+    tag, s, e, hz = ew.LP_VARIANTS[0]
+    assert (tag, s, e, hz) == ("lp500", 2.0, 50.0, 500.0)
+    variants = ew._variants(ew.WINDOWS_MS)
+    lp = [v for v in variants if v[0] == "lp500"][0]
+    assert lp[1] == (2.0, 50.0)                           # (start, end) window
+    assert lp[3] == 500.0                                 # cutoff Hz
+    assert lp[2].bandpass and lp[2].bp_high_hz == 500.0
+
+
+def test_win_pretty_spells_out_window_and_cutoff():
+    # the raw tag just gets an en-dash; the LP tag spells out BOTH numbers + units
+    assert ew._win_pretty("2-500ms") == "2–500ms"
+    lp = ew._win_pretty("lp500")
+    assert "2–50 ms" in lp and "500 Hz" in lp and "low-pass" in lp
+
+
+def test_raw_base_and_file_gain_resolution():
+    from src.utils.amplifier_records import (AmplifierGains, _norm_chan,
+                                             _norm_chan_free)
+    fp = r"d/chronicStim__BCH111SR___2026_09_18__00_45_12_evoked.mat"
+    rb = ew._raw_base(fp)
+    assert rb == "chronicStim__BCH111SR___2026_09_18__00_45_12"   # .mat + _evoked gone
+    g = AmplifierGains(by_file={_norm_chan_free(rb):
+                                {_norm_chan("BCH111SR"): 300.0}})
+    assert ew._file_gain(g, fp, "BCH111", "BCH111SR") == 300.0
+    assert ew._file_gain(None, fp, "BCH111", "BCH111SR") is None     # no gains loaded
+    assert ew._file_gain(AmplifierGains(), fp, "BCH111", "BCH111SR") is None  # unknown
+
+
+def test_scatter_by_decile_colors_when_bands_given():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from datetime import datetime
+    fig, ax = plt.subplots()
+    mdts = np.array([datetime(2026, 9, 20, h) for h in range(10)])
+    vz = np.linspace(-2, 2, 10)
+    bands = np.arange(10)                                 # one point per decile
+    assert ew._scatter_by_decile(ax, mdts, vz, bands, 10) is True
+    assert ew._scatter_by_decile(ax, mdts, vz, None, None) is False
+    plt.close(fig)
+
+
 # --------------------------------------------------------------------- #
 #  HF band power, circadian binning, stim P2P (the 2026-09-23 additions)
 # --------------------------------------------------------------------- #
