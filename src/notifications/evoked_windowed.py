@@ -239,11 +239,11 @@ def windowed_values(files, animal, channel, features, windows, week_key,
         s_peak = np.asarray(ev.get("stim_peak") or [], dtype=float)
         s_trough = np.asarray(ev.get("stim_trough") or [], dtype=float)
         fs = _fs_of(time_ms)
-        g = _file_gain(gains, fp, animal, channel)   # input-refer amplitudes
+        g = _file_gain(gains, fp, animal, channel)   # input-refer the EVOKED traces
         if g:
-            traces = traces / g
-            s_peak = s_peak / g if s_peak.size else s_peak
-            s_trough = s_trough / g if s_trough.size else s_trough
+            traces = traces / g          # evoked response scales with gain (÷ it)
+            # NOTE stim P2P (s_peak/s_trough) is left RAW: the stim artifact rails ->
+            # its recorded amplitude is gain-INdependent (verified 0.89 at 300× & 150×).
             gain_info["corrected"] += 1
             gain_info["gains"].add(round(g, 4))
         else:
