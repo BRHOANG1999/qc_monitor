@@ -127,11 +127,20 @@ def _gaussian_null(Xn: np.ndarray, seed: int) -> np.ndarray:
 
 
 def stability_curve(Xn: np.ndarray, k_range: tuple[int, int], *,
-                    n_boot: int = 100, seed: int = 0) -> pd.DataFrame:
+                    n_boot: int = 100, seed: int = 0,
+                    max_n: int = 2500) -> pd.DataFrame:
     """Per k: observed ARI/Jaccard, the same on a covariance-matched Gaussian null, and
     the observed-minus-null differences (the honest, k-inflation-corrected stability).
-    Columns: ``k, ari, jaccard, ari_null, jaccard_null, ari_excess, jaccard_excess``."""
+    Columns: ``k, ari, jaccard, ari_null, jaccard_null, ari_excess, jaccard_excess``.
+
+    The bootstrap is O(k_range x n_boot x n_trials) k-means fits, so on a large trace
+    matrix the trials are first subsampled to *max_n* (a representative sample is
+    enough to measure how reproducibly the partition splits; the final templates and
+    labels still use every trial). This keeps Stage 4 tractable at a high gather cap."""
     lo, hi = int(k_range[0]), int(k_range[1])
+    if Xn.shape[0] > max_n:
+        rng = np.random.default_rng(seed + 11)
+        Xn = Xn[np.sort(rng.choice(Xn.shape[0], size=max_n, replace=False))]
     block = _rs.block_length(_st.shape_pca(Xn, n_components=1, seed=seed)["Z"][:, 0])
     null = _gaussian_null(Xn, seed)
     rows = []
