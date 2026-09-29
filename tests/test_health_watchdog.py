@@ -68,7 +68,7 @@ def test_check_email_jobs_flags_error_loop(tmp_path):
     }
     res = {r.name: r for r in ck.check_email_jobs(config, now=now)}
     r = res["job:stim_stability_daily"]
-    assert r.status == "fail" and r.remedy == "restart:QCMonitorDaemon"
+    assert r.status == "fail" and r.remedy == "fixjob:stim_stability_daily"
 
 
 def test_check_services_flags_stopped(monkeypatch):
@@ -132,6 +132,23 @@ def test_apply_remedies_dry_run(tmp_path):
     actions = rem.apply_remedies(results, lg, dry_run=True)
     assert actions[0]["attempted"] is False
     assert "dry-run" in actions[0]["note"]
+
+
+def test_fixjob_releases_claim_and_restarts(tmp_path, monkeypatch):
+    lg = _ledger(tmp_path)
+    released = {}
+
+    class FakeStore:
+        def release_notification_sent(self, digest, date):
+            released["digest"] = digest
+
+    monkeypatch.setattr(rem, "restart_service", lambda name, **k: (True, "restarted"))
+    results = [ck.HealthResult("job:stim_stability_daily", "fail", "loop",
+                               remedy="fixjob:stim_stability_daily")]
+    actions = rem.apply_remedies(results, lg, dry_run=False, store=FakeStore())
+    assert actions[0]["attempted"] is True and actions[0]["ok"] is True
+    assert released.get("digest") == "stim_stability_daily"
+    assert "released" in actions[0]["note"]
 
 
 # --------------------------- watchdog cycle --------------------------- #

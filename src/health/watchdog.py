@@ -78,7 +78,7 @@ def run_cycle(config: dict, *, dry_run: bool = False, force_email: bool = False,
     store = store if store is not None else _open_store(config)
     results = _checks.run_all(config, store)
     ledger = _rem.RemediationLedger(config)
-    actions = _rem.apply_remedies(results, ledger, dry_run=dry_run)
+    actions = _rem.apply_remedies(results, ledger, dry_run=dry_run, store=store)
     escalated = ledger.escalated_keys()
     overall = _overall(results)
     report = build_report(results, actions, overall, escalated)

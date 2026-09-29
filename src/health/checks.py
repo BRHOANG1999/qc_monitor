@@ -154,10 +154,15 @@ def check_email_jobs(config: dict, *, now: datetime | None = None) -> list[Healt
     hc = _hcfg(config)
     grace_h = float(hc.get("job_grace_hours", 3.0))
     err_min = int(hc.get("error_loop_min", 2))
+    # Only count RECENT errors: a loop that stopped (e.g. after a restart) must not
+    # keep flagging FAIL, or the auto-fix would release the claim and re-fire a
+    # duplicate send. The window is short enough that only an ACTIVE loop (retries
+    # every ~90 s) accumulates >= err_min hits.
+    err_win_min = float(hc.get("error_window_min", 15.0))
     log_path = hc.get("log_file") or os.path.join("logs", "qc_monitor.log")
     state = _read_state(config)
     notif = _dig(config, ("notifications",)) or {}
-    errs = _recent_error_labels(log_path, now - timedelta(hours=1))
+    errs = _recent_error_labels(log_path, now - timedelta(minutes=err_win_min))
     out: list[HealthResult] = []
     for job in JOBS:
         cfg = _dig(notif, job.cfg_path) or {}
@@ -167,10 +172,13 @@ def check_email_jobs(config: dict, *, now: datetime | None = None) -> list[Healt
         n_err = sum(1 for e in errs if job.log_label.lower() in e.lower())
         overdue = _job_overdue(job, cfg, last, now, grace_h)
         if n_err >= err_min:
+            # Compound remedy: a mid-send crash can leave a stale dedup claim that a
+            # plain restart does NOT clear (the claim then silently suppresses the
+            # resend), so the fix is "release today's claim + restart the daemon".
             out.append(HealthResult(
                 f"job:{job.state_key}", "fail",
                 f"raising repeatedly ({n_err} errors/last hour); last sent {last or 'never'}",
-                remedy=f"restart:{_DAEMON}", severity="warning",
+                remedy=f"fixjob:{job.state_key}", severity="warning",
                 meta={"errors": n_err, "last": last}))
         elif overdue:
             out.append(HealthResult(

@@ -132,11 +132,42 @@ def _is_running(name: str, wait_sec: float) -> bool:
     return False
 
 
+_DAEMON = "QCMonitorDaemon"
+
+
+def _release_claim(digest: str, store) -> str:
+    """Clear today's dedup claim for *digest* so a resend can proceed (the fix for a
+    stale claim left by a crash mid-send). Best-effort; returns a note."""
+    if store is None:
+        return "no store handle (cannot release claim)"
+    from datetime import date
+    try:
+        store.release_notification_sent(digest, date.today().isoformat())
+        return f"released today's claim for {digest}"
+    except Exception as e:                               # noqa: BLE001
+        return f"claim release failed: {e}"
+
+
+def _do_remedy(key: str, store) -> tuple[bool, str]:
+    """Execute one remedy. ``restart:<svc>`` restarts a service. ``fixjob:<digest>``
+    releases the job's stale claim THEN restarts the daemon (reload code + un-suppress
+    the resend), in that order so the fixed code re-fires against a clear claim."""
+    if key.startswith("restart:"):
+        return restart_service(key.split(":", 1)[1])
+    if key.startswith("fixjob:"):
+        digest = key.split(":", 1)[1]
+        ok, note = restart_service(_DAEMON)
+        rel = _release_claim(digest, store)
+        return ok, f"{note}; {rel}"
+    return False, "no auto-fix for this remedy"
+
+
 def apply_remedies(results, ledger: RemediationLedger, *, dry_run: bool,
-                   now: float | None = None) -> list[dict]:
+                   store=None, now: float | None = None) -> list[dict]:
     """Apply the bounded auto-fix for each distinct remedy named by a failing result.
-    Returns a list of ``{remedy, attempted, ok, note}`` actions. Only
-    ``restart:<service>`` is auto-fixable; anything else is alert-only."""
+    Returns a list of ``{remedy, attempted, ok, note}``. Auto-fixable remedies are
+    ``restart:<service>`` and ``fixjob:<digest>`` (release stale claim + restart
+    daemon); anything else is alert-only."""
     remedies = sorted({r.remedy for r in results
                        if r.status == "fail" and r.remedy})
     actions: list[dict] = []
@@ -146,15 +177,15 @@ def apply_remedies(results, ledger: RemediationLedger, *, dry_run: bool,
             actions.append({"remedy": key, "attempted": False, "ok": False,
                             "note": why})
             continue
-        if not key.startswith("restart:"):
+        if not (key.startswith("restart:") or key.startswith("fixjob:")):
             actions.append({"remedy": key, "attempted": False, "ok": False,
                             "note": "no auto-fix for this remedy"})
             continue
         if dry_run:
             actions.append({"remedy": key, "attempted": False, "ok": False,
-                            "note": "dry-run (would restart)"})
+                            "note": "dry-run (would auto-fix)"})
             continue
-        ok, note = restart_service(key.split(":", 1)[1])
+        ok, note = _do_remedy(key, store)
         ledger.record(key, ok, now=now)
         actions.append({"remedy": key, "attempted": True, "ok": ok, "note": note})
     return actions
