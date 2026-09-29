@@ -26,9 +26,13 @@ def main(argv=None) -> int:
                     help="write figures + report (default: dry-run)")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore any cached dataset")
+    ap.add_argument("--days", type=int, default=None,
+                    help="override the gather window (days of recordings)")
     a = ap.parse_args(argv)
 
     config = load_config()
+    if a.days is not None:
+        config.setdefault("evoked_shapes", {})["days"] = int(a.days)
     print(f"evoked_shapes: {a.animal} (apply={a.apply})", flush=True)
     summary = _run.build_animal(a.animal, config, apply=a.apply,
                                 cache=not a.no_cache, log=_log)
