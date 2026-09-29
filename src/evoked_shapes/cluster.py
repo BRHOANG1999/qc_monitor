@@ -73,7 +73,7 @@ def assign_by_template(Xn: np.ndarray, templates: np.ndarray, *,
 
 
 def cluster_sweep(Xn: np.ndarray, *, k_range: tuple[int, int] = (2, 10),
-                  n_init: int = 50, seed: int = 0, absolute: bool = False) -> dict:
+                  n_init: int = 12, seed: int = 0, absolute: bool = False) -> dict:
     """Correlation k-means for every k in ``k_range`` (inclusive). Returns
     ``{k: result_dict}``. k values above the trial count are skipped."""
     lo, hi = int(k_range[0]), int(k_range[1])

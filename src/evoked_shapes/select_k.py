@@ -99,13 +99,13 @@ def _stability_once(Xn: np.ndarray, k: int, block: int, seed: int,
     """Mean bootstrap ARI and mean min-Jaccard of a k-means partition of *Xn* under
     moving-block resampling. Reference = fit on the full data."""
     from sklearn.metrics import adjusted_rand_score
-    ref = _cl.correlation_kmeans(Xn, k, seed=seed)["labels"]
+    ref = _cl.correlation_kmeans(Xn, k, n_init=8, seed=seed)["labels"]
     rng = np.random.default_rng(seed + 7)
     aris, jacs = [], []
     n = Xn.shape[0]
     for _ in range(n_boot):
         idx = _rs.block_index(n, block, rng)
-        res = _cl.correlation_kmeans(Xn[idx], k, n_init=10, seed=seed)
+        res = _cl.correlation_kmeans(Xn[idx], k, n_init=5, seed=seed)
         lab = _cl.assign_by_template(Xn, res["templates"])
         aris.append(adjusted_rand_score(ref, lab))
         jacs.append(_jaccard_min(ref, lab))
