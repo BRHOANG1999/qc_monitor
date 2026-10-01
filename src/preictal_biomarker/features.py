@@ -144,7 +144,9 @@ def _detrend_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     z = df["zss"].to_numpy(float)
     ok = np.isfinite(z)
-    for f in C.WAVEFORM_FEATURES:
+    for f in C.DETREND_FEATURES:
+        if f not in df.columns:
+            continue
         y = df[f].to_numpy(float)
         m = ok & np.isfinite(y)
         if m.sum() < 10:
@@ -174,13 +176,22 @@ def _add_csd(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("t_epoch").reset_index(drop=True)
     p = df[C.CSD_PRIMARY].to_numpy(float)
     w = int(C.CSD_WIN)
-    var = pd.Series(p).rolling(w, min_periods=w // 2).var(ddof=1).to_numpy()
-    ar1 = np.full(len(p), np.nan)
+    s = pd.Series(p)
+    mp = w // 2
+    var = s.rolling(w, min_periods=mp).var(ddof=1)
+    std = s.rolling(w, min_periods=mp).std(ddof=1)
+    mean = s.rolling(w, min_periods=mp).mean()
+    skew = s.rolling(w, min_periods=mp).skew()
+    dvar = pd.Series(np.r_[np.nan, np.diff(p)]).rolling(w, min_periods=mp).var(ddof=1)
+    df["csd_variance"] = var.to_numpy()                       # rising variance
+    df["csd_skew"] = skew.to_numpy()                          # rising skewness
+    df["csd_cv"] = (std / mean.abs().replace(0, np.nan)).to_numpy()   # coeff. of var
+    df["csd_redden"] = (var / dvar.replace(0, np.nan)).to_numpy()     # low/high power
+    ar1 = np.full(len(p), np.nan)                             # rising lag-1 autocorr
     for i in range(len(p)):
         lo = max(0, i - w + 1)
-        if i - lo + 1 >= w // 2:
+        if i - lo + 1 >= mp:
             ar1[i] = _ar1(p[lo:i + 1])
-    df["csd_variance"] = var
     df["csd_ar1"] = ar1
     return df
 

@@ -40,17 +40,43 @@ N_PCS = 6                     # PCs retained (~95% var in the original figures)
 K_STATES = 4                  # k-means clusters
 SEED = 0
 
-# The 8 features behind the figures. Six are per-waveform; two are across-trial
-# critical-slowing-down (CSD) statistics of a primary feature's time series.
+# ---- Expanded per-waveform metric set (all cheap -> already in the matrix) ----
+# Grouped so the state space is not energy-dominated. All computed on the 2-50 ms
+# evoked (feature branch) or residual (residual branch) waveform.
+AMPL_ENERGY = ["line_length", "rms_amplitude", "variance", "peak_to_trough",
+               "max_slope", "log_auc", "early_area", "late_area"]
+SHAPE_FEATURES = ["curvature", "skewness", "early_late_ratio", "autocorrelation"]
+LATENCY_FEATURES = ["peak_latency_ms", "trough_latency_ms", "tp_latency_ms",
+                    "max_slope_time_ms"]
+SPECTRAL_FEATURES = ["sum_power_low", "sum_power_mid", "sum_power_high",
+                     "freq_moment_low", "freq_moment_high", "freq_moment_vhigh",
+                     "wavelet_power_slow_gamma", "wavelet_power_gamma",
+                     "wavelet_power_high_gamma"]
+# Across-trial critical-slowing-down stats of the primary feature's time series.
+CSD_FEATURES = ["csd_variance", "csd_ar1", "csd_skew", "csd_cv", "csd_redden"]
+CSD_PRIMARY = "peak_to_trough"   # feature whose rolling stats = the CSD set
+CSD_WIN = 20                     # trials per rolling CSD window
+# pHFO occurrence (riding_event), joined per epoch. Added by features when present.
+PHFO_FEATURES = ["phfo_frac", "phfo_prom", "phfo_snr"]
+
+# The full feature set fed to PCA (pHFO appended when the join is available).
+FEATURES = (AMPL_ENERGY + SHAPE_FEATURES + LATENCY_FEATURES + SPECTRAL_FEATURES
+            + CSD_FEATURES)
+
+# Impedance (Z_ss) scales response MAGNITUDE -> detrend the amplitude/energy/power
+# features; leave latency / frequency-moment / ratio / shape features raw.
+DETREND_FEATURES = (["line_length", "rms_amplitude", "variance", "peak_to_trough",
+                     "max_slope", "log_auc", "early_area", "late_area"]
+                    + ["sum_power_low", "sum_power_mid", "sum_power_high",
+                       "wavelet_power_slow_gamma", "wavelet_power_gamma",
+                       "wavelet_power_high_gamma"])
+
+# amplitude-scaled features (gain-corrected in the matrix); kept for reference.
+AMPL_FEATURES = ["peak_to_trough", "rms_amplitude", "line_length", "max_slope"]
+# legacy 8-feature set (pre-expansion), kept so old caches/calls still resolve.
 WAVEFORM_FEATURES = ["line_length", "rms_amplitude", "variance",
                      "autocorrelation", "peak_to_trough", "max_slope"]
-CSD_FEATURES = ["csd_variance", "csd_ar1"]
-FEATURES8 = WAVEFORM_FEATURES + CSD_FEATURES
-CSD_PRIMARY = "peak_to_trough"   # feature whose rolling var / AR1 = the CSD pair
-CSD_WIN = 20                     # trials per rolling CSD window
-
-# amplitude-scaled features (gain-corrected in the matrix); the rest are shape.
-AMPL_FEATURES = ["peak_to_trough", "rms_amplitude", "line_length", "max_slope"]
+FEATURES8 = WAVEFORM_FEATURES + ["csd_variance", "csd_ar1"]
 
 # --- paths -------------------------------------------------------------------
 OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_preictal_biomarker")

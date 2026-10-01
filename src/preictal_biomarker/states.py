@@ -37,7 +37,7 @@ def fit_states(df: pd.DataFrame, *, features=None, n_pcs=None, k=None,
                seed=None) -> StateModel:
     """Fit PCA+k-means on the finite-feature rows; annotate every row with its PC
     coordinates and state (``-1`` where a feature was missing)."""
-    features = list(features or C.FEATURES8)
+    features = list(features or C.FEATURES)
     n_pcs = int(n_pcs or C.N_PCS)
     k = int(k or C.K_STATES)
     seed = C.SEED if seed is None else int(seed)
