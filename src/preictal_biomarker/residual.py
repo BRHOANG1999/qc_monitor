@@ -140,13 +140,20 @@ def fit_residual_states(data: dict, store, *, n_pcs=None, k=None, peri_only=True
     every epoch (for a gap-free continuous timeline)."""
     from sklearn.decomposition import PCA
     from sklearn.cluster import KMeans
-    n_pcs = int(n_pcs or C.N_PCS); k = int(k or C.K_STATES)
+    k = int(k or C.K_STATES)
     res, t = data["res"], data["t"]
     df, order = _seizure_join(t, store)
     X = res[order]
     if peri_only:
         keep = df["phase"].to_numpy() != "none"   # only epochs in a peri-ictal window
         df = df[keep].reset_index(drop=True); X = X[keep]
+    if n_pcs is None:                              # #PCs to reach VAR_TARGET var
+        full = PCA(random_state=C.SEED).fit(X)
+        n_pcs = int(np.searchsorted(np.cumsum(full.explained_variance_ratio_),
+                                    C.VAR_TARGET) + 1)
+        n_pcs = max(2, min(n_pcs, X.shape[1]))
+    else:
+        n_pcs = int(n_pcs)
     pca = PCA(n_components=n_pcs, random_state=C.SEED).fit(X)
     emb = pca.transform(X)
     km = KMeans(n_clusters=k, random_state=C.SEED, n_init=10).fit(emb)
@@ -307,7 +314,7 @@ def run_residual_metrics(*, force=False, n_surr=500) -> dict:
     from src.db.store import Store
     from src.dashboard.data_helpers import load_config
     cfg = load_config(); store = Store(cfg["database"]["path"]); db = cfg["database"]["path"]
-    df = residual_metric_matrix(store, db, force=force)
+    df = F._with_phfo(residual_metric_matrix(store, db, force=force))
     model = S.fit_states(df)
     lead = F.lead_onsets(store)
     pre = S.preictal_mask(model.df); base = S.baseline_mask(model.df)

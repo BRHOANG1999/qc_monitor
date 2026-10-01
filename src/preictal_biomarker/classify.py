@@ -76,7 +76,8 @@ def _labels_for_onsets(t, onsets):
 def classify_null(df: pd.DataFrame, lead_onsets, *, features=None,
                   n_surr: int = 500, seed: int = 0) -> dict:
     """Observed LOSO-AUC (pre vs baseline) + circular-shift null + p-value."""
-    features = list(features or C.FEATURES)
+    if features is None:
+        features = C.FEATURES + [c for c in C.PHFO_FEATURES if c in df.columns]
     features = [f for f in features if f in df.columns]
     X = df[features].to_numpy(float)
     t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)

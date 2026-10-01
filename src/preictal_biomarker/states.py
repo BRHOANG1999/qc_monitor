@@ -41,7 +41,9 @@ def fit_states(df: pd.DataFrame, *, features=None, n_pcs=None, k=None,
     The number of PCs is chosen to reach *var_target* cumulative variance
     (default C.VAR_TARGET=0.95), THEN k-means clusters on all of those PCs. Pass
     an explicit *n_pcs* to override with a fixed count."""
-    features = list(features or C.FEATURES)
+    if features is None:
+        features = C.FEATURES + [c for c in C.PHFO_FEATURES if c in df.columns]
+    features = list(features)
     var_target = C.VAR_TARGET if var_target is None else float(var_target)
     k = int(k or C.K_STATES)
     seed = C.SEED if seed is None else int(seed)

@@ -202,7 +202,7 @@ def build_feature_matrix(store, evoked_dir: str, db_path: str, *,
     parquet; pass force=True to rebuild. Warms LP sidecars on a cold build."""
     if not force and os.path.exists(C.FEATURE_CACHE):
         _log(f"loading cached feature matrix: {C.FEATURE_CACHE}")
-        return pd.read_pickle(C.FEATURE_CACHE)
+        return _with_phfo(pd.read_pickle(C.FEATURE_CACHE))
     onsets = scoped_onsets(store)
     assert onsets.size >= 2, "need >= 2 in-scope seizures"
     _log(f"{onsets.size} in-scope seizures "
@@ -219,4 +219,19 @@ def build_feature_matrix(store, evoked_dir: str, db_path: str, *,
     os.makedirs(C.CACHE_DIR, exist_ok=True)
     df.to_pickle(C.FEATURE_CACHE)
     _log(f"cached -> {C.FEATURE_CACHE}  ({len(df)} rows)")
+    return _with_phfo(df)
+
+
+def _with_phfo(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach per-epoch phfo_present by epoch time if the pHFO cache exists."""
+    try:
+        from . import phfo as _phfo
+        if os.path.exists(_phfo._PHFO_CACHE):
+            ptab = pd.read_pickle(_phfo._PHFO_CACHE)
+            df = _phfo.attach_phfo(df, ptab)
+            n = int(df["phfo_present"].notna().sum())
+            _log(f"attached pHFO: {n}/{len(df)} epochs matched "
+                 f"({100*df['phfo_present'].mean(skipna=True):.0f}% pHFO+)")
+    except Exception as e:                            # noqa: BLE001
+        _log(f"pHFO attach skipped: {type(e).__name__}: {e}")
     return df
