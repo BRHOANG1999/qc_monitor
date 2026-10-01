@@ -36,7 +36,11 @@ PREICTAL_SEC = 1800.0         # pre-ictal = 30 min before onset
 BASELINE_MIN_SEC = 7200.0     # clean baseline = >= 2 h from any seizure
 
 # --- state space -------------------------------------------------------------
-N_PCS = 6                     # PCs retained (~95% var in the original figures)
+# Retain as many PCs as needed to reach VAR_TARGET cumulative variance, THEN
+# cluster on those (not a fixed count). With the expanded feature set 6 PCs is
+# only ~68% var, so a fixed 6 would discard a third of the structure.
+VAR_TARGET = 0.95             # cumulative explained-variance target for #PCs
+N_PCS = 6                     # legacy fallback only (used if VAR_TARGET disabled)
 K_STATES = 4                  # k-means clusters
 SEED = 0
 
@@ -56,8 +60,9 @@ SPECTRAL_FEATURES = ["sum_power_low", "sum_power_mid", "sum_power_high",
 CSD_FEATURES = ["csd_variance", "csd_ar1", "csd_skew", "csd_cv", "csd_redden"]
 CSD_PRIMARY = "peak_to_trough"   # feature whose rolling stats = the CSD set
 CSD_WIN = 20                     # trials per rolling CSD window
-# pHFO occurrence (riding_event), joined per epoch. Added by features when present.
-PHFO_FEATURES = ["phfo_frac", "phfo_prom", "phfo_snr"]
+# pHFO occurrence (riding_event), joined per epoch (0/1). Added when the join
+# is available (see phfo.py); appended to FEATURES by features.build when present.
+PHFO_FEATURES = ["phfo_present"]
 
 # The full feature set fed to PCA (pHFO appended when the join is available).
 FEATURES = (AMPL_ENERGY + SHAPE_FEATURES + LATENCY_FEATURES + SPECTRAL_FEATURES

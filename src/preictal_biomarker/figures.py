@@ -60,7 +60,8 @@ def pca_scatter(ax, model, highlight_mask=None, pcx=0, pcy=1, *,
         ax.scatter(xs[hi], ys[hi], s=9, c=C.SEIZURE_COLOR, alpha=0.55,
                    linewidths=0, zorder=6,
                    label=f"pre-ictal ≤30 min (n={int(highlight_mask.sum())})")
-    _dark(ax, f"states (k={C.K_STATES}) on {C.N_PCS} PCs · PC{pcx+1} vs PC{pcy+1}")
+    _dark(ax, f"states (k={C.K_STATES}) on {len(model.explained_var)} PCs · "
+              f"PC{pcx+1} vs PC{pcy+1}")
     ax.set_xlabel(f"PC{pcx + 1}")
     ax.set_ylabel(f"PC{pcy + 1}")
     leg = ax.legend(fontsize=6.5, framealpha=0.15, loc="upper right")
@@ -113,7 +114,7 @@ def anchor_figure(model, occ, highlight_mask, out_png: str) -> str:
     occupancy_bars(fig.add_subplot(gs[0, 2]), occ, model)
     ev = model.explained_var
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · PCA/k-means state space "
-                 f"({C.N_PCS} PCs, {100*ev[:C.N_PCS].sum():.0f}% var) · anchor check",
+                 f"({len(ev)} PCs, {100*ev.sum():.0f}% var) · anchor check",
                  color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")

@@ -34,11 +34,15 @@ class StateModel:
 
 
 def fit_states(df: pd.DataFrame, *, features=None, n_pcs=None, k=None,
-               seed=None) -> StateModel:
+               seed=None, var_target=None) -> StateModel:
     """Fit PCA+k-means on the finite-feature rows; annotate every row with its PC
-    coordinates and state (``-1`` where a feature was missing)."""
+    coordinates and state (``-1`` where a feature was missing).
+
+    The number of PCs is chosen to reach *var_target* cumulative variance
+    (default C.VAR_TARGET=0.95), THEN k-means clusters on all of those PCs. Pass
+    an explicit *n_pcs* to override with a fixed count."""
     features = list(features or C.FEATURES)
-    n_pcs = int(n_pcs or C.N_PCS)
+    var_target = C.VAR_TARGET if var_target is None else float(var_target)
     k = int(k or C.K_STATES)
     seed = C.SEED if seed is None else int(seed)
     assert set(features).issubset(df.columns), "missing feature columns"
@@ -47,7 +51,14 @@ def fit_states(df: pd.DataFrame, *, features=None, n_pcs=None, k=None,
     assert mask.sum() > k * 10, "too few finite-feature rows to cluster"
     Xz = StandardScaler().fit_transform(X[mask])
     scaler = StandardScaler().fit(X[mask])
-    pca = PCA(n_components=n_pcs, random_state=seed).fit(Xz)
+    if n_pcs is not None:                              # explicit fixed count
+        pca = PCA(n_components=int(n_pcs), random_state=seed).fit(Xz)
+    else:                                              # #PCs to reach var_target
+        full = PCA(random_state=seed).fit(Xz)
+        n_pcs = int(np.searchsorted(np.cumsum(full.explained_variance_ratio_),
+                                    var_target) + 1)
+        n_pcs = max(2, min(n_pcs, Xz.shape[1]))
+        pca = PCA(n_components=n_pcs, random_state=seed).fit(Xz)
     emb = pca.transform(Xz)
     km = KMeans(n_clusters=k, random_state=seed, n_init=10).fit(emb)
     out = df.copy().reset_index(drop=True)
