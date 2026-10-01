@@ -4715,58 +4715,59 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             fname = os.path.basename(r.get("file_path") or "")
             is_active = (active_file_id is not None
                           and int(r["id"]) == int(active_file_id))
+            # Store only the row's display fields now; the Button components are
+            # built lazily for the KEPT days only (below). Building a Button for
+            # every one of up to _QUEUE_LIST_MAX rows and discarding all but
+            # _QUEUE_RENDER_CAP of them was the 7-12 s queue rebuild (it fires on
+            # every file navigation, just to move the active highlight).
+            g = day_groups.setdefault(
+                day_key, {"rows": [], "active": False})
+            g["rows"].append({
+                "file_id": int(r["id"]), "hour_label": hour_label,
+                "dur_h": dur_h, "age_days": age_days, "warn": warn,
+                "fname": fname, "is_active": is_active})
+            if is_active:
+                g["active"] = True
+
+        def _queue_btn(it: dict):
+            active = it["is_active"]
+            age = it["age_days"]
             btn_style: dict = {
                 "display": "flex", "flexDirection": "column",
-                "alignItems": "flex-start",
-                "width": "100%", "border": "none",
-                "background": ("rgba(94, 124, 226, 0.12)"
-                                 if is_active else "transparent"),
-                "color": "#cfd0d6",
-                "padding": "6px 10px",
-                "cursor": "pointer",
-                "borderBottom":
-                    "1px solid rgba(255,255,255,0.04)",
-                "borderLeft": (
-                    "3px solid #5e7ce2" if is_active
-                    else "3px solid transparent"),
+                "alignItems": "flex-start", "width": "100%", "border": "none",
+                "background": ("rgba(94, 124, 226, 0.12)" if active
+                                 else "transparent"),
+                "color": "#cfd0d6", "padding": "6px 10px", "cursor": "pointer",
+                "borderBottom": "1px solid rgba(255,255,255,0.04)",
+                "borderLeft": ("3px solid #5e7ce2" if active
+                                 else "3px solid transparent"),
                 "textAlign": "left",
             }
-            btn = html.Button([
+            return html.Button([
                 html.Div([
-                    html.Span(hour_label, style={
+                    html.Span(it["hour_label"], style={
                         "color": "#f0f0f5", "fontWeight": "600",
                         "fontSize": "12px"}),
-                    html.Span(f"  ({dur_h:.1f} h)", style={
+                    html.Span(f"  ({it['dur_h']:.1f} h)", style={
                         "color": "#888", "fontSize": "11px",
                         "marginLeft": "4px"}),
                     html.Span(
-                        f"  · {age_days:.1f} d old"
-                        if age_days >= 1 else
-                        f"  · {age_days * 24:.0f} h old",
+                        f"  · {age:.1f} d old" if age >= 1 else
+                        f"  · {age * 24:.0f} h old",
                         style={
-                            "color": ("#EF553B" if warn
-                                       else "#888"),
-                            "fontSize": "10px",
-                            "marginLeft": "auto"}),
+                            "color": ("#EF553B" if it["warn"] else "#888"),
+                            "fontSize": "10px", "marginLeft": "auto"}),
                 ], style={"display": "flex", "alignItems": "center",
                            "width": "100%"}),
                 html.Span(
-                    fname, title=fname,
+                    it["fname"], title=it["fname"],
                     style={"color": "#6f7080", "fontSize": "10px",
-                            "fontFamily": "ui-monospace, SF Mono, "
-                                           "monospace",
-                            "maxWidth": "100%",
-                            "overflow": "hidden",
+                            "fontFamily": "ui-monospace, SF Mono, monospace",
+                            "maxWidth": "100%", "overflow": "hidden",
                             "textOverflow": "ellipsis",
                             "whiteSpace": "nowrap"}),
-            ], id={"type": "video-queue-item",
-                    "file_id": int(r["id"])},
+            ], id={"type": "video-queue-item", "file_id": it["file_id"]},
                 n_clicks=0, style=btn_style)
-            g = day_groups.setdefault(
-                day_key, {"items": [], "active": False})
-            g["items"].append(btn)
-            if is_active:
-                g["active"] = True
 
         # One collapsible section per day; auto-open the day holding the loaded
         # recording, collapse the rest. Bound the rendered wildcard-button
@@ -4777,12 +4778,12 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         for day_key, g in reversed(list(day_groups.items())):   # recent -> old
             if g["active"] or budget > 0:
                 keep.add(day_key)
-                budget -= len(g["items"])
+                budget -= len(g["rows"])
         out = []
         for day_key, g in day_groups.items():
-            n_rec = len(g["items"])
+            n_rec = len(g["rows"])
             if day_key in keep:
-                body = html.Div(g["items"])
+                body = html.Div([_queue_btn(it) for it in g["rows"]])
             else:
                 body = html.Div(
                     f"{n_rec} recording{'' if n_rec == 1 else 's'} — open one "
