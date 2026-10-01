@@ -275,7 +275,9 @@ def per_seizure_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
     ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.6)
     ax.set_yticks(range(M.shape[0]))
     ax.set_yticklabels(traj["labels"], fontsize=7)
-    _dark(ax, f"per-seizure pre-ictal state trajectory (10-min dominant state)"
+    bw = float(traj["edges"][1] - traj["edges"][0])          # bin width (minutes)
+    blab = f"{bw:g}-min" if bw >= 1 else f"{int(round(bw * 60))}-s"
+    _dark(ax, f"per-seizure pre-ictal state trajectory ({blab} dominant state)"
               f"{title_suffix}")
     ax.set_xlabel("minutes from seizure onset")
     ax.set_ylabel("seizure")

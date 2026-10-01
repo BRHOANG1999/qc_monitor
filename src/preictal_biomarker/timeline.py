@@ -91,8 +91,9 @@ def render_timeline(df, onsets, out_png: str, *, bin_sec: float = 600.0,
                      fontsize=8, framealpha=0.0, bbox_to_anchor=(0.5, -0.02))
     for t in leg.get_texts():
         t.set_color(C.TEXT)
+    blab = f"{int(bin_sec//60)}-min" if bin_sec >= 60 else f"{int(bin_sec)}-s"
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · continuous window-dominant state "
-                 f"timeline ({int(bin_sec//60)}-min dominant state)",
+                 f"timeline ({blab} dominant state)",
                  color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0.03, 1, 0.97))
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
