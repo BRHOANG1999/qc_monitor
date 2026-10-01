@@ -8,6 +8,11 @@ glance from reproducible and nothing is buried in a scratch script.
 from __future__ import annotations
 
 import datetime as _dt
+import os as _os
+
+# Repo root (…/qc_monitor), so data paths resolve the same from any cwd — the
+# CLI, a notebook run from notebooks/, or an import elsewhere.
+_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 ANIMAL = "BCH111"
 CHANNEL = "BCH111SR"
@@ -48,9 +53,9 @@ CSD_WIN = 20                     # trials per rolling CSD window
 AMPL_FEATURES = ["peak_to_trough", "rms_amplitude", "line_length", "max_slope"]
 
 # --- paths -------------------------------------------------------------------
-OUT_DIR = "data/BCH111_preictal_biomarker"
-CACHE_DIR = "data/derivatives/preictal_biomarker"
-FEATURE_CACHE = CACHE_DIR + "/BCH111_feature_matrix.pkl"
+OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_preictal_biomarker")
+CACHE_DIR = _os.path.join(_ROOT, "data", "derivatives", "preictal_biomarker")
+FEATURE_CACHE = _os.path.join(CACHE_DIR, "BCH111_feature_matrix.pkl")
 
 # state display palette (matches the existing figures: 0 blue,1 teal,2 gold,3 red)
 STATE_COLORS = ["#5b6ee1", "#2ee6a6", "#f2c744", "#d62f2f"]
