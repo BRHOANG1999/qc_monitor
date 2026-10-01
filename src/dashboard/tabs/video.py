@@ -627,7 +627,13 @@ def _prefetch_chunk_safe(file_path: str, file_id: int) -> None:
     assert isinstance(file_path, str) and file_path, "path required"
     assert isinstance(file_id, int), "file_id must be int"
     try:
-        get_chunk(file_path)
+        # transient=True: cache the NEXT file at the LRU-OLDEST (evict-first)
+        # position so warming it can never push out the recording the operator is
+        # ACTIVELY reviewing. Without this the prefetch (interactive-priority)
+        # landed as newest and, with ~4.7 GB files in an 8 GB budget, evicted the
+        # current file -- so every overlay/zoom/interaction then re-read the
+        # current 4.7 GB chunk from the SMB share (the 5-11 s callbacks).
+        get_chunk(file_path, transient=True)
         logger.debug("prefetched chunk for file_id=%s", file_id)
     except Exception as e:
         logger.debug("prefetch skipped for file_id=%s: %s",
