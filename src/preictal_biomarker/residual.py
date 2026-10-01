@@ -260,6 +260,75 @@ def run_residual(*, force=False, with_anim=True) -> dict:
     return {"model": model, "extras": extras, "out": out}
 
 
+_RM_CACHE = C.CACHE_DIR + "/BCH111_resid_metrics.pkl"
+
+
+def residual_metric_matrix(store, db, *, force=False) -> pd.DataFrame:
+    """The SAME expanded metric set as the feature branch, but computed on the
+    RESIDUAL waveform (epoch - global mean): compute_all -> Z_ss-detrend -> CSD,
+    with the seizure join. So the two branches differ only by input (evoked vs
+    residual), enabling a like-for-like comparison. Cached."""
+    if not force and os.path.exists(_RM_CACHE):
+        _log(f"loading cached residual-metrics: {_RM_CACHE}")
+        return pd.read_pickle(_RM_CACHE)
+    from src.utils import evoked_features as ef
+    from src.db.store import Store  # noqa: F401 (store passed in)
+    from src.dashboard.data_helpers import load_config
+    ed = load_config()["chronic_evoked"]["evoked_output_dir"]
+    data = build_residual_matrix(store, ed)
+    res, t, tm = data["res"], data["t"], data["time_ms"]
+    fs = 1000.0 / float(np.mean(np.diff(tm)))
+    _log(f"compute_all on {res.shape[0]} residual epochs (~12 min) ...")
+    feats = ef.compute_all(res, tm, fs, expensive=False, include_wavelet=True)
+    df = pd.DataFrame({"t_epoch": t,
+                       "abs_dt": pd.to_datetime(t, unit="s")})
+    for c in set(C.FEATURES) | {C.CSD_PRIMARY}:
+        if c in feats:
+            df[c] = np.asarray(feats[c], float)
+    df = df.sort_values("t_epoch").reset_index(drop=True)
+    jdf, _order = _seizure_join(t, store)              # jdf sorted ascending by t
+    for col in ("time_to_onset_sec", "phase", "seizure_idx",
+                "seizure_onset_epoch"):
+        df[col] = jdf[col].to_numpy()
+    _log("attaching Z_ss, detrending, adding CSD ...")
+    df = F._attach_zss(df, db)
+    df = F._detrend_features(df)
+    df = F._add_csd(df)
+    os.makedirs(C.CACHE_DIR, exist_ok=True)
+    df.to_pickle(_RM_CACHE)
+    _log(f"cached -> {_RM_CACHE}  ({len(df)} rows)")
+    return df
+
+
+def run_residual_metrics(*, force=False, n_surr=500) -> dict:
+    """Residual-branch analysis on the SAME metric set as the feature branch:
+    fit states, render anchor + occupancy-null, run the classifier-vs-null."""
+    from . import figures as G, occupancy as O, classify as CL
+    from src.db.store import Store
+    from src.dashboard.data_helpers import load_config
+    cfg = load_config(); store = Store(cfg["database"]["path"]); db = cfg["database"]["path"]
+    df = residual_metric_matrix(store, db, force=force)
+    model = S.fit_states(df)
+    lead = F.lead_onsets(store)
+    pre = S.preictal_mask(model.df); base = S.baseline_mask(model.df)
+    occ = O.observed(model.df, pre, base)
+    od = os.path.join(C.OUT_DIR, "residual_metrics"); os.makedirs(od, exist_ok=True)
+    p = lambda n: os.path.join(od, n)
+    G.anchor_figure(model, occ, pre, p("residm_00_anchor.png"))
+    null = O.circular_shift_null(model.df, lead, n_surr=n_surr)
+    G.occupancy_null_compare(null, p("residm_05_occupancy_null_compare.png"),
+                             baseline=occ["baseline"])
+    clf = CL.classify_null(df, lead, n_surr=n_surr)
+    G.classifier_null_fig(clf, p("residm_08_classifier_null.png"))
+    ev = model.explained_var
+    _log(f"PC var%={[round(100*x,1) for x in ev]} cum={round(100*ev.sum(),1)}")
+    _log(f"classifier AUC={clf['auc']:.3f} p={clf['p']:.3f} "
+         f"(null med {clf['null_median']:.3f}, 95th {clf['null_hi']:.3f})")
+    for j in range(C.K_STATES):
+        _log(f"  occ state {j}: obs={null['observed'][j]:.1f}% p={null['p'][j]:.2f}")
+    return {"model": model, "occ": occ, "null": null, "clf": clf}
+
+
 def run_horizons(bins_min=(30.0, 10.0, 5.0, 1.0, 0.5)) -> dict:
     """Re-render the residual per-seizure trajectory (lead + all) and the state
     timeline at several dominant-state bin widths. Finer bins surface the rare
@@ -325,7 +394,9 @@ if __name__ == "__main__":
             s.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-    if "--full-timeline" in sys.argv:
+    if "--metrics" in sys.argv:
+        run_residual_metrics(force="--force" in sys.argv)
+    elif "--full-timeline" in sys.argv:
         run_full_timeline(force="--force" in sys.argv)
     elif "--horizons" in sys.argv:
         run_horizons()
