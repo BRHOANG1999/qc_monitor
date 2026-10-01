@@ -79,6 +79,39 @@ def circular_shift_null(df: pd.DataFrame, onsets: np.ndarray, *,
             "lo": loq, "hi": hiq, "p": p, "n_surr": int(n_surr)}
 
 
+def seizure_prob_by_state(df: pd.DataFrame, onsets, *, horizons_sec=None,
+                          k: int | None = None) -> dict:
+    """Forward predictive map: P(a seizure onset within H | current state) for
+    each state and each horizon H, with the marginal base rate P(sz within H).
+    tto = time to the NEXT onset (uncapped). A state is predictive for horizon H
+    when P(sz|state) > base rate (lift > 1).
+
+    NOTE: computed over whatever epochs are in df; if df is the peri-ictal matrix
+    the base rate is the within-monitoring-window rate (inflated vs the true
+    population). Use a full-record df for a population base rate."""
+    k = int(k or C.K_STATES)
+    horizons_sec = horizons_sec or [30, 60, 300, 600, 1800, 3600]
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    st = df["state"].to_numpy()
+    ons = np.sort(np.asarray(onsets, float))
+    idx = np.searchsorted(ons, t, side="left")
+    nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
+    tto = nxt - t                                        # time to next onset (s)
+    ok = (st >= 0) & np.isfinite(t)
+    P = np.full((k, len(horizons_sec)), np.nan)
+    base = np.full(len(horizons_sec), np.nan)
+    for h, H in enumerate(horizons_sec):
+        hit = (tto > 0) & (tto <= H)
+        base[h] = 100.0 * np.mean(hit[ok])
+        for s in range(k):
+            m = ok & (st == s)
+            if m.sum():
+                P[s, h] = 100.0 * np.mean(hit[m])
+    n_state = np.array([int((ok & (st == s)).sum()) for s in range(k)])
+    return {"P": P, "base": base, "horizons_sec": list(horizons_sec),
+            "n_state": n_state}
+
+
 def _two_sided_p(null_col: np.ndarray, obs: float, med: float) -> float:
     """Fraction of surrogates at least as far from the null median as observed
     (+1 smoothed). NaN-safe."""

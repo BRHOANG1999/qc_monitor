@@ -86,20 +86,33 @@ def state_heatmap(ax, model):
 
 
 def occupancy_bars(ax, occ, model):
-    """Pre-ictal vs clean-baseline occupancy per state (grouped bars)."""
+    """Pre-ictal vs clean-baseline occupancy per state (grouped bars), each bar =
+    % of THAT group's own epochs (gold bars sum to 100%, blue bars sum to 100%).
+    The ``N×`` label over each state is the enrichment = pre-ictal ÷ baseline
+    fraction (1.0× = no change; >1 = more likely pre-ictally)."""
     k = C.K_STATES
     x = np.arange(k)
     w = 0.38
-    ax.bar(x - w / 2, occ["preictal"], w, color="#f2c744",
+    pre = np.asarray(occ["preictal"], float)
+    base = np.asarray(occ["baseline"], float)
+    ax.bar(x - w / 2, pre, w, color="#f2c744",
            label=f"pre-ictal {int(C.PREICTAL_SEC//60)} min (n={occ['n_pre']})")
-    ax.bar(x + w / 2, occ["baseline"], w, color="#5b8def",
+    ax.bar(x + w / 2, base, w, color="#5b8def",
            label=f"clean baseline ≥{int(C.BASELINE_MIN_SEC//3600)} h "
                  f"(n={occ['n_base']})")
-    _dark(ax, "state occupancy · pre-ictal vs clean baseline")
+    for i in range(k):
+        fc = pre[i] / base[i] if base[i] > 0 else np.nan
+        y = max(pre[i], base[i])
+        ax.text(i, y + 1.2, f"{fc:.2f}×" if np.isfinite(fc) else "—",
+                ha="center", va="bottom", fontsize=8,
+                color="#f0a500" if (np.isfinite(fc) and abs(fc - 1) > 0.15)
+                else C.MUTED)
+    _dark(ax, "state occupancy · pre-ictal vs baseline (N× = pre ÷ baseline)")
     ax.set_xticks(x)
     ax.set_xticklabels([f"state {s}" for s in range(k)])
     ax.set_xlabel("state")
-    ax.set_ylabel("% of epochs in state")
+    ax.set_ylabel("% of each group's own epochs")
+    ax.set_ylim(0, max(pre.max(), base.max()) * 1.18)
     leg = ax.legend(fontsize=7.5, framealpha=0.15, loc="upper right")
     for t in leg.get_texts():
         t.set_color(C.TEXT)
@@ -286,6 +299,47 @@ def classifier_null_fig(res, out_png: str) -> str:
         t.set_color(C.TEXT)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout()
+    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def _hlabel(sec):
+    return f"{int(sec)}s" if sec < 60 else f"{int(sec//60)}min" if sec < 3600 \
+        else f"{int(sec//3600)}h"
+
+
+def seizure_prob_fig(res, out_png: str, *, title_suffix="") -> str:
+    """Forward predictive map. Left: P(seizure within H | state) vs horizon, one
+    line per state + dashed marginal base rate. Right: predictive LIFT
+    (P|state ÷ base rate); >1 = state carries above-chance seizure risk."""
+    P, base, hs = res["P"], res["base"], res["horizons_sec"]
+    k = P.shape[0]
+    xl = [_hlabel(s) for s in hs]
+    x = np.arange(len(hs))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5), facecolor=C.BG)
+    for s in range(k):
+        a1.plot(x, P[s], "-o", color=C.STATE_COLORS[s], lw=1.8, ms=4,
+                label=f"state {s} (n={res['n_state'][s]})")
+    a1.plot(x, base, "--", color=C.MUTED, lw=1.6, label="base rate (marginal)")
+    _dark(a1, "P(seizure within H | state)")
+    a1.set_xticks(x); a1.set_xticklabels(xl)
+    a1.set_xlabel("horizon H"); a1.set_ylabel("P(seizure within H) %")
+    leg = a1.legend(fontsize=7.5, framealpha=0.1, loc="upper left")
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    for s in range(k):
+        lift = P[s] / np.where(base > 0, base, np.nan)
+        a2.plot(x, lift, "-o", color=C.STATE_COLORS[s], lw=1.8, ms=4,
+                label=f"state {s}")
+    a2.axhline(1.0, color=C.MUTED, lw=1.2, ls="--")
+    _dark(a2, "predictive lift  (P|state ÷ base rate; >1 = above chance)")
+    a2.set_xticks(x); a2.set_xticklabels(xl)
+    a2.set_xlabel("horizon H"); a2.set_ylabel("lift ×")
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · forward seizure-probability by "
+                 f"state{title_suffix}", color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png

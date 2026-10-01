@@ -85,6 +85,12 @@ FEATURES8 = WAVEFORM_FEATURES + ["csd_variance", "csd_ar1"]
 
 # --- paths -------------------------------------------------------------------
 OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_preictal_biomarker")
+# Current reproducible-rebuild figures, split by analysis branch (so they're never
+# confused with the superseded original scratch PNGs, which live in ARCHIVE_DIR).
+EVOKED_DIR = _os.path.join(OUT_DIR, "evoked_branch")            # feature/evoked metrics
+RESID_WAVE_DIR = _os.path.join(OUT_DIR, "residual_waveform_branch")
+RESID_METRIC_DIR = _os.path.join(OUT_DIR, "residual_metrics_branch")
+ARCHIVE_DIR = _os.path.join(OUT_DIR, "_original_scratch_superseded")
 CACHE_DIR = _os.path.join(_ROOT, "data", "derivatives", "preictal_biomarker")
 FEATURE_CACHE = _os.path.join(CACHE_DIR, "BCH111_feature_matrix.pkl")
 

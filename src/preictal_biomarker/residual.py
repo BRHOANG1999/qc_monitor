@@ -226,7 +226,7 @@ def run_residual(*, force=False, with_anim=True) -> dict:
     _log(f"{len(model.df)} peri-ictal epochs | PC var%="
          f"{[round(100*x,1) for x in ev]} cum={round(100*ev.sum(),1)}")
     _log(f"state counts: {model.df['state'].value_counts().sort_index().to_dict()}")
-    od = os.path.join(C.OUT_DIR, "residual"); os.makedirs(od, exist_ok=True)
+    od = C.RESID_WAVE_DIR; os.makedirs(od, exist_ok=True)
     p = lambda n: os.path.join(od, n)
     pre = S.preictal_mask(model.df); base = S.baseline_mask(model.df)
     occ = O.observed(model.df, pre, base)
@@ -319,7 +319,7 @@ def run_residual_metrics(*, force=False, n_surr=500) -> dict:
     lead = F.lead_onsets(store)
     pre = S.preictal_mask(model.df); base = S.baseline_mask(model.df)
     occ = O.observed(model.df, pre, base)
-    od = os.path.join(C.OUT_DIR, "residual_metrics"); os.makedirs(od, exist_ok=True)
+    od = C.RESID_METRIC_DIR; os.makedirs(od, exist_ok=True)
     p = lambda n: os.path.join(od, n)
     G.anchor_figure(model, occ, pre, p("residm_00_anchor.png"))
     null = O.circular_shift_null(model.df, lead, n_surr=n_surr)
@@ -348,7 +348,7 @@ def run_horizons(bins_min=(30.0, 10.0, 5.0, 1.0, 0.5)) -> dict:
     data = build_residual_matrix(store, cfg["chronic_evoked"]["evoked_output_dir"])
     model, _ = fit_residual_states(data, store)
     lead = F.lead_onsets(store); allon = F.scoped_onsets(store)
-    od = os.path.join(C.OUT_DIR, "residual", "horizons"); os.makedirs(od, exist_ok=True)
+    od = os.path.join(C.RESID_WAVE_DIR, "horizons"); os.makedirs(od, exist_ok=True)
     out = {}
     for b in bins_min:
         tag = f"{int(b)}min" if b >= 1 else f"{int(round(b * 60))}s"
@@ -383,7 +383,7 @@ def run_full_timeline(bins_min=(30.0, 10.0, 5.0, 1.0), *, force=False) -> dict:
     _log(f"{len(model.df)} full-record epochs; states "
          f"{model.df['state'].value_counts().sort_index().to_dict()}")
     lead = F.lead_onsets(store)
-    od = os.path.join(C.OUT_DIR, "residual", "full_record"); os.makedirs(od, exist_ok=True)
+    od = os.path.join(C.RESID_WAVE_DIR, "full_record"); os.makedirs(od, exist_ok=True)
     out = {}
     for b in bins_min:
         tag = f"{int(b)}min" if b >= 1 else f"{int(round(b * 60))}s"
