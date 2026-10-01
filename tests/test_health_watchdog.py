@@ -71,6 +71,36 @@ def test_check_email_jobs_flags_error_loop(tmp_path):
     assert r.status == "fail" and r.remedy == "fixjob:stim_stability_daily"
 
 
+def test_eval_cpu_runaway_flags_pegging_and_bloated():
+    now = 1000.0
+    current = {
+        111: {"name": "MATLABWindow", "cpu_s": 2000.0, "create": 5.0},  # pegging
+        222: {"name": "MATLAB", "cpu_s": 200000.0, "create": 6.0},      # bloated
+        333: {"name": "MATLAB", "cpu_s": 100.0, "create": 7.0},         # fine
+    }
+    prev = {
+        "111": {"cpu_s": 800.0, "create": 5.0, "ts": 400.0},   # +1200 CPU-s / 600 s = 2 cores
+        "222": {"cpu_s": 199900.0, "create": 6.0, "ts": 400.0},
+        "333": {"cpu_s": 90.0, "create": 7.0, "ts": 400.0},
+    }
+    flagged = {f["pid"]: f for f in ck._eval_cpu_runaway(
+        current, prev, now, cores_thresh=1.5, total_hours_thresh=24.0)}
+    assert 111 in flagged and flagged[111]["reason"] == "pegging cores"
+    assert flagged[111]["cores"] == 2.0
+    assert 222 in flagged and flagged[222]["reason"] == "huge cumulative CPU"
+    assert 333 not in flagged
+
+
+def test_eval_cpu_runaway_ignores_reused_pid():
+    # pid 111 reused: create time differs -> no core-rate computed, cpu_s small -> fine
+    now = 1000.0
+    current = {111: {"name": "MATLAB", "cpu_s": 50.0, "create": 950.0}}
+    prev = {"111": {"cpu_s": 800.0, "create": 5.0, "ts": 400.0}}
+    flagged = ck._eval_cpu_runaway(current, prev, now, cores_thresh=1.5,
+                                   total_hours_thresh=24.0)
+    assert flagged == []
+
+
 def test_check_services_flags_stopped(monkeypatch):
     monkeypatch.setattr(ck, "_service_status",
                         lambda name: "Stopped" if name == "QCMonitorDaemon" else "Running")
@@ -165,6 +195,9 @@ def test_overall_and_should_email():
     assert wd._should_email("ok", "ok", [], False) is False
     assert wd._should_email("warn", "warn",
                             [{"attempted": True, "ok": True}], False) is True
+    # a NEWLY appearing warn (e.g. a cpu runaway) alerts once; steady warn stays quiet
+    assert wd._should_email("warn", "warn", [], False, new_problem=True) is True
+    assert wd._should_email("warn", "warn", [], False, new_problem=False) is False
 
 
 def test_run_cycle_dry_run_no_email(tmp_path, monkeypatch):

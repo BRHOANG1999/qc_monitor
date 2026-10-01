@@ -297,6 +297,106 @@ def _daemon_memory(hc: dict) -> HealthResult:
         remedy=f"restart:{_DAEMON}" if gb > max_rss_gb else None)
 
 
+# --------------------------------------------------------------------- #
+#  5. CPU runaway (e.g. orphaned MATLAB pegging cores for hours)
+# --------------------------------------------------------------------- #
+def _eval_cpu_runaway(current: dict, prev: dict, now_ts: float, *,
+                      cores_thresh: float, total_hours_thresh: float) -> list[dict]:
+    """Flag watched processes that are either pegging cores right now (average cores
+    used between the previous snapshot and this one >= cores_thresh) or have burned an
+    absurd amount of cumulative CPU (>= total_hours_thresh). Pure: *current*/*prev* map
+    pid -> {name, cpu_s, create}. Returns one dict per flagged pid."""
+    flagged = []
+    for pid, cur in current.items():
+        total_h = cur["cpu_s"] / 3600.0
+        cores = None
+        p = prev.get(str(pid)) or prev.get(pid)
+        # Same process only: cpu_s must be monotonic (a reused pid resets it) and the
+        # create time must match.
+        if (p and abs(p.get("create", -1) - cur["create"]) < 1.0
+                and cur["cpu_s"] >= p.get("cpu_s", 0.0)
+                and now_ts > p.get("ts", now_ts)):
+            cores = (cur["cpu_s"] - p["cpu_s"]) / (now_ts - p["ts"])
+        pegging = cores is not None and cores >= cores_thresh
+        bloated = total_h >= total_hours_thresh
+        if pegging or bloated:
+            flagged.append({
+                "pid": int(pid), "name": cur["name"],
+                "cores": (round(cores, 1) if cores is not None else None),
+                "total_hours": round(total_h, 1),
+                "reason": ("pegging cores" if pegging else "huge cumulative CPU")})
+    return flagged
+
+
+def _gather_cpu(names: list[str]) -> dict:
+    """pid -> {name, cpu_s (cumulative user+system), create} for running processes
+    whose name matches any of *names* (case-insensitive substring)."""
+    try:
+        import psutil
+    except ImportError:
+        return {}
+    wanted = [n.lower() for n in names]
+    out: dict = {}
+    for p in psutil.process_iter(["name", "cpu_times", "create_time"]):
+        try:
+            nm = (p.info.get("name") or "")
+            if not any(w in nm.lower() for w in wanted):
+                continue
+            ct = p.info.get("cpu_times")
+            cpu_s = float(ct.user + ct.system) if ct else 0.0
+            out[p.pid] = {"name": nm, "cpu_s": cpu_s,
+                          "create": float(p.info.get("create_time") or 0.0)}
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return out
+
+
+def check_cpu_runaway(config: dict, *, now: datetime | None = None) -> list[HealthResult]:
+    """Flag watched processes (orphaned/runaway MATLAB by default) pegging cores for a
+    long time. Alert-only: auto-killing a MATLAB worker can corrupt in-flight pipeline
+    output, so this never carries a remedy -- it surfaces the PIDs for a human."""
+    import json
+    import os
+    import time
+    hc = _hcfg(config)
+    names = hc.get("cpu_watch_names") or ["MATLAB"]
+    cores_thresh = float(hc.get("cpu_runaway_cores", 1.5))
+    total_h = float(hc.get("cpu_runaway_total_hours", 24.0))
+    snap_path = hc.get("cpu_snapshot_file") or os.path.join(
+        "data", "health_cpu_snapshot.json")
+    now_ts = (now.timestamp() if now else time.time())
+    current = _gather_cpu(names)
+    try:
+        with open(snap_path, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        prev = {}
+    flagged = _eval_cpu_runaway(current, prev.get("procs", {}), now_ts,
+                                cores_thresh=cores_thresh,
+                                total_hours_thresh=total_h)
+    snap = {"ts": now_ts,
+            "procs": {str(pid): {**v, "ts": now_ts} for pid, v in current.items()}}
+    try:
+        os.makedirs(os.path.dirname(snap_path) or ".", exist_ok=True)
+        tmp = snap_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        os.replace(tmp, snap_path)
+    except OSError:
+        pass
+    if not flagged:
+        return [HealthResult("cpu_runaway", "ok",
+                             f"no watched process ({'/'.join(names)}) over threshold")]
+    out = []
+    for f in flagged:
+        cores = f"{f['cores']} cores" if f["cores"] is not None else "n/a cores"
+        out.append(HealthResult(
+            f"cpu_runaway:{f['name']}:{f['pid']}", "warn",
+            f"{f['name']} pid {f['pid']} {f['reason']} "
+            f"({cores}, {f['total_hours']} CPU-h cumulative)", remedy=None))
+    return out
+
+
 def run_all(config: dict, store=None, *, now: datetime | None = None) -> list[HealthResult]:
     """Every probe, concatenated. ``store`` optional (pipeline check degrades to a
     warn without it)."""
@@ -305,4 +405,5 @@ def run_all(config: dict, store=None, *, now: datetime | None = None) -> list[He
     results += check_email_jobs(config, now=now)
     results += check_processing(config, store)
     results += check_disk_and_logs(config)
+    results += check_cpu_runaway(config, now=now)
     return results

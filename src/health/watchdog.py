@@ -61,12 +61,15 @@ def _severity(results, escalated: list[str]) -> str:
     return "warning" if any(r.status == "fail" for r in results) else "info"
 
 
-def _should_email(overall: str, prev: str, actions: list, force: bool) -> bool:
+def _should_email(overall: str, prev: str, actions: list, force: bool,
+                  new_problem: bool = False) -> bool:
     if force:
         return True
     if overall == "fail":
         return True
     if any(a["attempted"] for a in actions):
+        return True
+    if new_problem:                                      # a new warn/fail appeared
         return True
     return prev == "fail" and overall != "fail"          # recovery notice
 
@@ -85,11 +88,15 @@ def run_cycle(config: dict, *, dry_run: bool = False, force_email: bool = False,
     if log is not None:
         log(report)
     prev = ledger.last_status()
+    problems = sorted(r.name for r in results if r.status in ("warn", "fail"))
+    prev_problems = set(ledger.last_problems())
+    new_problem = any(p not in prev_problems for p in problems)
     sent = False
     if not dry_run:
-        if _should_email(overall, prev, actions, force_email):
+        if _should_email(overall, prev, actions, force_email, new_problem):
             sent = _send(config, report, _severity(results, escalated), emailer)
         ledger.set_status(overall)
+        ledger.set_problems(problems)
         ledger.save()
     return {"overall": overall, "n_fail": sum(1 for r in results if r.status == "fail"),
             "actions": actions, "escalated": escalated, "emailed": sent,

@@ -90,6 +90,14 @@ class RemediationLedger:
     def set_status(self, status: str) -> None:
         self._data["last_status"] = status
 
+    def last_problems(self) -> list:
+        """The check names that were warn/fail on the previous cycle (so a NEWLY
+        appearing problem can trigger one alert instead of staying silent)."""
+        return list(self._data.get("last_problems", []))
+
+    def set_problems(self, names) -> None:
+        self._data["last_problems"] = list(names)
+
 
 def restart_service(name: str, *, nssm_path: str | None = None,
                     verify_wait_sec: float = 8.0) -> tuple[bool, str]:
