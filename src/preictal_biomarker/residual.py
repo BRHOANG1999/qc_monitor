@@ -30,6 +30,7 @@ from . import config as C, features as F, states as S
 
 DECIM = 4                                   # keep every 4th sample (~5 kHz)
 _RES_CACHE = C.CACHE_DIR + "/BCH111_residual_matrix.npz"
+_RES_CACHE_FULL = C.CACHE_DIR + "/BCH111_residual_matrix_full.npz"
 
 
 def _log(m):
@@ -52,17 +53,29 @@ def _epoch_abs_dt(fp) -> np.ndarray | None:
     return np.asarray(out, float) if out else None
 
 
-def build_residual_matrix(store, evoked_dir: str, *, force=False) -> dict:
+def build_residual_matrix(store, evoked_dir: str, *, force=False,
+                          full_record=False) -> dict:
     """Residual waveform matrix for BCH111SR. Returns dict(res[N,S], t[N],
-    rec[N], time_ms[S], mean_wave[S]) and caches to npz."""
-    if not force and os.path.exists(_RES_CACHE):
-        _log(f"loading cached residual matrix: {_RES_CACHE}")
-        z = np.load(_RES_CACHE, allow_pickle=True)
+    rec[N], time_ms[S], mean_wave[S]) and caches to npz.
+
+    full_record=False (default): peri-ictal prefilter (epochs within ~8 h of a
+    seizure) -- the scope for the occupancy/null analysis. full_record=True: ALL
+    in-scope-date epochs (no peri-ictal filter) -- so the continuous timeline has
+    no artificial gaps on days far from any seizure."""
+    cache = _RES_CACHE_FULL if full_record else _RES_CACHE
+    if not force and os.path.exists(cache):
+        _log(f"loading cached residual matrix: {cache}")
+        z = np.load(cache, allow_pickle=True)
         return {k: z[k] for k in z.files}
-    onsets = F.scoped_onsets(store)
-    filt = _mx._near_seizure_file_filter(onsets, C.LOOKBACK_SEC,
-                                         _pcfg.PERIICTAL_PREFILTER_SLACK_SEC)
-    files = [f for f in _list_files(C.ANIMAL, evoked_dir, None) if filt(f)]
+    if full_record:
+        s0, s1 = C.ANALYSIS_START, C.ANALYSIS_END
+        files = [f for f in _list_files(C.ANIMAL, evoked_dir, None)
+                 if (_file_dt(f) is not None and s0 <= _file_dt(f) < s1)]
+    else:
+        onsets = F.scoped_onsets(store)
+        filt = _mx._near_seizure_file_filter(onsets, C.LOOKBACK_SEC,
+                                             _pcfg.PERIICTAL_PREFILTER_SLACK_SEC)
+        files = [f for f in _list_files(C.ANIMAL, evoked_dir, None) if filt(f)]
     _log(f"extracting 2-50 ms waveforms from {len(files)} files (crop-only) ...")
     waves, ts, recs = [], [], []
     tw_keep = None
@@ -90,7 +103,7 @@ def build_residual_matrix(store, evoked_dir: str, *, force=False) -> dict:
     res = (W - mean_wave).astype(np.float32)
     _log(f"{res.shape[0]} epochs x {res.shape[1]} samples; global mean subtracted")
     os.makedirs(C.CACHE_DIR, exist_ok=True)
-    np.savez_compressed(_RES_CACHE, res=res, t=t, rec=rec,
+    np.savez_compressed(cache, res=res, t=t, rec=rec,
                         time_ms=tw_keep, mean_wave=mean_wave)
     return {"res": res, "t": t, "rec": rec, "time_ms": tw_keep,
             "mean_wave": mean_wave}
@@ -120,17 +133,20 @@ def _seizure_join(t: np.ndarray, store) -> pd.DataFrame:
     return df, order
 
 
-def fit_residual_states(data: dict, store, *, n_pcs=None, k=None):
+def fit_residual_states(data: dict, store, *, n_pcs=None, k=None, peri_only=True):
     """PCA on residual waveforms -> k-means states. Returns (StateModel, extras)
-    where extras has per-state mean residual waveform + the time axis."""
+    where extras has per-state mean residual waveform + the time axis.
+    peri_only=True keeps only peri-ictal epochs (occupancy scope); False keeps
+    every epoch (for a gap-free continuous timeline)."""
     from sklearn.decomposition import PCA
     from sklearn.cluster import KMeans
     n_pcs = int(n_pcs or C.N_PCS); k = int(k or C.K_STATES)
     res, t = data["res"], data["t"]
     df, order = _seizure_join(t, store)
     X = res[order]
-    keep = df["phase"].to_numpy() != "none"       # only epochs in a peri-ictal window
-    df = df[keep].reset_index(drop=True); X = X[keep]
+    if peri_only:
+        keep = df["phase"].to_numpy() != "none"   # only epochs in a peri-ictal window
+        df = df[keep].reset_index(drop=True); X = X[keep]
     pca = PCA(n_components=n_pcs, random_state=C.SEED).fit(X)
     emb = pca.transform(X)
     km = KMeans(n_clusters=k, random_state=C.SEED, n_init=10).fit(emb)
@@ -244,6 +260,64 @@ def run_residual(*, force=False, with_anim=True) -> dict:
     return {"model": model, "extras": extras, "out": out}
 
 
+def run_horizons(bins_min=(30.0, 10.0, 5.0, 1.0, 0.5)) -> dict:
+    """Re-render the residual per-seizure trajectory (lead + all) and the state
+    timeline at several dominant-state bin widths. Finer bins surface the rare
+    deviation states (gold=2 ~1%, red=3 ~4%) that a 10-min plurality washes out
+    (e.g. the post-ictal red state in the minutes just after onset)."""
+    from . import figures as G, trajectory as TR, timeline as TL
+    from src.db.store import Store
+    from src.dashboard.data_helpers import load_config
+    cfg = load_config(); store = Store(cfg["database"]["path"])
+    data = build_residual_matrix(store, cfg["chronic_evoked"]["evoked_output_dir"])
+    model, _ = fit_residual_states(data, store)
+    lead = F.lead_onsets(store); allon = F.scoped_onsets(store)
+    od = os.path.join(C.OUT_DIR, "residual", "horizons"); os.makedirs(od, exist_ok=True)
+    out = {}
+    for b in bins_min:
+        tag = f"{int(b)}min" if b >= 1 else f"{int(round(b * 60))}s"
+        out[f"traj_lead_{tag}"] = G.per_seizure_trajectory_fig(
+            TR.per_seizure_trajectory(model.df, lead, bin_min=b),
+            os.path.join(od, f"resid_traj_lead_{tag}.png"),
+            title_suffix=f" — lead (residual, {tag} bins)")
+        out[f"traj_all_{tag}"] = G.per_seizure_trajectory_fig(
+            TR.per_seizure_trajectory(model.df, allon, bin_min=b),
+            os.path.join(od, f"resid_traj_all_{tag}.png"),
+            title_suffix=f" — all (residual, {tag} bins)")
+        out[f"timeline_{tag}"] = TL.render_timeline(
+            model.df, lead, os.path.join(od, f"resid_timeline_{tag}.png"),
+            bin_sec=b * 60.0)
+        _log(f"horizon {tag}: rendered trajectory (lead/all) + timeline")
+    for kk, vv in out.items():
+        _log(f"{kk} -> {vv}")
+    return out
+
+
+def run_full_timeline(bins_min=(30.0, 10.0, 5.0, 1.0), *, force=False) -> dict:
+    """Continuous FULL-RECORD state timeline (no peri-ictal gaps): fit states on
+    every in-scope-date epoch (not just near-seizure ones) and render the
+    24h/2d/1wk timeline at several bin widths."""
+    from . import timeline as TL
+    from src.db.store import Store
+    from src.dashboard.data_helpers import load_config
+    cfg = load_config(); store = Store(cfg["database"]["path"])
+    ed = cfg["chronic_evoked"]["evoked_output_dir"]
+    data = build_residual_matrix(store, ed, full_record=True, force=force)
+    model, _ = fit_residual_states(data, store, peri_only=False)
+    _log(f"{len(model.df)} full-record epochs; states "
+         f"{model.df['state'].value_counts().sort_index().to_dict()}")
+    lead = F.lead_onsets(store)
+    od = os.path.join(C.OUT_DIR, "residual", "full_record"); os.makedirs(od, exist_ok=True)
+    out = {}
+    for b in bins_min:
+        tag = f"{int(b)}min" if b >= 1 else f"{int(round(b * 60))}s"
+        out[tag] = TL.render_timeline(
+            model.df, lead, os.path.join(od, f"resid_full_timeline_{tag}.png"),
+            bin_sec=b * 60.0)
+        _log(f"full-record timeline {tag} -> {out[tag]}")
+    return out
+
+
 if __name__ == "__main__":
     import sys
     for s in (sys.stdout, sys.stderr):
@@ -251,4 +325,10 @@ if __name__ == "__main__":
             s.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-    run_residual(force="--force" in sys.argv, with_anim="--no-anim" not in sys.argv)
+    if "--full-timeline" in sys.argv:
+        run_full_timeline(force="--force" in sys.argv)
+    elif "--horizons" in sys.argv:
+        run_horizons()
+    else:
+        run_residual(force="--force" in sys.argv,
+                     with_anim="--no-anim" not in sys.argv)
