@@ -26,7 +26,10 @@ _MAX_ENTRIES = 3
 # ~1.9 GB and the largest ~4.7 GB, so a budget of only 4 GB held barely ONE
 # recording -- the background sweep then evicted the interactive user's
 # recording on every load and the Video tab re-read it from SMB every time.
-_MAX_BYTES = 8_000_000_000
+# 11 GB holds the file being reviewed AND the transient next-in-queue prefetch
+# (2 x 4.7 GB) side by side, so advancing to the next file is instant instead of a
+# fresh 4.7 GB SMB read; still well under the daemon RSS watchdog threshold.
+_MAX_BYTES = 11_000_000_000
 _od: "OrderedDict[str, ChunkData]" = OrderedDict()
 _lock = RLock()
 

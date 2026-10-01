@@ -103,6 +103,18 @@ _DECIM_MAX = 8
 _decim_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
 _decim_lock = RLock()
 
+# Memoize the full-recording FILTERED series (one filtfilt pass over the whole
+# channel per filter setting). The zoom callback used to re-run filtfilt on the
+# visible window plus a settling margin EVERY zoom -- and that margin scales as
+# ~5/highpass seconds, so at a 0.5 Hz high-pass even a tight zoom-in filtered
+# ~400k samples. Caching the whole filtered channel turns every zoom into a pure
+# slice + decimate (no filtfilt), and the one full pass has no interior edge
+# transient to hide. Keyed like _blanked_cache + the filter fingerprint. One
+# filtered channel is ~0.3 GB for a long recording; cap small.
+_FILTERED_MAX = 4
+_filtered_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
+_filtered_lock = RLock()
+
 # LABEL_STYLE / DROPDOWN_STYLE now come from src.dashboard.components
 # (the shared design system) -- imported above. The local copies used to
 # duplicate those token values inline and drifted (the old LABEL_STYLE
@@ -1019,6 +1031,44 @@ def _get_blanked_series(file_path: str, channel: int,
             _blanked_cache.popitem(last=False)
 
     return series, fs, n_blanked
+
+
+def _filter_fingerprint(filter_state: dict | None) -> tuple:
+    """Hashable (hp, lp, notch, smooth) key for the filtered-series cache. None
+    when no filter is set (caller skips filtering entirely)."""
+    st = filter_state or {}
+    vals = tuple(st.get(k) for k in ("hp", "lp", "notch", "smooth"))
+    return vals if any(vals) else None
+
+
+def _get_filtered_series(file_path: str, channel: int, series: np.ndarray,
+                         fs: float, filter_state: dict | None,
+                         blank_pre_ms: float, blank_post_ms: float,
+                         stim_times: np.ndarray | None) -> np.ndarray:
+    """Full-channel filtered series for *filter_state*, filtfilt'd ONCE over the
+    whole blanked *series* and cached, so the zoom callback can slice it instead of
+    re-filtering a huge settling margin on every relayout. Returns *series*
+    unchanged when no filter is set. Keyed like _blanked_cache + the filter
+    fingerprint."""
+    fp = _filter_fingerprint(filter_state)
+    if fp is None:
+        return series
+    key = (file_path, int(channel), float(blank_pre_ms), float(blank_post_ms),
+           _stim_fingerprint(stim_times), fp)
+    with _filtered_lock:
+        hit = _filtered_cache.pop(key, None)
+        if hit is not None:
+            _filtered_cache[key] = hit                   # LRU touch
+            return hit[0]
+    st = filter_state or {}
+    filt = apply_filter(series, fs, highpass=st.get("hp"), lowpass=st.get("lp"),
+                        notch=st.get("notch"), smoothing_ms=st.get("smooth"))
+    filt = np.asarray(filt, dtype=np.float32)
+    with _filtered_lock:
+        _filtered_cache[key] = (filt, fs)
+        while len(_filtered_cache) > _FILTERED_MAX:
+            _filtered_cache.popitem(last=False)
+    return filt
 
 
 def _get_analytic_env(file_path: str, channel: int, series: np.ndarray, fs: float,
@@ -7441,30 +7491,20 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         if hi <= lo:
             return no_update
 
-        # Apply the same filter the time-domain plot used -- but only on
-        # the VISIBLE window plus a settling margin, not the whole
-        # recording. The old code filtfilt'd the entire full-rate chunk
-        # on every zoom (millions of samples), which is the lingering
-        # post-decimate wait the reviewer noticed. The margin keeps
-        # filtfilt's edge transients out of the displayed window; it
-        # scales with the high-pass cutoff (low cutoffs settle slowly).
-        # No filter set -> skip the pass entirely.
-        st = filter_state or {}
-        has_filter = any(st.get(k) for k in ("hp", "lp", "notch",
-                                               "smooth"))
-        if has_filter:
-            hp = float(st.get("hp") or 0)
-            margin = int(min(n, max(2.0, 5.0 / max(hp, 0.5)) * fs))
-            a = max(0, lo - margin)
-            b = min(n, hi + margin)
+        # Filter ONCE over the whole channel (cached), then just slice the visible
+        # window out of it. The old code re-ran filtfilt on every zoom over the
+        # visible window plus a settling margin that scales as ~5/highpass seconds,
+        # so at a low high-pass even a tight zoom-in filtered hundreds of thousands
+        # of samples -- the lingering refilter wait. The cached full-channel filter
+        # also has no interior edge transient to hide, so no margin is needed.
+        # No filter set -> slice the raw blanked series.
+        if _filter_fingerprint(filter_state) is not None:
             try:
-                filt = apply_filter(
-                    series[a:b], fs,
-                    highpass=st.get("hp"), lowpass=st.get("lp"),
-                    notch=st.get("notch"),
-                    smoothing_ms=st.get("smooth"),
-                )
-                seg = filt[lo - a:hi - a]
+                filt = _get_filtered_series(
+                    file_path, channel, series, fs, filter_state,
+                    blank_pre_ms, blank_post_ms,
+                    stim_times if len(stim_times) else None)
+                seg = filt[lo:hi]
             except Exception as e:
                 logger.debug("zoom filter skipped: %s", e)
                 seg = series[lo:hi]
