@@ -261,6 +261,35 @@ def mdates_num(epoch):
     return _md.date2num(_dt.datetime.fromtimestamp(float(epoch)))
 
 
+def classifier_null_fig(res, out_png: str) -> str:
+    """Pre-ictal-vs-baseline classifier: null AUC distribution (circular-shift)
+    with the observed LOSO-AUC and chance marked. Observed left of the null's
+    upper tail = not separable above chance."""
+    null = res["null"][np.isfinite(res["null"])]
+    fig, ax = plt.subplots(figsize=(9, 5), facecolor=C.BG)
+    ax.hist(null, bins=40, color=C.MUTED, alpha=0.6, label="circular-shift null")
+    ax.axvline(0.5, color=C.MUTED, lw=1.0, ls=":", label="chance (0.5)")
+    ax.axvline(res["null_median"], color="#ff6b6b", lw=1.4, label="null median")
+    ax.axvline(res["null_hi"], color="#ff6b6b", lw=1.0, ls="--", label="null 95th")
+    ax.axvline(res["auc"], color="#f2c744", lw=2.6, label=f"observed AUC={res['auc']:.3f}")
+    _dark(ax, f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal vs baseline classifier "
+              f"(LOSO, {res['n_features']} features)")
+    ax.set_xlabel("ROC-AUC (leave-one-seizure-out)")
+    ax.set_ylabel("surrogate count")
+    ax.text(0.02, 0.96, f"p = {res['p']:.3f}\nn_pre={res['n_pre']}  "
+            f"n_base={res['n_base']}\nsurrogates={res['n_surr']}",
+            transform=ax.transAxes, va="top", color=C.TEXT, fontsize=9,
+            bbox=dict(boxstyle="round", fc=C.PANEL, ec=C.MUTED, alpha=0.8))
+    leg = ax.legend(fontsize=8, framealpha=0.1, loc="upper right")
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def per_seizure_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
     """Per-seizure dominant-state trajectory heatmap (one row per seizure; x =
     minutes from onset; colour = 10-min dominant state; white line at onset)."""
