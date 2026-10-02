@@ -108,6 +108,9 @@ def run_full(*, force_features: bool = False, n_surr: int = 2000) -> dict:
             title_suffix=f" — {tag} seizures")
     out["state1_timeline"] = TL.render_state_fraction_timeline(
         model.df, allon, p("13_state1_occurrence_timeline.png"), target=1)
+    # Full-span (all weeks) metric evolution -- the days-scale drift the 2 h views miss.
+    out["metric_evolution"] = G.metric_evolution_fig(
+        model, lead, p("14_metric_evolution_fullspan.png"))
     for j in range(C.K_STATES):
         print(f"  state {j} [{model.labels[j]}]: obs={null['observed'][j]:.1f}% "
               f"null med={null['median'][j]:.1f}% p={null['p'][j]:.2f}")

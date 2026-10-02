@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt             # noqa: E402
 from matplotlib.patches import Patch        # noqa: E402
 import numpy as np                          # noqa: E402
+import pandas as pd                         # noqa: E402
 
 from . import config as C                   # noqa: E402
 
@@ -523,6 +524,77 @@ def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
                  color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def metric_evolution_fig(model, onsets, out_png: str, *, metrics=None,
+                         bin_min: float = 30.0, title_suffix="") -> str:
+    """Full-span evolution over the WHOLE record (all weeks), not a 2-h window: a
+    dominant-state strip on top, then PC1/PC2 and key raw evoked metrics as binned
+    median (+ IQR band) time series, with the lead seizure onsets marked. Shows the
+    long-timescale drift the per-seizure views can't capture."""
+    import datetime as _dt
+    import matplotlib.dates as mdates
+    from . import trajectory as _T
+    df = model.df
+    series = ["pc1", "pc2"] + list(metrics or ["peak_to_trough", "line_length",
+                                               "log_auc", "csd_variance"])
+    series = [s for s in series if s in df.columns]
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    fin = np.isfinite(t); t = t[fin]
+    lo, hi = t.min(), t.max()
+    edges = np.arange(lo, hi + bin_min * 60, bin_min * 60)
+    centers = edges[:-1] + bin_min * 30
+    which = np.clip(np.searchsorted(edges, t, side="right") - 1, 0, centers.size - 1)
+    xdt = [_dt.datetime.fromtimestamp(c) for c in centers]
+    ons = np.sort(np.asarray(onsets, float))
+    tl = _T.dominant_state_timeline(df, bin_sec=max(600.0, bin_min * 60))
+    nrows = 1 + len(series)
+    fig, axes = plt.subplots(nrows, 1, figsize=(15, 1.5 * nrows + 1), sharex=True,
+                             facecolor=C.BG)
+    from . import timeline as _TL
+    ax0 = axes[0]; ax0.set_facecolor(C.PANEL)
+    ssel = (tl["centers"] >= lo) & (tl["centers"] <= hi)
+    sc = tl["centers"][ssel]
+    ax0.imshow(_TL._rgb_row(tl["dominant"][ssel]), aspect="auto", origin="lower",
+               extent=[mdates.date2num(_dt.datetime.fromtimestamp(sc[0])),
+                       mdates.date2num(_dt.datetime.fromtimestamp(sc[-1])), 0, 1],
+               interpolation="nearest", zorder=0)
+    ax0.set_yticks([]); ax0.set_ylabel("state", color=C.TEXT, fontsize=9,
+                                       rotation=0, ha="right", va="center")
+    for ax, s in zip(axes[1:], series):
+        ax.set_facecolor(C.PANEL)
+        v = pd.to_numeric(df[s], errors="coerce").to_numpy(float)[fin]
+        med = np.full(centers.size, np.nan)
+        q1 = np.full(centers.size, np.nan); q3 = np.full(centers.size, np.nan)
+        for c in range(centers.size):
+            vv = v[which == c]; vv = vv[np.isfinite(vv)]
+            if vv.size:
+                med[c] = np.median(vv)
+                q1[c], q3[c] = np.percentile(vv, [25, 75])
+        ax.fill_between(xdt, q1, q3, color=C.ACCENT, alpha=0.18, lw=0)
+        ax.plot(xdt, med, color=C.ACCENT, lw=1.0)
+        ax.set_ylabel(s, color=C.TEXT, fontsize=8, rotation=0, ha="right",
+                      va="center")
+        ax.tick_params(colors=C.MUTED, labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_color(C.MUTED)
+    for ax in axes:                                       # onset lines on every panel
+        for o in ons:
+            if lo <= o <= hi:
+                ax.axvline(mdates.date2num(_dt.datetime.fromtimestamp(o)),
+                           color=C.SEIZURE_COLOR, lw=1.0, zorder=3)
+    axes[-1].xaxis.set_major_locator(mdates.DayLocator())
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    axes[-1].set_xlabel("date", color=C.TEXT)
+    ndays = (hi - lo) / 86400.0
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · full-span metric evolution "
+                 f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; red = lead "
+                 f"onset){title_suffix}", color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
