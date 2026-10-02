@@ -18,7 +18,8 @@ from matplotlib.colors import to_rgb        # noqa: E402
 from matplotlib.patches import Patch        # noqa: E402
 import numpy as np                          # noqa: E402
 
-from . import config as C, trajectory as T  # noqa: E402
+from . import config as C, trajectory as T, figures as _G  # noqa: E402
+_savefig = _G._savefig
 
 _WINDOWS = [("1 week", 7 * 86400.0), ("2 days", 2 * 86400.0),
             ("24 hours", 86400.0)]
@@ -97,6 +98,6 @@ def render_timeline(df, onsets, out_png: str, *, bin_sec: float = 600.0,
                  color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0.03, 1, 0.97))
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png

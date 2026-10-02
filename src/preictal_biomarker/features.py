@@ -97,6 +97,63 @@ def _warm(evoked_dir: str, onsets: np.ndarray) -> None:
     _log(f"sidecars ready: built {built} of {total} candidate files")
 
 
+def _in_scope_file(fp) -> bool:
+    """Recording datetime within the analysis window (for the full-record scope)."""
+    from src.utils.evoked_output import parse_recording_dt
+    d = parse_recording_dt(fp)
+    return d is not None and C.ANALYSIS_START <= d < C.ANALYSIS_END
+
+
+def _warm_full(evoked_dir: str) -> None:
+    """Warm LP sidecars for EVERY in-scope recording (not just near-seizure)."""
+    _log("warming LP500 sidecars for ALL in-scope recordings (24/7 data) ...")
+
+    def prog(i, n, fp):
+        if i == 1 or i % 20 == 0 or i == n:
+            _log(f"  sidecar {i}/{n}: {os.path.basename(str(fp))[:50]}")
+
+    built, total = _passive.warm_variant(C.ANIMAL, evoked_dir, "evokedw",
+                                         lp_cfg(), progress=prog,
+                                         file_filter=_in_scope_file)
+    _log(f"sidecars ready: built {built} of {total} in-scope files")
+
+
+def _seizure_join_full(df: pd.DataFrame, store) -> pd.DataFrame:
+    """Keep ALL epochs; label each by time to the NEXT seizure onset (uncapped).
+    phase='pre' within LOOKBACK_SEC before an onset, else 'inter'. So nothing far
+    from a seizure is dropped (that is the clean baseline + the true base rate)."""
+    on = np.sort(np.array([s.onset_epoch for s in
+                           _isi.scored_seizures(store, C.ANIMAL)], float))
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    idx = np.searchsorted(on, t, side="left")
+    nxt = np.where(idx < on.size, on[np.clip(idx, 0, on.size - 1)], np.inf)
+    tto = nxt - t
+    df = df.copy()
+    df["time_to_onset_sec"] = tto
+    df["seizure_onset_epoch"] = np.where(np.isfinite(nxt), nxt, np.nan)
+    df["phase"] = np.where((tto > 0) & (tto <= C.LOOKBACK_SEC), "pre", "inter")
+    df["seizure_idx"] = np.where(idx < on.size, idx, -1)
+    return df
+
+
+def build_raw_matrix_full(store, evoked_dir: str) -> pd.DataFrame:
+    """FULL-RECORD matrix: EVERY in-scope evoked epoch for BCH111SR (no peri-ictal
+    epoch drop), with the 6-waveform + spectral/shape cheap metrics from sidecars
+    and the seizure-timing join. This is the correct scope -- 24/7 data."""
+    t, mcols, chan, sess, rec = _mx._epoch_columns(
+        C.ANIMAL, evoked_dir, _pcfg.CHEAP_METRICS, "evokedw", lp_cfg(),
+        warm_missing=False, file_filter=_in_scope_file)
+    assert t.size, "no epochs read -- were the full-record sidecars warmed?"
+    df = pd.DataFrame({"t_epoch": t, "channel": chan, "rec": rec})
+    for m in _pcfg.CHEAP_METRICS:
+        df[m] = mcols[m]
+    df = df[df["channel"] == C.CHANNEL].reset_index(drop=True)
+    s0, s1 = C.ANALYSIS_START.timestamp(), C.ANALYSIS_END.timestamp()
+    df = df[df["t_epoch"].between(s0, s1)].reset_index(drop=True)
+    df["abs_dt"] = pd.to_datetime(df["t_epoch"], unit="s").astype(str)
+    return _seizure_join_full(df, store)
+
+
 def build_raw_matrix(store, evoked_dir: str) -> pd.DataFrame:
     """Channel-filtered, in-scope peri-ictal matrix with the 6 waveform features
     (gain-corrected by the matrix). Seizure-join metadata included."""
@@ -134,6 +191,60 @@ def _attach_zss(df: pd.DataFrame, db_path: str, *, tol_sec: float = 7200.0
     df = df.copy()
     df["ra"] = ra
     df["zss"] = zss
+    return df
+
+
+def _attach_gain(df: pd.DataFrame, evoked_dir: str) -> pd.DataFrame:
+    """Per-recording amplifier gain (File_Records), joined by nearest epoch time.
+    Spans the Sep-28 300->150x change; unresolved recordings get NaN (left as-is)."""
+    import glob
+    from src.notifications.evoked_windowed import _file_gain
+    from src.utils.amplifier_records import load_amplifier_gains
+    from src.utils.evoked_output import parse_recording_dt
+    from src.dashboard.data_helpers import load_config
+    gains = load_amplifier_gains(load_config())
+    gmap = {}
+    for fp in glob.glob(os.path.join(evoked_dir, f"*{C.ANIMAL}*_evoked.mat")):
+        if not _in_scope_file(fp):
+            continue
+        d = parse_recording_dt(fp)
+        g = _file_gain(gains, fp, C.ANIMAL, C.CHANNEL)
+        if d is not None and g:
+            gmap[d.timestamp()] = float(g)
+    df = df.copy()
+    if not gmap:
+        _log("no amplifier gains resolved — features left un-normalized")
+        df["gain"] = np.nan
+        return df
+    keys = np.array(sorted(gmap), float)
+    t = pd.to_datetime(df["abs_dt"]).map(lambda d: d.timestamp()).to_numpy(float)
+    pos = np.clip(np.searchsorted(keys, t), 1, keys.size - 1)
+    nearest = np.where(np.abs(keys[pos] - t) < np.abs(keys[pos - 1] - t),
+                       keys[pos], keys[pos - 1])
+    df["gain"] = [gmap[k] for k in nearest]
+    _log(f"gain resolved for {len(gmap)} recordings; "
+         f"values {sorted(set(round(v) for v in gmap.values()))}")
+    return df
+
+
+def _gain_normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Divide gain-scaling features by the recording's gain (linear ÷g, power ÷g²,
+    log-area −log g) so the Sep-28 gain change is not read as a real amplitude step."""
+    df = df.copy()
+    g = df.get("gain")
+    if g is None:
+        return df
+    g = g.to_numpy(float)
+    ok = np.isfinite(g) & (g > 0)
+    for f in C.GAIN_LINEAR:
+        if f in df.columns:
+            v = df[f].to_numpy(float); v[ok] = v[ok] / g[ok]; df[f] = v
+    for f in C.GAIN_QUAD:
+        if f in df.columns:
+            v = df[f].to_numpy(float); v[ok] = v[ok] / (g[ok] ** 2); df[f] = v
+    for f in C.GAIN_LOG:
+        if f in df.columns:
+            v = df[f].to_numpy(float); v[ok] = v[ok] - np.log(g[ok]); df[f] = v
     return df
 
 
@@ -197,28 +308,42 @@ def _add_csd(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_feature_matrix(store, evoked_dir: str, db_path: str, *,
-                         force: bool = False) -> pd.DataFrame:
-    """Full per-epoch [t_epoch, meta, 8 features] matrix for BCH111SR. Cached to
-    parquet; pass force=True to rebuild. Warms LP sidecars on a cold build."""
-    if not force and os.path.exists(C.FEATURE_CACHE):
-        _log(f"loading cached feature matrix: {C.FEATURE_CACHE}")
-        return _with_phfo(pd.read_pickle(C.FEATURE_CACHE))
+                         force: bool = False, full_record=None) -> pd.DataFrame:
+    """Per-epoch feature matrix for BCH111SR. Cached; force=True rebuilds.
+
+    full_record (default C.FULL_RECORD=True): include EVERY in-scope evoked epoch
+    (24/7 data) -- the correct scope for states/occupancy/timeline/base-rate.
+    full_record=False: only peri-ictal epochs (quick peri-ictal views)."""
+    full_record = C.FULL_RECORD if full_record is None else bool(full_record)
+    cache = C.FEATURE_CACHE_FULL if full_record else C.FEATURE_CACHE_PERI
+    if not force and os.path.exists(cache):
+        _log(f"loading cached feature matrix: {cache}")
+        return _with_phfo(pd.read_pickle(cache))
     onsets = scoped_onsets(store)
     assert onsets.size >= 2, "need >= 2 in-scope seizures"
     _log(f"{onsets.size} in-scope seizures "
-         f"({C.ANALYSIS_START:%Y-%m-%d}..{C.ANALYSIS_END:%Y-%m-%d})")
-    _warm(evoked_dir, onsets)
-    _log("building peri-ictal matrix (reading LP sidecars) ...")
-    df = build_raw_matrix(store, evoked_dir)
-    _log(f"{len(df)} BCH111SR rows; attaching Z_ss and detrending ...")
+         f"({C.ANALYSIS_START:%Y-%m-%d}..{C.ANALYSIS_END:%Y-%m-%d}) · "
+         f"scope={'FULL RECORD (all epochs)' if full_record else 'peri-ictal'}")
+    if full_record:
+        _warm_full(evoked_dir)
+        _log("building FULL-RECORD matrix (every in-scope epoch) ...")
+        df = build_raw_matrix_full(store, evoked_dir)
+    else:
+        _warm(evoked_dir, onsets)
+        _log("building peri-ictal matrix (reading LP sidecars) ...")
+        df = build_raw_matrix(store, evoked_dir)
+    _log(f"{len(df)} BCH111SR rows; gain-normalizing (File_Records) ...")
+    df = _attach_gain(df, evoked_dir)
+    df = _gain_normalize(df)
+    _log("attaching Z_ss and detrending ...")
     df = _attach_zss(df, db_path)
     n_z = int(np.isfinite(df["zss"]).sum())
     _log(f"Z_ss matched for {n_z}/{len(df)} rows; CSD on '{C.CSD_PRIMARY}' ...")
     df = _detrend_features(df)
     df = _add_csd(df)
     os.makedirs(C.CACHE_DIR, exist_ok=True)
-    df.to_pickle(C.FEATURE_CACHE)
-    _log(f"cached -> {C.FEATURE_CACHE}  ({len(df)} rows)")
+    df.to_pickle(cache)
+    _log(f"cached -> {cache}  ({len(df)} rows)")
     return _with_phfo(df)
 
 

@@ -31,6 +31,8 @@ def _loso_auc(X, grp, base, rng) -> float:
         return np.nan
     bidx = np.flatnonzero(base)
     rng.shuffle(bidx)
+    if bidx.size > 30000:                              # cap negatives (AUC-stable)
+        bidx = bidx[:30000]
     half = bidx.size // 2
     b_tr, b_te = bidx[:half], bidx[half:]
     ys, ps = [], []
@@ -59,18 +61,70 @@ def _labels_for_onsets(t, onsets):
     precedes within PREICTAL_SEC (else -1); base = epochs >= BASELINE_MIN_SEC
     from the nearest onset (either side)."""
     ons = np.sort(np.asarray(onsets, float))
-    nxt = np.searchsorted(ons, t, side="left")
-    grp = np.full(t.size, -1, dtype=int)
-    for i, ti in enumerate(t):
-        j = nxt[i]
-        if j < ons.size and 0 < ons[j] - ti <= C.PREICTAL_SEC:
-            grp[i] = j
-    # distance to nearest onset (either side)
-    d = np.full(t.size, np.inf)
-    for o in ons:
-        d = np.minimum(d, np.abs(t - o))
-    base = d >= C.BASELINE_MIN_SEC
+    if ons.size == 0:
+        return np.full(t.size, -1, int), np.zeros(t.size, bool)
+    idx = np.searchsorted(ons, t, side="left")         # next onset at/after t
+    nxt = ons[np.clip(idx, 0, ons.size - 1)]
+    delta = nxt - t
+    grp = np.where((idx < ons.size) & (delta > 0) & (delta <= C.PREICTAL_SEC),
+                   idx, -1)
+    prev = ons[np.clip(idx - 1, 0, ons.size - 1)]      # nearest onset either side
+    dist = np.minimum(np.abs(nxt - t), np.abs(t - prev))
+    base = dist >= C.BASELINE_MIN_SEC
     return grp, base
+
+
+def _baseline_predictors(t, onsets):
+    """The two confounds to beat: clock-hour (cyclic sin/cos) and time-since-last
+    seizure (log). Clock is absolute (fixed per epoch); tsl is relative to *onsets*."""
+    hour = (t % 86400.0) / 3600.0
+    ons = np.sort(np.asarray(onsets, float))
+    idx = np.searchsorted(ons, t, side="right") - 1
+    prev = np.where(idx >= 0, ons[np.clip(idx, 0, ons.size - 1)], t - 7 * 86400.0)
+    tsl = np.clip(t - prev, 0, 14 * 86400.0)
+    return np.column_stack([np.sin(2 * np.pi * hour / 24),
+                            np.cos(2 * np.pi * hour / 24), np.log1p(tsl)])
+
+
+def incremental_evoked_test(df: pd.DataFrame, onsets, *, features=None,
+                            n_surr: int = 300, seed: int = 0) -> dict:
+    """Does the evoked feature set add forward predictive value BEYOND clock-hour +
+    time-since-last-seizure? Compares LOSO-AUC of a baseline (clock+tsl) model vs
+    baseline+evoked, and tests the increment (ΔAUC) against the circular-shift null.
+    If ΔAUC is within the null, the evoked response adds nothing over timing."""
+    if features is None:
+        features = C.FEATURES + [c for c in C.PHFO_FEATURES if c in df.columns]
+    features = [f for f in features if f in df.columns]
+    Xev = df[features].to_numpy(float)
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    ok = np.all(np.isfinite(Xev), axis=1) & np.isfinite(t)
+    Xev, t = Xev[ok], t[ok]
+    lo, hi = np.nanmin(t), np.nanmax(t); span = hi - lo
+    ons = np.sort(np.asarray(onsets, float))
+
+    def aucs(o, sd):
+        grp, base = _labels_for_onsets(t, o)
+        B = _baseline_predictors(t, o)
+        a = _loso_auc(B, grp, base, np.random.default_rng(sd))
+        b = _loso_auc(np.hstack([B, Xev]), grp, base, np.random.default_rng(sd))
+        return a, b
+
+    a_obs, b_obs = aucs(ons, seed)
+    d_obs = (b_obs - a_obs) if (np.isfinite(a_obs) and np.isfinite(b_obs)) else np.nan
+    rng = np.random.default_rng(seed)
+    nd = np.full(n_surr, np.nan)
+    for i in range(n_surr):
+        sh = lo + ((ons - lo + rng.uniform(0, span)) % span)
+        a_s, b_s = aucs(sh, 1000 + i)
+        if np.isfinite(a_s) and np.isfinite(b_s):
+            nd[i] = b_s - a_s
+    ndv = nd[np.isfinite(nd)]
+    p = float((np.sum(ndv >= d_obs) + 1) / (ndv.size + 1)) if (
+        ndv.size and np.isfinite(d_obs)) else np.nan
+    return {"auc_base": a_obs, "auc_full": b_obs, "delta": d_obs,
+            "null_delta": nd, "null_delta_med": float(np.nanmedian(ndv))
+            if ndv.size else np.nan, "p": p, "n_features": len(features),
+            "n_surr": int(n_surr)}
 
 
 def classify_null(df: pd.DataFrame, lead_onsets, *, features=None,

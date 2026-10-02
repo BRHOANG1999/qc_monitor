@@ -23,9 +23,20 @@ BANDPASS = True               # 1-500 Hz Butterworth before windowing ("LP500")
 BP_LOW_HZ = 1.0
 BP_HIGH_HZ = 500.0
 
-# --- date scope (the gain-constant 300x window; seizures >= 2026-09-13) -------
+# --- date scope: 2026-09-13 .. now (24/7 data). Spans the Sep-28 gain change
+#     (300->150x), so amplitude features are GAIN-NORMALIZED (see GAIN_* below).
 ANALYSIS_START = _dt.datetime(2026, 9, 13)
-ANALYSIS_END = _dt.datetime(2026, 9, 23)        # exclusive
+ANALYSIS_END = _dt.datetime(2026, 10, 2)        # exclusive (through Oct 1)
+
+# Gain normalization (File_Records amplifier gain per recording). Amplitude scales
+# linearly with gain, power/variance quadratically, log-area additively; the rest
+# (latency, frequency moments, ratios, autocorr, CSD, pHFO) are gain-invariant.
+GAIN_LINEAR = ["line_length", "rms_amplitude", "peak_to_trough", "max_slope",
+               "early_area", "late_area"]
+GAIN_QUAD = ["variance", "sum_power_low", "sum_power_mid", "sum_power_high",
+             "wavelet_power_slow_gamma", "wavelet_power_gamma",
+             "wavelet_power_high_gamma"]
+GAIN_LOG = ["log_auc"]
 
 # --- seizure handling --------------------------------------------------------
 LEAD_GAP_H = 6.0              # cluster-leader gap: drop followers within 6 h
@@ -92,7 +103,13 @@ RESID_WAVE_DIR = _os.path.join(OUT_DIR, "residual_waveform_branch")
 RESID_METRIC_DIR = _os.path.join(OUT_DIR, "residual_metrics_branch")
 ARCHIVE_DIR = _os.path.join(OUT_DIR, "_original_scratch_superseded")
 CACHE_DIR = _os.path.join(_ROOT, "data", "derivatives", "preictal_biomarker")
-FEATURE_CACHE = _os.path.join(CACHE_DIR, "BCH111_feature_matrix.pkl")
+# NOTE: recording is 24/7 -> analyses MUST use the FULL record (every evoked
+# response in the date window), not just near-seizure epochs. FULL_RECORD=True is
+# the default scope; the peri-ictal cache is kept only for quick peri-ictal views.
+FULL_RECORD = True
+FEATURE_CACHE_PERI = _os.path.join(CACHE_DIR, "BCH111_feature_matrix.pkl")
+FEATURE_CACHE_FULL = _os.path.join(CACHE_DIR, "BCH111_feature_matrix_full.pkl")
+FEATURE_CACHE = FEATURE_CACHE_FULL if FULL_RECORD else FEATURE_CACHE_PERI
 
 # state display palette (matches the existing figures: 0 blue,1 teal,2 gold,3 red)
 STATE_COLORS = ["#5b6ee1", "#2ee6a6", "#f2c744", "#d62f2f"]

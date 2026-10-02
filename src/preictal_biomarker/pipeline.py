@@ -102,6 +102,19 @@ def run_classifier(*, n_surr: int = 500) -> dict:
     return r
 
 
+def run_incremental(*, n_surr: int = 300) -> dict:
+    """Does evoked add beyond clock + time-since-seizure? (the decisive test)."""
+    from . import classify as CL
+    store, evoked_dir, db = _ctx()
+    df = F.build_feature_matrix(store, evoked_dir, db)
+    r = CL.incremental_evoked_test(df, F.lead_onsets(store), n_surr=n_surr)
+    out = os.path.join(C.EVOKED_DIR, "11_incremental_evoked.png")
+    G.incremental_test_fig(r, out)
+    print(f"[pipeline] AUC base={r['auc_base']:.3f} full={r['auc_full']:.3f} "
+          f"Δ={r['delta']:+.3f} p={r['p']:.3f} -> {out}")
+    return r
+
+
 def run_anim(*, step_lead: float = 2.0, step_all: float = 3.0, fps: int = 12,
              smoke: bool = False) -> dict:
     """Render the shared-PCA pre-ictal trajectory animations: lead + all."""
@@ -138,6 +151,8 @@ if __name__ == "__main__":
         run_anim(smoke="--smoke" in sys.argv)
     elif "--classifier" in sys.argv:
         run_classifier()
+    elif "--incremental" in sys.argv:
+        run_incremental()
     elif "--full" in sys.argv:
         run_full(force_features="--force" in sys.argv)
     else:

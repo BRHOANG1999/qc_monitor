@@ -23,6 +23,23 @@ def _fig(nrows=1, ncols=1, figsize=(10, 5)):
     return fig, ax
 
 
+def _savefig(_fig, out_png, **kw):
+    """savefig with retry — the Windows data drive intermittently throws
+    OSError(22) mid-write; a short retry clears it."""
+    import time as _t
+    kw.setdefault("facecolor", C.BG)
+    kw.setdefault("dpi", 130)
+    err = None
+    for _ in range(5):
+        try:
+            _fig.savefig(out_png, **kw)
+            return out_png
+        except OSError as e:                          # flaky I/O (Errno 22)
+            err = e
+            _t.sleep(0.6)
+    raise err
+
+
 def _dark(ax, title=None):
     ax.set_facecolor(C.PANEL)
     for sp in ax.spines.values():
@@ -130,7 +147,7 @@ def anchor_figure(model, occ, highlight_mask, out_png: str) -> str:
                  f"({len(ev)} PCs, {100*ev.sum():.0f}% var) · anchor check",
                  color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -198,7 +215,7 @@ def occupancy_null_compare(null_res, out_png: str, *, baseline=None) -> str:
                  color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -237,7 +254,7 @@ def null_schematic(df, onsets, out_png: str, *, n_examples=3, seed=1) -> str:
     ax.set_xlabel("record time", color=C.TEXT)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout()
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -264,7 +281,7 @@ def null_worked_example(null_res, out_png: str) -> str:
                  f"(observed inside the null = chance)", color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -273,6 +290,39 @@ def mdates_num(epoch):
     import datetime as _dt
     import matplotlib.dates as _md
     return _md.date2num(_dt.datetime.fromtimestamp(float(epoch)))
+
+
+def incremental_test_fig(res, out_png: str) -> str:
+    """Does evoked add beyond clock+tsl? Left: baseline vs baseline+evoked LOSO-AUC.
+    Right: null distribution of the increment ΔAUC with the observed increment."""
+    nd = res["null_delta"][np.isfinite(res["null_delta"])]
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 5), facecolor=C.BG)
+    a1.bar([0, 1], [res["auc_base"], res["auc_full"]],
+           color=[C.MUTED, C.ACCENT], width=0.6)
+    a1.axhline(0.5, color=C.MUTED, lw=1.0, ls=":")
+    _dark(a1, "LOSO-AUC: timing vs timing + evoked")
+    a1.set_xticks([0, 1])
+    a1.set_xticklabels(["clock + time-since-seizure", "+ evoked (31f)"], fontsize=9)
+    a1.set_ylabel("ROC-AUC")
+    for i, v in enumerate([res["auc_base"], res["auc_full"]]):
+        a1.text(i, v + 0.01, f"{v:.3f}", ha="center", color=C.TEXT, fontsize=9)
+    a2.hist(nd, bins=40, color=C.MUTED, alpha=0.6, label="shift-null ΔAUC")
+    a2.axvline(0, color=C.MUTED, lw=1.0, ls=":")
+    a2.axvline(res["null_delta_med"], color="#ff6b6b", lw=1.3, label="null median")
+    a2.axvline(res["delta"], color="#f2c744", lw=2.6,
+               label=f"observed Δ={res['delta']:+.3f}")
+    _dark(a2, f"evoked increment vs null · p={res['p']:.3f}")
+    a2.set_xlabel("ΔAUC (evoked beyond timing)"); a2.set_ylabel("surrogate count")
+    leg = a2.legend(fontsize=8, framealpha=0.1)
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · does the evoked response add beyond "
+                 "clock-hour + time-since-seizure?", color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _savefig(fig, out_png, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
 
 
 def classifier_null_fig(res, out_png: str) -> str:
@@ -299,7 +349,7 @@ def classifier_null_fig(res, out_png: str) -> str:
         t.set_color(C.TEXT)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout()
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -340,7 +390,7 @@ def seizure_prob_fig(res, out_png: str, *, title_suffix="") -> str:
                  f"state{title_suffix}", color=C.TEXT, fontsize=12)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
@@ -373,6 +423,6 @@ def per_seizure_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
     for t in leg.get_texts():
         t.set_color(C.TEXT)
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    fig.savefig(out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
