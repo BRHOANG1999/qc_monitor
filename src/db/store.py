@@ -3058,6 +3058,73 @@ class Store:
         finally:
             conn.close()
 
+    def video_file_summary(self, file_id: int,
+                           animal_id: str | None = None,
+                           channel: int | None = None) -> dict:
+        """File-level + review summary for the Video Review 'copy info' button.
+
+        One indexed read of processed_files + the latest review_state (via
+        get_review_state) with its markers summarized. Safe defaults when the file
+        or review row is missing. Returns a flat dict:
+        ``{file_id, session_dir, session_name, file_path, chunk_datetime,
+        duration_sec, channel, channel_name, review_status, note, n_events,
+        max_racine, animal_id}``.
+        """
+        assert isinstance(file_id, int), "file_id must be int"
+        out = {
+            "file_id": int(file_id), "session_dir": "", "session_name": "",
+            "file_path": "", "chunk_datetime": "", "duration_sec": None,
+            "channel": channel, "channel_name": "", "review_status": "",
+            "note": "", "n_events": 0, "max_racine": None,
+            "animal_id": animal_id or "",
+        }
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT session_dir, session_name, file_path, chunk_datetime, "
+                "duration_sec FROM processed_files WHERE id = ?",
+                (int(file_id),)).fetchone()
+        finally:
+            conn.close()
+        if row:
+            out["session_dir"] = row["session_dir"] or ""
+            out["session_name"] = row["session_name"] or ""
+            out["file_path"] = row["file_path"] or ""
+            out["chunk_datetime"] = row["chunk_datetime"] or ""
+            out["duration_sec"] = row["duration_sec"]
+        if channel is not None and out["session_dir"]:
+            try:
+                names = self._channel_names_for_session(out["session_dir"])
+                if 0 <= int(channel) < len(names):
+                    out["channel_name"] = str(names[int(channel)])
+            except (TypeError, ValueError):
+                pass
+        rs = self.get_review_state(int(file_id), animal_id)
+        if rs:
+            out["review_status"] = rs.get("status") or ""
+            out["note"] = rs.get("note") or ""
+            if rs.get("animal_id"):
+                out["animal_id"] = rs["animal_id"]
+            try:
+                events = json.loads(rs.get("markers_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                events = []
+            if isinstance(events, list):
+                out["n_events"] = len(events)
+                racines = []
+                for e in events:
+                    if not isinstance(e, dict):
+                        continue
+                    rac = e.get("racine")
+                    if rac in (None, ""):
+                        continue
+                    try:
+                        racines.append(int(rac))
+                    except (TypeError, ValueError):
+                        continue
+                out["max_racine"] = max(racines) if racines else None
+        return out
+
     def review_statuses_for_files(self, file_ids,
                                    animal_id: str | None = None) -> dict:
         """Latest review status per file_id -> ``{file_id: status}``.

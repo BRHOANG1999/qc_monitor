@@ -19,6 +19,8 @@ selection; clientside callbacks handle the cursor + click-to-seek.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
@@ -1149,6 +1151,27 @@ def _mmss(sec) -> str:
     h, rem = divmod(s, 3600)
     m, ss = divmod(rem, 60)
     return f"{h}:{m:02d}:{ss:02d}" if h else f"{m:02d}:{ss:02d}"
+
+
+# Navigation-focused "copy this recording's info" CSV columns (the Video Review
+# analysis-tab copy button). File identity + location + review summary -- enough to
+# re-find the recording and know its state; NOT the live analysis/filter settings.
+_VIDEO_INFO_COLUMNS = [
+    "animal", "session", "file_id", "channel", "channel_name", "chunk_datetime",
+    "duration", "review_status", "n_events", "max_racine", "note", "file_path",
+]
+
+
+def _video_info_csv(row: dict, include_header: bool) -> str:
+    """One CSV row (optionally preceded by the header line) for *row*, built with the
+    house csv.writer style so a note containing commas/quotes is escaped correctly."""
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    if include_header:
+        w.writerow(_VIDEO_INFO_COLUMNS)
+    w.writerow(["" if row.get(c) is None else str(row.get(c))
+                for c in _VIDEO_INFO_COLUMNS])
+    return buf.getvalue().rstrip("\n")
 
 
 def _fmt_time(sec) -> str:
@@ -3436,6 +3459,30 @@ def layout(store: Store, bridge: dict | None = None):
                            style={"color": "#888", "fontSize": "11px",
                                    "marginLeft": "16px",
                                    "alignSelf": "center"}),
+                # Copy this recording's identity + review status as one CSV row, so a
+                # reviewer can save it and navigate back later. dcc.Clipboard copies
+                # its `content` (kept current by the callback below) within the click
+                # gesture, so the browser never blocks the write.
+                html.Div([
+                    html.Span("Copy info", style={
+                        "color": "#a0a0b0", "fontSize": "11px",
+                        "marginRight": "4px"}),
+                    dcc.Clipboard(
+                        id="video-copy-info-clip", content="",
+                        title="Copy this recording's info as a CSV row",
+                        style={"color": "#5e7ce2", "cursor": "pointer",
+                               "fontSize": "18px", "display": "inline-block",
+                               "verticalAlign": "middle"}),
+                    dcc.Checklist(
+                        id="video-copy-info-header",
+                        options=[{"label": " header", "value": "header"}],
+                        value=["header"],
+                        style={"display": "inline-block", "marginLeft": "8px",
+                               "color": "#a0a0b0", "fontSize": "11px"},
+                        inputStyle={"marginRight": "3px"}),
+                ], style={"display": "flex", "alignItems": "center",
+                           "marginLeft": "auto", "gap": "2px",
+                           "alignSelf": "center"}),
             ], style={"marginTop": "12px", "marginBottom": "4px",
                        "display": "flex", "gap": "10px",
                        "flexWrap": "wrap",
@@ -7527,6 +7574,54 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         p["data"][0]["x"] = x_p
         p["data"][0]["y"] = y_p
         return p
+
+    # ---- Copy file info (CSV row) -> clipboard ---- #
+    # Keep the dcc.Clipboard's content current for the loaded file so the copy
+    # happens inside the user's click gesture. Rebuilds are a couple of indexed DB
+    # lookups (file metadata + latest review), not the chunk-load path. Re-fires on
+    # a scoring autosave so the review summary (status / #events / racine) stays live.
+    @app.callback(
+        Output("video-copy-info-clip", "content"),
+        Input("video-file-dropdown", "value"),
+        Input("video-channel-dropdown", "value"),
+        Input("video-queue-animal", "value"),
+        Input("video-copy-info-header", "value"),
+        Input("video-autosave-state", "data"),
+    )
+    def _video_copy_info_content(file_id, channel, animal_value, header_toggle,
+                                 _autosave):
+        if not file_id:
+            return ""
+        ids = _animal_ids_from_picker(animal_value)
+        animal_id = ids[0] if ids else None
+        try:
+            ch = int(channel) if channel is not None else None
+        except (TypeError, ValueError):
+            ch = None
+        try:
+            summary = store.video_file_summary(int(file_id), animal_id, ch)
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("copy-info summary failed file=%s: %s", file_id, e)
+            return ""
+        session = os.path.basename(summary.get("session_dir") or "") \
+            or (summary.get("session_name") or "")
+        row = {
+            "animal": summary.get("animal_id") or (animal_id or ""),
+            "session": session,
+            "file_id": summary.get("file_id"),
+            "channel": ch if ch is not None else "",
+            "channel_name": summary.get("channel_name") or "",
+            "chunk_datetime": summary.get("chunk_datetime") or "",
+            "duration": _mmss(summary.get("duration_sec")),
+            "review_status": summary.get("review_status") or "",
+            "n_events": summary.get("n_events") or 0,
+            "max_racine": (summary.get("max_racine")
+                           if summary.get("max_racine") is not None else ""),
+            "note": summary.get("note") or "",
+            "file_path": summary.get("file_path") or "",
+        }
+        include_header = "header" in (header_toggle or [])
+        return _video_info_csv(row, include_header)
 
     # ---- Note save: capture the full review context for restore ---- #
     @app.callback(
