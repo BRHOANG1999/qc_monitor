@@ -376,30 +376,32 @@ def run_cluster_traces(*, n_traces=25, seed=0) -> str:
     return out
 
 
-def run_anim_lfp(*, step_lead=2.0, step_all=3.0, fps=12) -> dict:
-    """Re-render the pre-ictal PCA trajectory animations WITH a time-locked
-    stim-blanked LFP panel beneath (lead + all)."""
-    from . import anim as A
+def run_anim_lfp(*, which="lead", step_min=2.0, fps=12, with_env=True,
+                 frames=True) -> dict:
+    """Full trajectory animation: PCA comet + per-epoch evoked LFP + CONTINUOUS
+    LFP envelope (−120→0 min, seizure at 0), all time-locked; + per-frame PNGs and
+    a step-through HTML viewer. which='lead' (12 raw reads) or 'all' (43, slow)."""
+    from . import anim as A, continuous_lfp as CL
     from src.db.store import Store
     from src.dashboard.data_helpers import load_config
     cfg = load_config(); store = Store(cfg["database"]["path"])
     ed = cfg["chronic_evoked"]["evoked_output_dir"]; db = cfg["database"]["path"]
     evoked, tm, _st, t_w, model = evoked_and_states(store, ed, db)
-    lead = F.lead_onsets(store); allon = F.scoped_onsets(store)
+    onsets = F.lead_onsets(store) if which == "lead" else F.scoped_onsets(store)
+    lfp_env = None
+    if with_env:
+        envd = CL.build_lfp_envelopes(store, onsets, pre_h=2.0, post_h=0.35)
+        lfp_env = [envd.get(CL._key(o)) for o in onsets]
     adir = os.path.join(C.EVOKED_DIR, "anim")
+    fdir = os.path.join(adir, f"{which}_frames") if frames else None
     pr = lambda i, n: print(f"  frame {i}/{n}", flush=True) if i % 80 == 0 else None
-    kw = dict(waveforms=evoked, wave_t=t_w, wave_time_ms=tm, fps=fps, progress=pr)
-    out = {}
-    _log(f"rendering lead LFP animation ({lead.size} seizures) ...")
-    out["lead"] = A.animate_set(model, lead, A.seizure_labels(lead),
-                                os.path.join(adir, "preictal_traj_lead_lfp"),
-                                step_min=step_lead, **kw)
-    _log(f"rendering all LFP animation ({allon.size} seizures) ...")
-    out["all"] = A.animate_set(model, allon, A.seizure_labels(allon),
-                               os.path.join(adir, "preictal_traj_all_lfp"),
-                               step_min=step_all, **kw)
-    for k, v in out.items():
-        _log(f"{k}: {v}")
+    _log(f"rendering {which} full animation ({onsets.size} seizures) ...")
+    out = A.animate_set(model, onsets, A.seizure_labels(onsets),
+                        os.path.join(adir, f"preictal_traj_{which}_full"),
+                        step_min=step_min, fps=fps, waveforms=evoked, wave_t=t_w,
+                        wave_time_ms=tm, lfp_env=lfp_env, frames_dir=fdir,
+                        progress=pr)
+    _log(f"done: {out}")
     return out
 
 
@@ -469,7 +471,7 @@ if __name__ == "__main__":
         except (AttributeError, ValueError):
             pass
     if "--anim-lfp" in sys.argv:
-        run_anim_lfp()
+        run_anim_lfp(which="all" if "--all" in sys.argv else "lead")
     elif "--cluster-traces" in sys.argv:
         run_cluster_traces()
     elif "--metrics" in sys.argv:

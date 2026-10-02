@@ -64,58 +64,97 @@ def _comet_rgba(states, rel, cursor, trail_min, floor=0.18):
     return rgba, size, vis
 
 
+def _export_frames(fig, update, n_frames, frames_dir, fps) -> str:
+    """Save every frame as a PNG + a step-through HTML viewer (slider / arrow keys)."""
+    os.makedirs(frames_dir, exist_ok=True)
+    for f in os.listdir(frames_dir):
+        if f.startswith("frame_") and f.endswith(".png"):
+            os.remove(os.path.join(frames_dir, f))
+    for fi in range(n_frames):
+        update(fi)
+        fig.savefig(os.path.join(frames_dir, f"frame_{fi:05d}.png"), dpi=110,
+                    facecolor=C.BG)
+    html = _VIEWER_HTML.replace("__N__", str(n_frames)).replace("__FPS__", str(fps))
+    with open(os.path.join(frames_dir, "viewer.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+    return frames_dir
+
+
+_VIEWER_HTML = """<!doctype html><html><head><meta charset=utf-8><title>frames</title>
+<style>body{background:#15151f;color:#f0f0f5;font-family:sans-serif;text-align:center;margin:0}
+img{max-width:100%;height:auto}.row{margin:8px}button{background:#1e1e2f;color:#f0f0f5;border:1px solid #9aa0b4;padding:4px 10px;cursor:pointer}</style></head>
+<body><div class=row><button id=prev>&#9664; prev</button> <button id=play>play</button>
+<button id=next>next &#9654;</button> <input id=sl type=range min=0 max="__N__" value=0 style="width:55%">
+<span id=lbl></span> &nbsp;(&#8592;/&#8594; to step)</div>
+<img id=im><script>
+const N=__N__,FPS=__FPS__;let i=0,t=null;
+const im=document.getElementById('im'),sl=document.getElementById('sl'),lbl=document.getElementById('lbl');
+sl.max=N-1;function show(k){i=(k+N)%N;im.src='frame_'+String(i).padStart(5,'0')+'.png';sl.value=i;lbl.textContent=i+' / '+(N-1);}
+prev.onclick=()=>show(i-1);next.onclick=()=>show(i+1);sl.oninput=()=>show(+sl.value);
+document.onkeydown=e=>{if(e.key==='ArrowRight')show(i+1);if(e.key==='ArrowLeft')show(i-1);};
+play.onclick=function(){if(t){clearInterval(t);t=null;this.textContent='play';}else{t=setInterval(()=>show(i+1),1000/FPS);this.textContent='pause';}};
+show(0);</script></body></html>"""
+
+
 def animate_set(model, onsets, labels, out_basename, *, pre_min=120.0,
                 post_min=10.0, step_min=2.0, trail_min=40.0, fps=12,
-                progress=None, waveforms=None, wave_t=None,
-                wave_time_ms=None) -> dict:
-    """One animation stepping through each seizure in *onsets* sequentially, in the
-    shared PCA space. When *waveforms* (+ wave_t + wave_time_ms) are given, a
-    bottom panel shows the actual stim-blanked LFP, time-locked to the cursor (the
-    current epoch bold + a fading trail). Saves <out_basename>.gif (+ .mp4)."""
+                progress=None, waveforms=None, wave_t=None, wave_time_ms=None,
+                lfp_env=None, frames_dir=None) -> dict:
+    """Step each seizure through the shared PCA space. Optional panels: per-epoch
+    stim-blanked evoked LFP (waveforms), and the CONTINUOUS LFP envelope over the
+    full −pre_min..post_min window with the seizure at 0 (lfp_env, one dict per
+    onset). Both are time-locked to the cursor. frames_dir also exports per-frame
+    PNGs + a step-through HTML viewer. Saves <out_basename>.mp4 (+ .gif)."""
     df = model.df
     allx, ally = df["pc1"].to_numpy(), df["pc2"].to_numpy()
     fin = np.isfinite(allx) & np.isfinite(ally)
     tracks = [_seizure_track(df, o, pre_min, post_min) for o in onsets]
     has_lfp = waveforms is not None and wave_time_ms is not None
+    has_env = lfp_env is not None
     widx = [_wave_idx_for(tr[4], wave_t) for tr in tracks] if has_lfp else None
     steps = np.arange(-pre_min, post_min + step_min, step_min)
     frames = [(si, c) for si in range(len(onsets)) for c in steps]
     n_trail = 6
 
+    heights = [6.0]; names = ["p"]
     if has_lfp:
-        fig = plt.figure(figsize=(9.5, 9.4), facecolor=C.BG)
-        gs = fig.add_gridspec(3, 1, height_ratios=[6, 2.3, 0.7], hspace=0.38)
-        axp, axl, axt = (fig.add_subplot(gs[i, 0]) for i in range(3))
-        panels = (axp, axl, axt)
-    else:
-        fig = plt.figure(figsize=(9.5, 7.2), facecolor=C.BG)
-        gs = fig.add_gridspec(2, 1, height_ratios=[6, 1], hspace=0.28)
-        axp, axt = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0])
-        axl = None; panels = (axp, axt)
-    for ax in panels:
-        ax.set_facecolor(C.PANEL)
-        for sp in ax.spines.values():
+        heights.append(2.2); names.append("l")
+    heights.append(2.2 if has_env else 0.7); names.append("c" if has_env else "t")
+    fig = plt.figure(figsize=(9.5, 1.15 * sum(heights) + 1), facecolor=C.BG)
+    gs = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.45)
+    ax = {names[i]: fig.add_subplot(gs[i, 0]) for i in range(len(heights))}
+    axp = ax["p"]; axl = ax.get("l"); axc = ax.get("c"); axt = ax.get("t")
+    for a in ax.values():
+        a.set_facecolor(C.PANEL)
+        for sp in a.spines.values():
             sp.set_color(C.MUTED)
-        ax.tick_params(colors=C.MUTED, labelsize=8)
+        a.tick_params(colors=C.MUTED, labelsize=8)
     axp.scatter(allx[fin], ally[fin], s=4, c=C.NODATA_COLOR, alpha=0.25,
-                linewidths=0, zorder=0)                      # shared backdrop
+                linewidths=0, zorder=0)
     axp.set_xlabel("PC1", color=C.TEXT); axp.set_ylabel("PC2", color=C.TEXT)
-    xpad = np.nanpercentile(allx[fin], [1, 99]); ypad = np.nanpercentile(ally[fin], [1, 99])
-    axp.set_xlim(xpad[0] - 2, xpad[1] + 2); axp.set_ylim(ypad[0] - 2, ypad[1] + 2)
+    xp = np.nanpercentile(allx[fin], [1, 99]); yp = np.nanpercentile(ally[fin], [1, 99])
+    axp.set_xlim(xp[0] - 2, xp[1] + 2); axp.set_ylim(yp[0] - 2, yp[1] + 2)
     comet = axp.scatter([], [], zorder=5)
     lfp_lines = []
     if has_lfp:
         yl = np.nanpercentile(waveforms, [0.3, 99.7])
         axl.set_xlim(wave_time_ms[0], wave_time_ms[-1]); axl.set_ylim(yl[0], yl[1])
         axl.axhline(0, color=C.MUTED, lw=0.5)
-        axl.set_xlabel("ms since stim (stim-blanked LFP)", color=C.TEXT)
-        axl.set_ylabel("LFP", color=C.TEXT)
+        axl.set_xlabel("ms since stim (evoked, stim-blanked)", color=C.TEXT)
+        axl.set_ylabel("evoked", color=C.TEXT)
         lfp_lines = [axl.plot([], [], lw=0.8)[0] for _ in range(n_trail)]
-    axt.set_xlim(-pre_min, post_min); axt.set_ylim(0, 1); axt.set_yticks([])
-    axt.axvline(0, color=C.SEIZURE_COLOR, lw=1.5)
-    axt.set_xlabel("minutes to seizure onset", color=C.TEXT)
-    cursor = axt.axvline(-pre_min, color=C.ACCENT, lw=2.0)
+    cur_ax = axc if has_env else axt
+    cur_ax.set_xlim(-pre_min, post_min)
+    cur_ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.5)
+    cur_ax.set_xlabel("minutes to seizure onset" + (" (continuous LFP)"
+                      if has_env else ""), color=C.TEXT)
+    if has_env:
+        axc.set_ylabel("LFP", color=C.TEXT)
+    else:
+        axt.set_ylim(0, 1); axt.set_yticks([])
+    cursor = cur_ax.axvline(-pre_min, color=C.ACCENT, lw=2.0)
     title = axp.set_title("", color=C.TEXT, fontsize=11, loc="left")
+    env_state = {"si": -1, "fill": None}
 
     def update(fi):
         si, c = frames[fi]
@@ -127,7 +166,7 @@ def animate_set(model, onsets, labels, out_basename, *, pre_min=120.0,
         else:
             comet.set_offsets(np.empty((0, 2)))
         if has_lfp:
-            recent = np.where(rel <= c)[0][-n_trail:][::-1]   # newest first
+            recent = np.where(rel <= c)[0][-n_trail:][::-1]
             wi = widx[si]
             for k, ln in enumerate(lfp_lines):
                 if k < len(recent) and wi[recent[k]] >= 0:
@@ -138,25 +177,41 @@ def animate_set(model, onsets, labels, out_basename, *, pre_min=120.0,
                     ln.set_linewidth(2.4 if k == 0 else 0.8)
                 else:
                     ln.set_data([], [])
+        if has_env and si != env_state["si"]:
+            if env_state["fill"] is not None:
+                env_state["fill"].remove(); env_state["fill"] = None
+            e = lfp_env[si]
+            if e and e.get("env_t") is not None and len(e["env_t"]):
+                env_state["fill"] = axc.fill_between(
+                    e["env_t"], e["env_lo"], e["env_hi"], color="#8aa0c0",
+                    alpha=0.8, lw=0)
+                lo = np.nanpercentile(e["env_lo"], 0.5)
+                hi = np.nanpercentile(e["env_hi"], 99.5)
+                if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                    axc.set_ylim(lo, hi)
+            env_state["si"] = si
         cursor.set_xdata([c, c])
         title.set_text(f"{C.ANIMAL} · {C.CHANNEL} · seizure {si+1}/{len(onsets)} "
                        f"· {labels[si]} · t={c:+.0f} min")
         if progress and fi % 40 == 0:
             progress(fi, len(frames))
-        return (comet, cursor, title, *lfp_lines)
+        return comet, cursor, title
 
+    os.makedirs(os.path.dirname(out_basename), exist_ok=True)
+    out = {"n_frames": len(frames), "n_seizures": len(onsets)}
+    if frames_dir:
+        out["frames"] = _export_frames(fig, update, len(frames), frames_dir, fps)
     ani = manim.FuncAnimation(fig, update, frames=len(frames), blit=False,
                               interval=1000 / fps)
-    os.makedirs(os.path.dirname(out_basename), exist_ok=True)
-    gif = out_basename + ".gif"
-    ani.save(gif, writer=manim.PillowWriter(fps=fps))
-    mp4 = None
     if manim.writers.is_available("ffmpeg"):
         mp4 = out_basename + ".mp4"
         ani.save(mp4, writer=manim.FFMpegWriter(fps=fps, bitrate=2400))
+        out["mp4"] = mp4
+    if not frames_dir:                                     # gif only when not stepping
+        gif = out_basename + ".gif"
+        ani.save(gif, writer=manim.PillowWriter(fps=fps)); out["gif"] = gif
     plt.close(fig)
-    return {"gif": gif, "mp4": mp4, "n_frames": len(frames),
-            "n_seizures": len(onsets)}
+    return out
 
 
 def seizure_labels(onsets) -> list:
