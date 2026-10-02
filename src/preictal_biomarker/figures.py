@@ -591,7 +591,7 @@ def metric_evolution_fig(model, onsets, out_png: str, *, metrics=None,
     axes[-1].set_xlabel("date", color=C.TEXT)
     ndays = (hi - lo) / 86400.0
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · full-span metric evolution "
-                 f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; red = lead "
+                 f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; white = lead "
                  f"onset){title_suffix}", color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
