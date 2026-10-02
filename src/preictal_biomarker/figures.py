@@ -578,8 +578,9 @@ def state_fraction_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str
     M = np.ma.masked_invalid(traj["matrix"].astype(float))
     cmap = LinearSegmentedColormap.from_list("frac", [C.PANEL, C.STATE_COLORS[tgt]])
     cmap.set_bad(C.NODATA_COLOR)
-    vmax = float(np.nanmax(traj["matrix"]))
-    vmax = vmax if (np.isfinite(vmax) and vmax > 0) else 1.0
+    pos = traj["matrix"][np.isfinite(traj["matrix"]) & (traj["matrix"] > 0)]
+    vmax = float(np.nanpercentile(pos, 95)) if pos.size else 0.0  # robust to outliers
+    vmax = vmax if vmax > 0 else 1.0
     e = traj["edges"]
     fig, ax = plt.subplots(figsize=(13, 0.5 * M.shape[0] + 2.2), facecolor=C.BG)
     im = ax.imshow(M, aspect="auto", cmap=cmap, origin="upper", vmin=0, vmax=vmax,
@@ -592,7 +593,7 @@ def state_fraction_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str
     cbar.ax.tick_params(colors=C.MUTED, labelsize=7)
     cbar.outline.set_edgecolor(C.MUTED)
     _dark(ax, f"per-seizure state-{tgt} occurrence (10-min fraction; "
-              f"max {vmax:.0%}){title_suffix}")
+              f"{vmax:.0%}+ saturates){title_suffix}")
     ax.set_xlabel("minutes from seizure onset"); ax.set_ylabel("seizure")
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout()

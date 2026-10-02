@@ -127,8 +127,9 @@ def render_state_fraction_timeline(df, onsets, out_png: str, *, target: int = 1,
     state per bin (brightness = occurrence), seizure onsets marked. Tracks a rare
     state the dominant-state timeline would never show."""
     tl = T.state_fraction_timeline(df, target=target, bin_sec=bin_sec)
-    mx = np.nanmax(tl["frac"]) if np.isfinite(np.nanmax(tl["frac"])) else 1.0
-    vmax = float(mx) if mx > 0 else 1.0
+    pos = tl["frac"][np.isfinite(tl["frac"]) & (tl["frac"] > 0)]
+    vmax = float(np.nanpercentile(pos, 95)) if pos.size else 0.0  # robust to outliers
+    vmax = vmax if vmax > 0 else 1.0
     end = anchor if anchor is not None else float(tl["centers"][-1])
     fig, axes = plt.subplots(len(_WINDOWS), 1, figsize=(15, 6.5), facecolor=C.BG)
     for ax, (label, dur) in zip(axes, _WINDOWS):
@@ -146,7 +147,7 @@ def render_state_fraction_timeline(df, onsets, out_png: str, *, target: int = 1,
         t.set_color(C.TEXT)
     blab = f"{int(bin_sec//60)}-min" if bin_sec >= 60 else f"{int(bin_sec)}-s"
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · state-{target} occurrence timeline "
-                 f"({blab} fraction; max {vmax:.0%})", color=C.TEXT, fontsize=12)
+                 f"({blab} fraction; {vmax:.0%}+ saturates)", color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0.03, 1, 0.97))
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
