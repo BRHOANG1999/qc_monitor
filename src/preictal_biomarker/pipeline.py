@@ -148,6 +148,40 @@ def run_incremental(*, n_surr: int = 300) -> dict:
     return r
 
 
+def run_regression(*, n_surr: int = 500, incremental: bool = True,
+                   force_features: bool = False) -> dict:
+    """Supervised log(time-to-seizure) regression (the advisor's reframe): eyeball
+    gate -> LOSO held-out Spearman + per-horizon AUC vs circular-shift null ->
+    per-seizure slope forest (+ the incremental beyond-clock test). Figures 15-17."""
+    from . import regression as R
+    store, evoked_dir, db = _ctx()
+    df = F.build_feature_matrix(store, evoked_dir, db, force=force_features)
+    model = S.fit_states(df)                          # provides pc1/pc2
+    lead = F.lead_onsets(store)
+    p = lambda n: os.path.join(C.EVOKED_DIR, n)
+    out = {}
+    out["eyeball"] = G.regression_eyeball_fig(
+        R.eyeball_trajectories(model.df, lead), p("15_regression_eyeball.png"))
+    reg = R.regression_null(model.df, lead, n_surr=n_surr)
+    out["null"] = G.regression_null_fig(reg, p("16_regression_null.png"))
+    ps = R.per_seizure_regression(model.df, lead, feature=C.CSD_PRIMARY)
+    out["forest"] = G.per_seizure_regression_fig(
+        ps, p("17_per_seizure_regression.png"))
+    inc = R.incremental_evoked_regression(model.df, lead) if incremental else None
+    print(f"[pipeline] regression Spearman={reg['spearman']:.3f} "
+          f"p={reg['p_spearman']:.3f} | horizon AUC "
+          f"{[round(reg['horizon_auc'][h], 3) for h in reg['horizons']]} "
+          f"p {[round(reg['p_horizon'][h], 3) for h in reg['horizons']]}")
+    print(f"[pipeline] per-seizure median rho={ps['across']['median_rho']:.3f} "
+          f"surrogate p={ps['surrogate']['p']:.3f} floor={ps['sign_flip_floor']:.4f}")
+    if inc:
+        print(f"[pipeline] incremental dSpearman={inc['delta']:+.3f} p={inc['p']:.3f}"
+              f" (base={inc['spearman_base']:.3f} full={inc['spearman_full']:.3f})")
+    for k, v in out.items():
+        print(f"[pipeline] {k} -> {v}")
+    return {"reg": reg, "forest": ps, "inc": inc, "out": out}
+
+
 def run_anim(*, step_lead: float = 2.0, step_all: float = 3.0, fps: int = 12,
              smoke: bool = False) -> dict:
     """Render the shared-PCA pre-ictal trajectory animations: lead + all."""
@@ -186,6 +220,8 @@ if __name__ == "__main__":
         run_classifier()
     elif "--incremental" in sys.argv:
         run_incremental()
+    elif "--regression" in sys.argv:
+        run_regression(force_features="--force" in sys.argv)
     elif "--full" in sys.argv:
         run_full(force_features="--force" in sys.argv)
     else:

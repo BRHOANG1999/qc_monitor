@@ -94,6 +94,21 @@ WAVEFORM_FEATURES = ["line_length", "rms_amplitude", "variance",
                      "autocorrelation", "peak_to_trough", "max_slope"]
 FEATURES8 = WAVEFORM_FEATURES + ["csd_variance", "csd_ar1"]
 
+# --- supervised log(time-to-seizure) regression ------------------------------
+# Supervised reframe (advisor): instead of clustering (which captures slow drift),
+# label each window by time-to-next-LEAD-onset and ask whether the evoked response
+# predicts log(TTS) on HELD-OUT seizures, beating a circular-shift null.
+# PARAMETER (analyst choice): the HANDFUL of predictors -- chosen from the eyeball
+# figure, NOT tuned on the regressor (12 seizures -> all 30 would overfit).
+REGRESSION_FEATURES = ["pc1", "pc2", "peak_to_trough", "line_length", "log_auc"]
+REG_TARGET_CAP_SEC = LOOKBACK_SEC        # 6 h ceiling: target = log(min(tto, cap))
+REG_POSTICTAL_BUFFER_SEC = 3600.0        # drop the hour AFTER any lead onset
+REG_FAR_MIN_SEC = LOOKBACK_SEC           # "far"/baseline rows: tto_to_lead > 6 h
+REG_MIN_LEADTIME_SEC = 2.0               # log() floor + dyadic log-ladder floor
+REG_HORIZONS_SEC = [30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0]  # per-horizon AUC
+REG_NEG_CAP = 30000                      # cap far/baseline rows (as classify._loso)
+REG_RIDGE_ALPHA = 1.0                    # L2 strength for the handful regressor
+
 # --- paths -------------------------------------------------------------------
 OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_preictal_biomarker")
 # Current reproducible-rebuild figures, split by analysis branch (so they're never

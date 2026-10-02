@@ -623,6 +623,120 @@ def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
     return out_png
 
 
+def regression_eyeball_fig(ey, out_png: str, *, title_suffix="") -> str:
+    """Eyeball gate: each handful feature vs LOG time-to-onset, per-seizure baseline-
+    normalized (thin lines) + bold mean + p25/p75 band. If nothing bends toward onset
+    (right edge) across seizures, a model won't rescue it. x = min-to-onset (log,
+    onset at right); faint dashed line = the 30-min pre-ictal mark."""
+    traj, feats = ey["traj"], ey["features"]
+    n = len(feats)
+    fig, axes = plt.subplots(1, n, figsize=(3.5 * n, 4.3), facecolor=C.BG,
+                             squeeze=False)
+    for ax, f in zip(axes[0], feats):
+        tj = traj[f]; cen = tj["centers"] / 60.0
+        for line in tj["per_seizure"].values():
+            ax.plot(cen, line, color=C.ACCENT, lw=0.7, alpha=0.30)
+        ax.fill_between(cen, tj["p25"], tj["p75"], color=C.ACCENT, alpha=0.15, lw=0)
+        ax.plot(cen, tj["median"], color=C.SEIZURE_COLOR, lw=2.4)
+        ax.axhline(0, color=C.MUTED, lw=0.6, ls=":")
+        ax.axvline(C.PREICTAL_SEC / 60.0, color=C.MUTED, lw=0.8, ls="--")
+        ax.set_xscale("log"); ax.invert_xaxis()          # onset (small lead) on right
+        _dark(ax, f)
+        ax.set_xlabel("min to onset (log)")
+    axes[0][0].set_ylabel("baseline-normalized (z)", color=C.TEXT)
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · evoked feature vs log time-to-onset "
+                 f"({ey['n_seizures']} lead seizures; thin=seizure, bold=mean)"
+                 f"{title_suffix}", color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def regression_null_fig(reg, out_png: str, *, title_suffix="") -> str:
+    """Held-out LOSO log-tto performance vs the circular-shift null. Left: pooled
+    predicted-vs-actual (log-tto) + identity. Middle: Spearman vs shift-null hist.
+    Right: per-horizon AUC + shift-null 95% band + per-horizon p."""
+    fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(15, 4.6), facecolor=C.BG)
+    yt, yp = reg["y_true"], reg["y_pred"]
+    if yt.size:
+        a1.scatter(yt, yp, s=3, c=C.ACCENT, alpha=0.12, linewidths=0)
+        lim = [float(np.nanmin([yt.min(), yp.min()])),
+               float(np.nanmax([yt.max(), yp.max()]))]
+        a1.plot(lim, lim, color=C.MUTED, ls="--", lw=1)
+    _dark(a1, f"held-out pred vs actual  (Spearman ρ={reg['spearman']:.3f})")
+    a1.set_xlabel("actual log(sec-to-onset)"); a1.set_ylabel("predicted")
+    ns = reg["null_spearman"]; ns = ns[np.isfinite(ns)]
+    if ns.size:
+        a2.hist(ns, bins=30, color=C.MUTED, alpha=0.6)
+        a2.axvline(float(np.median(ns)), color="#ff6b6b", lw=1.2, ls="--")
+    a2.axvline(reg["spearman"], color="#f2c744", lw=2.4)
+    a2.axvline(0, color=C.MUTED, lw=0.8, ls=":")
+    _dark(a2, f"Spearman vs shift null (p={reg['p_spearman']:.3f})")
+    a2.set_xlabel("Spearman ρ"); a2.set_ylabel("surrogates")
+    hs = reg["horizons"]; x = np.arange(len(hs))
+    obs = [reg["horizon_auc"].get(float(H), np.nan) for H in hs]
+    lo = [np.nanpercentile(reg["null_horizon"][float(H)], 2.5) for H in hs]
+    hi = [np.nanpercentile(reg["null_horizon"][float(H)], 97.5) for H in hs]
+    a3.fill_between(x, lo, hi, color=C.MUTED, alpha=0.25, lw=0, label="null 95%")
+    a3.plot(x, obs, "-o", color=C.ACCENT, lw=1.8, label="observed")
+    a3.axhline(0.5, color=C.MUTED, lw=0.8, ls=":")
+    for i, H in enumerate(hs):
+        p = reg["p_horizon"].get(float(H), np.nan)
+        if np.isfinite(p) and np.isfinite(obs[i]):
+            a3.annotate(f"{p:.2f}", (x[i], obs[i]), textcoords="offset points",
+                        xytext=(0, 7), ha="center", color=C.TEXT, fontsize=7)
+    a3.set_xticks(x); a3.set_xticklabels([_hlabel(H) for H in hs])
+    _dark(a3, "per-horizon AUC vs shift null")
+    a3.set_xlabel("horizon H"); a3.set_ylabel("AUC")
+    leg = a3.legend(fontsize=7, framealpha=0.1)
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · log-tto regression vs circular-shift "
+                 f"null (n_pre={reg['n_pre']}, n_far={reg['n_far']}, "
+                 f"{reg['n_surr']} shifts){title_suffix}", color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def per_seizure_regression_fig(ps, out_png: str, *, title_suffix="") -> str:
+    """Per-seizure slope forest: one row per lead seizure = its OLS slope of the
+    feature vs time-to-onset with a block-bootstrap 95% CI. Green when the CI
+    excludes 0 ('ramps'), muted otherwise. 'Look at the 12 individually.'"""
+    import datetime as _dt
+    forest = ps["forest"]; ons = ps["onsets"]
+    rows = sorted(forest, key=lambda r: r["seizure_idx"])
+    yloc = np.arange(len(rows))
+    fig, ax = plt.subplots(figsize=(8, 0.42 * max(len(rows), 1) + 2.2),
+                           facecolor=C.BG)
+    for i, r in enumerate(rows):
+        sig = np.isfinite(r["ci_lo"]) and (r["ci_lo"] > 0 or r["ci_hi"] < 0)
+        col = C.STATE_COLORS[1] if sig else C.MUTED
+        ax.plot([r["ci_lo"], r["ci_hi"]], [i, i], color=col, lw=1.6, zorder=2)
+        ax.plot([r["slope"]], [i], "o", color=col, ms=5, zorder=3)
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.0, ls="--")
+    labels = [_dt.datetime.fromtimestamp(float(ons[r["seizure_idx"]])).strftime(
+        "%m-%d %H:%M") if r["seizure_idx"] < len(ons) else str(r["seizure_idx"])
+        for r in rows]
+    ax.set_yticks(yloc); ax.set_yticklabels(labels, fontsize=7)
+    ax.invert_yaxis()
+    ac = ps["across"]; su = ps["surrogate"]
+    _dark(ax, f"per-seizure slope of {ps['feature']} vs time-to-onset  "
+              f"(median ρ={ac['median_rho']:.2f}, surrogate p={su['p']:.3f}, "
+              f"floor={ps['sign_flip_floor']:.3f}){title_suffix}")
+    ax.set_xlabel("OLS slope (feature per sec-to-onset) ± block-bootstrap 95% CI")
+    ax.set_ylabel("lead seizure")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def cluster_validity_fig(res, out_png: str, *, title_suffix="") -> str:
     """Four-panel 'are there discrete states?' diagnostic: PC1 histogram + dip p,
     GMM BIC vs k, bootstrap ARI vs a covariance-matched Gaussian null, silhouette vs
