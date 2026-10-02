@@ -2911,37 +2911,65 @@ def layout(store: Store, bridge: dict | None = None):
                 open_default=False,
                 content=html.Div([
                     html.Div([
-                        html.Label("Session", style=LABEL_STYLE,
-                                    title="A session is a continuous run of "
-                                           "recording with one animal."),
-                        dcc.Dropdown(
-                            id="video-session-dropdown",
-                            options=session_options,
-                            value=default_session,
-                            style=DROPDOWN_STYLE,
-                            className="dark-dropdown"),
-                    ], style={"flex": "2", "minWidth": "200px"}),
+                        html.Div([
+                            html.Label("Session", style=LABEL_STYLE,
+                                        title="A session is a continuous run of "
+                                               "recording with one animal."),
+                            dcc.Dropdown(
+                                id="video-session-dropdown",
+                                options=session_options,
+                                value=default_session,
+                                style=DROPDOWN_STYLE,
+                                className="dark-dropdown"),
+                        ], style={"flex": "2", "minWidth": "200px"}),
+                        html.Div([
+                            html.Label("File (chunk)", style=LABEL_STYLE,
+                                        title="Each chunk is roughly one hour of "
+                                               "recording, named with its start "
+                                               "timestamp."),
+                            dcc.Dropdown(
+                                id="video-file-dropdown", options=[],
+                                style=DROPDOWN_STYLE,
+                                className="dark-dropdown"),
+                        ], style={"flex": "3", "minWidth": "220px"}),
+                        html.Div([
+                            html.Label("Brain channel", style=LABEL_STYLE,
+                                        title="Which electrode contact to "
+                                               "display the LFP trace for."),
+                            dcc.Dropdown(
+                                id="video-channel-dropdown", options=[],
+                                value=0, style=DROPDOWN_STYLE,
+                                className="dark-dropdown"),
+                        ], style={"flex": "1", "minWidth": "160px"}),
+                    ], style={"display": "flex", "gap": "16px",
+                               "flexWrap": "wrap"}),
+                    # Copy this recording's FILE information (identity + location +
+                    # review status) as one CSV row, so a reviewer can save it and
+                    # navigate back to the file later. dcc.Clipboard copies its
+                    # `content` (kept current by the callback below) within the click
+                    # gesture, so the browser never blocks the write.
                     html.Div([
-                        html.Label("File (chunk)", style=LABEL_STYLE,
-                                    title="Each chunk is roughly one hour of "
-                                           "recording, named with its start "
-                                           "timestamp."),
-                        dcc.Dropdown(
-                            id="video-file-dropdown", options=[],
-                            style=DROPDOWN_STYLE,
-                            className="dark-dropdown"),
-                    ], style={"flex": "3", "minWidth": "220px"}),
-                    html.Div([
-                        html.Label("Brain channel", style=LABEL_STYLE,
-                                    title="Which electrode contact to "
-                                           "display the LFP trace for."),
-                        dcc.Dropdown(
-                            id="video-channel-dropdown", options=[],
-                            value=0, style=DROPDOWN_STYLE,
-                            className="dark-dropdown"),
-                    ], style={"flex": "1", "minWidth": "160px"}),
-                ], style={"display": "flex", "gap": "16px",
-                           "flexWrap": "wrap"}),
+                        html.Label("Copy file info", style=LABEL_STYLE,
+                                    title="Copy this recording's identity, location "
+                                           "and review status as a CSV row to the "
+                                           "clipboard."),
+                        dcc.Clipboard(
+                            id="video-copy-info-clip", content="",
+                            title="Copy this recording's file info as a CSV row",
+                            style={"color": "#5e7ce2", "cursor": "pointer",
+                                   "fontSize": "18px", "display": "inline-block",
+                                   "verticalAlign": "middle",
+                                   "marginLeft": "8px"}),
+                        dcc.Checklist(
+                            id="video-copy-info-header",
+                            options=[{"label": " header line", "value": "header"}],
+                            value=["header"],
+                            style={"display": "inline-block", "marginLeft": "12px",
+                                   "color": "#a0a0b0", "fontSize": "11px"},
+                            inputStyle={"marginRight": "3px"}),
+                    ], style={"display": "flex", "alignItems": "center",
+                               "marginTop": "12px"}),
+                ]),
             ),
             # Bulk pre-screen (Hilbert thresholding) -- a batch tool
             # scoped to the animal picked above, NOT part of picking one
@@ -3459,30 +3487,6 @@ def layout(store: Store, bridge: dict | None = None):
                            style={"color": "#888", "fontSize": "11px",
                                    "marginLeft": "16px",
                                    "alignSelf": "center"}),
-                # Copy this recording's identity + review status as one CSV row, so a
-                # reviewer can save it and navigate back later. dcc.Clipboard copies
-                # its `content` (kept current by the callback below) within the click
-                # gesture, so the browser never blocks the write.
-                html.Div([
-                    html.Span("Copy info", style={
-                        "color": "#a0a0b0", "fontSize": "11px",
-                        "marginRight": "4px"}),
-                    dcc.Clipboard(
-                        id="video-copy-info-clip", content="",
-                        title="Copy this recording's info as a CSV row",
-                        style={"color": "#5e7ce2", "cursor": "pointer",
-                               "fontSize": "18px", "display": "inline-block",
-                               "verticalAlign": "middle"}),
-                    dcc.Checklist(
-                        id="video-copy-info-header",
-                        options=[{"label": " header", "value": "header"}],
-                        value=["header"],
-                        style={"display": "inline-block", "marginLeft": "8px",
-                               "color": "#a0a0b0", "fontSize": "11px"},
-                        inputStyle={"marginRight": "3px"}),
-                ], style={"display": "flex", "alignItems": "center",
-                           "marginLeft": "auto", "gap": "2px",
-                           "alignSelf": "center"}),
             ], style={"marginTop": "12px", "marginBottom": "4px",
                        "display": "flex", "gap": "10px",
                        "flexWrap": "wrap",
