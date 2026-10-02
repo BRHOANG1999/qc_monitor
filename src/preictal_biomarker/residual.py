@@ -7,9 +7,10 @@ k-means states, occupancy + circular-shift null, per-seizure trajectory, timelin
 and animations then reuse the representation-agnostic backend unchanged.
 
 Design notes
-- Traces are read crop-only over 2-50 ms (fast windowed read, no LP) and decimated
-  by ``DECIM`` for a tractable, denoised PCA input. This differs from the main
-  branch's LP500 features by design (a different representation to compare).
+- Traces are read FULL (all post-stim samples), 1-500 Hz bandpassed, then windowed
+  to 2-50 ms and decimated by ``DECIM`` -- the SAME band as the main branch's LP500
+  features (via ``evoked_features.preprocess`` / ``_bandpass``), so the residual
+  representation and the engineered features are on one band (no HF-noise confound).
 - Per-epoch time (``abs_dt``) is taken from the warmed feature sidecar, paired to
   the windowed traces by index (validated per file); the seizure join reuses the
   committed ``periictal.matrix`` helpers.
@@ -22,13 +23,19 @@ import os
 import numpy as np
 import pandas as pd
 
-from src.notifications.evoked_stim_corr import _win_traces, _file_dt, _list_files
+from src.notifications.evoked_stim_corr import (_file_dt, _list_files, _match_key)
 from src.utils.evoked_output import read_feature_sidecar
+from src.utils import evoked_features as _ef
 from src.periictal import matrix as _mx, passive as _passive, config as _pcfg
 from src.preictal import isi as _isi
 from . import config as C, features as F, states as S
 
 DECIM = 4                                   # keep every 4th sample (~5 kHz)
+# LP500 preprocess config (1-500 Hz bandpass on the full trace, then 2-50 ms crop)
+# -- identical band to the engineered-feature sidecars (evoked_windowed._bandpass).
+_LP_CFG = _ef.FeatureConfig(window_start_ms=C.WINDOW_MS[0],
+                            window_end_ms=C.WINDOW_MS[1], bandpass=C.BANDPASS,
+                            bp_low_hz=C.BP_LOW_HZ, bp_high_hz=C.BP_HIGH_HZ)
 _RES_CACHE = C.CACHE_DIR + "/BCH111_residual_matrix.npz"
 _RES_CACHE_FULL = C.CACHE_DIR + "/BCH111_residual_matrix_full.npz"
 
@@ -51,6 +58,31 @@ def _epoch_abs_dt(fp) -> np.ndarray | None:
         d = parse_iso(r.get("abs_dt")) if r.get("abs_dt") else None
         out.append(d.timestamp() if d else np.nan)
     return np.asarray(out, float) if out else None
+
+
+def _full_traces(path, channel):
+    """(traces[:, all_samples], time_ms, fs) -- FULL evokedData read so the 1-500 Hz
+    bandpass can run on the whole post-stim trace BEFORE windowing (a 1 Hz high-pass
+    is meaningless on a 48 ms crop). fs from the median time step. None on failure."""
+    import h5py
+    try:
+        with h5py.File(path, "r") as g:
+            grp = g.get("allAnimalResults")
+            if grp is None:
+                return None
+            node = grp.get(channel) or grp.get(_match_key(list(grp.keys()), channel))
+            if node is None or "evokedData" not in node or "timeAxis" not in node:
+                return None
+            t = np.asarray(node["timeAxis"][()], float).ravel()
+            tr = np.asarray(node["evokedData"][()], float)
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+    if tr.ndim != 2 or tr.shape[1] != t.size or t.size < 4:
+        return None
+    dt = float(np.median(np.diff(t)))                    # ms
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+    return tr, t, 1000.0 / dt
 
 
 def build_residual_matrix(store, evoked_dir: str, *, force=False,
@@ -76,19 +108,21 @@ def build_residual_matrix(store, evoked_dir: str, *, force=False,
         filt = _mx._near_seizure_file_filter(onsets, C.LOOKBACK_SEC,
                                              _pcfg.PERIICTAL_PREFILTER_SLACK_SEC)
         files = [f for f in _list_files(C.ANIMAL, evoked_dir, None) if filt(f)]
-    _log(f"extracting 2-50 ms waveforms from {len(files)} files (crop-only) ...")
+    _log(f"extracting 2-50 ms waveforms from {len(files)} files "
+         f"(full read -> 1-500 Hz bandpass -> window) ...")
     waves, ts, recs = [], [], []
     tw_keep = None
     for i, fp in enumerate(files):
         if i % 20 == 0:
             _log(f"  file {i}/{len(files)}")
-        wt = _win_traces(fp, C.CHANNEL, C.WINDOW_MS)
+        ft = _full_traces(fp, C.CHANNEL)
         adt = _epoch_abs_dt(fp)
-        if wt is None or adt is None:
+        if ft is None or adt is None:
             continue
-        tr, tw = wt
-        if tr.shape[0] != adt.size:            # order/count must line up
+        tr_full, t_full, fs = ft
+        if tr_full.shape[0] != adt.size:       # order/count must line up
             continue
+        tr, tw = _ef.preprocess(tr_full, t_full, fs, _LP_CFG)   # LP500 then 2-50 ms
         waves.append(tr[:, ::DECIM].astype(np.float32))
         ts.append(adt)
         recs.append(np.full(adt.size, _file_dt(fp).timestamp()))
