@@ -140,6 +140,98 @@ def seizure_prob_null(df: pd.DataFrame, onsets, *, horizons_sec=None,
             "n_state": obs["n_state"], "n_surr": int(n_surr)}
 
 
+_RISK_EDGES_MIN = (1.0, 5.0, 10.0, 30.0, 60.0)       # disjoint bins + 'none' (>60)
+
+
+def _risk_bin_labels(t: np.ndarray, onsets, edges_min=_RISK_EDGES_MIN):
+    """Disjoint time-to-NEXT-onset bin per epoch: (0,e0],(e0,e1],...,(e_{n-2},e_{n-1}],
+    and 'none' (>last edge, <=0, or no next onset). Returns (labels[int], n_bins,
+    names). Seizure times are FIXED here -- only the states get shifted in the null."""
+    ons = np.sort(np.asarray(onsets, float))
+    if ons.size == 0:
+        return np.full(t.size, len(edges_min), int), len(edges_min) + 1, \
+            _risk_bin_names(edges_min)
+    idx = np.searchsorted(ons, t, side="left")
+    nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
+    dmin = (nxt - t) / 60.0
+    lab = np.full(t.size, len(edges_min), int)           # default 'none'
+    prev = 0.0
+    for i, e in enumerate(edges_min):
+        lab[(dmin > prev) & (dmin <= e)] = i
+        prev = e
+    return lab, len(edges_min) + 1, _risk_bin_names(edges_min)
+
+
+def _risk_bin_names(edges_min=_RISK_EDGES_MIN) -> list:
+    names, prev = [], 0.0
+    for e in edges_min:
+        names.append(f"{int(prev)}-{int(e)}"); prev = e
+    return names + ["none"]
+
+
+def _lift_table(state: np.ndarray, lab: np.ndarray, k: int, nb: int) -> np.ndarray:
+    """lift(state, bin) = P(bin | state) / P(bin); NaN where a cell is empty.
+    Vectorized (bincount over state*nb+bin) so 1000 surrogates stay cheap."""
+    ok = state >= 0
+    s, b = state[ok], lab[ok]
+    n = s.size
+    if n == 0:
+        return np.full((k, nb), np.nan)
+    cnt = np.bincount(s * nb + b, minlength=k * nb).reshape(k, nb).astype(float)
+    ns = cnt.sum(axis=1, keepdims=True)                  # per-state totals
+    pb = cnt.sum(axis=0) / n                             # marginal P(bin)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        L = (cnt / np.where(ns > 0, ns, np.nan)) / np.where(pb > 0, pb, np.nan)
+    return L
+
+
+def state_risk_bin_null(df: pd.DataFrame, onsets, *, edges_min=_RISK_EDGES_MIN,
+                        k: int | None = None, n_surr: int = 1000,
+                        min_shift_sec: float = 7200.0, seed: int = 0) -> dict:
+    """Is the state->seizure-risk link real, or an artifact of state autocorrelation?
+
+    Keeps seizure times (and thus each epoch's disjoint time-to-seizure bin) FIXED,
+    and circularly shifts the STATE sequence in TIME by a random offset (wrapped,
+    >= min_shift_sec so near-seizure epochs decouple), re-pairing shifted states to
+    fixed bins. The state x bin lift table is recomputed per shift (n_surr times);
+    the 2.5-97.5 percentiles are the chance band and p = fraction of shifts whose
+    lift >= observed (one-sided enrichment). If observed sits inside the band, the
+    state->risk association has disappeared under the null."""
+    k = int(k or C.K_STATES)
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    s = df["state"].to_numpy()
+    fin = np.isfinite(t)
+    t, s = t[fin], s[fin]
+    order = np.argsort(t); t, s = t[order], s[order]
+    lab, nb, names = _risk_bin_labels(t, onsets, edges_min)
+    span = t[-1] - t[0]
+    assert span > 2 * min_shift_sec, "record span too short for the 2 h shift floor"
+    obs = _lift_table(s, lab, k, nb)
+    rng = np.random.default_rng(seed)
+    null = np.full((n_surr, k, nb), np.nan)
+    for i in range(n_surr):                              # bounded loop
+        delta = rng.uniform(min_shift_sec, span - min_shift_sec)
+        rot = t[0] + ((t - delta - t[0]) % span)        # wrapped rotated time
+        j = np.clip(np.searchsorted(t, rot, side="left"), 0, t.size - 1)
+        jm = np.clip(j - 1, 0, t.size - 1)
+        pick = np.where(np.abs(t[j] - rot) <= np.abs(rot - t[jm]), j, jm)
+        null[i] = _lift_table(s[pick], lab, k, nb)       # states shifted, bins fixed
+    lo = np.nanpercentile(null, 2.5, axis=0)
+    hi = np.nanpercentile(null, 97.5, axis=0)
+    med = np.nanmedian(null, axis=0)
+    p = np.full((k, nb), np.nan)
+    for si in range(k):
+        for j in range(nb):
+            col = null[:, si, j][np.isfinite(null[:, si, j])]
+            if col.size and np.isfinite(obs[si, j]):
+                p[si, j] = (np.sum(col >= obs[si, j]) + 1) / (col.size + 1)
+    n_state = np.array([int((s == si).sum()) for si in range(k)])
+    n_bin = np.array([int((lab == j).sum()) for j in range(nb)])
+    return {"obs": obs, "lo": lo, "hi": hi, "med": med, "p": p, "names": names,
+            "n_bins": nb, "n_state": n_state, "n_bin": n_bin, "n_surr": int(n_surr),
+            "min_shift_sec": float(min_shift_sec), "edges_min": list(edges_min)}
+
+
 def _two_sided_p(null_col: np.ndarray, obs: float, med: float) -> float:
     """Fraction of surrogates at least as far from the null median as observed
     (+1 smoothed). NaN-safe."""

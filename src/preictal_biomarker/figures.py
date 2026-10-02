@@ -441,6 +441,53 @@ def seizure_prob_fig(res, out_png: str, *, title_suffix="") -> str:
     return out_png
 
 
+def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
+                            title_suffix="") -> str:
+    """Per state: observed state x time-to-seizure-bin LIFT vs the circular-shift-of-
+    STATES null. Shaded = 2.5-97.5 chance band; dashed = null median; dotted = lift 1;
+    one-sided p per bin (* p<0.05). Observed inside the band => state->risk is not
+    distinguishable from chance (the link disappears under the null)."""
+    obs, lo, hi, med, p = res["obs"], res["lo"], res["hi"], res["med"], res["p"]
+    names = res["names"]; k = obs.shape[0]
+    nprox = len(names) - 1                                # drop the 'none' bin
+    x = np.arange(nprox)
+    rows = (k + 1) // 2
+    fig, axes = plt.subplots(rows, 2, figsize=(12, 3.1 * rows + 1), facecolor=C.BG,
+                             squeeze=False)
+    for s in range(k):
+        ax = axes[s // 2][s % 2]
+        ax.fill_between(x, lo[s, :nprox], hi[s, :nprox], color=C.MUTED, alpha=0.25,
+                        lw=0, label="shift-null 95% band")
+        ax.plot(x, med[s, :nprox], "--", color=C.MUTED, lw=1.0, label="null median")
+        ax.plot(x, obs[s, :nprox], "-o", color=C.STATE_COLORS[s], lw=2.0, ms=5,
+                label="observed")
+        ax.axhline(1.0, color=C.TEXT, lw=0.8, ls=":")
+        for j in range(nprox):
+            if np.isfinite(p[s, j]) and np.isfinite(obs[s, j]):
+                sig = "*" if p[s, j] < 0.05 else ""
+                ax.annotate(f"p={p[s, j]:.2f}{sig}", (x[j], obs[s, j]),
+                            textcoords="offset points", xytext=(0, 8), ha="center",
+                            color=(C.ACCENT if sig else C.TEXT), fontsize=7)
+        lab = labels[s] if labels else f"state {s}"
+        _dark(ax, f"{lab}  (n={res['n_state'][s]})")
+        ax.set_xticks(x); ax.set_xticklabels(names[:nprox])
+        ax.set_xlabel("time to next seizure (min)"); ax.set_ylabel("lift ×")
+        leg = ax.legend(fontsize=7, framealpha=0.1, loc="upper left")
+        for t in leg.get_texts():
+            t.set_color(C.TEXT)
+    for s in range(k, rows * 2):
+        axes[s // 2][s % 2].axis("off")
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · state→seizure-risk vs circular-shift"
+                 f"-of-states null ({res['n_surr']} shifts, ≥"
+                 f"{res['min_shift_sec']/3600:.0f} h){title_suffix}",
+                 color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def per_seizure_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
     """Per-seizure dominant-state trajectory heatmap (one row per seizure; x =
     minutes from onset; colour = 10-min dominant state; white line at onset)."""
