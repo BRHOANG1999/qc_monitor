@@ -117,14 +117,27 @@ def occupancy_bars(ax, occ, model):
     ax.bar(x + w / 2, base, w, color="#5b8def",
            label=f"clean baseline ≥{int(C.BASELINE_MIN_SEC//3600)} h "
                  f"(n={occ['n_base']})")
+    ymax = max(pre.max(), base.max())
     for i in range(k):
         fc = pre[i] / base[i] if base[i] > 0 else np.nan
         y = max(pre[i], base[i])
-        ax.text(i, y + 1.2, f"{fc:.2f}×" if np.isfinite(fc) else "—",
+        ax.text(i, y + 0.012 * ymax, f"{fc:.2f}×" if np.isfinite(fc) else "—",
                 ha="center", va="bottom", fontsize=8,
                 color="#f0a500" if (np.isfinite(fc) and abs(fc - 1) > 0.15)
                 else C.MUTED)
-    _dark(ax, "state occupancy · pre-ictal vs baseline (N× = pre ÷ baseline)")
+        # epoch COUNT inside each bar (pct × group total), rotated
+        npre_i = int(round(pre[i] / 100.0 * occ["n_pre"]))
+        nbase_i = int(round(base[i] / 100.0 * occ["n_base"]))
+        for xoff, bar, cnt, col in ((-w / 2, pre[i], npre_i, "#1a1a1a"),
+                                    (w / 2, base[i], nbase_i, "#f0f0f5")):
+            inside = bar > 0.10 * ymax
+            ax.text(i + xoff, bar / 2 if inside else bar + 0.004 * ymax,
+                    f"{cnt:,} = {bar:.0f}%", ha="center",
+                    va="center" if inside else "bottom", rotation=90,
+                    fontsize=6.5, color=col if inside else C.MUTED)
+    _dark(ax, f"occupancy = % WITHIN each group (pre n={occ['n_pre']:,} vs "
+              f"baseline n={occ['n_base']:,}, ~{occ['n_base']/max(1,occ['n_pre']):.0f}× "
+              f"bigger) · N× = ratio of the %")
     ax.set_xticks(x)
     ax.set_xticklabels([f"state {s}" for s in range(k)])
     ax.set_xlabel("state")
@@ -350,6 +363,39 @@ def classifier_null_fig(res, out_png: str) -> str:
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig.tight_layout()
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def cluster_traces_fig(waveforms, time_ms, states, out_png, *, k=None,
+                       n_traces=25, seed=0, title_suffix="") -> str:
+    """Per state: the MEAN evoked waveform (thick white) over *n_traces* random
+    example traces (thin, state colour). Shows what each cluster's response looks
+    like."""
+    k = int(k or C.K_STATES)
+    rng = np.random.default_rng(seed)
+    fig, axes = plt.subplots(1, k, figsize=(4.0 * k, 4.2), facecolor=C.BG,
+                             sharey=True)
+    axes = np.atleast_1d(axes)
+    for s in range(k):
+        ax = axes[s]
+        idx = np.where(states == s)[0]
+        if idx.size:
+            pick = rng.choice(idx, min(n_traces, idx.size), replace=False)
+            for j in pick:
+                ax.plot(time_ms, waveforms[j], color=C.STATE_COLORS[s], lw=0.5,
+                        alpha=0.30)
+            ax.plot(time_ms, np.nanmean(waveforms[idx], axis=0), color="#ffffff",
+                    lw=2.4, label="mean")
+        _dark(ax, f"state {s} · {C.STATE_COLORS[s] and ''}n={idx.size:,}")
+        ax.set_xlabel("ms since stim")
+    axes[0].set_ylabel("evoked response (gain-norm, a.u.)")
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · per-state evoked waveform "
+                 f"(mean + {n_traces} random traces){title_suffix}",
+                 color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    _savefig(fig, out_png, bbox_inches="tight")
     plt.close(fig)
     return out_png
 

@@ -336,6 +336,73 @@ def run_residual_metrics(*, force=False, n_surr=500) -> dict:
     return {"model": model, "occ": occ, "null": null, "clf": clf}
 
 
+def _states_by_time(model_df, t_w):
+    """State label for each waveform epoch (time t_w) by nearest feature-epoch."""
+    tf = pd.to_numeric(model_df["t_epoch"], errors="coerce").to_numpy(float)
+    sf = model_df["state"].to_numpy()
+    order = np.argsort(tf); tf, sf = tf[order], sf[order]
+    pos = np.clip(np.searchsorted(tf, t_w), 1, tf.size - 1)
+    near = np.where(np.abs(tf[pos] - t_w) < np.abs(tf[pos - 1] - t_w), pos, pos - 1)
+    st = sf[near]
+    st[np.abs(tf[near] - t_w) > 5.0] = -1                  # no match within 5 s
+    return st
+
+
+def evoked_and_states(store, ed, db):
+    """Reconstruct raw 2-50 ms (stim-blanked) evoked waveforms + the feature-branch
+    state per waveform epoch + the time axis. Shared by the cluster-traces figure
+    and the animation LFP panel."""
+    from . import features as F, states as S
+    data = build_residual_matrix(store, ed, full_record=True)
+    evoked = data["res"] + data["mean_wave"]              # residual + global mean
+    model = S.fit_states(F.build_feature_matrix(store, ed, db))
+    st = _states_by_time(model.df, data["t"])
+    return evoked, data["time_ms"], st, data["t"], model
+
+
+def run_cluster_traces(*, n_traces=25, seed=0) -> str:
+    """Per-state evoked waveform (mean + n_traces random traces) for the feature-
+    branch states, on the full record."""
+    from . import figures as G
+    from src.db.store import Store
+    from src.dashboard.data_helpers import load_config
+    cfg = load_config(); store = Store(cfg["database"]["path"])
+    ed = cfg["chronic_evoked"]["evoked_output_dir"]; db = cfg["database"]["path"]
+    evoked, tm, st, _t, _m = evoked_and_states(store, ed, db)
+    out = os.path.join(C.EVOKED_DIR, "12_cluster_traces.png")
+    G.cluster_traces_fig(evoked, tm, st, out, n_traces=n_traces, seed=seed)
+    _log(f"cluster traces -> {out}  (state counts "
+         f"{dict(zip(*np.unique(st[st>=0], return_counts=True)))})")
+    return out
+
+
+def run_anim_lfp(*, step_lead=2.0, step_all=3.0, fps=12) -> dict:
+    """Re-render the pre-ictal PCA trajectory animations WITH a time-locked
+    stim-blanked LFP panel beneath (lead + all)."""
+    from . import anim as A
+    from src.db.store import Store
+    from src.dashboard.data_helpers import load_config
+    cfg = load_config(); store = Store(cfg["database"]["path"])
+    ed = cfg["chronic_evoked"]["evoked_output_dir"]; db = cfg["database"]["path"]
+    evoked, tm, _st, t_w, model = evoked_and_states(store, ed, db)
+    lead = F.lead_onsets(store); allon = F.scoped_onsets(store)
+    adir = os.path.join(C.EVOKED_DIR, "anim")
+    pr = lambda i, n: print(f"  frame {i}/{n}", flush=True) if i % 80 == 0 else None
+    kw = dict(waveforms=evoked, wave_t=t_w, wave_time_ms=tm, fps=fps, progress=pr)
+    out = {}
+    _log(f"rendering lead LFP animation ({lead.size} seizures) ...")
+    out["lead"] = A.animate_set(model, lead, A.seizure_labels(lead),
+                                os.path.join(adir, "preictal_traj_lead_lfp"),
+                                step_min=step_lead, **kw)
+    _log(f"rendering all LFP animation ({allon.size} seizures) ...")
+    out["all"] = A.animate_set(model, allon, A.seizure_labels(allon),
+                               os.path.join(adir, "preictal_traj_all_lfp"),
+                               step_min=step_all, **kw)
+    for k, v in out.items():
+        _log(f"{k}: {v}")
+    return out
+
+
 def run_horizons(bins_min=(30.0, 10.0, 5.0, 1.0, 0.5)) -> dict:
     """Re-render the residual per-seizure trajectory (lead + all) and the state
     timeline at several dominant-state bin widths. Finer bins surface the rare
@@ -401,7 +468,11 @@ if __name__ == "__main__":
             s.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-    if "--metrics" in sys.argv:
+    if "--anim-lfp" in sys.argv:
+        run_anim_lfp()
+    elif "--cluster-traces" in sys.argv:
+        run_cluster_traces()
+    elif "--metrics" in sys.argv:
         run_residual_metrics(force="--force" in sys.argv)
     elif "--full-timeline" in sys.argv:
         run_full_timeline(force="--force" in sys.argv)

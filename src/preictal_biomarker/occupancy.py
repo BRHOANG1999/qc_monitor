@@ -112,6 +112,34 @@ def seizure_prob_by_state(df: pd.DataFrame, onsets, *, horizons_sec=None,
             "n_state": n_state}
 
 
+def seizure_prob_null(df: pd.DataFrame, onsets, *, horizons_sec=None,
+                      k: int | None = None, n_surr: int = 500, seed: int = 0) -> dict:
+    """Shift-null for the per-state forward lift P(sz within H|state)/base: is a
+    state's elevated seizure probability more than random onset alignments give?
+    Returns observed lift [k,H] and a one-sided p per state×horizon."""
+    k = int(k or C.K_STATES)
+    hs = horizons_sec or [30, 60, 300, 600, 1800, 3600]
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    lo, hi = np.nanmin(t), np.nanmax(t); span = hi - lo
+    ons = np.sort(np.asarray(onsets, float))
+    obs = seizure_prob_by_state(df, ons, horizons_sec=hs, k=k)
+    obs_lift = obs["P"] / np.where(obs["base"] > 0, obs["base"], np.nan)
+    rng = np.random.default_rng(seed)
+    nl = np.full((n_surr, k, len(hs)), np.nan)
+    for i in range(n_surr):
+        sh = lo + ((ons - lo + rng.uniform(0, span)) % span)
+        r = seizure_prob_by_state(df, sh, horizons_sec=hs, k=k)
+        nl[i] = r["P"] / np.where(r["base"] > 0, r["base"], np.nan)
+    p = np.full((k, len(hs)), np.nan)
+    for s in range(k):
+        for h in range(len(hs)):
+            col = nl[:, s, h][np.isfinite(nl[:, s, h])]
+            if col.size and np.isfinite(obs_lift[s, h]):
+                p[s, h] = (np.sum(col >= obs_lift[s, h]) + 1) / (col.size + 1)
+    return {"horizons_sec": hs, "obs_lift": obs_lift, "p": p,
+            "n_state": obs["n_state"], "n_surr": int(n_surr)}
+
+
 def _two_sided_p(null_col: np.ndarray, obs: float, med: float) -> float:
     """Fraction of surrogates at least as far from the null median as observed
     (+1 smoothed). NaN-safe."""
