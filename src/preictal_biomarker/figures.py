@@ -528,6 +528,79 @@ def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
     return out_png
 
 
+def cluster_validity_fig(res, out_png: str, *, title_suffix="") -> str:
+    """Four-panel 'are there discrete states?' diagnostic: PC1 histogram + dip p,
+    GMM BIC vs k, bootstrap ARI vs a covariance-matched Gaussian null, silhouette vs
+    k. Unimodal PCs + monotone BIC + low silhouette => a continuum, not states."""
+    fig, ((a, b), (c, d)) = plt.subplots(2, 2, figsize=(12, 8), facecolor=C.BG)
+    a.hist(res["Zpc1"], bins=60, color=C.ACCENT, alpha=0.85)
+    dp = res["dips"][0]
+    _dark(a, f"PC1 distribution  (dip p={dp['p']:.2f}, bimodality={dp['bimodality']:.2f})")
+    a.set_xlabel("PC1"); a.set_ylabel("count")
+    if res["bic"]:
+        ks = sorted(res["bic"])
+        b.plot(ks, [res["bic"][k] for k in ks], "-o", color=C.STATE_COLORS[0])
+        if res["bic_min_k"] is not None:
+            b.axvline(res["bic_min_k"], color=C.MUTED, ls="--", lw=1)
+    _dark(b, "GMM BIC vs k  (interior min => a natural k; monotone => continuum)")
+    b.set_xlabel("k (GMM components)"); b.set_ylabel("BIC (lower = better)")
+    s = res["stability"]
+    c.plot(s["k"], s["ari"], "-o", color=C.STATE_COLORS[1], label="observed")
+    c.plot(s["k"], s["ari_null"], "--o", color=C.MUTED, label="Gaussian null")
+    c.fill_between(s["k"], s["ari_null"], s["ari"], color=C.STATE_COLORS[1], alpha=0.15)
+    _dark(c, "bootstrap cluster stability vs matched Gaussian null")
+    c.set_xlabel("k (k-means)"); c.set_ylabel("ARI (reproducibility)")
+    leg = c.legend(fontsize=8, framealpha=0.1)
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    sk = sorted(res["silhouette"])
+    d.plot(sk, [res["silhouette"][k] for k in sk], "-o", color=C.STATE_COLORS[2])
+    d.axhline(0.5, color=C.MUTED, ls="--", lw=1)
+    _dark(d, "silhouette vs k  (~0.5+ = separated; ~0 = no structure)")
+    d.set_xlabel("k (k-means)"); d.set_ylabel("silhouette")
+    verdict = "DISCRETE states" if res["discrete"] else "CONTINUUM (no discrete states)"
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · cluster validity → {verdict}  "
+                 f"(N={res['n']:,}, {res['ncomp']} PCs @ {int(res['var_target']*100)}%)"
+                 f"{title_suffix}", color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def state_fraction_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
+    """Per-seizure heatmap of the FRACTION of epochs in one target state per 10-min
+    bin (one row per seizure; x = minutes from onset). Tracks a rare state's
+    occurrence, which the dominant-state view hides. Bright = more; NaN = no data."""
+    from matplotlib.colors import LinearSegmentedColormap
+    tgt = int(traj["target"])
+    M = np.ma.masked_invalid(traj["matrix"].astype(float))
+    cmap = LinearSegmentedColormap.from_list("frac", [C.PANEL, C.STATE_COLORS[tgt]])
+    cmap.set_bad(C.NODATA_COLOR)
+    vmax = float(np.nanmax(traj["matrix"]))
+    vmax = vmax if (np.isfinite(vmax) and vmax > 0) else 1.0
+    e = traj["edges"]
+    fig, ax = plt.subplots(figsize=(13, 0.5 * M.shape[0] + 2.2), facecolor=C.BG)
+    im = ax.imshow(M, aspect="auto", cmap=cmap, origin="upper", vmin=0, vmax=vmax,
+                   extent=[e[0], e[-1], M.shape[0] - 0.5, -0.5],
+                   interpolation="nearest")
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.6)
+    ax.set_yticks(range(M.shape[0])); ax.set_yticklabels(traj["labels"], fontsize=7)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    cbar.set_label(f"fraction in state {tgt}", color=C.TEXT, fontsize=8)
+    cbar.ax.tick_params(colors=C.MUTED, labelsize=7)
+    cbar.outline.set_edgecolor(C.MUTED)
+    _dark(ax, f"per-seizure state-{tgt} occurrence (10-min fraction; "
+              f"max {vmax:.0%}){title_suffix}")
+    ax.set_xlabel("minutes from seizure onset"); ax.set_ylabel("seizure")
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout()
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def per_seizure_trajectory_fig(traj, out_png: str, *, title_suffix="") -> str:
     """Per-seizure dominant-state trajectory heatmap (one row per seizure; x =
     minutes from onset; colour = 10-min dominant state; white line at onset)."""

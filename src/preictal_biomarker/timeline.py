@@ -73,6 +73,87 @@ def _strip(ax, tl, lo, hi, onsets, label):
                   ha="right", va="center")
 
 
+def _frac_rgb_row(frac: np.ndarray, target: int, vmax: float) -> np.ndarray:
+    """[1 x n x 3] RGB: interpolate PANEL->state(target) by frac/vmax; NaN->no-data."""
+    base = np.array(to_rgb(C.PANEL)); tgt = np.array(to_rgb(C.STATE_COLORS[int(target)]))
+    nod = np.array(to_rgb(C.NODATA_COLOR))
+    rgb = np.zeros((1, frac.size, 3))
+    for i, f in enumerate(frac):
+        if not np.isfinite(f):
+            rgb[0, i] = nod
+        else:
+            a = 0.0 if vmax <= 0 else min(1.0, f / vmax)
+            rgb[0, i] = base + a * (tgt - base)
+    return rgb
+
+
+def _frac_strip(ax, tl, lo, hi, onsets, label, vmax):
+    sel = (tl["centers"] >= lo) & (tl["centers"] <= hi)
+    fr = tl["frac"][sel]
+    if fr.size == 0:
+        fr = np.array([np.nan]); lo_e, hi_e = lo, hi
+    else:
+        c = tl["centers"][sel]; lo_e, hi_e = c[0], c[-1]
+    ax.imshow(_frac_rgb_row(fr, tl["target"], vmax), aspect="auto", origin="lower",
+              extent=[mdates.date2num(_dt.datetime.fromtimestamp(lo_e)),
+                      mdates.date2num(_dt.datetime.fromtimestamp(hi_e)), 0, 1],
+              interpolation="nearest", zorder=0)
+    nsz = 0
+    for o in np.sort(onsets):
+        if lo <= o <= hi:
+            x = mdates.date2num(_dt.datetime.fromtimestamp(o))
+            ax.axvline(x, color=C.SEIZURE_COLOR, lw=1.3, zorder=3)
+            nsz += 1
+    ax.set_xlim(mdates.date2num(_dt.datetime.fromtimestamp(lo)),
+                mdates.date2num(_dt.datetime.fromtimestamp(hi)))
+    ax.set_ylim(0, 1); ax.set_yticks([])
+    span_h = (hi - lo) / 3600.0
+    loc = mdates.DayLocator() if span_h > 60 else mdates.HourLocator(
+        interval=3 if span_h <= 30 else 6)
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(
+        "%m-%d" if span_h > 60 else "%m-%d %H:%M"))
+    ax.tick_params(colors=C.MUTED, labelsize=7)
+    for sp in ax.spines.values():
+        sp.set_color(C.MUTED)
+    ax.set_ylabel(f"{label}\n{nsz} sz", color=C.TEXT, fontsize=9, rotation=0,
+                  ha="right", va="center")
+
+
+def render_state_fraction_timeline(df, onsets, out_png: str, *, target: int = 1,
+                                   bin_sec: float = 600.0,
+                                   anchor: float | None = None) -> str:
+    """Three stacked strips (1 wk / 2 d / 24 h) of the FRACTION of epochs in *target*
+    state per bin (brightness = occurrence), seizure onsets marked. Tracks a rare
+    state the dominant-state timeline would never show."""
+    tl = T.state_fraction_timeline(df, target=target, bin_sec=bin_sec)
+    mx = np.nanmax(tl["frac"]) if np.isfinite(np.nanmax(tl["frac"])) else 1.0
+    vmax = float(mx) if mx > 0 else 1.0
+    end = anchor if anchor is not None else float(tl["centers"][-1])
+    fig, axes = plt.subplots(len(_WINDOWS), 1, figsize=(15, 6.5), facecolor=C.BG)
+    for ax, (label, dur) in zip(axes, _WINDOWS):
+        ax.set_facecolor(C.PANEL)
+        _frac_strip(ax, tl, end - dur, end, np.asarray(onsets, float), label, vmax)
+    handles = [Patch(color=C.STATE_COLORS[int(target)],
+                     label=f"state {target} present (brighter = more)"),
+               Patch(color=C.PANEL, label=f"no state {target}"),
+               Patch(color=C.NODATA_COLOR, label="no data"),
+               plt.Line2D([0], [0], color=C.SEIZURE_COLOR, lw=1.3,
+                          label="seizure onset")]
+    leg = fig.legend(handles=handles, loc="lower center", ncol=len(handles),
+                     fontsize=8, framealpha=0.0, bbox_to_anchor=(0.5, -0.02))
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    blab = f"{int(bin_sec//60)}-min" if bin_sec >= 60 else f"{int(bin_sec)}-s"
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · state-{target} occurrence timeline "
+                 f"({blab} fraction; max {vmax:.0%})", color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def render_timeline(df, onsets, out_png: str, *, bin_sec: float = 600.0,
                     anchor: float | None = None) -> str:
     """Three stacked dominant-state strips (1 wk / 2 d / 24 h) ending at *anchor*

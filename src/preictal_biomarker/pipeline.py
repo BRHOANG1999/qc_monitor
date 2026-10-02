@@ -96,6 +96,18 @@ def run_full(*, force_features: bool = False, n_surr: int = 2000) -> dict:
             O.state_risk_bin_null(model.df, ons, n_surr=1000),
             p(f"10_state_risk_shift_null_{tag}.png"), labels=model.labels,
             title_suffix=f" — {tag} seizures")        # disjoint-bin lift null
+    # Do discrete states even exist, or is k-means binning a continuum?
+    from . import validity as V
+    out["validity"] = G.cluster_validity_fig(
+        V.cluster_validity(df), p("11_cluster_validity.png"))
+    # Track the rare state 1's occurrence (fraction/bin), which dominant-state hides.
+    for tag, ons in (("lead", lead), ("all", allon)):
+        out[f"state1_traj_{tag}"] = G.state_fraction_trajectory_fig(
+            TR.per_seizure_state_fraction(model.df, ons, target=1),
+            p(f"13_state1_occurrence_traj_{tag}.png"),
+            title_suffix=f" — {tag} seizures")
+    out["state1_timeline"] = TL.render_state_fraction_timeline(
+        model.df, allon, p("13_state1_occurrence_timeline.png"), target=1)
     for j in range(C.K_STATES):
         print(f"  state {j} [{model.labels[j]}]: obs={null['observed'][j]:.1f}% "
               f"null med={null['median'][j]:.1f}% p={null['p'][j]:.2f}")
