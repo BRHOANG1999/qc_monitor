@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+
 from src.db.store import Store
 from src.dashboard.data_helpers import load_config
 from . import config as C, features as F, states as S, occupancy as O, figures as G
@@ -110,7 +112,8 @@ def run_full(*, force_features: bool = False, n_surr: int = 2000) -> dict:
         model.df, allon, p("13_state1_occurrence_timeline.png"), target=1)
     # Full-span (all weeks) metric evolution -- the days-scale drift the 2 h views miss.
     out["metric_evolution"] = G.metric_evolution_fig(
-        model, lead, p("14_metric_evolution_fullspan.png"))
+        model, lead, p("14_metric_evolution_fullspan.png"),
+        follower_onsets=allon[~np.isin(allon, lead)])  # dashed = followers
     for j in range(C.K_STATES):
         print(f"  state {j} [{model.labels[j]}]: obs={null['observed'][j]:.1f}% "
               f"null med={null['median'][j]:.1f}% p={null['p'][j]:.2f}")

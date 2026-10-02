@@ -529,12 +529,13 @@ def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
     return out_png
 
 
-def metric_evolution_fig(model, onsets, out_png: str, *, metrics=None,
-                         bin_min: float = 30.0, title_suffix="") -> str:
+def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
+                         metrics=None, bin_min: float = 30.0, title_suffix="") -> str:
     """Full-span evolution over the WHOLE record (all weeks), not a 2-h window: a
     dominant-state strip on top, then PC1/PC2 and key raw evoked metrics as binned
-    median (+ IQR band) time series, with the lead seizure onsets marked. Shows the
-    long-timescale drift the per-seizure views can't capture."""
+    median (+ IQR band) time series. Lead onsets = solid white lines; follower
+    (non-lead) onsets = dashed, more transparent. Shows the long-timescale drift the
+    per-seizure views can't capture."""
     import datetime as _dt
     import matplotlib.dates as mdates
     from . import trajectory as _T
@@ -581,18 +582,25 @@ def metric_evolution_fig(model, onsets, out_png: str, *, metrics=None,
         ax.tick_params(colors=C.MUTED, labelsize=7)
         for sp in ax.spines.values():
             sp.set_color(C.MUTED)
+    fol = np.sort(np.asarray(follower_onsets, float)) if follower_onsets is not None \
+        else np.empty(0)
     for ax in axes:                                       # onset lines on every panel
-        for o in ons:
+        for o in fol:                                     # followers: dashed, faint
             if lo <= o <= hi:
                 ax.axvline(mdates.date2num(_dt.datetime.fromtimestamp(o)),
-                           color=C.SEIZURE_COLOR, lw=1.0, zorder=3)
+                           color=C.SEIZURE_COLOR, lw=0.8, ls="--", alpha=0.45,
+                           zorder=2)
+        for o in ons:                                     # leaders: solid, opaque
+            if lo <= o <= hi:
+                ax.axvline(mdates.date2num(_dt.datetime.fromtimestamp(o)),
+                           color=C.SEIZURE_COLOR, lw=1.1, alpha=1.0, zorder=3)
     axes[-1].xaxis.set_major_locator(mdates.DayLocator())
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     axes[-1].set_xlabel("date", color=C.TEXT)
     ndays = (hi - lo) / 86400.0
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · full-span metric evolution "
-                 f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; white = lead "
-                 f"onset){title_suffix}", color=C.TEXT, fontsize=12)
+                 f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; solid = lead, "
+                 f"dashed = follower onset){title_suffix}", color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
