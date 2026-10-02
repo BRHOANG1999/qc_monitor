@@ -232,6 +232,82 @@ def state_risk_bin_null(df: pd.DataFrame, onsets, *, edges_min=_RISK_EDGES_MIN,
             "min_shift_sec": float(min_shift_sec), "edges_min": list(edges_min)}
 
 
+def seizure_prob_shift_null(df: pd.DataFrame, onsets, *, horizons_sec=None,
+                            k: int | None = None, n_surr: int = 1000,
+                            min_shift_sec: float = 7200.0, seed: int = 0) -> dict:
+    """Circular-shift-of-STATES null for the forward map at CUMULATIVE horizons --
+    the null band for BOTH the left panel P(seizure within H | state) and the right
+    panel lift. Seizure times (hence each epoch's time-to-next-onset and the base
+    rate) are FIXED; the state sequence is rotated in time (wrapped, >= min_shift_sec)
+    n_surr times, and P(.|state) recomputed. Returns observed + 2.5-97.5 band + median
+    + one-sided p (fraction of shifts >= observed) for P and lift."""
+    k = int(k or C.K_STATES)
+    hs = list(horizons_sec or [30, 60, 300, 600, 1800, 3600])
+    t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
+    s = df["state"].to_numpy()
+    fin = np.isfinite(t)
+    t, s = t[fin], s[fin]
+    order = np.argsort(t); t, s = t[order], s[order]
+    ons = np.sort(np.asarray(onsets, float))
+    idx = np.searchsorted(ons, t, side="left")
+    nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
+    tto = nxt - t
+    H = len(hs)
+    hit = np.zeros((t.size, H))                           # cumulative hit per horizon
+    for h, Hs in enumerate(hs):
+        hit[:, h] = ((tto > 0) & (tto <= Hs)).astype(float)
+    valid = s >= 0
+    base = 100.0 * hit[valid].mean(axis=0)                # fixed base rate per horizon
+
+    def ptable(sv):
+        ok = sv >= 0
+        cs = np.bincount(sv[ok], minlength=k).astype(float)
+        P = np.full((k, H), np.nan)
+        for h in range(H):
+            hc = np.bincount(sv[ok], weights=hit[ok, h], minlength=k)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                P[:, h] = 100.0 * hc / np.where(cs > 0, cs, np.nan)
+        return P
+
+    obs = ptable(s)
+    span = t[-1] - t[0]
+    assert span > 2 * min_shift_sec, "record span too short for the 2 h shift floor"
+    rng = np.random.default_rng(seed)
+    nullP = np.full((n_surr, k, H), np.nan)
+    for i in range(n_surr):                               # bounded loop
+        delta = rng.uniform(min_shift_sec, span - min_shift_sec)
+        rot = t[0] + ((t - delta - t[0]) % span)
+        j = np.clip(np.searchsorted(t, rot, side="left"), 0, t.size - 1)
+        jm = np.clip(j - 1, 0, t.size - 1)
+        pick = np.where(np.abs(t[j] - rot) <= np.abs(rot - t[jm]), j, jm)
+        nullP[i] = ptable(s[pick])
+    baseS = np.where(base > 0, base, np.nan)
+    nullL = nullP / baseS[None, None, :]
+    obsL = obs / baseS[None, :]
+
+    def band(a):
+        return (np.nanpercentile(a, 2.5, axis=0), np.nanpercentile(a, 97.5, axis=0),
+                np.nanmedian(a, axis=0))
+
+    loP, hiP, medP = band(nullP)
+    loL, hiL, medL = band(nullL)
+
+    def pvals(nullA, obsA):
+        p = np.full((k, H), np.nan)
+        for si in range(k):
+            for h in range(H):
+                col = nullA[:, si, h][np.isfinite(nullA[:, si, h])]
+                if col.size and np.isfinite(obsA[si, h]):
+                    p[si, h] = (np.sum(col >= obsA[si, h]) + 1) / (col.size + 1)
+        return p
+
+    n_state = np.array([int((s == si).sum()) for si in range(k)])
+    return {"horizons_sec": hs, "base": base, "obs": obs, "loP": loP, "hiP": hiP,
+            "medP": medP, "obs_lift": obsL, "loL": loL, "hiL": hiL, "medL": medL,
+            "pP": pvals(nullP, obs), "pL": pvals(nullL, obsL), "n_state": n_state,
+            "n_surr": int(n_surr), "min_shift_sec": float(min_shift_sec)}
+
+
 def _two_sided_p(null_col: np.ndarray, obs: float, med: float) -> float:
     """Fraction of surrogates at least as far from the null median as observed
     (+1 smoothed). NaN-safe."""

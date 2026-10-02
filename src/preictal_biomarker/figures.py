@@ -441,6 +441,46 @@ def seizure_prob_fig(res, out_png: str, *, title_suffix="") -> str:
     return out_png
 
 
+def seizure_prob_null_fig(res, out_png: str, *, labels=None,
+                          title_suffix="") -> str:
+    """The 09 forward map WITH the circular-shift-of-states null band on BOTH panels.
+    Left: observed P(seizure within H | state) + per-state 2.5-97.5 shift-null band +
+    dashed base rate. Right: observed lift + per-state band + dashed chance line. An
+    observed curve inside its band = not distinguishable from chance."""
+    hs = res["horizons_sec"]; k = res["obs"].shape[0]
+    xl = [_hlabel(s) for s in hs]; x = np.arange(len(hs))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5.2), facecolor=C.BG)
+    for s in range(k):
+        col = C.STATE_COLORS[s]
+        lab = labels[s] if labels else f"state {s}"
+        a1.fill_between(x, res["loP"][s], res["hiP"][s], color=col, alpha=0.13, lw=0)
+        a1.plot(x, res["obs"][s], "-o", color=col, lw=1.8, ms=4,
+                label=f"{lab} (n={res['n_state'][s]})")
+    a1.plot(x, res["base"], "--", color=C.MUTED, lw=1.6, label="base rate (marginal)")
+    _dark(a1, "P(seizure within H | state)  + shift-null 95% band")
+    a1.set_xticks(x); a1.set_xticklabels(xl)
+    a1.set_xlabel("horizon H"); a1.set_ylabel("P(seizure within H) %")
+    leg = a1.legend(fontsize=7.5, framealpha=0.1, loc="upper left")
+    for t in leg.get_texts():
+        t.set_color(C.TEXT)
+    for s in range(k):
+        col = C.STATE_COLORS[s]
+        a2.fill_between(x, res["loL"][s], res["hiL"][s], color=col, alpha=0.13, lw=0)
+        a2.plot(x, res["obs_lift"][s], "-o", color=col, lw=1.8, ms=4)
+    a2.axhline(1.0, color=C.MUTED, lw=1.2, ls="--")
+    _dark(a2, "predictive lift  + shift-null 95% band")
+    a2.set_xticks(x); a2.set_xticklabels(xl)
+    a2.set_xlabel("horizon H"); a2.set_ylabel("lift ×")
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · forward seizure-probability vs "
+                 f"circular-shift-of-states null ({res['n_surr']} shifts)"
+                 f"{title_suffix}", color=C.TEXT, fontsize=12)
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
                             title_suffix="") -> str:
     """Per state: observed state x time-to-seizure-bin LIFT vs the circular-shift-of-

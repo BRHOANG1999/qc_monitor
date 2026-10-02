@@ -88,10 +88,14 @@ def run_full(*, force_features: bool = False, n_surr: int = 2000) -> dict:
     # Does state->risk survive a circular-shift-of-STATES null (disjoint t-to-sz bins,
     # states rotated >=2 h, seizure times fixed, 1000 shifts)? -> both inside the band.
     for tag, ons in (("lead", lead), ("all", allon)):
+        out[f"seizure_prob_null_{tag}"] = G.seizure_prob_null_fig(
+            O.seizure_prob_shift_null(model.df, ons, n_surr=1000),
+            p(f"09_seizure_prob_by_state_null_{tag}.png"), labels=model.labels,
+            title_suffix=f" — {tag} seizures")        # null band on P + lift panels
         out[f"state_risk_null_{tag}"] = G.state_risk_bin_null_fig(
             O.state_risk_bin_null(model.df, ons, n_surr=1000),
             p(f"10_state_risk_shift_null_{tag}.png"), labels=model.labels,
-            title_suffix=f" — {tag} seizures")
+            title_suffix=f" — {tag} seizures")        # disjoint-bin lift null
     for j in range(C.K_STATES):
         print(f"  state {j} [{model.labels[j]}]: obs={null['observed'][j]:.1f}% "
               f"null med={null['median'][j]:.1f}% p={null['p'][j]:.2f}")
