@@ -3061,22 +3061,19 @@ class Store:
     def video_file_summary(self, file_id: int,
                            animal_id: str | None = None,
                            channel: int | None = None) -> dict:
-        """File-level + review summary for the Video Review 'copy info' button.
+        """File-identity summary for the Video Review 'copy file info' button: the
+        recording the user picked in the manual session/file/channel selector.
 
-        One indexed read of processed_files + the latest review_state (via
-        get_review_state) with its markers summarized. Safe defaults when the file
-        or review row is missing. Returns a flat dict:
+        One indexed read of processed_files + the session's channel list for the
+        channel name. Safe defaults when the file is missing. Returns a flat dict:
         ``{file_id, session_dir, session_name, file_path, chunk_datetime,
-        duration_sec, channel, channel_name, review_status, note, n_events,
-        max_racine, animal_id}``.
+        duration_sec, channel, channel_name, animal_id}``.
         """
         assert isinstance(file_id, int), "file_id must be int"
         out = {
             "file_id": int(file_id), "session_dir": "", "session_name": "",
             "file_path": "", "chunk_datetime": "", "duration_sec": None,
-            "channel": channel, "channel_name": "", "review_status": "",
-            "note": "", "n_events": 0, "max_racine": None,
-            "animal_id": animal_id or "",
+            "channel": channel, "channel_name": "", "animal_id": animal_id or "",
         }
         conn = self._connect()
         try:
@@ -3099,30 +3096,6 @@ class Store:
                     out["channel_name"] = str(names[int(channel)])
             except (TypeError, ValueError):
                 pass
-        rs = self.get_review_state(int(file_id), animal_id)
-        if rs:
-            out["review_status"] = rs.get("status") or ""
-            out["note"] = rs.get("note") or ""
-            if rs.get("animal_id"):
-                out["animal_id"] = rs["animal_id"]
-            try:
-                events = json.loads(rs.get("markers_json") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                events = []
-            if isinstance(events, list):
-                out["n_events"] = len(events)
-                racines = []
-                for e in events:
-                    if not isinstance(e, dict):
-                        continue
-                    rac = e.get("racine")
-                    if rac in (None, ""):
-                        continue
-                    try:
-                        racines.append(int(rac))
-                    except (TypeError, ValueError):
-                        continue
-                out["max_racine"] = max(racines) if racines else None
         return out
 
     def review_statuses_for_files(self, file_ids,

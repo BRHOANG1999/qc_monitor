@@ -29,28 +29,23 @@ def _seed(tmp_path):
             (1, "G:/data/sessA/rec_001.mat", "G:/data/2026_09_30__sessA",
              "sessA", "2026_09_30__12_00_00", 3725.0))
         conn.execute(
-            "INSERT INTO review_state (file_id, user_email, status, "
-            "markers_json, note, animal_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (1, "u@x", "has_events",
-             json.dumps([{"EO_sec": 5, "racine": 3},
-                         {"EO_sec": 10, "racine": 5}]),
-             "seizure, mild", "BCH062",
-             "2026-09-30T12:00:00", "2026-09-30T12:00:00"))
+            "INSERT INTO session_config (session_dir, channel_names, "
+            "discovered_at) VALUES (?,?,?)",
+            ("G:/data/2026_09_30__sessA",
+             json.dumps(["BCH062SR", "BCH062SLM", "stimCopy"]),
+             "2026-09-30T12:00:00"))
         conn.commit()
     return store
 
 
 def test_summary_fields(tmp_path):
     store = _seed(tmp_path)
-    s = store.video_file_summary(1, "BCH062")
+    s = store.video_file_summary(1, "BCH062", channel=1)
     assert s["session_dir"] == "G:/data/2026_09_30__sessA"
+    assert s["session_name"] == "sessA"
     assert s["chunk_datetime"] == "2026_09_30__12_00_00"
     assert s["duration_sec"] == 3725.0
-    assert s["review_status"] == "has_events"
-    assert s["n_events"] == 2
-    assert s["max_racine"] == 5
-    assert s["note"] == "seizure, mild"
+    assert s["channel"] == 1 and s["channel_name"] == "BCH062SLM"
     assert s["animal_id"] == "BCH062"
 
 
@@ -58,38 +53,30 @@ def test_summary_missing_file(tmp_path):
     store = _seed(tmp_path)
     s = store.video_file_summary(999, "BCH062")
     assert s["file_id"] == 999
-    assert s["review_status"] == "" and s["n_events"] == 0
-    assert s["max_racine"] is None
+    assert s["session_dir"] == "" and s["file_path"] == ""
 
 
-def test_summary_no_review_row(tmp_path):
-    store = Store(str(tmp_path / "m.db"))
-    with store.connection() as conn:
-        conn.execute(
-            "INSERT INTO processed_files (id, file_path, session_dir, "
-            "chunk_datetime) VALUES (1, 'p.mat', 'sd', 'cd')")
-        conn.commit()
-    s = store.video_file_summary(1)
-    assert s["review_status"] == "" and s["n_events"] == 0
-    assert s["session_dir"] == "sd"
+def test_summary_channel_out_of_range(tmp_path):
+    store = _seed(tmp_path)
+    s = store.video_file_summary(1, "BCH062", channel=99)
+    assert s["channel_name"] == ""          # no crash, just blank
 
 
 def test_csv_header_toggle_and_quoting():
     row = {c: "" for c in _VIDEO_INFO_COLUMNS}
-    row.update({"animal": "BCH062", "session": "sessA", "file_id": 1,
-                "channel": 2, "channel_name": "BCH062SR",
+    row.update({"animal": "BCH062", "session": "2026_09_30__sess,A",
+                "file_id": 1, "channel": 1, "channel_name": "BCH062SLM",
                 "chunk_datetime": "2026_09_30__12_00_00", "duration": "1:02:05",
-                "review_status": "has_events", "n_events": 2, "max_racine": 5,
-                "note": "seizure, mild", "file_path": "G:/data/sessA/rec.mat"})
+                "file_path": "G:/data/sessA/rec.mat"})
+    import csv as _csv
     with_h = _video_info_csv(row, True)
     lines = with_h.split("\n")
     assert len(lines) == 2
     assert lines[0].split(",")[0] == "animal"       # header present
-    # a note with a comma must be quoted, so the data line is not over-split
-    import csv as _csv
+    # a session with a comma must be quoted, so the data line is not over-split
     parsed = next(_csv.reader([lines[1]]))
     assert parsed == [str(row[c]) for c in _VIDEO_INFO_COLUMNS]
-    assert "seizure, mild" in parsed
+    assert "2026_09_30__sess,A" in parsed
 
     no_h = _video_info_csv(row, False)
     assert "\n" not in no_h                          # single data row, no header

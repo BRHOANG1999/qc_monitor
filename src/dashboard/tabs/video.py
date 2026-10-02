@@ -1153,12 +1153,13 @@ def _mmss(sec) -> str:
     return f"{h}:{m:02d}:{ss:02d}" if h else f"{m:02d}:{ss:02d}"
 
 
-# Navigation-focused "copy this recording's info" CSV columns (the Video Review
-# analysis-tab copy button). File identity + location + review summary -- enough to
-# re-find the recording and know its state; NOT the live analysis/filter settings.
+# "Copy file info" CSV columns for the manual recording picker: everything that
+# identifies the recording the user selected (animal + session + file + channel and
+# what they represent) -- enough to re-find and re-open it. NOT review/scoring, NOT
+# the analysis/filter settings.
 _VIDEO_INFO_COLUMNS = [
-    "animal", "session", "file_id", "channel", "channel_name", "chunk_datetime",
-    "duration", "review_status", "n_events", "max_racine", "note", "file_path",
+    "animal", "session", "file_id", "chunk_datetime", "duration",
+    "channel", "channel_name", "file_path",
 ]
 
 
@@ -7580,20 +7581,17 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         return p
 
     # ---- Copy file info (CSV row) -> clipboard ---- #
-    # Keep the dcc.Clipboard's content current for the loaded file so the copy
-    # happens inside the user's click gesture. Rebuilds are a couple of indexed DB
-    # lookups (file metadata + latest review), not the chunk-load path. Re-fires on
-    # a scoring autosave so the review summary (status / #events / racine) stays live.
+    # Keep the dcc.Clipboard's content current for the selected recording so the copy
+    # happens inside the user's click gesture. Rebuilds are one indexed processed_files
+    # lookup (+ the session channel list), not the chunk-load path.
     @app.callback(
         Output("video-copy-info-clip", "content"),
         Input("video-file-dropdown", "value"),
         Input("video-channel-dropdown", "value"),
         Input("video-queue-animal", "value"),
         Input("video-copy-info-header", "value"),
-        Input("video-autosave-state", "data"),
     )
-    def _video_copy_info_content(file_id, channel, animal_value, header_toggle,
-                                 _autosave):
+    def _video_copy_info_content(file_id, channel, animal_value, header_toggle):
         if not file_id:
             return ""
         ids = _animal_ids_from_picker(animal_value)
@@ -7613,15 +7611,10 @@ def register_callbacks(app, store: Store, config: dict) -> None:
             "animal": summary.get("animal_id") or (animal_id or ""),
             "session": session,
             "file_id": summary.get("file_id"),
-            "channel": ch if ch is not None else "",
-            "channel_name": summary.get("channel_name") or "",
             "chunk_datetime": summary.get("chunk_datetime") or "",
             "duration": _mmss(summary.get("duration_sec")),
-            "review_status": summary.get("review_status") or "",
-            "n_events": summary.get("n_events") or 0,
-            "max_racine": (summary.get("max_racine")
-                           if summary.get("max_racine") is not None else ""),
-            "note": summary.get("note") or "",
+            "channel": ch if ch is not None else "",
+            "channel_name": summary.get("channel_name") or "",
             "file_path": summary.get("file_path") or "",
         }
         include_header = "header" in (header_toggle or [])
