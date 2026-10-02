@@ -80,7 +80,11 @@ def run_full(*, force_features: bool = False, n_surr: int = 2000) -> dict:
         title_suffix=" — all seizures")
     out["timeline"] = TL.render_timeline(model.df, lead, p("07_state_timeline.png"))
     out["seizure_prob"] = G.seizure_prob_fig(
-        O.seizure_prob_by_state(model.df, allon), p("09_seizure_prob_by_state.png"))
+        O.seizure_prob_by_state(model.df, allon), p("09_seizure_prob_by_state.png"),
+        title_suffix=" — all seizures")
+    out["seizure_prob_lead"] = G.seizure_prob_fig(
+        O.seizure_prob_by_state(model.df, lead),
+        p("09_seizure_prob_by_state_lead.png"), title_suffix=" — lead seizures only")
     for j in range(C.K_STATES):
         print(f"  state {j} [{model.labels[j]}]: obs={null['observed'][j]:.1f}% "
               f"null med={null['median'][j]:.1f}% p={null['p'][j]:.2f}")
