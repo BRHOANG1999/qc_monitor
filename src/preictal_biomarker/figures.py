@@ -530,7 +530,8 @@ def state_risk_bin_null_fig(res, out_png: str, *, labels=None,
 
 
 def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
-                         metrics=None, bin_min: float = 30.0, title_suffix="") -> str:
+                         metrics=None, bin_min: float = 30.0, state_filter=None,
+                         title_suffix="") -> str:
     """Full-span evolution over the WHOLE record (all weeks), not a 2-h window: a
     dominant-state strip on top, then PC1/PC2 and key raw evoked metrics as binned
     median (+ IQR band) time series. Lead onsets = solid white lines; follower
@@ -545,6 +546,8 @@ def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
     series = [s for s in series if s in df.columns]
     t = pd.to_numeric(df["t_epoch"], errors="coerce").to_numpy(float)
     fin = np.isfinite(t); t = t[fin]
+    st = df["state"].to_numpy()[fin]
+    keep = np.ones(t.size, bool) if state_filter is None else (st == state_filter)
     lo, hi = t.min(), t.max()
     edges = np.arange(lo, hi + bin_min * 60, bin_min * 60)
     centers = edges[:-1] + bin_min * 30
@@ -557,13 +560,23 @@ def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
                              facecolor=C.BG)
     from . import timeline as _TL
     ax0 = axes[0]; ax0.set_facecolor(C.PANEL)
-    ssel = (tl["centers"] >= lo) & (tl["centers"] <= hi)
-    sc = tl["centers"][ssel]
-    ax0.imshow(_TL._rgb_row(tl["dominant"][ssel]), aspect="auto", origin="lower",
+    if state_filter is None:                              # all-state dominant strip
+        rgb = _TL._rgb_row(tl["dominant"][(tl["centers"] >= lo) & (tl["centers"] <= hi)])
+        ax0_label = "state"
+    else:                                                 # state-filter occurrence strip
+        ft = _T.state_fraction_timeline(df, target=state_filter,
+                                        bin_sec=max(600.0, bin_min * 60))
+        fsel = (ft["centers"] >= lo) & (ft["centers"] <= hi)
+        pos = ft["frac"][np.isfinite(ft["frac"]) & (ft["frac"] > 0)]
+        vmx = float(np.nanpercentile(pos, 95)) if pos.size else 1.0
+        rgb = _TL._frac_rgb_row(ft["frac"][fsel], state_filter, vmx if vmx > 0 else 1.0)
+        tl = ft; ax0_label = f"state {state_filter}"
+    sc = tl["centers"][(tl["centers"] >= lo) & (tl["centers"] <= hi)]
+    ax0.imshow(rgb, aspect="auto", origin="lower",
                extent=[mdates.date2num(_dt.datetime.fromtimestamp(sc[0])),
                        mdates.date2num(_dt.datetime.fromtimestamp(sc[-1])), 0, 1],
                interpolation="nearest", zorder=0)
-    ax0.set_yticks([]); ax0.set_ylabel("state", color=C.TEXT, fontsize=9,
+    ax0.set_yticks([]); ax0.set_ylabel(ax0_label, color=C.TEXT, fontsize=9,
                                        rotation=0, ha="right", va="center")
     for ax, s in zip(axes[1:], series):
         ax.set_facecolor(C.PANEL)
@@ -571,12 +584,13 @@ def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
         med = np.full(centers.size, np.nan)
         q1 = np.full(centers.size, np.nan); q3 = np.full(centers.size, np.nan)
         for c in range(centers.size):
-            vv = v[which == c]; vv = vv[np.isfinite(vv)]
+            vv = v[(which == c) & keep]; vv = vv[np.isfinite(vv)]
             if vv.size:
                 med[c] = np.median(vv)
                 q1[c], q3[c] = np.percentile(vv, [25, 75])
         ax.fill_between(xdt, q1, q3, color=C.ACCENT, alpha=0.18, lw=0)
-        ax.plot(xdt, med, color=C.ACCENT, lw=1.0)
+        mk = "." if state_filter is not None else None    # sparse cluster -> markers
+        ax.plot(xdt, med, color=C.ACCENT, lw=1.0, marker=mk, ms=2.5)
         ax.set_ylabel(s, color=C.TEXT, fontsize=8, rotation=0, ha="right",
                       va="center")
         ax.tick_params(colors=C.MUTED, labelsize=7)
@@ -598,7 +612,8 @@ def metric_evolution_fig(model, onsets, out_png: str, *, follower_onsets=None,
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     axes[-1].set_xlabel("date", color=C.TEXT)
     ndays = (hi - lo) / 86400.0
-    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · full-span metric evolution "
+    scope = f" · CLUSTER {state_filter} ONLY" if state_filter is not None else ""
+    fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · full-span metric evolution{scope} "
                  f"({ndays:.0f} days, {bin_min:.0f}-min median ± IQR; solid = lead, "
                  f"dashed = follower onset){title_suffix}", color=C.TEXT, fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
