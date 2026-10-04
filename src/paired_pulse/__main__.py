@@ -1,0 +1,30 @@
+"""CLI: python -m src.paired_pulse [--since YYYY-MM-DD] [--force] [--dry]
+
+Default writes the figures + CSV + manifest to data/BCH111_paired_pulse/.
+--dry only builds the matrix and prints PPR medians. --force rebuilds the cache.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import sys
+
+from . import run as _run
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+    since = None
+    if "--since" in argv:
+        since = _dt.datetime.strptime(argv[argv.index("--since") + 1], "%Y-%m-%d")
+    _run.run(since=since, force=("--force" in argv), apply=("--dry" not in argv))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
