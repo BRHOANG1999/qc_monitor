@@ -74,9 +74,15 @@ def ppr_over_time_fig(mat, out_png, *, onsets=None, bin_min=30.0) -> str:
         _dark(ax, f"PPR {f}  (median {np.median(vf):.2f}, "
                   f"{100*np.mean(vf>1):.0f}% facilitation)")
         ax.set_ylabel("S2/S1", color=C.TEXT, fontsize=8)
-    axes[-1, 0].xaxis.set_major_locator(mdates.DayLocator())
-    axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
-    axes[-1, 0].set_xlabel("date", color=C.TEXT)
+    ax = axes[-1, 0]
+    span_h = (t.max() - t.min()) / 3600.0
+    if span_h <= 48:
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=3 if span_h <= 30 else 6))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    else:
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    ax.set_xlabel("date", color=C.TEXT)
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse ratio over time "
                  f"(ISI {C.ISI_MS:.0f} ms, {bin_min:.0f}-min median ± IQR; "
                  f"white = lead seizure)", color=C.TEXT, fontsize=12)
