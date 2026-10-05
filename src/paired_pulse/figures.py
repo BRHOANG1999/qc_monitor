@@ -415,9 +415,10 @@ def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
 
 def waveform_traces_fig(td, out_png, *, onset_set="lead", which="resid", bin_min=5.0,
                         cap_h=2.0, title="") -> str:
-    """EVERY individual pre-ictal evoked response overlaid, each coloured by its own
-    time-to-onset (full density, not downsampled), with the linear bin-means drawn bold
-    on top. 'each evoked response following the trend'. which='s2' or 'resid' (S2 − S1)."""
+    """Full-density spread of every individual pre-ictal evoked response (faint grey, not
+    downsampled) with the per-lead-time bin-MEANS drawn bold on top and coloured by time
+    to onset -- that colour gradient is the trend (colouring 10k+ overlapping near-identical
+    traces individually just blends to mush). which='s2' or 'resid' (S2 − S1)."""
     import matplotlib.cm as _cm
     import matplotlib.colors as _mc
     from matplotlib.collections import LineCollection
@@ -427,38 +428,40 @@ def waveform_traces_fig(td, out_png, *, onset_set="lead", which="resid", bin_min
     fig, ax = plt.subplots(figsize=(9.8, 5.6), facecolor=C.BG)
     n = 0
     if arr is not None and arr.shape[0]:
-        n = arr.shape[0]
         fin = np.all(np.isfinite(arr), axis=1) & np.isfinite(tto) & (tto > 0)
         arr, tto = arr[fin], tto[fin]; n = arr.shape[0]
-        norm = _mc.LogNorm(vmin=max(np.nanmin(tto), 0.1), vmax=np.nanmax(tto))
-        cmap = TURBO_VIS
+        # full-density spread: every trace, faint neutral grey
         segs = [np.column_stack([tw, arr[i]]) for i in range(n)]
-        lc = LineCollection(segs, linewidths=0.35, cmap=cmap, norm=norm)
-        lc.set_array(tto)
-        lc.set_alpha(float(np.clip(300.0 / max(n, 1), 0.012, 0.3)))
+        lc = LineCollection(segs, linewidths=0.3, colors=C.MUTED,
+                            alpha=float(np.clip(60.0 / max(n, 1), 0.006, 0.15)))
         ax.add_collection(lc)
+        # trend = bin-means coloured by lead-time (this is what the colorbar maps)
+        cmap = TURBO_VIS
         edges = np.arange(0.0, cap_h * 3600.0 + bin_min * 60.0, bin_min * 60.0) / 60.0
+        cens = 0.5 * (edges[:-1] + edges[1:])
+        norm = _mc.LogNorm(vmin=max(cens.min(), 0.1), vmax=cens.max())
         for b in range(edges.size - 1):
             m = (tto >= edges[b]) & (tto < edges[b + 1])
             if m.sum() >= 30:
-                cc = 0.5 * (edges[b] + edges[b + 1])
-                ax.plot(tw, np.nanmean(arr[m], axis=0), color=cmap(norm(cc)), lw=2.4,
-                        zorder=5)
-        cb = fig.colorbar(lc, ax=ax)
-        cb.set_label("min to onset (log; blue=near, red=far)", color=C.TEXT, fontsize=8)
+                ax.plot(tw, np.nanmean(arr[m], axis=0), color=cmap(norm(cens[b])),
+                        lw=2.4, zorder=5)
+        sm = _cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax)
+        cb.set_label("bin-mean lead-time (min; log; blue=near, red=far)", color=C.TEXT,
+                     fontsize=8)
         cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
         ax.set_xlim(float(tw[0]), float(tw[-1]))
-        lo, hi = np.nanpercentile(arr, [0.2, 99.8])
-        pad = 0.08 * (hi - lo) if hi > lo else 0.1
+        lo, hi = np.nanpercentile(arr, [0.5, 99.5])
+        pad = 0.10 * (hi - lo) if hi > lo else 0.1
         ax.set_ylim(lo - pad, hi + pad)
     ax.axhline(0, color=C.MUTED, lw=0.6)
     _dark(ax, title)
     ax.set_xlabel("ms from pulse onset", color=C.TEXT)
     ax.set_ylabel("S2 LFP (≤500 Hz)" if which == "s2" else "S2 − S1 residual",
                   color=C.TEXT)
-    _footnote(fig, _base_note(f"{onset_set} seizures · {n:,} individual pre-ictal "
-                              f"responses (full density) + {bin_min:.0f}-min linear bin "
-                              f"means · strict pre-ictal (on/post-onset excluded)"))
+    _footnote(fig, _base_note(f"{onset_set} seizures · {n:,} individual responses (grey, "
+                              f"full density) + {bin_min:.0f}-min bin means coloured by "
+                              f"lead-time · strict pre-ictal (on/post-onset excluded)"))
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
