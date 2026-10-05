@@ -287,6 +287,17 @@ def _bandpass(a: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
     return sosfiltfilt(sos, a, axis=1, padlen=pad)
 
 
+def _lowpass(a: np.ndarray, fs: float, hi: float) -> np.ndarray:
+    """Zero-phase low-pass only (no high-pass corner). SOS form for the same numerical
+    stability reason as _bandpass at fs=20 kHz."""
+    from scipy.signal import butter, sosfiltfilt
+    nyq = 0.5 * fs
+    hi = max(1e-3, min(hi, nyq * 0.99))
+    sos = butter(4, hi / nyq, btype="low", output="sos")
+    pad = min(a.shape[1] - 1, 3 * (2 * sos.shape[0] + 1))
+    return sosfiltfilt(sos, a, axis=1, padlen=pad)
+
+
 def _notch(a: np.ndarray, fs: float, f0: float) -> np.ndarray:
     from scipy.signal import iirnotch, filtfilt
     if f0 <= 0 or f0 >= 0.5 * fs:

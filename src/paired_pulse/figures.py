@@ -39,9 +39,10 @@ def _dark(ax, title=None):
 
 def _base_note(extra=""):
     """Standard analysis-parameters footnote string (window / ISI / band)."""
+    band = getattr(C, "FILTER_LABEL", f"{C.BP_LOW_HZ:.0f}–{C.BP_HIGH_HZ:.0f} Hz")
     s = (f"BCH111SR · ISI {C.ISI_MS:.0f} ms · per-pulse window "
-         f"{C.WIN[0]:.0f}–{C.WIN[1]:.0f} ms at each pulse's own onset · "
-         f"{C.BP_LOW_HZ:.0f}–{C.BP_HIGH_HZ:.0f} Hz · PPR = feature(S2)/feature(S1)")
+         f"{C.WIN[0]:.0f}–{C.WIN[1]:.0f} ms at each pulse's own onset (stim artifact "
+         f"excluded) · {band} · PPR = feature(S2)/feature(S1)")
     return s + (f" · {extra}" if extra else "")
 
 
@@ -136,12 +137,12 @@ def s1_s2_overlay_fig(wf, out_png, *, n_traces=40, seed=0) -> str:
         tt.set_color(C.TEXT)
     for ax in (a, b, c):
         ax.set_xlabel("ms from pulse onset", color=C.TEXT)
-    a.set_ylabel("LFP (1-500 Hz)", color=C.TEXT)
+    a.set_ylabel("LFP (≤500 Hz)", color=C.TEXT)
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse evoked responses "
                  f"(n={s1.shape[0]} pairs; mean + {len(idx)} traces)",
                  color=C.TEXT, fontsize=12)
-    _footnote(fig, _base_note("S1 blue / S2 orange; each windowed 1–49 ms at its own "
-                              "onset; residual = S2 − S1"))
+    _footnote(fig, _base_note(f"S1 blue / S2 orange; each windowed {C.WIN[0]:.0f}–"
+                              f"{C.WIN[1]:.0f} ms at its own onset; residual = S2 − S1"))
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
@@ -385,7 +386,7 @@ def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
     ax.axhline(0, color=C.MUTED, lw=0.6)
     _dark(ax, title)
     ax.set_xlabel("ms from pulse onset", color=C.TEXT)
-    ax.set_ylabel("S2 LFP (1–500 Hz)" if which == "s2" else "S2 − S1 residual",
+    ax.set_ylabel("S2 LFP (≤500 Hz)" if which == "s2" else "S2 − S1 residual",
                   color=C.TEXT)
     _footnote(fig, _base_note(f"{onset_set} seizures · averaged per dyadic log "
                               f"lead-time bin (n≥{min_n}) · pre-ictal only (on/post-onset "

@@ -20,8 +20,6 @@ import os
 
 import numpy as np
 
-from src.utils import evoked_features as _ef
-
 from . import config as C, data as D, figures as G
 
 BIN_MIN = (1.0, 5.0, 10.0, 30.0)        # minute bin widths to sweep
@@ -112,7 +110,7 @@ def waveforms(store, evoked_dir, *, bin_sizes=BIN_MIN, cap_h=CAP_H, since=None,
         s1_on, s2_on, paired = D._pulse_onsets(stim, tax)
         if paired.sum() < 5:
             continue
-        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        lfp_f = D._filter(lfp, fs)
         s1w, twin = D._window_array(lfp_f, tax, s1_on, fs)
         s2w, _ = D._window_array(lfp_f, tax, s2_on, fs)
         base = D._file_dt(fp).timestamp()

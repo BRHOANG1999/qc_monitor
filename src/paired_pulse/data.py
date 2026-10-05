@@ -25,6 +25,16 @@ def _log(m):
     print(f"[paired_pulse.data] {m}", flush=True)
 
 
+def _filter(lfp, fs):
+    """Apply the configured filter to the full trace. Default FILTER_MODE='lowpass' is a
+    500 Hz low-pass ONLY (no high-pass corner -> no artifact ring / baseline droop)."""
+    if not C.BANDPASS:
+        return lfp
+    if getattr(C, "FILTER_MODE", "bandpass") == "lowpass":
+        return _ef._lowpass(lfp, fs, C.BP_HIGH_HZ)
+    return _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ)
+
+
 def list_pp_files(evoked_dir, since=None):
     """Evoked files for the animal on/after *since* (default C.PP_START_DATE)."""
     since = since or C.PP_START_DATE
@@ -81,9 +91,12 @@ def _pulse_onsets(stim, t):
     return s1, s2, paired
 
 
-def _window_array(lfp_f, t, onsets_ms, fs):
+def _window_array(lfp_f, t, onsets_ms, fs, demean=None):
     """[n_ep x NWIN] where each row is that epoch's LFP windowed C.WIN ms from its own
-    onset, plus the rebased time axis (same for all rows)."""
+    onset, plus the rebased time axis (same for all rows). When demean (default
+    C.BASELINE_SUBTRACT) each row has its own mean subtracted -- the low-pass keeps DC,
+    so this baseline-removal restores DC-insensitive amplitude features."""
+    demean = C.BASELINE_SUBTRACT if demean is None else demean
     nwin = int(round((C.WIN[1] - C.WIN[0]) / 1000.0 * fs))
     out = np.full((lfp_f.shape[0], nwin), np.nan)
     twin = None
@@ -95,6 +108,8 @@ def _window_array(lfp_f, t, onsets_ms, fs):
             out[m] = seg
             if twin is None:
                 twin = t[a:a + nwin] - on
+    if demean:
+        out = out - np.nanmean(out, axis=1, keepdims=True)
     return out, (twin if twin is not None else np.linspace(C.WIN[0], C.WIN[1], nwin))
 
 
@@ -122,7 +137,7 @@ def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
     s1_on, s2_on, paired = _pulse_onsets(stim, t)
     if paired.sum() < 5:
         return None                                      # not a paired-pulse file
-    lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+    lfp_f = _filter(lfp, fs)
     s1w, twin = _window_array(lfp_f, t, s1_on, fs)
     s2w, _ = _window_array(lfp_f, t, s2_on, fs)
     f1 = _ef.compute_all(s1w, twin, fs, include_wavelet=False)
@@ -139,8 +154,8 @@ def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
         # pHFO is HIGH-frequency (band ~124-990 Hz) -> detect on the WIDEBAND (raw)
         # window, NOT the 1-500 Hz trace used for the amplitude features/waveforms
         # (which would clip the pHFO band at 500 Hz and undercount).
-        s1w_raw, _ = _window_array(lfp, t, s1_on, fs)
-        s2w_raw, _ = _window_array(lfp, t, s2_on, fs)
+        s1w_raw, _ = _window_array(lfp, t, s1_on, fs, demean=False)
+        s2w_raw, _ = _window_array(lfp, t, s2_on, fs, demean=False)
         cols["s1_phfo_present"] = _phfo_present(s1w_raw, twin, fs, band)
         cols["s2_phfo_present"] = _phfo_present(s2w_raw, twin, fs, band)
     fdt = _file_dt(fp)
@@ -170,7 +185,7 @@ def mean_waveforms(evoked_dir, *, since=None, max_files=6, channel=None) -> dict
         s1_on, s2_on, paired = _pulse_onsets(stim, t)
         if paired.sum() < 5:
             continue
-        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        lfp_f = _filter(lfp, fs)
         a, twin = _window_array(lfp_f, t, s1_on, fs)
         b, _ = _window_array(lfp_f, t, s2_on, fs)
         s1s.append(a[paired]); s2s.append(b[paired])
@@ -198,7 +213,7 @@ def example_pairs(evoked_dir, *, since=None, n_files=3, n_per=4, channel=None,
         s1_on, s2_on, paired = _pulse_onsets(stim, t)
         if paired.sum() < 5:
             continue
-        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        lfp_f = _filter(lfp, fs)
         s1w, twin = _window_array(lfp_f, t, s1_on, fs)
         s2w, _ = _window_array(lfp_f, t, s2_on, fs)
         idx = np.flatnonzero(paired)
@@ -235,7 +250,7 @@ def waveform_by_leadtime(store, evoked_dir, *, since=None, cap_h=12.0,
         s1_on, s2_on, paired = _pulse_onsets(stim, t)
         if paired.sum() < 5:
             continue
-        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        lfp_f = _filter(lfp, fs)
         s1w, twin = _window_array(lfp_f, t, s1_on, fs)
         s2w, _ = _window_array(lfp_f, t, s2_on, fs)
         base = _file_dt(fp).timestamp()
