@@ -201,19 +201,36 @@ def run(*, since=None, force=False, n_surr=200, bin_sizes=BIN_MIN, cap_h=CAP_H) 
                 title=f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal PPR (p2p), {int(bm)}-min "
                 f"linear bins — {oset} seizures (n={ons.size}; 1 = equal)")
 
-    # waveform-by-bin for every bin width, in one file pass ------------------------
+    # waveform-by-bin (averaged lines) for every bin width, in one file pass --------
     wf = waveforms(store, ed, bin_sizes=bin_sizes, cap_h=cap_h, since=since)
     for bm in bin_sizes:
-        tag = f"{int(bm)}min"
+        tag = f"{int(bm)}min"; blab = f"{int(bm)}-min linear"
         for oset in ("lead", "all"):
             out[f"s2_wave_{oset}_{tag}"] = G.waveform_by_bin_fig(
                 wf[bm], p(f"s2_waveform_by_bin_{oset}_{tag}.png"), onset_set=oset,
-                which="s2", title=f"{C.ANIMAL} · {C.CHANNEL} · averaged S2 per pre-ictal "
-                f"bin ({int(bm)}-min linear) — {oset} seizures")
+                which="s2", bin_label=blab, log_color=False,
+                title=f"{C.ANIMAL} · {C.CHANNEL} · averaged S2 per pre-ictal "
+                f"bin ({blab}) — {oset} seizures")
             out[f"resid_wave_{oset}_{tag}"] = G.waveform_by_bin_fig(
                 wf[bm], p(f"residual_waveform_by_bin_{oset}_{tag}.png"), onset_set=oset,
-                which="resid", title=f"{C.ANIMAL} · {C.CHANNEL} · S2 − S1 residual per "
-                f"pre-ictal bin ({int(bm)}-min linear) — {oset} seizures")
+                which="resid", bin_label=blab, log_color=False,
+                title=f"{C.ANIMAL} · {C.CHANNEL} · S2 − S1 residual per "
+                f"pre-ictal bin ({blab}) — {oset} seizures")
+
+    # every individual evoked response overlaid (full density), coloured by lead-time,
+    # with 1- and 5-min linear bin means on top ------------------------------------
+    td = D.preictal_traces(store, ed, since=since, cap_h=cap_h)
+    for bm in (1.0, 5.0):
+        tag = f"{int(bm)}min"
+        for oset in ("lead", "all"):
+            out[f"s2_traces_{oset}_{tag}"] = G.waveform_traces_fig(
+                td, p(f"s2_traces_{oset}_{tag}.png"), onset_set=oset, which="s2",
+                bin_min=bm, cap_h=cap_h, title=f"{C.ANIMAL} · {C.CHANNEL} · individual "
+                f"S2 responses by lead-time ({int(bm)}-min means) — {oset} seizures")
+            out[f"resid_traces_{oset}_{tag}"] = G.waveform_traces_fig(
+                td, p(f"residual_traces_{oset}_{tag}.png"), onset_set=oset, which="resid",
+                bin_min=bm, cap_h=cap_h, title=f"{C.ANIMAL} · {C.CHANNEL} · individual "
+                f"S2 − S1 residuals by lead-time ({int(bm)}-min means) — {oset} seizures")
 
     for k, v in out.items():
         print(f"[paired_pulse.linbins] {k} -> {v}", flush=True)

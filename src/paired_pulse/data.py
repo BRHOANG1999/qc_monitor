@@ -286,6 +286,54 @@ def waveform_by_leadtime(store, evoked_dir, *, since=None, cap_h=12.0,
     return out
 
 
+def preictal_traces(store, evoked_dir, *, since=None, cap_h=2.0, channel=None) -> dict:
+    """EVERY individual STRICT pre-ictal windowed S2 and residual (S2−S1) trace + its
+    time-to-onset (minutes), for lead and all seizures, in one file pass. Full density
+    (not downsampled) for the 'each evoked response following the trend' overlay."""
+    from src.preictal import isi as _isi
+    from .linear_bins import _preictal
+    channel = channel or C.CHANNEL
+    sz = _isi.scored_seizures(store, C.ANIMAL)
+    ons = {"all": np.sort(np.array([s.onset_epoch for s in sz], float)),
+           "lead": np.sort(np.array([s.onset_epoch for s in
+                                     _isi.leading_seizures(sz, 6 * 3600.0)], float))}
+    cap = cap_h * 3600.0
+    buf = {k: {"s2": [], "resid": [], "tto": []} for k in ons}
+    twin = None
+    for fp, _d in list_pp_files(evoked_dir, since):
+        r = _read_file(fp, channel)
+        if r is None:
+            continue
+        lfp, stim, t, fs, st = r
+        s1_on, s2_on, paired = _pulse_onsets(stim, t)
+        if paired.sum() < 5:
+            continue
+        lfp_f = _filter(lfp, fs)
+        s1w, twin = _window_array(lfp_f, t, s1_on, fs)
+        s2w, _ = _window_array(lfp_f, t, s2_on, fs)
+        base = _file_dt(fp).timestamp()
+        te = base + st if (st is not None and st.size == lfp.shape[0]) else \
+            np.full(lfp.shape[0], base)
+        for k, o in ons.items():
+            if not o.size:
+                continue
+            m, tto = _preictal(te, o, cap)
+            m = m & paired
+            if not m.any():
+                continue
+            buf[k]["s2"].append(s2w[m])
+            buf[k]["resid"].append(s2w[m] - s1w[m])
+            buf[k]["tto"].append(tto[m] / 60.0)             # minutes
+    out = {"twin": twin}
+    for k in ons:
+        if buf[k]["s2"]:
+            out[k] = {"s2": np.vstack(buf[k]["s2"]), "resid": np.vstack(buf[k]["resid"]),
+                      "tto": np.concatenate(buf[k]["tto"])}
+        else:
+            out[k] = {"s2": None, "resid": None, "tto": None}
+    return out
+
+
 def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFrame:
     """Concatenate per-epoch paired-pulse features across files + join seizure
     proximity (time_to_onset_sec vs lead onsets). Cached to C.PP_CACHE."""

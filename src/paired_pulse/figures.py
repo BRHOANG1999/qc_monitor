@@ -364,9 +364,10 @@ def example_pairs_fig(ex, out_png, *, title="") -> str:
 
 
 def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
-                        min_n=30) -> str:
-    """Averaged evoked waveform per LOG lead-time bin, overlaid and color-coded by
-    time-to-onset. which='s2' = pulse-2 response; which='resid' = S2 − S1 residual."""
+                        min_n=30, bin_label="dyadic log", log_color=True) -> str:
+    """Averaged evoked waveform per lead-time bin, overlaid and color-coded by
+    time-to-onset. which='s2' = pulse-2 response; which='resid' = S2 − S1 residual.
+    bin_label names the binning in the footnote (e.g. '5-min linear')."""
     import matplotlib.cm as _cm
     import matplotlib.colors as _mc
     tw, cen = wb["twin"], wb["centers"]
@@ -375,22 +376,77 @@ def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
     if data is not None:
         valid = np.where((cnt >= min_n) & np.all(np.isfinite(data), axis=1))[0]
         if valid.size:
-            norm = _mc.LogNorm(vmin=max(cen[valid].min(), 1e-2), vmax=cen[valid].max())
+            vmin = max(cen[valid].min(), 1e-2) if log_color else cen[valid].min()
+            norm = (_mc.LogNorm(vmin=vmin, vmax=cen[valid].max()) if log_color
+                    else _mc.Normalize(vmin=vmin, vmax=cen[valid].max()))
             cmap = _cm.turbo
             for b in valid:
                 ax.plot(tw, data[b], color=cmap(norm(cen[b])), lw=1.5)
             sm = _cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
             cb = fig.colorbar(sm, ax=ax)
-            cb.set_label("min to onset (log; blue=near, red=far)", color=C.TEXT, fontsize=8)
+            lab = "min to onset (%s; blue=near, red=far)" % ("log" if log_color else "lin")
+            cb.set_label(lab, color=C.TEXT, fontsize=8)
             cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
     ax.axhline(0, color=C.MUTED, lw=0.6)
     _dark(ax, title)
     ax.set_xlabel("ms from pulse onset", color=C.TEXT)
     ax.set_ylabel("S2 LFP (≤500 Hz)" if which == "s2" else "S2 − S1 residual",
                   color=C.TEXT)
-    _footnote(fig, _base_note(f"{onset_set} seizures · averaged per dyadic log "
+    _footnote(fig, _base_note(f"{onset_set} seizures · averaged per {bin_label} "
                               f"lead-time bin (n≥{min_n}) · pre-ictal only (on/post-onset "
                               f"excluded)"))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def waveform_traces_fig(td, out_png, *, onset_set="lead", which="resid", bin_min=5.0,
+                        cap_h=2.0, title="") -> str:
+    """EVERY individual pre-ictal evoked response overlaid, each coloured by its own
+    time-to-onset (full density, not downsampled), with the linear bin-means drawn bold
+    on top. 'each evoked response following the trend'. which='s2' or 'resid' (S2 − S1)."""
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mc
+    from matplotlib.collections import LineCollection
+    tw = td["twin"]
+    d = td.get(onset_set) or {}
+    arr = d.get(which); tto = d.get("tto")
+    fig, ax = plt.subplots(figsize=(9.8, 5.6), facecolor=C.BG)
+    n = 0
+    if arr is not None and arr.shape[0]:
+        n = arr.shape[0]
+        fin = np.all(np.isfinite(arr), axis=1) & np.isfinite(tto) & (tto > 0)
+        arr, tto = arr[fin], tto[fin]; n = arr.shape[0]
+        norm = _mc.LogNorm(vmin=max(np.nanmin(tto), 0.1), vmax=np.nanmax(tto))
+        cmap = _cm.turbo
+        segs = [np.column_stack([tw, arr[i]]) for i in range(n)]
+        lc = LineCollection(segs, linewidths=0.35, cmap=cmap, norm=norm)
+        lc.set_array(tto)
+        lc.set_alpha(float(np.clip(300.0 / max(n, 1), 0.012, 0.3)))
+        ax.add_collection(lc)
+        edges = np.arange(0.0, cap_h * 3600.0 + bin_min * 60.0, bin_min * 60.0) / 60.0
+        for b in range(edges.size - 1):
+            m = (tto >= edges[b]) & (tto < edges[b + 1])
+            if m.sum() >= 30:
+                cc = 0.5 * (edges[b] + edges[b + 1])
+                ax.plot(tw, np.nanmean(arr[m], axis=0), color=cmap(norm(cc)), lw=2.4,
+                        zorder=5)
+        cb = fig.colorbar(lc, ax=ax)
+        cb.set_label("min to onset (log; blue=near, red=far)", color=C.TEXT, fontsize=8)
+        cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
+        ax.set_xlim(float(tw[0]), float(tw[-1]))
+        lo, hi = np.nanpercentile(arr, [0.2, 99.8])
+        pad = 0.08 * (hi - lo) if hi > lo else 0.1
+        ax.set_ylim(lo - pad, hi + pad)
+    ax.axhline(0, color=C.MUTED, lw=0.6)
+    _dark(ax, title)
+    ax.set_xlabel("ms from pulse onset", color=C.TEXT)
+    ax.set_ylabel("S2 LFP (≤500 Hz)" if which == "s2" else "S2 − S1 residual",
+                  color=C.TEXT)
+    _footnote(fig, _base_note(f"{onset_set} seizures · {n:,} individual pre-ictal "
+                              f"responses (full density) + {bin_min:.0f}-min linear bin "
+                              f"means · strict pre-ictal (on/post-onset excluded)"))
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
