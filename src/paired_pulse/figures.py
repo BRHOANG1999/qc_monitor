@@ -17,6 +17,18 @@ import pandas as pd                        # noqa: E402
 from . import config as C                  # noqa: E402
 
 
+def _truncate_cmap(cmap, lo=0.16, hi=0.97, n=256):
+    """Clip a colormap's range so its endpoints stay legible on the dark background.
+    Turbo's low end is near-black purple (invisible on #15151f); start at 0.16 instead."""
+    import matplotlib.colors as _mcol
+    return _mcol.LinearSegmentedColormap.from_list(
+        f"{getattr(cmap, 'name', 'c')}_vis", cmap(np.linspace(lo, hi, n)))
+
+
+# Shared dark-background-safe sequential map for per-seizure / lead-time coding.
+TURBO_VIS = _truncate_cmap(plt.cm.turbo)
+
+
 def _savefig(fig, out, **kw):
     os.makedirs(os.path.dirname(out), exist_ok=True)
     for i in range(5):                                   # Windows errno22 retry
@@ -291,7 +303,7 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
     edges = np.arange(-pre_h * 60, post_h * 60 + bin_min, bin_min)
     cen = 0.5 * (edges[:-1] + edges[1:])
     fig, ax = plt.subplots(figsize=(11.5, 5.6), facecolor=C.BG)
-    cmap = plt.cm.turbo
+    cmap = TURBO_VIS
     lines = []
     for i, o in enumerate(ons):
         rel = (t - o) / 60.0
@@ -379,7 +391,7 @@ def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
             vmin = max(cen[valid].min(), 1e-2) if log_color else cen[valid].min()
             norm = (_mc.LogNorm(vmin=vmin, vmax=cen[valid].max()) if log_color
                     else _mc.Normalize(vmin=vmin, vmax=cen[valid].max()))
-            cmap = _cm.turbo
+            cmap = TURBO_VIS
             for b in valid:
                 ax.plot(tw, data[b], color=cmap(norm(cen[b])), lw=1.5)
             sm = _cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
@@ -419,7 +431,7 @@ def waveform_traces_fig(td, out_png, *, onset_set="lead", which="resid", bin_min
         fin = np.all(np.isfinite(arr), axis=1) & np.isfinite(tto) & (tto > 0)
         arr, tto = arr[fin], tto[fin]; n = arr.shape[0]
         norm = _mc.LogNorm(vmin=max(np.nanmin(tto), 0.1), vmax=np.nanmax(tto))
-        cmap = _cm.turbo
+        cmap = TURBO_VIS
         segs = [np.column_stack([tw, arr[i]]) for i in range(n)]
         lc = LineCollection(segs, linewidths=0.35, cmap=cmap, norm=norm)
         lc.set_array(tto)
@@ -579,7 +591,7 @@ def periictal_trajectory_log_fig(mat, onsets, out_png, *, feature="ppr_peak_to_t
     prev = np.where(pidx >= 0, ons[np.clip(pidx, 0, ons.size - 1)], -np.inf)
     tsl = t - prev
     fig, ax = plt.subplots(figsize=(10.5, 5.6), facecolor=C.BG)
-    cmap = plt.cm.turbo
+    cmap = TURBO_VIS
     lines = []
     for i, o in enumerate(ons):
         tto = o - t
