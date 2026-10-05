@@ -278,6 +278,14 @@ def _stim_times_for_file(store: Store, file_id: int) -> np.ndarray:
     return _stim_blank.stim_times_for_file(store, file_id)
 
 
+def _pulse_times_for_file(store: Store, file_id: int) -> np.ndarray:
+    """Every stim PULSE time for BLANKING (paired-pulse second pulse included). Uses
+    the stimCopy channel so a paired pulse is fully blanked; see
+    stim_blank.pulse_times_for_file. Only the blanking path uses this -- the stim
+    overlay keeps _stim_times_for_file (one entry per stim epoch)."""
+    return _stim_blank.pulse_times_for_file(store, file_id)
+
+
 def _stim_copy_channels(store: Store, session_dir: str | None) -> set[int]:
     return _stim_blank.stim_copy_channels(store, session_dir)
 
@@ -1381,7 +1389,7 @@ def _render_hilbert_trace(store, file_id: int,
     # Blank by default (match _update_lfp) so the envelope reflects the
     # EEG, not the stim artifact; never blank a stim_copy channel.
     do_blank = (int(channel) not in stim_copy) and (not show_raw)
-    stim_times = (_stim_times_for_file(store, file_id)
+    stim_times = (_pulse_times_for_file(store, file_id)
                    if do_blank
                    else np.asarray([], dtype=np.float64))
     try:
@@ -1513,7 +1521,7 @@ def _render_band_power_trace(store, file_id: int, channel: int | None,
     session_dir = _session_dir_for_file(store, file_id)
     stim_copy = _stim_copy_channels(store, session_dir)
     do_blank = (int(channel) not in stim_copy) and (not show_raw)
-    stim_times = (_stim_times_for_file(store, file_id)
+    stim_times = (_pulse_times_for_file(store, file_id)
                    if do_blank else np.asarray([], dtype=np.float64))
     try:
         series, fs, _ = _get_blanked_series(
@@ -1612,7 +1620,7 @@ def _render_wavelet_band_power(store, file_id: int, channel: int | None,
     session_dir = _session_dir_for_file(store, file_id)
     stim_copy = _stim_copy_channels(store, session_dir)
     do_blank = (int(channel) not in stim_copy) and (not show_raw)
-    stim_times = (_stim_times_for_file(store, file_id)
+    stim_times = (_pulse_times_for_file(store, file_id)
                    if do_blank else np.asarray([], dtype=np.float64))
     try:
         series, fs, _ = _get_blanked_series(
@@ -2056,7 +2064,7 @@ def _render_auc_trace(store, file_id: int, channel: int | None,
     session_dir = _session_dir_for_file(store, file_id)
     stim_copy = _stim_copy_channels(store, session_dir)
     do_blank = (int(channel) not in stim_copy) and (not show_raw)
-    stim_times = (_stim_times_for_file(store, file_id)
+    stim_times = (_pulse_times_for_file(store, file_id)
                    if do_blank
                    else np.asarray([], dtype=np.float64))
     try:
@@ -6914,7 +6922,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         is_stim_copy = channel in stim_copy
         show_raw = "raw" in (blank_raw or [])
         do_blank = (not is_stim_copy) and (not show_raw)
-        stim_times = (_stim_times_for_file(store, file_id)
+        stim_times = (_pulse_times_for_file(store, file_id)
                        if do_blank
                        else np.asarray([], dtype=np.float64))
 
@@ -7520,7 +7528,7 @@ def register_callbacks(app, store: Store, config: dict) -> None:
         # blank a stim_copy channel, and honor the "Show raw" toggle.
         do_blank = (channel not in stim_copy) and (
             "raw" not in (blank_raw or []))
-        stim_times = (_stim_times_for_file(store, file_id)
+        stim_times = (_pulse_times_for_file(store, file_id)
                        if do_blank
                        else np.asarray([], dtype=np.float64))
 

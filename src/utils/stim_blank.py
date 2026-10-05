@@ -204,6 +204,35 @@ def stim_times_for_file(store, file_id: int) -> np.ndarray:
     return _stim_times_from_copy(store, file_id, session_dir)
 
 
+def pulse_times_for_file(store, file_id: int) -> np.ndarray:
+    """Every stim PULSE onset time (sec) for BLANKING, including the second pulse of
+    a paired-pulse protocol.
+
+    ``stim_times_for_file`` returns the MATLAB catalogue's one row per stim EPOCH --
+    for a paired pulse that is the pair's anchor, so only the FIRST pulse falls inside
+    the [pre, post] blank window and the second pulse's artifact leaks through. The
+    stimCopy channel records the stimulator output directly, so detecting its rising
+    edges (merged only within a 3 ms refractory) yields EVERY pulse -- both members of
+    a pair (any inter-pulse interval > 3 ms), each pulse of a train, etc. We therefore
+    prefer the stimCopy detection here and fall back to the epoch catalogue only when
+    no stimCopy channel is available (then paired blanking degrades to first-pulse-only
+    as before, never worse).
+
+    Kept separate from ``stim_times_for_file`` on purpose: the stim OVERLAY and the
+    mass-analyze sweep want the epoch anchors (one per trial) and the sweep must not pay
+    a per-file stimCopy scan, so only the interactive blanking path calls this.
+    """
+    with store.connection() as conn:
+        sd_row = conn.execute(
+            "SELECT session_dir FROM processed_files WHERE id=?",
+            (file_id,)).fetchone()
+    session_dir = sd_row["session_dir"] if sd_row else None
+    pulses = _stim_times_from_copy(store, file_id, session_dir)
+    if pulses.size:
+        return pulses
+    return stim_times_for_file(store, file_id)
+
+
 def stim_copy_channels(store, session_dir: str | None) -> set[int]:
     """Channel indices flagged as stim-copy in the session config.
 

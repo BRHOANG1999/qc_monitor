@@ -62,6 +62,45 @@ def test_detect_stim_onsets_finds_pulses():
     assert abs(onsets[0] - 0.5) < 0.01
 
 
+def test_detect_stim_onsets_finds_both_pulses_of_a_pair():
+    """Paired-pulse: two pulses per trial, 40 ms apart. The stimCopy detector must
+    return BOTH pulses (not merge them), so blanking covers the second pulse that the
+    one-per-epoch MATLAB catalogue misses."""
+    from src.utils.stim_blank import detect_stim_onsets
+    fs, n = 1000.0, 10000
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(n) * 0.5
+    pulse_times = []
+    for trial in np.arange(1.0, 9.0, 2.0):          # 4 trials, 2 pulses each
+        for t in (trial, trial + 0.040):            # 40 ms inter-pulse interval
+            c = int(t * fs)
+            x[c:c + 3] = 120.0
+            pulse_times.append(t)
+    onsets = detect_stim_onsets(x, fs)
+    assert len(onsets) == len(pulse_times) == 8      # both pulses per pair
+    # Each pair's two pulses are ~40 ms apart, not merged.
+    assert abs((onsets[1] - onsets[0]) - 0.040) < 0.005
+
+
+def test_paired_pulse_blanking_nans_both_pulses():
+    """With both pulse times, blank_series_with_stim_times NaNs BOTH pulse windows --
+    the second pulse's artifact no longer leaks past the first pulse's window."""
+    fs = 2000.0
+    n = int(fs * 2.0)
+    s = np.ones(n, dtype=np.float32)
+    p1, p2 = 1.0, 1.040                              # 40 ms apart
+    out = blank_series_with_stim_times(s, fs, np.asarray([p1, p2]),
+                                       blank_pre_ms=-5.0, blank_post_ms=15.0)
+    # Both pulse centers are NaN...
+    assert np.isnan(out[int(p1 * fs)]) and np.isnan(out[int(p2 * fs)])
+    # ...while the gap between the pair's windows (e.g. +25 ms after p1) is untouched.
+    assert out[int((p1 + 0.025) * fs)] == 1.0
+    # A single-time (first-pulse-only) blank would leave the 2nd pulse NaN-free:
+    only1 = blank_series_with_stim_times(s, fs, np.asarray([p1]),
+                                         blank_pre_ms=-5.0, blank_post_ms=15.0)
+    assert not np.isnan(only1[int(p2 * fs)])         # the bug this fix addresses
+
+
 def test_detect_stim_onsets_baseline_is_empty():
     from src.utils.stim_blank import detect_stim_onsets
     rng = np.random.default_rng(1)
