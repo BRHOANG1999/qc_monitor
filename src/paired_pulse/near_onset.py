@@ -87,13 +87,14 @@ def s1_s2_amplitude_fig(mat, onsets, out_png, *, win_min=10.0, bin_min=0.5,
         ax.set_ylabel("S1/S2 ÷ far baseline", color=C.TEXT, fontsize=8)
         if i // ncol == nrow - 1:
             ax.set_xlabel("minutes to onset", color=C.TEXT, fontsize=8)
-    h, lab = axes[0][0].get_legend_handles_labels()
-    if h:
-        leg = fig.legend(h + [axes[0][0].twinx().plot([], [], color=C.SEIZURE_COLOR,
-                         ls="--")[0]], lab + ["PPR"], fontsize=8, framealpha=0.1,
-                         loc="upper right")
-        for tt in leg.get_texts():
-            tt.set_color(C.TEXT)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([], [], color=C.S1_COLOR, lw=1.9),
+               Line2D([], [], color=C.S2_COLOR, lw=1.9),
+               Line2D([], [], color=C.SEIZURE_COLOR, lw=1.4, ls="--")]
+    leg = fig.legend(handles, ["S1 (p2p)", "S2 (p2p)", "PPR"], fontsize=8,
+                     framealpha=0.1, loc="upper right")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
     fig.suptitle(title, color=C.TEXT, fontsize=12)
     G._footnote(fig, G._base_note(f"per-seizure S1/S2 p2p ÷ far-edge baseline + PPR; last "
                                   f"{win_min:.0f} min, {bin_min*60:.0f}-s bins; 2-min "
@@ -162,7 +163,8 @@ def per_seizure_stats_fig(mat, onsets, out_png, *, cap_h=2.0, title="") -> str:
     for si, o in enumerate(ons):
         ax.scatter([], [], color=cmap(si / max(ons.size - 1, 1)),
                    label=_dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M"))
-    leg = ax.legend(fontsize=7, framealpha=0.1, loc="lower right", title="seizure")
+    leg = ax.legend(fontsize=7, framealpha=0.1, loc="center left",
+                    bbox_to_anchor=(1.01, 0.5), title="seizure")
     for tt in leg.get_texts():
         tt.set_color(C.TEXT)
     leg.get_title().set_color(C.TEXT)
