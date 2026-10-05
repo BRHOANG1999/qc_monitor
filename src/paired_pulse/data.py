@@ -18,6 +18,7 @@ import pandas as pd
 from . import config as C
 from src.notifications.evoked_stim_corr import _list_files, _file_dt, _match_key
 from src.utils import evoked_features as _ef
+from src.riding_event import primitives as _prim
 
 
 def _log(m):
@@ -97,8 +98,22 @@ def _window_array(lfp_f, t, onsets_ms, fs):
     return out, (twin if twin is not None else np.linspace(C.WIN[0], C.WIN[1], nwin))
 
 
-def extract_pairs(fp, channel=None) -> pd.DataFrame | None:
-    """Per-epoch S1/S2 features + PPR for one file. None if unreadable / not paired."""
+def _phfo_present(win, twin, fs, band) -> np.ndarray:
+    """Per-epoch pHFO on an already-onset-aligned window, via the riding_event
+    primitives (robust-median template subtract -> gate the residual). 0/1."""
+    if band is None or win.shape[0] == 0:
+        return np.zeros(win.shape[0], np.int8)
+    mask = np.ones(twin.size, bool)
+    template, _k = _prim.robust_template(win, iters=1, k=4.0, win_mask=mask)
+    resid = _prim.residuals(win, template)
+    frac, prom, snr = _prim.phfo_metrics_epochs(resid, twin, fs, band,
+                                                gate_ms=(float(twin[0]), float(twin[-1])))
+    return _prim.phfo_gate(frac, prom, snr).astype(np.int8)
+
+
+def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
+    """Per-epoch S1/S2 features + PPR for one file. None if unreadable / not paired.
+    When *band* (the pHFO band) is given, also flags pHFO on each pulse."""
     channel = channel or C.CHANNEL
     r = _read_file(fp, channel)
     if r is None:
@@ -120,6 +135,9 @@ def extract_pairs(fp, channel=None) -> pd.DataFrame | None:
             cols[f"s2_{feat}"] = b
             with np.errstate(divide="ignore", invalid="ignore"):
                 cols[f"ppr_{feat}"] = b / np.where(a != 0, a, np.nan)
+    if band is not None:                                 # pHFO per pulse (S2 is the ask)
+        cols["s1_phfo_present"] = _phfo_present(s1w, twin, fs, band)
+        cols["s2_phfo_present"] = _phfo_present(s2w, twin, fs, band)
     fdt = _file_dt(fp)
     base = fdt.timestamp() if fdt is not None else np.nan
     t_epoch = base + st if (st is not None and st.size == lfp.shape[0]) else np.full(
@@ -162,12 +180,19 @@ def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFra
         _log(f"loading cached paired-pulse matrix: {C.PP_CACHE}")
         return pd.read_pickle(C.PP_CACHE)
     files = list_pp_files(evoked_dir, since)
+    band = None
+    try:
+        from src.riding_event.periictal import ensure_template
+        band = ensure_template(store, C.ANIMAL)["band"]
+        _log(f"pHFO band: {band[0]:.0f}-{band[1]:.0f} Hz")
+    except Exception as e:                                # noqa: BLE001
+        _log(f"pHFO band unavailable ({type(e).__name__}); skipping pHFO")
     _log(f"scanning {len(files)} files since {(since or C.PP_START_DATE):%Y-%m-%d} ...")
     frames = []
     for i, (fp, _d) in enumerate(files):
         if i % 20 == 0:
             _log(f"  file {i}/{len(files)}")
-        df = extract_pairs(fp)
+        df = extract_pairs(fp, band=band)
         if df is not None:
             frames.append(df)
     assert frames, "no paired-pulse epochs found in range"
@@ -180,15 +205,27 @@ def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFra
 
 
 def _attach_seizures(store, mat) -> pd.DataFrame:
-    """time_to_onset_sec = time to the next LEAD seizure onset (searchsorted)."""
-    from src.preictal_biomarker import features as _F
-    ons = np.sort(_F.lead_onsets(store))
+    """Join seizure proximity. time_to_onset_sec = time to the next LEAD onset (clean
+    pre-ictal trend); tto_any_sec = time to the next ANY scored event (for the
+    P(event within H) figure). Uses isi directly -- NOT the Sep13-Oct2 scoped
+    preictal_biomarker.lead_onsets, which would exclude the paired-pulse window."""
+    from src.preictal import isi as _isi
+    sz = _isi.scored_seizures(store, C.ANIMAL)
+    allon = np.sort(np.array([s.onset_epoch for s in sz], float))
+    leadon = np.sort(np.array([s.onset_epoch for s in
+                               _isi.leading_seizures(sz, 6 * 3600.0)], float))
     t = mat["t_epoch"].to_numpy(float)
-    if ons.size:
+
+    def _tto(ons):
+        if not ons.size:
+            return np.full(t.size, np.inf)
         idx = np.searchsorted(ons, t, side="left")
-        nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
-        mat["time_to_onset_sec"] = nxt - t
-    else:
-        mat["time_to_onset_sec"] = np.inf
-    mat["n_lead_in_window"] = int(ons.size)
+        return np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)],
+                        np.inf) - t
+
+    mat["time_to_onset_sec"] = _tto(leadon)              # next LEAD
+    mat["tto_any_sec"] = _tto(allon)                     # next ANY event
+    lo, hi = t.min(), t.max()
+    mat["n_lead_in_window"] = int(((leadon >= lo) & (leadon <= hi)).sum())
+    mat["n_event_in_window"] = int(((allon >= lo) & (allon <= hi)).sum())
     return mat

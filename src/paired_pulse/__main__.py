@@ -22,7 +22,11 @@ def main(argv=None) -> int:
     since = None
     if "--since" in argv:
         since = _dt.datetime.strptime(argv[argv.index("--since") + 1], "%Y-%m-%d")
-    _run.run(since=since, force=("--force" in argv), apply=("--dry" not in argv))
+    force = "--force" in argv
+    if "--periictal" in argv:
+        _run.run_periictal(since=since, force=force)
+    else:
+        _run.run(since=since, force=force, apply=("--dry" not in argv))
     return 0
 
 

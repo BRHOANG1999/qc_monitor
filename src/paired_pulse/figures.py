@@ -160,6 +160,138 @@ def ppr_vs_seizure_fig(mat, out_png, *, feature=None, cap_h=12.0) -> str:
     return out_png
 
 
+_HLAB = {600: "10 min", 1800: "30 min", 3600: "1 h", 7200: "2 h"}
+_HCOL = {600: "#5e7ce2", 1800: "#2ee6a6", 3600: "#e6800f", 7200: "#d62f2f"}
+
+
+def metric_trend_fig(mat, cols, onset_col, out_png, *, labels=None, title="",
+                     cap_h=12.0, ref1=False) -> str:
+    """Pre-ictal trend: each metric vs LOG time-to-onset (median + IQR), onset at the
+    right. ref1 draws the PPR=1 (equal) line."""
+    from src.periictal import trajectory as _TR
+    tto = mat[onset_col].to_numpy(float)
+    edges = _TR.default_edges(cap_h * 3600, 2.0)
+    labels = labels or {}
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.4 * len(cols), 4.2),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        v = mat[col].to_numpy(float)
+        m = (np.isfinite(tto) & (tto > C.WIN[1] / 1000.0)
+             & (tto <= cap_h * 3600) & np.isfinite(v))
+        if m.sum() >= 20:
+            tj = _TR.lead_time_trajectory(tto[m], v[m], np.zeros(int(m.sum())),
+                                          edges, log_centers=True)
+            cen = tj["centers"] / 60.0
+            ax.fill_between(cen, tj["p25"], tj["p75"], color=C.ACCENT, alpha=0.18, lw=0)
+            ax.plot(cen, tj["median"], "-o", color=C.ACCENT, lw=1.6, ms=3)
+            ax.set_xscale("log"); ax.invert_xaxis()
+        else:
+            ax.text(0.5, 0.5, f"n={int(m.sum())}", ha="center", va="center",
+                    color=C.MUTED, transform=ax.transAxes)
+        if ref1:
+            ax.axhline(1.0, color=C.MUTED, lw=0.9, ls="--")
+        _dark(ax, labels.get(col, col))
+        ax.set_xlabel("min to onset (log)", color=C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def seizure_prob_vs_metric_fig(mat, cols, onset_col, out_png, *, horizons,
+                               labels=None, title="", nbins=6) -> str:
+    """Metric on x (quantile bins), P(event within H) on y, one curve per horizon
+    (+ dotted base rate). Does a metric level predict an imminent event?"""
+    tto = mat[onset_col].to_numpy(float)
+    labels = labels or {}
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.7 * len(cols), 4.4),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        x = mat[col].to_numpy(float)
+        ok = np.isfinite(x) & np.isfinite(tto)
+        xq, tq = x[ok], tto[ok]
+        uniq = np.unique(xq)
+        binary = uniq.size <= 2                           # e.g. pHFO 0/1
+        if binary:
+            cen = uniq
+            groups = [xq == u for u in uniq]
+        else:
+            edges = np.unique(np.quantile(xq, np.linspace(0, 1, nbins + 1)))
+            if edges.size < 3:
+                ax.text(0.5, 0.5, "constant", ha="center", va="center",
+                        color=C.MUTED, transform=ax.transAxes)
+                _dark(ax, labels.get(col, col)); continue
+            cen = 0.5 * (edges[:-1] + edges[1:])
+            bidx = np.clip(np.searchsorted(edges, xq, "right") - 1, 0, edges.size - 2)
+            groups = [bidx == b for b in range(edges.size - 1)]
+        for H in horizons:
+            hit = (tq > 0) & (tq <= H)
+            P = [100 * np.mean(hit[g]) if g.any() else np.nan for g in groups]
+            ax.plot(cen, P, "-o", color=_HCOL.get(H, C.ACCENT), lw=1.5, ms=4,
+                    label=_HLAB.get(H, f"{H}s"))
+            ax.axhline(100 * np.mean(hit), color=_HCOL.get(H, C.ACCENT), lw=0.7, ls=":")
+        _dark(ax, labels.get(col, col))
+        ax.set_xlabel(labels.get(col, col), color=C.TEXT)
+        if binary and set(uniq) <= {0.0, 1.0}:
+            ax.set_xticks([0, 1]); ax.set_xticklabels(["absent", "present"])
+    axes[0][0].set_ylabel("P(event within H) %", color=C.TEXT)
+    h, lab = axes[0][0].get_legend_handles_labels()
+    if h:
+        leg = fig.legend(h, lab, fontsize=8, framealpha=0.1, title="horizon",
+                         loc="upper right")
+        for t in leg.get_texts():
+            t.set_color(C.TEXT)
+        leg.get_title().set_color(C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
+                             pre_h=2.0, post_h=1.0, bin_min=10.0, title="") -> str:
+    """Peri-ictal PPR trajectory: one line per seizure + bold mean, over -pre_h..+post_h
+    around onset. y=1 is equal (above = facilitation, below = depression)."""
+    t = mat["t_epoch"].to_numpy(float)
+    v = mat[feature].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    edges = np.arange(-pre_h * 60, post_h * 60 + bin_min, bin_min)
+    cen = 0.5 * (edges[:-1] + edges[1:])
+    fig, ax = plt.subplots(figsize=(11, 5.6), facecolor=C.BG)
+    lines = []
+    for o in ons:
+        rel = (t - o) / 60.0
+        m = (rel >= -pre_h * 60) & (rel <= post_h * 60) & np.isfinite(v)
+        if m.sum() < 5:
+            continue
+        bi = np.clip(np.searchsorted(edges, rel[m], "right") - 1, 0, cen.size - 1)
+        line = np.array([np.median(v[m][bi == b]) if np.any(bi == b) else np.nan
+                         for b in range(cen.size)])
+        ax.plot(cen, line, color=C.MUTED, lw=0.9, alpha=0.55)
+        lines.append(line)
+    if lines:
+        mean = np.nanmean(np.vstack(lines), axis=0)
+        ax.plot(cen, mean, color=C.S2_COLOR, lw=2.8, label=f"mean ({len(lines)} seizures)")
+    ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=1.1, ls="--")
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.3)
+    ax.text(0.015, 0.97, "facilitation ↑", transform=ax.transAxes, color=C.FACIL_COLOR,
+            fontsize=9, va="top")
+    ax.text(0.015, 0.03, "depression ↓", transform=ax.transAxes, color=C.DEPR_COLOR,
+            fontsize=9, va="bottom")
+    _dark(ax, title)
+    ax.set_xlabel("minutes from seizure onset (− pre-ictal / + post-ictal)", color=C.TEXT)
+    ax.set_ylabel(f"PPR ({feature.replace('ppr_', '')})", color=C.TEXT)
+    leg = ax.legend(fontsize=8, framealpha=0.1, loc="upper right")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    fig.tight_layout()
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def ppr_distribution_fig(mat, out_png) -> str:
     """Per-feature PPR histogram: facilitation (>1) vs depression (<1)."""
     feats = [f for f in C.FEATURES if f"ppr_{f}" in mat.columns]
