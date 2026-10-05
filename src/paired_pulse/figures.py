@@ -565,6 +565,51 @@ def trajectory_null_fig(res, out_png, *, title="") -> str:
     return out_png
 
 
+_PROX = [("≤5 min", 0.0, 300.0, "#d62f2f"), ("5–10 min", 300.0, 600.0, "#e6800f"),
+         ("10–30 min", 600.0, 1800.0, "#f2c744"), ("30–60 min", 1800.0, 3600.0,
+          "#2ee6a6"), (">1 h", 3600.0, np.inf, C.MUTED)]
+
+
+def ppr_distribution_proximity_fig(mat, onsets, out_png, *, cols=None,
+                                   title="") -> str:
+    """PPR distribution per feature, STACKED by proximity to the nearest seizure
+    (|time to nearest onset|, either side): ≤5 / 5–10 / 10–30 / 30–60 min / >1 h.
+    Shows which PPR values are occupied by near-seizure epochs."""
+    cols = cols or [f"ppr_{f}" for f in C.FEATURES if f"ppr_{f}" in mat.columns]
+    t = mat["t_epoch"].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    idx = np.searchsorted(ons, t, side="left")
+    nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
+    prv = np.where(idx > 0, ons[np.clip(idx - 1, 0, ons.size - 1)], np.inf)
+    nearest = np.minimum(np.abs(nxt - t), np.abs(t - prv))
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.7 * len(cols), 4.3),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        v = mat[col].to_numpy(float)
+        ok = np.isfinite(v) & np.isfinite(nearest)
+        vv, nn = v[ok], nearest[ok]
+        q = np.nanpercentile(vv, [0.5, 99.5])
+        bins = np.linspace(q[0], q[1], 50)
+        data = [vv[(nn > a) & (nn <= b)] for _l, a, b, _c in _PROX]
+        ax.hist(data, bins=bins, stacked=True, color=[c for *_, c in _PROX],
+                label=[l for l, *_ in _PROX])
+        ax.axvline(1.0, color=C.SEIZURE_COLOR, lw=0.9, ls="--")
+        _dark(ax, col.replace("ppr_", "PPR ").replace("_", " "))
+        ax.set_xlabel("PPR (S2/S1)", color=C.TEXT)
+    axes[0][0].set_ylabel("pairs", color=C.TEXT)
+    leg = axes[0][-1].legend(fontsize=7, framealpha=0.1, title="to nearest seizure")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    leg.get_title().set_color(C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    _footnote(fig, _base_note("stacked by |time to nearest onset| (pre or post) · "
+                              + _span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def ppr_distribution_fig(mat, out_png) -> str:
     """Per-feature PPR histogram: facilitation (>1) vs depression (<1)."""
     feats = [f for f in C.FEATURES if f"ppr_{f}" in mat.columns]
