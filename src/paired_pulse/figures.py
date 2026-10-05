@@ -278,9 +278,12 @@ def seizure_prob_vs_metric_fig(mat, cols, onset_col, out_png, *, horizons,
 
 
 def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
-                             pre_h=2.0, post_h=1.0, bin_min=10.0, title="") -> str:
+                             pre_h=2.0, post_h=1.0, bin_min=10.0, strict=False,
+                             title="") -> str:
     """Peri-ictal PPR trajectory: one line per seizure + bold mean, over -pre_h..+post_h
-    around onset. y=1 is equal (above = facilitation, below = depression)."""
+    around onset. y=1 is equal (above = facilitation, below = depression). strict=True
+    blanks the onset + ALL post-onset data (pre-ictal approach-half only: an epoch counts
+    for a seizure only if that seizure is nearer than the previous onset)."""
     t = mat["t_epoch"].to_numpy(float)
     v = mat[feature].to_numpy(float)
     ons = np.sort(np.asarray(onsets, float))
@@ -292,6 +295,10 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
     for i, o in enumerate(ons):
         rel = (t - o) / 60.0
         m = (rel >= -pre_h * 60) & (rel <= post_h * 60) & np.isfinite(v)
+        if strict:                                       # pre-ictal approach-half only
+            pi = np.searchsorted(ons, o, side="left") - 1
+            prev = ons[pi] if pi >= 0 else -np.inf
+            m = m & (t < o) & ((o - t) <= (t - prev))
         if m.sum() < 5:
             continue
         bi = np.clip(np.searchsorted(edges, rel[m], "right") - 1, 0, cen.size - 1)
@@ -660,6 +667,52 @@ def ppr_distribution_proximity_fig(mat, onsets, out_png, *, cols=None,
     fig.suptitle(title, color=C.TEXT, fontsize=12)
     _footnote(fig, _base_note("stacked by |time to nearest onset| (pre or post) · "
                               + _span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def ppr_ecdf_proximity_fig(mat, onsets, out_png, *, cols=None, title="") -> str:
+    """PPR distribution shift as seizures approach, shown as OVERLAID ECDFs per proximity
+    stratum (|time to nearest onset|): ≤5 / 5–10 / 10–30 / 30–60 min / >1 h. No binning;
+    a leftward (lower-PPR) shift near onset appears as a horizontal offset of the curve.
+    n per stratum is in the legend so a sparse near-onset curve isn't over-read."""
+    cols = cols or [f"ppr_{f}" for f in C.FEATURES if f"ppr_{f}" in mat.columns]
+    t = mat["t_epoch"].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    idx = np.searchsorted(ons, t, side="left")
+    nxt = np.where(idx < ons.size, ons[np.clip(idx, 0, ons.size - 1)], np.inf)
+    prv = np.where(idx > 0, ons[np.clip(idx - 1, 0, ons.size - 1)], np.inf)
+    nearest = np.minimum(np.abs(nxt - t), np.abs(t - prv))
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.9 * len(cols), 4.4),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        v = mat[col].to_numpy(float)
+        ok = np.isfinite(v) & np.isfinite(nearest)
+        vv, nn = v[ok], nearest[ok]
+        q = np.nanpercentile(vv, [0.5, 99.5])
+        for lab, a, b, c in _PROX:
+            x = np.sort(vv[(nn > a) & (nn <= b)])
+            if x.size < 3:
+                continue
+            y = np.arange(1, x.size + 1) / x.size
+            ax.step(x, y, where="post", color=c, lw=1.8, alpha=0.95,
+                    label=f"{lab} (n={x.size:,})")
+        ax.axvline(1.0, color=C.SEIZURE_COLOR, lw=0.9, ls="--")
+        ax.set_xlim(q[0], q[1])
+        ax.set_ylim(0, 1)
+        _dark(ax, col.replace("ppr_", "PPR ").replace("_", " "))
+        ax.set_xlabel("PPR (S2/S1)", color=C.TEXT)
+    axes[0][0].set_ylabel("cumulative fraction", color=C.TEXT)
+    leg = axes[0][-1].legend(fontsize=7, framealpha=0.1, title="to nearest seizure",
+                             loc="lower right")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    leg.get_title().set_color(C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    _footnote(fig, _base_note("overlaid ECDFs by |time to nearest onset| (pre or post); "
+                              "normalized per stratum, n in legend · " + _span_str(mat)))
     fig.tight_layout(rect=(0, 0.03, 1, 0.93))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
