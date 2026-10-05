@@ -18,7 +18,6 @@ import pandas as pd
 from . import config as C
 from src.notifications.evoked_stim_corr import _list_files, _file_dt, _match_key
 from src.utils import evoked_features as _ef
-from src.riding_event import primitives as _prim
 
 
 def _log(m):
@@ -113,22 +112,8 @@ def _window_array(lfp_f, t, onsets_ms, fs, demean=None):
     return out, (twin if twin is not None else np.linspace(C.WIN[0], C.WIN[1], nwin))
 
 
-def _phfo_present(win, twin, fs, band) -> np.ndarray:
-    """Per-epoch pHFO on an already-onset-aligned window, via the riding_event
-    primitives (robust-median template subtract -> gate the residual). 0/1."""
-    if band is None or win.shape[0] == 0:
-        return np.zeros(win.shape[0], np.int8)
-    mask = np.ones(twin.size, bool)
-    template, _k = _prim.robust_template(win, iters=1, k=4.0, win_mask=mask)
-    resid = _prim.residuals(win, template)
-    frac, prom, snr = _prim.phfo_metrics_epochs(resid, twin, fs, band,
-                                                gate_ms=(float(twin[0]), float(twin[-1])))
-    return _prim.phfo_gate(frac, prom, snr).astype(np.int8)
-
-
-def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
-    """Per-epoch S1/S2 features + PPR for one file. None if unreadable / not paired.
-    When *band* (the pHFO band) is given, also flags pHFO on each pulse."""
+def extract_pairs(fp, channel=None) -> pd.DataFrame | None:
+    """Per-epoch S1/S2 features + PPR for one file. None if unreadable / not paired."""
     channel = channel or C.CHANNEL
     r = _read_file(fp, channel)
     if r is None:
@@ -150,14 +135,6 @@ def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
             cols[f"s2_{feat}"] = b
             with np.errstate(divide="ignore", invalid="ignore"):
                 cols[f"ppr_{feat}"] = b / np.where(a != 0, a, np.nan)
-    if band is not None:                                 # pHFO per pulse (S2 is the ask)
-        # pHFO is HIGH-frequency (band ~124-990 Hz) -> detect on the WIDEBAND (raw)
-        # window, NOT the 1-500 Hz trace used for the amplitude features/waveforms
-        # (which would clip the pHFO band at 500 Hz and undercount).
-        s1w_raw, _ = _window_array(lfp, t, s1_on, fs, demean=False)
-        s2w_raw, _ = _window_array(lfp, t, s2_on, fs, demean=False)
-        cols["s1_phfo_present"] = _phfo_present(s1w_raw, twin, fs, band)
-        cols["s2_phfo_present"] = _phfo_present(s2w_raw, twin, fs, band)
     fdt = _file_dt(fp)
     base = fdt.timestamp() if fdt is not None else np.nan
     t_epoch = base + st if (st is not None and st.size == lfp.shape[0]) else np.full(
@@ -341,19 +318,12 @@ def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFra
         _log(f"loading cached paired-pulse matrix: {C.PP_CACHE}")
         return pd.read_pickle(C.PP_CACHE)
     files = list_pp_files(evoked_dir, since)
-    band = None
-    try:
-        from src.riding_event.periictal import ensure_template
-        band = ensure_template(store, C.ANIMAL)["band"]
-        _log(f"pHFO band: {band[0]:.0f}-{band[1]:.0f} Hz")
-    except Exception as e:                                # noqa: BLE001
-        _log(f"pHFO band unavailable ({type(e).__name__}); skipping pHFO")
     _log(f"scanning {len(files)} files since {(since or C.PP_START_DATE):%Y-%m-%d} ...")
     frames = []
     for i, (fp, _d) in enumerate(files):
         if i % 20 == 0:
             _log(f"  file {i}/{len(files)}")
-        df = extract_pairs(fp, band=band)
+        df = extract_pairs(fp)
         if df is not None:
             frames.append(df)
     assert frames, "no paired-pulse epochs found in range"

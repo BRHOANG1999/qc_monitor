@@ -12,10 +12,8 @@ import numpy as np
 from . import config as C, data as D, figures as G
 
 _GROUPS = {
-    "s1": ["s1_peak_to_trough", "s1_rms_amplitude", "s1_line_length",
-           "s1_max_slope", "s1_phfo_present"],
-    "s2": ["s2_peak_to_trough", "s2_rms_amplitude", "s2_line_length",
-           "s2_max_slope", "s2_phfo_present"],
+    "s1": ["s1_peak_to_trough", "s1_rms_amplitude", "s1_line_length", "s1_max_slope"],
+    "s2": ["s2_peak_to_trough", "s2_rms_amplitude", "s2_line_length", "s2_max_slope"],
     "ppr": ["ppr_peak_to_trough", "ppr_rms_amplitude", "ppr_line_length",
             "ppr_max_slope"],
 }
@@ -42,7 +40,7 @@ def _preictal_filter(mat, onsets, buffer=None):
 def _label(col):
     return (col.replace("peak_to_trough", "p2p").replace("rms_amplitude", "rms")
             .replace("line_length", "line-len").replace("max_slope", "slope")
-            .replace("phfo_present", "pHFO").replace("_", " "))
+            .replace("_", " "))
 
 
 def _ctx():

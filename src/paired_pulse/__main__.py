@@ -32,6 +32,9 @@ def main(argv=None) -> int:
     elif "--linbins" in argv:
         from . import linear_bins as _lb
         _lb.run(since=since, force=force)
+    elif "--nearonset" in argv:
+        from . import near_onset as _no
+        _no.run(since=since, force=force)
     elif "--all" in argv:
         _run.run(since=since, force=force, apply=True)
         _run.run_periictal(since=since)
@@ -39,6 +42,8 @@ def main(argv=None) -> int:
         _run.run_continuous(since=since)
         from . import linear_bins as _lb
         _lb.run(since=since)
+        from . import near_onset as _no
+        _no.run(since=since)
     else:
         _run.run(since=since, force=force, apply=("--dry" not in argv))
     return 0

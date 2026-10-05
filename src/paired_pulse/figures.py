@@ -250,7 +250,7 @@ def seizure_prob_vs_metric_fig(mat, cols, onset_col, out_png, *, horizons,
         ok = np.isfinite(x) & np.isfinite(tto)
         xq, tq = x[ok], tto[ok]
         uniq = np.unique(xq)
-        binary = uniq.size <= 2                           # e.g. pHFO 0/1
+        binary = uniq.size <= 2                           # a 0/1 flag, if any
         if binary:
             cen = uniq
             groups = [xq == u for u in uniq]
@@ -628,10 +628,11 @@ def periictal_trajectory_log_fig(mat, onsets, out_png, *, feature="ppr_peak_to_t
     return out_png
 
 
-def trend_null_fig(results, out_png, *, labels=None, title="", ref1=False) -> str:
+def trend_null_fig(results, out_png, *, labels=None, title="", ref1=False,
+                   logx=True, xlabel=None) -> str:
     """Pre-ictal trend vs circular-shift null, per metric (small multiples). Observed
     bin-mean (accent) + shift-null 95% band + null median; bins where observed exits
-    the band (p<0.05) marked. x = log min to onset (onset at right)."""
+    the band (p<0.05) marked. x = min to onset (log by default; onset at right)."""
     labels = labels or {}
     cols = list(results)
     fig, axes = plt.subplots(1, len(cols), figsize=(3.5 * len(cols), 4.3),
@@ -648,9 +649,12 @@ def trend_null_fig(results, out_png, *, labels=None, title="", ref1=False) -> st
                     label="p<0.05")
         if ref1:
             ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=0.8, ls=":")
-        ax.set_xscale("log"); ax.invert_xaxis()
+        if logx:
+            ax.set_xscale("log")
+        ax.invert_xaxis()
         _dark(ax, labels.get(col, col))
-        ax.set_xlabel("min to onset (log)", color=C.TEXT)
+        ax.set_xlabel(xlabel or ("min to onset (log)" if logx else "min to onset"),
+                      color=C.TEXT)
     h, lab = axes[0][0].get_legend_handles_labels()
     if h:
         leg = fig.legend(h, lab, fontsize=8, framealpha=0.1, loc="upper right")
