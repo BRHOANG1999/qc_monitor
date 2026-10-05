@@ -136,8 +136,13 @@ def extract_pairs(fp, channel=None, *, band=None) -> pd.DataFrame | None:
             with np.errstate(divide="ignore", invalid="ignore"):
                 cols[f"ppr_{feat}"] = b / np.where(a != 0, a, np.nan)
     if band is not None:                                 # pHFO per pulse (S2 is the ask)
-        cols["s1_phfo_present"] = _phfo_present(s1w, twin, fs, band)
-        cols["s2_phfo_present"] = _phfo_present(s2w, twin, fs, band)
+        # pHFO is HIGH-frequency (band ~124-990 Hz) -> detect on the WIDEBAND (raw)
+        # window, NOT the 1-500 Hz trace used for the amplitude features/waveforms
+        # (which would clip the pHFO band at 500 Hz and undercount).
+        s1w_raw, _ = _window_array(lfp, t, s1_on, fs)
+        s2w_raw, _ = _window_array(lfp, t, s2_on, fs)
+        cols["s1_phfo_present"] = _phfo_present(s1w_raw, twin, fs, band)
+        cols["s2_phfo_present"] = _phfo_present(s2w_raw, twin, fs, band)
     fdt = _file_dt(fp)
     base = fdt.timestamp() if fdt is not None else np.nan
     t_epoch = base + st if (st is not None and st.size == lfp.shape[0]) else np.full(
@@ -173,6 +178,99 @@ def mean_waveforms(evoked_dir, *, since=None, max_files=6, channel=None) -> dict
     return {"twin": twin, "s1": np.vstack(s1s), "s2": np.vstack(s2s)}
 
 
+def example_pairs(evoked_dir, *, since=None, n_files=3, n_per=4, channel=None,
+                  seed=0) -> dict:
+    """A handful of INDIVIDUAL paired-pulse epochs (S1 + S2 windowed traces) sampled
+    from files spread across the window, for an example-evoked-responses figure."""
+    channel = channel or C.CHANNEL
+    files = list_pp_files(evoked_dir, since)
+    if len(files) > n_files:
+        picks = [files[int(k)] for k in np.linspace(0, len(files) - 1, n_files)]
+    else:
+        picks = files
+    rng = np.random.default_rng(seed)
+    out, twin = [], None
+    for fp, _d in picks:
+        r = _read_file(fp, channel)
+        if r is None:
+            continue
+        lfp, stim, t, fs, _st = r
+        s1_on, s2_on, paired = _pulse_onsets(stim, t)
+        if paired.sum() < 5:
+            continue
+        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        s1w, twin = _window_array(lfp_f, t, s1_on, fs)
+        s2w, _ = _window_array(lfp_f, t, s2_on, fs)
+        idx = np.flatnonzero(paired)
+        for k in rng.choice(idx, size=min(n_per, idx.size), replace=False):
+            p1 = float(np.ptp(s1w[k])); p2 = float(np.ptp(s2w[k]))
+            out.append({"s1": s1w[k], "s2": s2w[k],
+                        "ppr": p2 / p1 if p1 else np.nan,
+                        "label": _file_dt(fp).strftime("%m-%d %H:%M")})
+    return {"twin": twin, "pairs": out}
+
+
+def waveform_by_leadtime(store, evoked_dir, *, since=None, cap_h=12.0,
+                         channel=None) -> dict:
+    """Averaged S1 & S2 evoked waveforms (and the S2−S1 residual) per LOG lead-time
+    bin, pooled across epochs, for both lead and all seizures. One file-read pass;
+    accumulates per-bin sums (memory-light). Bins match the pre-ictal trend edges."""
+    from src.periictal import trajectory as _TR
+    from src.preictal import isi as _isi
+    channel = channel or C.CHANNEL
+    edges = _TR.default_edges(cap_h * 3600, 2.0)
+    nb = edges.size - 1
+    cen = np.sqrt(edges[:-1] * edges[1:]) / 60.0          # geo centers (min)
+    sz = _isi.scored_seizures(store, C.ANIMAL)
+    ons = {"all": np.sort(np.array([s.onset_epoch for s in sz], float)),
+           "lead": np.sort(np.array([s.onset_epoch for s in
+                                     _isi.leading_seizures(sz, 6 * 3600.0)], float))}
+    acc = {k: {"s1": None, "s2": None, "cnt": np.zeros(nb)} for k in ons}
+    twin = None
+    for fp, _d in list_pp_files(evoked_dir, since):
+        r = _read_file(fp, channel)
+        if r is None:
+            continue
+        lfp, stim, t, fs, st = r
+        s1_on, s2_on, paired = _pulse_onsets(stim, t)
+        if paired.sum() < 5:
+            continue
+        lfp_f = _ef._bandpass(lfp, fs, C.BP_LOW_HZ, C.BP_HIGH_HZ) if C.BANDPASS else lfp
+        s1w, twin = _window_array(lfp_f, t, s1_on, fs)
+        s2w, _ = _window_array(lfp_f, t, s2_on, fs)
+        base = _file_dt(fp).timestamp()
+        te = base + st if (st is not None and st.size == lfp.shape[0]) else \
+            np.full(lfp.shape[0], base)
+        for k, o in ons.items():
+            if not o.size:
+                continue
+            idx = np.searchsorted(o, te, side="left")
+            nxt = np.where(idx < o.size, o[np.clip(idx, 0, o.size - 1)], np.inf)
+            tto = nxt - te
+            pidx = np.searchsorted(o, te, side="right") - 1
+            prev = np.where(pidx >= 0, o[np.clip(pidx, 0, o.size - 1)], -np.inf)
+            m = (paired & (tto > 0) & (tto <= edges[-1])    # pre-ictal only; exclude
+                 & (te - prev > C.POSTICTAL_BUFFER_SEC))     # on/post prior onset
+            if not m.any():
+                continue
+            bi = np.clip(np.searchsorted(edges, tto[m], "right") - 1, 0, nb - 1)
+            if acc[k]["s1"] is None:
+                acc[k]["s1"] = np.zeros((nb, s1w.shape[1]))
+                acc[k]["s2"] = np.zeros((nb, s2w.shape[1]))
+            np.add.at(acc[k]["s1"], bi, s1w[m])
+            np.add.at(acc[k]["s2"], bi, s2w[m])
+            np.add.at(acc[k]["cnt"], bi, 1)
+    out = {"twin": twin, "centers": cen, "edges": edges}
+    for k in ons:
+        c = acc[k]["cnt"]
+        d = np.where(c[:, None] > 0, c[:, None], np.nan)
+        s1m = acc[k]["s1"] / d if acc[k]["s1"] is not None else None
+        s2m = acc[k]["s2"] / d if acc[k]["s2"] is not None else None
+        out[k] = {"s1": s1m, "s2": s2m,
+                  "resid": (s2m - s1m) if s2m is not None else None, "cnt": c}
+    return out
+
+
 def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFrame:
     """Concatenate per-epoch paired-pulse features across files + join seizure
     proximity (time_to_onset_sec vs lead onsets). Cached to C.PP_CACHE."""
@@ -202,6 +300,98 @@ def build_pp_matrix(store, evoked_dir, *, since=None, force=False) -> pd.DataFra
     mat.to_pickle(C.PP_CACHE)
     _log(f"{len(mat)} paired epochs from {len(frames)} files -> {C.PP_CACHE}")
     return mat
+
+
+def _band_p(null, obs):
+    """Per-bin 2.5/97.5 band, median, and two-sided shift-null p (fraction of
+    surrogates at least as far from the null median as the observed)."""
+    lo = np.nanpercentile(null, 2.5, axis=0)
+    hi = np.nanpercentile(null, 97.5, axis=0)
+    med = np.nanmedian(null, axis=0)
+    p = np.full(obs.size, np.nan)
+    for b in range(obs.size):
+        col = null[:, b][np.isfinite(null[:, b])]
+        if col.size and np.isfinite(obs[b]):
+            p[b] = (np.sum(np.abs(col - med[b]) >= abs(obs[b] - med[b])) + 1) / (col.size + 1)
+    return lo, hi, med, p
+
+
+def trend_shift_null(mat, onsets, *, feature="ppr_peak_to_trough", cap_h=12.0,
+                     n_surr=500, min_shift_h=3.0, seed=0) -> dict:
+    """Circular-shift null for the pre-ictal TREND: bin-mean of *feature* vs LOG
+    time-to-next-onset, then shift the onsets (wrapped, >= min_shift_h) and recompute,
+    n_surr times. Tests whether the near-onset change beats random alignment to the
+    same (drifting) metric series."""
+    from src.periictal import trajectory as _TR
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    ok = np.isfinite(t) & np.isfinite(v); t, v = t[ok], v[ok]
+    ons = np.sort(np.asarray(onsets, float))
+    edges = _TR.default_edges(cap_h * 3600, 2.0)
+    nb = edges.size - 1
+    cen = np.sqrt(edges[:-1] * edges[1:]) / 60.0          # geo centers (min)
+
+    def _stat(o):
+        so = np.sort(o)
+        idx = np.searchsorted(so, t, side="left")
+        nxt = np.where(idx < so.size, so[np.clip(idx, 0, so.size - 1)], np.inf)
+        tto = nxt - t
+        pidx = np.searchsorted(so, t, side="right") - 1
+        prev = np.where(pidx >= 0, so[np.clip(pidx, 0, so.size - 1)], -np.inf)
+        m = (tto > 0) & (tto <= edges[-1]) & (t - prev > C.POSTICTAL_BUFFER_SEC)
+        bi = np.clip(np.searchsorted(edges, tto[m], "right") - 1, 0, nb - 1)
+        sv = np.bincount(bi, weights=v[m], minlength=nb)
+        cv = np.bincount(bi, minlength=nb)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return sv / np.where(cv > 0, cv, np.nan)
+
+    obs = _stat(ons)
+    lo_t, hi_t = t.min(), t.max(); span = hi_t - lo_t; ms = min_shift_h * 3600
+    rng = np.random.default_rng(seed)
+    null = np.full((int(n_surr), nb), np.nan)
+    for i in range(int(n_surr)):
+        null[i] = _stat(lo_t + ((ons - lo_t + rng.uniform(ms, span - ms)) % span))
+    lo, hi, med, p = _band_p(null, obs)
+    return {"centers": cen, "obs": obs, "lo": lo, "hi": hi, "med": med, "p": p,
+            "n_surr": int(n_surr), "feature": feature}
+
+
+def trajectory_shift_null(mat, onsets, *, feature="ppr_peak_to_trough", pre_h=2.0,
+                          post_h=1.0, bin_min=10.0, n_surr=500, min_shift_h=3.0,
+                          seed=0) -> dict:
+    """Circular-shift null for the peri-ictal trajectory (-pre_h..+post_h around onset,
+    per-onset bin-mean then mean across onsets). Shift onsets (wrapped) n_surr times."""
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    ok = np.isfinite(t) & np.isfinite(v); t, v = t[ok], v[ok]
+    ons = np.sort(np.asarray(onsets, float))
+    edges = np.arange(-pre_h * 60, post_h * 60 + bin_min, bin_min)
+    cen = 0.5 * (edges[:-1] + edges[1:]); nb = cen.size
+
+    def _traj(o):
+        acc = np.zeros(nb); cnt = np.zeros(nb)
+        for on in o:
+            rel = (t - on) / 60.0
+            m = (rel >= edges[0]) & (rel < edges[-1])
+            if m.sum() < 3:
+                continue
+            bi = np.clip(np.searchsorted(edges, rel[m], "right") - 1, 0, nb - 1)
+            sv = np.bincount(bi, weights=v[m], minlength=nb)
+            cv = np.bincount(bi, minlength=nb)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                line = sv / np.where(cv > 0, cv, np.nan)
+            acc = np.where(np.isfinite(line), acc + np.nan_to_num(line), acc)
+            cnt = cnt + np.isfinite(line)
+        return acc / np.where(cnt > 0, cnt, np.nan)
+
+    obs = _traj(ons)
+    lo_t, hi_t = t.min(), t.max(); span = hi_t - lo_t; ms = min_shift_h * 3600
+    rng = np.random.default_rng(seed)
+    null = np.full((int(n_surr), nb), np.nan)
+    for i in range(int(n_surr)):
+        null[i] = _traj(lo_t + ((ons - lo_t + rng.uniform(ms, span - ms)) % span))
+    lo, hi, med, p = _band_p(null, obs)
+    return {"centers": cen, "obs": obs, "lo": lo, "hi": hi, "med": med, "p": p,
+            "n_surr": int(n_surr), "bin_min": bin_min, "n_onsets": int(ons.size),
+            "feature": feature}
 
 
 def _attach_seizures(store, mat) -> pd.DataFrame:

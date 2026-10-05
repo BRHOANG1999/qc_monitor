@@ -25,6 +25,15 @@ def main(argv=None) -> int:
     force = "--force" in argv
     if "--periictal" in argv:
         _run.run_periictal(since=since, force=force)
+    elif "--null" in argv:
+        _run.run_null(since=since, force=force)
+    elif "--continuous" in argv:
+        _run.run_continuous(since=since, force=force)
+    elif "--all" in argv:
+        _run.run(since=since, force=force, apply=True)
+        _run.run_periictal(since=since)
+        _run.run_null(since=since)
+        _run.run_continuous(since=since)
     else:
         _run.run(since=since, force=force, apply=("--dry" not in argv))
     return 0

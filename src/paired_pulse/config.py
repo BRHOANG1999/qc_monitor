@@ -20,6 +20,11 @@ WIN = (1.0, 49.0)                   # per-pulse analysis window (ms from its ons
 SECOND_PULSE_TOL_MS = 5.0           # accept a stim-copy deflection at ISI +/- tol
 SECOND_PULSE_FRAC = 0.2             # a partner deflection must be >= this * anchor amp
 
+# Pre-ictal binning excludes epochs AT/AFTER an onset: an epoch is pre-ictal only if
+# the next onset is ahead (tto > 0) AND it is > this buffer since the PREVIOUS onset
+# (so post-ictal recovery from a prior seizure doesn't leak into pre-ictal bins).
+POSTICTAL_BUFFER_SEC = 3600.0       # 1 h post-ictal exclusion
+
 # 1-500 Hz band, matching the single-pulse evoked feature pipeline.
 BANDPASS = True
 BP_LOW_HZ = 1.0
@@ -49,5 +54,6 @@ ACCENT = "#5e7ce2"
 S1_COLOR = "#2663c4"                # pulse 1 = blue   (KMRecorder P1 [0.15 0.35 0.75])
 S2_COLOR = "#e6800f"               # pulse 2 = orange (KMRecorder P2 [0.90 0.50 0.10])
 SEIZURE_COLOR = "#ffffff"
+NODATA_COLOR = "#3a3a46"
 FACIL_COLOR = "#2ee6a6"            # PPR > 1 (facilitation)
 DEPR_COLOR = "#d62f2f"             # PPR < 1 (depression)

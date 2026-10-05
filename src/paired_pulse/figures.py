@@ -37,6 +37,25 @@ def _dark(ax, title=None):
         ax.set_title(title, color=C.TEXT, fontsize=10, loc="left")
 
 
+def _base_note(extra=""):
+    """Standard analysis-parameters footnote string (window / ISI / band)."""
+    s = (f"BCH111SR · ISI {C.ISI_MS:.0f} ms · per-pulse window "
+         f"{C.WIN[0]:.0f}–{C.WIN[1]:.0f} ms at each pulse's own onset · "
+         f"{C.BP_LOW_HZ:.0f}–{C.BP_HIGH_HZ:.0f} Hz · PPR = feature(S2)/feature(S1)")
+    return s + (f" · {extra}" if extra else "")
+
+
+def _span_str(mat):
+    import datetime as _d
+    t = mat["t_epoch"].to_numpy(float)
+    return (f"{_d.datetime.fromtimestamp(t.min()):%m-%d %H:%M}–"
+            f"{_d.datetime.fromtimestamp(t.max()):%m-%d %H:%M} · {len(mat):,} pairs")
+
+
+def _footnote(fig, text):
+    fig.text(0.006, 0.004, text, color=C.MUTED, fontsize=6.5, ha="left", va="bottom")
+
+
 def _binned(t, v, bin_sec):
     """(centers_dt, median, p25, p75) of v over fixed time bins."""
     lo, hi = np.nanmin(t), np.nanmax(t)
@@ -86,7 +105,8 @@ def ppr_over_time_fig(mat, out_png, *, onsets=None, bin_min=30.0) -> str:
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse ratio over time "
                  f"(ISI {C.ISI_MS:.0f} ms, {bin_min:.0f}-min median ± IQR; "
                  f"white = lead seizure)", color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _footnote(fig, _base_note(_span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -120,7 +140,9 @@ def s1_s2_overlay_fig(wf, out_png, *, n_traces=40, seed=0) -> str:
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse evoked responses "
                  f"(n={s1.shape[0]} pairs; mean + {len(idx)} traces)",
                  color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _footnote(fig, _base_note("S1 blue / S2 orange; each windowed 1–49 ms at its own "
+                              "onset; residual = S2 − S1"))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -154,7 +176,8 @@ def ppr_vs_seizure_fig(mat, out_png, *, feature=None, cap_h=12.0) -> str:
     ax.set_ylabel("PPR (S2/S1)", color=C.TEXT)
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse ratio vs seizure proximity",
                  color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    _footnote(fig, _base_note(_span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -193,7 +216,9 @@ def metric_trend_fig(mat, cols, onset_col, out_png, *, labels=None, title="",
         _dark(ax, labels.get(col, col))
         ax.set_xlabel("min to onset (log)", color=C.TEXT)
     fig.suptitle(title, color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    _footnote(fig, _base_note(f"pre-ictal trend, median ± IQR per dyadic log bin · "
+                              f"{_span_str(mat)}"))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -244,7 +269,9 @@ def seizure_prob_vs_metric_fig(mat, cols, onset_col, out_png, *, horizons,
             t.set_color(C.TEXT)
         leg.get_title().set_color(C.TEXT)
     fig.suptitle(title, color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    _footnote(fig, _base_note(f"P(next event within H | metric quantile bin); dotted "
+                              f"= base rate · {_span_str(mat)}"))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -286,7 +313,253 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
     leg = ax.legend(fontsize=8, framealpha=0.1, loc="upper right")
     for tt in leg.get_texts():
         tt.set_color(C.TEXT)
-    fig.tight_layout()
+    _footnote(fig, _base_note(f"{bin_min:.0f}-min bins; per-seizure median then mean "
+                              f"across seizures · {_span_str(mat)}"))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def example_pairs_fig(ex, out_png, *, title="") -> str:
+    """Grid of individual paired-pulse epochs: S1 (blue) + S2 (orange) overlaid, PPR +
+    timestamp per panel. Example evoked responses across the window."""
+    tw = ex["twin"]; pairs = ex["pairs"]
+    n = len(pairs)
+    ncol = 4
+    nrow = int(np.ceil(n / ncol)) if n else 1
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 2.3 * nrow + 0.6),
+                             facecolor=C.BG, squeeze=False)
+    for i in range(nrow * ncol):
+        ax = axes[i // ncol][i % ncol]
+        if i < n:
+            pr = pairs[i]
+            ax.plot(tw, pr["s1"], color=C.S1_COLOR, lw=1.3)
+            ax.plot(tw, pr["s2"], color=C.S2_COLOR, lw=1.3)
+            ax.axhline(0, color=C.MUTED, lw=0.5)
+            _dark(ax, f"{pr['label']} · PPR {pr['ppr']:.2f}")
+            if i // ncol == nrow - 1:
+                ax.set_xlabel("ms from onset", color=C.TEXT, fontsize=8)
+        else:
+            ax.axis("off")
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    _footnote(fig, _base_note("S1 blue / S2 orange; individual epochs sampled across "
+                              "the window"))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def waveform_by_bin_fig(wb, out_png, *, onset_set="lead", which="s2", title="",
+                        min_n=30) -> str:
+    """Averaged evoked waveform per LOG lead-time bin, overlaid and color-coded by
+    time-to-onset. which='s2' = pulse-2 response; which='resid' = S2 − S1 residual."""
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mc
+    tw, cen = wb["twin"], wb["centers"]
+    data = wb[onset_set][which]; cnt = wb[onset_set]["cnt"]
+    fig, ax = plt.subplots(figsize=(9.5, 5.6), facecolor=C.BG)
+    if data is not None:
+        valid = np.where((cnt >= min_n) & np.all(np.isfinite(data), axis=1))[0]
+        if valid.size:
+            norm = _mc.LogNorm(vmin=max(cen[valid].min(), 1e-2), vmax=cen[valid].max())
+            cmap = _cm.turbo
+            for b in valid:
+                ax.plot(tw, data[b], color=cmap(norm(cen[b])), lw=1.5)
+            sm = _cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+            cb = fig.colorbar(sm, ax=ax)
+            cb.set_label("min to onset (log; blue=near, red=far)", color=C.TEXT, fontsize=8)
+            cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
+    ax.axhline(0, color=C.MUTED, lw=0.6)
+    _dark(ax, title)
+    ax.set_xlabel("ms from pulse onset", color=C.TEXT)
+    ax.set_ylabel("S2 LFP (1–500 Hz)" if which == "s2" else "S2 − S1 residual",
+                  color=C.TEXT)
+    _footnote(fig, _base_note(f"{onset_set} seizures · averaged per dyadic log "
+                              f"lead-time bin (n≥{min_n}) · pre-ictal only (on/post-onset "
+                              f"excluded)"))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def _ctraj_matrix(mat, onsets, feature, pre_min, post_min, bin_min):
+    import datetime as _dt
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    edges = np.arange(-pre_min, post_min + bin_min, bin_min)
+    M = np.full((ons.size, edges.size - 1), np.nan)
+    for r, o in enumerate(ons):
+        rel = (t - o) / 60.0
+        for c in range(edges.size - 1):
+            s = v[(rel >= edges[c]) & (rel < edges[c + 1])]
+            s = s[np.isfinite(s)]
+            if s.size:
+                M[r, c] = np.median(s)
+    labels = [_dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M") for o in ons]
+    return M, edges, labels
+
+
+def continuous_trajectory_heatmap(mat, onsets, out_png, *, feature, pre_min=120.0,
+                                  post_min=20.0, bin_min=10.0, diverging=False,
+                                  title="") -> str:
+    """Per-seizure peri-ictal heatmap of a CONTINUOUS measure (one row per seizure,
+    x = min from onset, colour = median feature per 10-min bin). Replaces the discrete
+    k-means state coloring. diverging=True centers the colormap at 1 (for PPR)."""
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mc
+    M, edges, labels = _ctraj_matrix(mat, onsets, feature, pre_min, post_min, bin_min)
+    Mm = np.ma.masked_invalid(M)
+    fin = M[np.isfinite(M)]
+    if diverging and fin.size:
+        d = np.nanpercentile(np.abs(fin - 1.0), 98)
+        norm = _mc.TwoSlopeNorm(vcenter=1.0, vmin=1 - d, vmax=1 + d); cmap = _cm.RdBu_r
+    else:
+        lo, hi = (np.nanpercentile(fin, [2, 98]) if fin.size else (0, 1))
+        norm = _mc.Normalize(vmin=lo, vmax=hi); cmap = _cm.viridis
+    cmap = cmap.copy(); cmap.set_bad(C.NODATA_COLOR)
+    fig, ax = plt.subplots(figsize=(13, 0.4 * M.shape[0] + 2.4), facecolor=C.BG)
+    im = ax.imshow(Mm, aspect="auto", cmap=cmap, norm=norm, origin="upper",
+                   extent=[edges[0], edges[-1], M.shape[0] - 0.5, -0.5],
+                   interpolation="nearest")
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.6)
+    ax.set_yticks(range(M.shape[0])); ax.set_yticklabels(labels, fontsize=7)
+    cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    cb.set_label(feature.replace("_", " ") + (" (1 = equal)" if diverging else ""),
+                 color=C.TEXT, fontsize=8)
+    cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
+    _dark(ax, title)
+    ax.set_xlabel("minutes from seizure onset", color=C.TEXT)
+    ax.set_ylabel("seizure", color=C.TEXT)
+    _footnote(fig, _base_note(f"{bin_min:.0f}-min bins; median per bin; white line = onset"))
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def continuous_timeline_fig(mat, onsets, out_png, *, feature, bin_min=10.0,
+                            diverging=False, title="") -> str:
+    """Continuous measure over the whole paired-pulse record as a colour strip (median
+    per 10-min bin), seizure onsets marked. The continuous-measure analogue of the
+    discrete state timeline."""
+    import datetime as _dt
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mc
+    import matplotlib.dates as _md
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    lo, hi = t.min(), t.max()
+    edges = np.arange(lo, hi + bin_min * 60, bin_min * 60)
+    cen = edges[:-1] + bin_min * 30
+    which = np.clip(np.searchsorted(edges, t, "right") - 1, 0, cen.size - 1)
+    row = np.array([np.median(v[(which == c) & np.isfinite(v)])
+                    if np.any((which == c) & np.isfinite(v)) else np.nan
+                    for c in range(cen.size)])
+    fin = row[np.isfinite(row)]
+    if diverging and fin.size:
+        d = np.nanpercentile(np.abs(fin - 1.0), 98)
+        norm = _mc.TwoSlopeNorm(vcenter=1.0, vmin=1 - d, vmax=1 + d); cmap = _cm.RdBu_r
+    else:
+        q = np.nanpercentile(fin, [2, 98]) if fin.size else (0, 1)
+        norm = _mc.Normalize(vmin=q[0], vmax=q[1]); cmap = _cm.viridis
+    rgba = _cm.ScalarMappable(norm=norm, cmap=cmap).to_rgba(row)
+    rgba[~np.isfinite(row)] = _mc.to_rgba(C.NODATA_COLOR)
+    fig, ax = plt.subplots(figsize=(15, 3.0), facecolor=C.BG)
+    ax.imshow(rgba[None, :, :], aspect="auto", origin="lower",
+              extent=[_md.date2num(_dt.datetime.fromtimestamp(cen[0])),
+                      _md.date2num(_dt.datetime.fromtimestamp(cen[-1])), 0, 1],
+              interpolation="nearest")
+    for o in np.sort(np.asarray(onsets, float)):
+        if lo <= o <= hi:
+            ax.axvline(_md.date2num(_dt.datetime.fromtimestamp(o)),
+                       color=C.SEIZURE_COLOR, lw=1.1)
+    ax.set_yticks([]); ax.xaxis_date()
+    ax.xaxis.set_major_locator(_md.HourLocator(interval=6))
+    ax.xaxis.set_major_formatter(_md.DateFormatter("%m-%d %H:%M"))
+    ax.tick_params(colors=C.MUTED, labelsize=7)
+    for sp in ax.spines.values():
+        sp.set_color(C.MUTED)
+    sm = _cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.01)
+    cb.set_label(feature.replace("_", " ") + (" (1 = equal)" if diverging else ""),
+                 color=C.TEXT, fontsize=8)
+    cb.ax.tick_params(colors=C.MUTED, labelsize=7); cb.outline.set_edgecolor(C.MUTED)
+    ax.set_title(title, color=C.TEXT, fontsize=12, loc="left")
+    ax.set_xlabel("time", color=C.TEXT)
+    _footnote(fig, _base_note(f"{bin_min:.0f}-min bins; median per bin; "
+                              f"white = seizure onset · {_span_str(mat)}"))
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def trend_null_fig(results, out_png, *, labels=None, title="", ref1=False) -> str:
+    """Pre-ictal trend vs circular-shift null, per metric (small multiples). Observed
+    bin-mean (accent) + shift-null 95% band + null median; bins where observed exits
+    the band (p<0.05) marked. x = log min to onset (onset at right)."""
+    labels = labels or {}
+    cols = list(results)
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.5 * len(cols), 4.3),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        r = results[col]; cen = r["centers"]
+        ax.fill_between(cen, r["lo"], r["hi"], color=C.MUTED, alpha=0.28,
+                        label="shift-null 95%")
+        ax.plot(cen, r["med"], color=C.MUTED, lw=0.9, ls="--")
+        ax.plot(cen, r["obs"], "-o", color=C.ACCENT, lw=1.7, ms=3, label="observed")
+        sig = r["p"] < 0.05
+        if sig.any():
+            ax.plot(cen[sig], r["obs"][sig], "o", color=C.FACIL_COLOR, ms=6,
+                    label="p<0.05")
+        if ref1:
+            ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=0.8, ls=":")
+        ax.set_xscale("log"); ax.invert_xaxis()
+        _dark(ax, labels.get(col, col))
+        ax.set_xlabel("min to onset (log)", color=C.TEXT)
+    h, lab = axes[0][0].get_legend_handles_labels()
+    if h:
+        leg = fig.legend(h, lab, fontsize=8, framealpha=0.1, loc="upper right")
+        for t in leg.get_texts():
+            t.set_color(C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    ns = next(iter(results.values()))["n_surr"] if results else 0
+    _footnote(fig, _base_note(f"circular-shift null ({ns} onset shifts, wrapped, ≥3 h "
+                              f"floor); observed bin-mean vs null band"))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def trajectory_null_fig(res, out_png, *, title="") -> str:
+    """Peri-ictal PPR trajectory vs circular-shift null: observed mean + shift-null 95%
+    band + null median, y=1 = equal. Bins where observed exits the band (p<0.05) are
+    marked (per-bin, uncorrected)."""
+    cen = res["centers"]
+    fig, ax = plt.subplots(figsize=(11, 5.6), facecolor=C.BG)
+    ax.fill_between(cen, res["lo"], res["hi"], color=C.MUTED, alpha=0.3,
+                    label="shift-null 95%")
+    ax.plot(cen, res["med"], color=C.MUTED, lw=1.0, ls="--", label="null median")
+    ax.plot(cen, res["obs"], color=C.S2_COLOR, lw=2.6, label="observed mean")
+    sig = res["p"] < 0.05
+    if sig.any():
+        ax.plot(cen[sig], res["obs"][sig], "o", color=C.FACIL_COLOR, ms=6,
+                label="p<0.05 (per-bin)")
+    ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=1.0, ls="--")
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.2)
+    _dark(ax, title)
+    ax.set_xlabel("minutes from seizure onset (− pre-ictal / + post-ictal)", color=C.TEXT)
+    ax.set_ylabel(f"PPR ({res['feature'].replace('ppr_', '')})", color=C.TEXT)
+    leg = ax.legend(fontsize=8, framealpha=0.1, loc="upper right")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    _footnote(fig, _base_note(f"{res['bin_min']:.0f}-min bins · circular-shift null "
+                              f"({res['n_surr']} shifts, wrapped, ≥3 h) · "
+                              f"n={res['n_onsets']} seizures"))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -308,7 +581,8 @@ def ppr_distribution_fig(mat, out_png) -> str:
     axes[0][0].set_ylabel("pairs", color=C.TEXT)
     fig.suptitle(f"{C.ANIMAL} · {C.CHANNEL} · paired-pulse ratio distribution "
                  f"(ISI {C.ISI_MS:.0f} ms, n={len(mat)} pairs)", color=C.TEXT, fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    _footnote(fig, _base_note(_span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
