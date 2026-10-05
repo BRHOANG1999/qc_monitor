@@ -51,9 +51,12 @@ PRIMARY = "peak_to_trough"
 PP_START_DATE = _dt.datetime(2026, 10, 1)
 
 # --- paths -------------------------------------------------------------------
-OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_paired_pulse")
+# New-methodology output (500 Hz low-pass only, 3-45 ms window, NO pHFO) lives in its own
+# folder + cache so the earlier 1-500 Hz / pHFO figures in data/BCH111_paired_pulse/ stay
+# intact for comparison.
+OUT_DIR = _os.path.join(_ROOT, "data", "BCH111_paired_pulse_lp500")
 CACHE_DIR = _os.path.join(_ROOT, "data", "derivatives", "paired_pulse")
-PP_CACHE = _os.path.join(CACHE_DIR, "BCH111_paired_pulse_matrix.pkl")
+PP_CACHE = _os.path.join(CACHE_DIR, "BCH111_paired_pulse_lp500_matrix.pkl")
 
 # --- dark theme (matches the project dashboards) -----------------------------
 BG = "#15151f"
