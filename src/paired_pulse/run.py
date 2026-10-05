@@ -132,6 +132,10 @@ def run_periictal(*, since=None, force=False) -> dict:
             mat, ons, p(f"periictal_ppr_{oset}.png"),
             title=f"{C.ANIMAL} · {C.CHANNEL} · peri-ictal PPR (p2p) — "
             f"{oset} seizures (n={ons.size}; 1 = equal)")
+        out[f"periictal_ppr_log_{oset}"] = G.periictal_trajectory_log_fig(
+            mat, ons, p(f"periictal_ppr_log_{oset}.png"),
+            title=f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal PPR (p2p), log time — "
+            f"{oset} seizures (n={ons.size}; 1 = equal)")
     for oset, ons in (("lead", leadon), ("all", allon)):
         out[f"ppr_dist_prox_{oset}"] = G.ppr_distribution_proximity_fig(
             mat, ons, p(f"ppr_distribution_proximity_{oset}.png"),

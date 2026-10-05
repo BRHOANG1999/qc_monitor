@@ -286,9 +286,10 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
     ons = np.sort(np.asarray(onsets, float))
     edges = np.arange(-pre_h * 60, post_h * 60 + bin_min, bin_min)
     cen = 0.5 * (edges[:-1] + edges[1:])
-    fig, ax = plt.subplots(figsize=(11, 5.6), facecolor=C.BG)
+    fig, ax = plt.subplots(figsize=(11.5, 5.6), facecolor=C.BG)
+    cmap = plt.cm.turbo
     lines = []
-    for o in ons:
+    for i, o in enumerate(ons):
         rel = (t - o) / 60.0
         m = (rel >= -pre_h * 60) & (rel <= post_h * 60) & np.isfinite(v)
         if m.sum() < 5:
@@ -296,11 +297,13 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
         bi = np.clip(np.searchsorted(edges, rel[m], "right") - 1, 0, cen.size - 1)
         line = np.array([np.median(v[m][bi == b]) if np.any(bi == b) else np.nan
                          for b in range(cen.size)])
-        ax.plot(cen, line, color=C.MUTED, lw=0.9, alpha=0.55)
+        ax.plot(cen, line, color=cmap(i / max(len(ons) - 1, 1)), lw=1.1, alpha=0.8,
+                label=_dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M"))
         lines.append(line)
     if lines:
         mean = np.nanmean(np.vstack(lines), axis=0)
-        ax.plot(cen, mean, color=C.S2_COLOR, lw=2.8, label=f"mean ({len(lines)} seizures)")
+        ax.plot(cen, mean, color=C.SEIZURE_COLOR, lw=3.0, zorder=5,
+                label=f"mean ({len(lines)})")
     ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=1.1, ls="--")
     ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.3)
     ax.text(0.015, 0.97, "facilitation ↑", transform=ax.transAxes, color=C.FACIL_COLOR,
@@ -310,7 +313,8 @@ def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_troug
     _dark(ax, title)
     ax.set_xlabel("minutes from seizure onset (− pre-ictal / + post-ictal)", color=C.TEXT)
     ax.set_ylabel(f"PPR ({feature.replace('ppr_', '')})", color=C.TEXT)
-    leg = ax.legend(fontsize=8, framealpha=0.1, loc="upper right")
+    leg = ax.legend(fontsize=6.5, framealpha=0.1, loc="upper right",
+                    ncol=2 if len(ons) > 8 else 1)
     for tt in leg.get_texts():
         tt.set_color(C.TEXT)
     _footnote(fig, _base_note(f"{bin_min:.0f}-min bins; per-seizure median then mean "
@@ -491,6 +495,58 @@ def continuous_timeline_fig(mat, onsets, out_png, *, feature, bin_min=10.0,
     _footnote(fig, _base_note(f"{bin_min:.0f}-min bins; median per bin; "
                               f"white = seizure onset · {_span_str(mat)}"))
     fig.tight_layout(rect=(0, 0.04, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def periictal_trajectory_log_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
+                                 cap_h=2.0, floor_s=2.0, buffer=None, title="") -> str:
+    """Pre-ictal PPR trajectory on a LOG time-to-onset x-axis (onset at right): one line
+    per seizure (median per dyadic log bin) + bold mean. Pre-ictal only (on/post-onset
+    excluded). y=1 = equal (above facilitation, below depression)."""
+    from src.periictal import trajectory as _TR
+    buffer = C.POSTICTAL_BUFFER_SEC if buffer is None else buffer
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    edges = _TR.default_edges(cap_h * 3600, floor_s)
+    cen = np.sqrt(edges[:-1] * edges[1:]) / 60.0; nb = cen.size
+    pidx = np.searchsorted(ons, t, side="right") - 1
+    prev = np.where(pidx >= 0, ons[np.clip(pidx, 0, ons.size - 1)], -np.inf)
+    tsl = t - prev
+    fig, ax = plt.subplots(figsize=(10.5, 5.6), facecolor=C.BG)
+    cmap = plt.cm.turbo
+    lines = []
+    for i, o in enumerate(ons):
+        tto = o - t
+        m = (tto > 0) & (tto <= edges[-1]) & (tsl > buffer) & np.isfinite(v)
+        if m.sum() < 5:
+            continue
+        bi = np.clip(np.searchsorted(edges, tto[m], "right") - 1, 0, nb - 1)
+        line = np.array([np.median(v[m][bi == b]) if np.any(bi == b) else np.nan
+                         for b in range(nb)])
+        ax.plot(cen, line, color=cmap(i / max(len(ons) - 1, 1)), lw=1.1, alpha=0.8,
+                label=_dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M"))
+        lines.append(line)
+    if lines:
+        ax.plot(cen, np.nanmean(np.vstack(lines), axis=0), color=C.SEIZURE_COLOR,
+                lw=3.0, zorder=5, label=f"mean ({len(lines)})")
+    ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=1.1, ls="--")
+    ax.set_xscale("log"); ax.invert_xaxis()
+    ax.text(0.015, 0.97, "facilitation ↑", transform=ax.transAxes, color=C.FACIL_COLOR,
+            fontsize=9, va="top")
+    ax.text(0.015, 0.03, "depression ↓", transform=ax.transAxes, color=C.DEPR_COLOR,
+            fontsize=9, va="bottom")
+    _dark(ax, title)
+    ax.set_xlabel("min to seizure onset (log; onset at right)", color=C.TEXT)
+    ax.set_ylabel(f"PPR ({feature.replace('ppr_', '')})", color=C.TEXT)
+    leg = ax.legend(fontsize=6.5, framealpha=0.1, loc="upper right",
+                    ncol=2 if len(ons) > 8 else 1)
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    _footnote(fig, _base_note(f"dyadic log lead-time bins to {cap_h:.0f} h; per-seizure "
+                              f"median then mean · pre-ictal only · {_span_str(mat)}"))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
     _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
     plt.close(fig)
     return out_png
