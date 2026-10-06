@@ -46,9 +46,9 @@ FILTER_LABEL = "≤500 Hz low-pass"  # for figure footnotes
 FEATURES = ["peak_to_trough", "rms_amplitude", "line_length", "max_slope"]
 PRIMARY = "peak_to_trough"
 
-# Scope the file scan: paired-pulse began on/after this date (auto-detection still
-# skips any non-paired epoch, so a loose bound is safe). Override with --since.
-PP_START_DATE = _dt.datetime(2026, 10, 1)
+# Scope the file scan: analyze paired-pulse from 2026-10-03 onward (user-set; drops the
+# first ~day of setup). Auto-detection still skips any non-paired epoch. Override --since.
+PP_START_DATE = _dt.datetime(2026, 10, 3)
 
 # --- paths -------------------------------------------------------------------
 # New-methodology output (500 Hz low-pass only, 3-45 ms window, NO pHFO) lives in its own

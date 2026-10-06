@@ -383,7 +383,12 @@ def ppr_over_time_scatter_fig(mat, out_png, *, onsets=None) -> str:
     feats = [f for f in C.FEATURES if f"ppr_{f}" in mat.columns]
     t = mat["t_epoch"].to_numpy(float)
     dts = mdates.date2num([_dt.datetime.fromtimestamp(x) for x in t])
+    tlo, thi = float(t.min()), float(t.max())
     ons = np.sort(np.asarray(onsets, float)) if onsets is not None else np.empty(0)
+    ons = ons[(ons >= tlo) & (ons <= thi)]                 # only onsets within the data
+    xlo = mdates.date2num(_dt.datetime.fromtimestamp(tlo))
+    xhi = mdates.date2num(_dt.datetime.fromtimestamp(thi))
+    xpad = 0.03 * (xhi - xlo) if xhi > xlo else 0.5
     fig, axes = plt.subplots(len(feats), 1, figsize=(14, 1.9 * len(feats) + 1),
                              sharex=True, facecolor=C.BG, squeeze=False)
     for ax, f in zip(axes[:, 0], feats):
@@ -400,7 +405,8 @@ def ppr_over_time_scatter_fig(mat, out_png, *, onsets=None) -> str:
                        color=C.SEIZURE_COLOR, lw=0.8, alpha=0.7)
         _yclip(ax, v[ok])
         _dark(ax); ax.set_ylabel(f, color=C.TEXT, fontsize=8)
-    axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    axes[-1, 0].set_xlim(xlo - xpad, xhi + xpad)
+    axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     fig.suptitle("PPR over time — unbinned scatter (accent = binned median)",
                  color=C.TEXT, fontsize=12)
     _footnote(fig, _base_note("each epoch plotted · " + _span_str(mat)))
