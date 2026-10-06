@@ -35,6 +35,9 @@ def main(argv=None) -> int:
     elif "--nearonset" in argv:
         from . import near_onset as _no
         _no.run(since=since, force=force)
+    elif "--rescluster" in argv:
+        from . import residual_cluster as _rc
+        _rc.run(force=force)
     elif "--all" in argv:
         _run.run(since=since, force=force, apply=True)
         _run.run_periictal(since=since)
@@ -44,6 +47,8 @@ def main(argv=None) -> int:
         _lb.run(since=since)
         from . import near_onset as _no
         _no.run(since=since)
+        from . import residual_cluster as _rc
+        _rc.run(force=force)
     else:
         _run.run(since=since, force=force, apply=("--dry" not in argv))
     return 0
