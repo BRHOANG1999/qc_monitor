@@ -177,6 +177,84 @@ def per_seizure_stats_fig(mat, onsets, out_png, *, cap_h=2.0, title="") -> str:
     return summary, out_png
 
 
+def periictal_zoom_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
+                       pre_min=15.0, post_min=5.0, roll_min=1.0, step_min=0.5,
+                       n_surr=400, title="") -> str:
+    """Per-seizure zoom (−15→+5 min), one panel each: raw points + a 1-min rolling median
+    over them + the circular-shift null 95% band behind. The clean visual test for a
+    small near-onset sag -- if the rolling medians don't dip below the band near 0 in most
+    panels, there's no pre-ictal drop."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    t = mat["t_epoch"].to_numpy(float); v = mat[feature].to_numpy(float)
+    ok = np.isfinite(v); t, v = t[ok], v[ok]
+    ons = np.sort(np.asarray(onsets, float))
+    lo, hi = t.min(), t.max(); span = hi - lo; ms = 3 * 3600.0
+    grid = np.arange(-pre_min, post_min + step_min, step_min)
+    hw = roll_min / 2.0
+
+    def _rollmed(center):
+        a = np.searchsorted(t, center - (pre_min + 1) * 60)
+        b = np.searchsorted(t, center + (post_min + 1) * 60)
+        tl, vl = t[a:b], v[a:b]
+        if tl.size < 3:
+            return np.full(grid.size, np.nan)
+        rel = (tl - center) / 60.0
+        out = np.full(grid.size, np.nan)
+        for i, g in enumerate(grid):
+            msk = (rel >= g - hw) & (rel < g + hw)
+            if msk.sum() >= 3:
+                out[i] = np.median(vl[msk])
+        return out
+
+    n = ons.size; ncol = 3 if n > 4 else 2
+    nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.7 * ncol, 3.0 * nrow + 0.6),
+                             facecolor=C.BG, squeeze=False)
+    rng = np.random.default_rng(0)
+    for idx in range(nrow * ncol):
+        ax = axes[idx // ncol][idx % ncol]
+        if idx >= n:
+            ax.axis("off"); continue
+        o = ons[idx]
+        rel = (t - o) / 60.0
+        m = (rel >= -pre_min) & (rel <= post_min)
+        null = np.full((n_surr, grid.size), np.nan)
+        for s in range(n_surr):
+            op = lo + ((o - lo + rng.uniform(ms, span - ms)) % span)
+            null[s] = _rollmed(op)
+        ax.fill_between(grid, np.nanpercentile(null, 2.5, axis=0),
+                        np.nanpercentile(null, 97.5, axis=0), color=C.MUTED, alpha=0.28,
+                        lw=0, label="shift-null 95%")
+        if m.sum():
+            ax.scatter(rel[m], v[m], s=6, color=C.ACCENT, alpha=0.30, linewidths=0,
+                       rasterized=True)
+            G._yclip(ax, v[m])
+        ax.plot(grid, _rollmed(o), color=C.SEIZURE_COLOR, lw=2.2, label="1-min median")
+        if feature.startswith("ppr"):
+            ax.axhline(1.0, color=C.MUTED, lw=0.7, ls=":")
+        ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.1)
+        G._dark(ax, _dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M"))
+        if idx // ncol == nrow - 1:
+            ax.set_xlabel("minutes from onset", color=C.TEXT, fontsize=8)
+        if idx % ncol == 0:
+            ax.set_ylabel(feature.replace("_", " "), color=C.TEXT, fontsize=8)
+    handles = [Line2D([], [], color=C.SEIZURE_COLOR, lw=2.2, label="1-min rolling median"),
+               Line2D([], [], color=C.MUTED, lw=7, alpha=0.4, label="shift-null 95%"),
+               Line2D([], [], marker="o", color=C.ACCENT, lw=0, label="epoch")]
+    leg = fig.legend(handles=handles, fontsize=8, framealpha=0.1, loc="upper right")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    G._footnote(fig, G._base_note(f"per-seizure −{pre_min:.0f}→+{post_min:.0f} min; "
+                                  f"{roll_min:.0f}-min rolling median over points; shaded "
+                                  "= circular-shift null 95% · " + G._span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+    G._savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 _TREND_FEATS = [("ppr_peak_to_trough", "PPR p2p"), ("ppr_rms_amplitude", "PPR rms")]
 
 
@@ -335,6 +413,13 @@ def run(*, since=None, force=False, n_surr=1000) -> dict:
         f"& circadian nulls")
     out["trend_statistic"] = tfp
     print("[paired_pulse.near_onset] trend-stat: " + "; ".join(tsumm), flush=True)
+
+    # #6 per-seizure zoom (-15..+5 min): points + 1-min rolling median + shift-null band
+    for feat, flab in (("ppr_peak_to_trough", "p2p"), ("ppr_rms_amplitude", "rms")):
+        out[f"zoom_lead_{flab}"] = periictal_zoom_fig(
+            mat, onsets["lead"], p(f"periictal_zoom_lead_{flab}.png"), feature=feat,
+            title=f"{C.ANIMAL} · {C.CHANNEL} · per-seizure zoom (−15→+5 min) PPR {flab} "
+            f"— lead seizures")
 
     for k, v in out.items():
         print(f"[paired_pulse.near_onset] {k} -> {v}", flush=True)
