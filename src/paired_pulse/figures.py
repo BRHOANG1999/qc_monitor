@@ -290,6 +290,126 @@ def seizure_prob_vs_metric_fig(mat, cols, onset_col, out_png, *, horizons,
     return out_png
 
 
+def _yclip(ax, y):
+    lo, hi = np.nanpercentile(y, [0.5, 99.5])
+    if hi > lo:
+        ax.set_ylim(lo - 0.05 * (hi - lo), hi + 0.05 * (hi - lo))
+
+
+def metric_scatter_fig(mat, cols, onset_col, out_png, *, labels=None, title="",
+                       cap_h=12.0, ref1=False) -> str:
+    """UNBINNED scatter version of the pre-ictal trend: every epoch as a point (metric vs
+    log time-to-onset, onset at right), with the binned median overlaid thin for the eye."""
+    labels = labels or {}
+    tto = mat[onset_col].to_numpy(float) / 60.0                 # minutes
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.6 * len(cols), 4.3),
+                             facecolor=C.BG, squeeze=False)
+    for ax, col in zip(axes[0], cols):
+        v = mat[col].to_numpy(float)
+        m = (tto > C.WIN[1] / 1000.0) & (tto <= cap_h * 60) & np.isfinite(v)
+        x, y = tto[m], v[m]
+        if x.size:
+            a = float(np.clip(1500.0 / x.size, 0.015, 0.5))
+            ax.scatter(x, y, s=3, c=C.MUTED, alpha=a, linewidths=0, rasterized=True)
+            edges = np.logspace(np.log10(max(x.min(), 0.05)), np.log10(x.max()), 18)
+            cen = np.sqrt(edges[:-1] * edges[1:])
+            med = np.array([np.median(y[(x >= edges[i]) & (x < edges[i + 1])])
+                            if np.any((x >= edges[i]) & (x < edges[i + 1])) else np.nan
+                            for i in range(cen.size)])
+            ax.plot(cen, med, color=C.ACCENT, lw=1.8, label="binned median")
+            _yclip(ax, y)
+        if ref1:
+            ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=0.8, ls=":")
+        ax.set_xscale("log"); ax.invert_xaxis()
+        _dark(ax, labels.get(col, col))
+        ax.set_xlabel("min to onset (log)", color=C.TEXT)
+    fig.suptitle(title, color=C.TEXT, fontsize=12)
+    _footnote(fig, _base_note("each epoch plotted (unbinned scatter); accent line = "
+                              "binned median for reference · " + _span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def trajectory_scatter_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
+                           pre_h=2.0, post_h=0.0, strict=True, title="") -> str:
+    """UNBINNED scatter version of the peri-ictal trajectory: every epoch as a point
+    (metric vs minutes from onset), coloured by seizure, + bold per-seizure-mean line."""
+    t = mat["t_epoch"].to_numpy(float)
+    v = mat[feature].to_numpy(float)
+    ons = np.sort(np.asarray(onsets, float))
+    fig, ax = plt.subplots(figsize=(11.5, 5.6), facecolor=C.BG)
+    cmap = TURBO_VIS
+    ally = []
+    for i, o in enumerate(ons):
+        rel = (t - o) / 60.0
+        m = (rel >= -pre_h * 60) & (rel <= post_h * 60) & np.isfinite(v)
+        if strict:
+            pi = np.searchsorted(ons, o, side="left") - 1
+            prev = ons[pi] if pi >= 0 else -np.inf
+            m = m & (t < o) & ((o - t) <= (t - prev))
+        if m.sum() < 5:
+            continue
+        col = cmap(i / max(len(ons) - 1, 1))
+        a = float(np.clip(400.0 / m.sum(), 0.04, 0.5))
+        ax.scatter(rel[m], v[m], s=5, color=col, alpha=a, linewidths=0, rasterized=True,
+                   label=_dt.datetime.fromtimestamp(o).strftime("%m-%d %H:%M"))
+        ally.append(v[m])
+    if feature.startswith("ppr"):
+        ax.axhline(1.0, color=C.SEIZURE_COLOR, lw=1.0, ls="--")
+    ax.axvline(0, color=C.SEIZURE_COLOR, lw=1.1)
+    if ally:
+        _yclip(ax, np.concatenate(ally))
+    _dark(ax, title)
+    ax.set_xlabel("minutes from seizure onset", color=C.TEXT)
+    ax.set_ylabel(feature.replace("_", " "), color=C.TEXT)
+    leg = ax.legend(fontsize=6.5, framealpha=0.1, loc="upper right",
+                    ncol=2 if len(ons) > 8 else 1, markerscale=2.0)
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    _footnote(fig, _base_note("each epoch plotted (unbinned scatter), coloured by seizure "
+                              f"· {'strict pre-ictal' if strict else '−pre / +post onset'}"
+                              " · " + _span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
+def ppr_over_time_scatter_fig(mat, out_png, *, onsets=None) -> str:
+    """UNBINNED scatter version of PPR-over-time: every epoch as a point vs calendar time,
+    + binned median line, seizure onsets marked."""
+    feats = [f for f in C.FEATURES if f"ppr_{f}" in mat.columns]
+    t = mat["t_epoch"].to_numpy(float)
+    dts = mdates.date2num([_dt.datetime.fromtimestamp(x) for x in t])
+    ons = np.sort(np.asarray(onsets, float)) if onsets is not None else np.empty(0)
+    fig, axes = plt.subplots(len(feats), 1, figsize=(14, 1.9 * len(feats) + 1),
+                             sharex=True, facecolor=C.BG, squeeze=False)
+    for ax, f in zip(axes[:, 0], feats):
+        v = mat[f"ppr_{f}"].to_numpy(float)
+        ok = np.isfinite(v)
+        a = float(np.clip(1500.0 / max(ok.sum(), 1), 0.015, 0.4))
+        ax.scatter(dts[ok], v[ok], s=3, c=C.MUTED, alpha=a, linewidths=0, rasterized=True)
+        cen, med, _q1, _q3 = _binned(t, v, 30 * 60)
+        if cen:
+            ax.plot(mdates.date2num(cen), med, color=C.ACCENT, lw=1.5)
+        ax.axhline(1.0, color=C.MUTED, lw=0.8, ls="--")
+        for o in ons:
+            ax.axvline(mdates.date2num(_dt.datetime.fromtimestamp(o)),
+                       color=C.SEIZURE_COLOR, lw=0.8, alpha=0.7)
+        _yclip(ax, v[ok])
+        _dark(ax); ax.set_ylabel(f, color=C.TEXT, fontsize=8)
+    axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    fig.suptitle("PPR over time — unbinned scatter (accent = binned median)",
+                 color=C.TEXT, fontsize=12)
+    _footnote(fig, _base_note("each epoch plotted · " + _span_str(mat)))
+    fig.tight_layout(rect=(0, 0.02, 1, 0.96))
+    _savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return out_png
+
+
 def periictal_trajectory_fig(mat, onsets, out_png, *, feature="ppr_peak_to_trough",
                              pre_h=2.0, post_h=1.0, bin_min=10.0, strict=False,
                              title="") -> str:

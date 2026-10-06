@@ -75,6 +75,8 @@ def run(*, since=None, force=False, apply=True) -> dict:
     p = lambda n: os.path.join(C.OUT_DIR, n)
     out = {"over_time": G.ppr_over_time_fig(mat, p("01_ppr_over_time.png"),
                                             onsets=onsets),
+           "over_time_scatter": G.ppr_over_time_scatter_fig(
+               mat, p("01_ppr_over_time_scatter.png"), onsets=onsets),
            "overlay": G.s1_s2_overlay_fig(D.mean_waveforms(ed, since=since),
                                           p("02_s1_s2_overlay.png")),
            "vs_seizure": G.ppr_vs_seizure_fig(mat, p("03_ppr_vs_seizure.png")),
@@ -120,6 +122,10 @@ def run_periictal(*, since=None, force=False) -> dict:
                 mf, cols, ocol, p(f"{g}_{oset}_trend.png"), labels=labels,
                 title=f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal trend — {tag}",
                 ref1=(g == "ppr"))
+            out[f"{g}_{oset}_trend_scatter"] = G.metric_scatter_fig(
+                mf, cols, ocol, p(f"{g}_{oset}_trend_scatter.png"), labels=labels,
+                title=f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal trend (unbinned) — {tag}",
+                ref1=(g == "ppr"))
             out[f"{g}_{oset}_prob"] = G.seizure_prob_vs_metric_fig(
                 mf, cols, ocol, p(f"{g}_{oset}_prob.png"), horizons=_HORIZONS,
                 labels=labels, title=f"{C.ANIMAL} · {C.CHANNEL} · "
@@ -133,6 +139,11 @@ def run_periictal(*, since=None, force=False) -> dict:
         out[f"periictal_ppr_log_{oset}"] = G.periictal_trajectory_log_fig(
             mat, ons, p(f"periictal_ppr_log_{oset}.png"),
             title=f"{C.ANIMAL} · {C.CHANNEL} · pre-ictal PPR (p2p), log time — "
+            f"{oset} seizures (n={ons.size}; 1 = equal)")
+        out[f"periictal_ppr_scatter_{oset}"] = G.trajectory_scatter_fig(
+            mat, ons, p(f"periictal_ppr_scatter_{oset}.png"),
+            feature="ppr_peak_to_trough", pre_h=2.0, post_h=1.0, strict=False,
+            title=f"{C.ANIMAL} · {C.CHANNEL} · peri-ictal PPR (p2p), unbinned — "
             f"{oset} seizures (n={ons.size}; 1 = equal)")
     for oset, ons in (("lead", leadon), ("all", allon)):
         out[f"ppr_dist_prox_{oset}"] = G.ppr_distribution_proximity_fig(

@@ -177,6 +177,107 @@ def per_seizure_stats_fig(mat, onsets, out_png, *, cap_h=2.0, title="") -> str:
     return summary, out_png
 
 
+_TREND_FEATS = [("ppr_peak_to_trough", "PPR p2p"), ("ppr_rms_amplitude", "PPR rms")]
+
+
+def trend_statistic_fig(mat, lead, allon, out_png, *, n_surr=2000, title="") -> tuple:
+    """Last-10-min minus baseline (30 min-2 h) contrast per onset-set, tested against BOTH
+    a standard circular-shift null AND a TIME-OF-DAY-MATCHED (circadian) null -- surrogate
+    onsets shifted by ~k·24 h (±2 h), so each keeps the original clock time / circadian
+    phase. If the drop survives the circadian null it is beyond a vigilance-state confound.
+    Per-seizure contrasts shown as coloured dots. Excludes the last 30 s (onset leakage)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    t = mat["t_epoch"].to_numpy(float)
+    lo, hi = t.min(), t.max(); span = hi - lo; ms = 3 * 3600.0
+    rng = np.random.default_rng(0)
+
+    def _su():
+        return rng.uniform(ms, span - ms)
+
+    def _sc():                                              # circadian: ~k*24h +/- 2h
+        kmax = int((span - ms) // 86400.0)
+        if kmax < 1:
+            return _su()
+        for _ in range(200):
+            s = int(rng.integers(1, kmax + 1)) * 86400.0 + rng.uniform(-7200.0, 7200.0)
+            if ms <= s <= span - ms:
+                return s
+        return _su()
+
+    def _contrast(ons, v):
+        ons = np.sort(ons)
+        i = np.searchsorted(ons, t, "left")
+        nxt = np.where(i < ons.size, ons[np.clip(i, 0, ons.size - 1)], np.inf)
+        tto = nxt - t
+        pi = np.searchsorted(ons, t, "right") - 1
+        prev = np.where(pi >= 0, ons[np.clip(pi, 0, ons.size - 1)], -np.inf)
+        ok = (t - prev > 3600.0) & np.isfinite(v)
+        n = v[ok & (tto > 30.0) & (tto <= 600.0)]
+        b = v[ok & (tto > 1800.0) & (tto <= 7200.0)]
+        return (np.mean(n) - np.mean(b)) if n.size >= 10 and b.size >= 10 else np.nan
+
+    fig, ax = plt.subplots(figsize=(9.2, 5.3), facecolor=C.BG)
+    cmap = G.TURBO_VIS
+    xt, xl, xi, summ, allv = [], [], 0, [], []
+    for feat, flab in _TREND_FEATS:
+        v = mat[feat].to_numpy(float)
+        for nm, ons in (("lead", lead), ("all", allon)):
+            ons = np.sort(ons); obs = _contrast(ons, v)
+            nu = np.array([_contrast(lo + ((ons - lo + _su()) % span), v)
+                           for _ in range(n_surr)]); nu = nu[np.isfinite(nu)]
+            nc = np.array([_contrast(lo + ((ons - lo + _sc()) % span), v)
+                           for _ in range(n_surr)]); nc = nc[np.isfinite(nc)]
+
+            def _p(nl, o=obs):
+                m = np.median(nl)
+                return (np.sum(np.abs(nl - m) >= abs(o - m)) + 1) / (nl.size + 1)
+            pu, pc = _p(nu), _p(nc)
+            ax.plot([xi - 0.16] * 2, np.percentile(nu, [2.5, 97.5]), color=C.MUTED,
+                    lw=7, alpha=0.5, solid_capstyle="round")
+            ax.plot([xi + 0.16] * 2, np.percentile(nc, [2.5, 97.5]), color=C.ACCENT,
+                    lw=7, alpha=0.5, solid_capstyle="round")
+            for j, o in enumerate(ons):
+                tt = o - t
+                n = v[(tt > 30.0) & (tt <= 600.0) & np.isfinite(v)]
+                b = v[(tt > 1800.0) & (tt <= 7200.0) & np.isfinite(v)]
+                if n.size >= 8 and b.size >= 8:
+                    cv = np.mean(n) - np.mean(b); allv.append(cv)
+                    ax.scatter(xi + rng.uniform(-0.05, 0.05), cv, s=26,
+                               color=cmap(j / max(ons.size - 1, 1)), zorder=3,
+                               edgecolors=C.BG, linewidths=0.4)
+            ax.scatter(xi, obs, marker="D", s=95, color=C.SEIZURE_COLOR, zorder=5,
+                       edgecolors=C.BG, linewidths=0.6)
+            xt.append(xi); xl.append(f"{flab}\n{nm}")
+            summ.append(f"{flab} {nm}: obs={obs:+.4f} p_shift={pu:.3f} p_circ={pc:.3f}")
+            ax.annotate(f"p$_s$={pu:.2f}\np$_c$={pc:.2f}", (xi, 1.0),
+                        xycoords=("data", "axes fraction"), ha="center", va="top",
+                        fontsize=7, color=C.TEXT)
+            xi += 1
+    ax.axhline(0, color=C.MUTED, lw=0.9)
+    if allv:
+        G._yclip(ax, np.array(allv + [0.0]))
+    ax.set_xticks(xt); ax.set_xticklabels(xl)
+    ax.set_xlim(-0.5, xi - 0.5)
+    G._dark(ax, title)
+    ax.set_ylabel("last 10 min − baseline (30 min–2 h)   [<0 = PPR lower near onset]",
+                  color=C.TEXT, fontsize=9)
+    handles = [Line2D([], [], color=C.MUTED, lw=7, alpha=0.5, label="shift-null 95%"),
+               Line2D([], [], color=C.ACCENT, lw=7, alpha=0.5, label="circadian-null 95%"),
+               Line2D([], [], marker="D", color=C.SEIZURE_COLOR, lw=0, label="observed"),
+               Line2D([], [], marker="o", color=C.MUTED, lw=0, label="per seizure")]
+    leg = ax.legend(handles=handles, fontsize=7.5, framealpha=0.1, loc="lower left")
+    for tt in leg.get_texts():
+        tt.set_color(C.TEXT)
+    G._footnote(fig, G._base_note("last-10-min−baseline contrast vs circular-shift AND "
+                                  "time-of-day-matched (circadian) nulls; last 30 s "
+                                  "excluded · " + G._span_str(mat)))
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    G._savefig(fig, out_png, dpi=130, facecolor=C.BG, bbox_inches="tight")
+    plt.close(fig)
+    return summ, out_png
+
+
 def run(*, since=None, force=False, n_surr=1000) -> dict:
     """Generate the near-onset per-seizure analyses into periictal/near_onset/."""
     from src.preictal import isi as _isi
@@ -226,6 +327,14 @@ def run(*, since=None, force=False, n_surr=1000) -> dict:
         out[f"perseiz_{oset}"] = fp
         print(f"[paired_pulse.near_onset] {oset} consistency: " + "; ".join(summ),
               flush=True)
+
+    # #5 last-10-min trend statistic vs shift-null AND circadian (time-of-day) null
+    tsumm, tfp = trend_statistic_fig(
+        mat, onsets["lead"], onsets["all"], p("trend_statistic_dual_null.png"),
+        n_surr=2000, title=f"{C.ANIMAL} · {C.CHANNEL} · last-10-min PPR drop vs shift "
+        f"& circadian nulls")
+    out["trend_statistic"] = tfp
+    print("[paired_pulse.near_onset] trend-stat: " + "; ".join(tsumm), flush=True)
 
     for k, v in out.items():
         print(f"[paired_pulse.near_onset] {k} -> {v}", flush=True)
