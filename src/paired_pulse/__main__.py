@@ -38,6 +38,9 @@ def main(argv=None) -> int:
     elif "--rescluster" in argv:
         from . import residual_cluster as _rc
         _rc.run(force=force)
+    elif "--risk" in argv:
+        from . import risk as _risk
+        _risk.run(since=since, force=force)
     elif "--all" in argv:
         _run.run(since=since, force=force, apply=True)
         _run.run_periictal(since=since)
@@ -47,6 +50,8 @@ def main(argv=None) -> int:
         _lb.run(since=since)
         from . import near_onset as _no
         _no.run(since=since)
+        from . import risk as _risk
+        _risk.run(since=since)
         from . import residual_cluster as _rc
         _rc.run(force=force)
     else:
